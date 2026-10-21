@@ -5299,12 +5299,13 @@ private:
         // stale and the drafting rounds' fixed overhead is priced into the columns it does not
         // belong to). While plain wins, that often would give away a round costing twice a plain
         // one every 2 * kProbeInterval rounds (measured about 4 % of the size's tokens at six rows,
-        // 2026-10-21), so the probe thins to every kProbeLossFactor'th cycle and alternates one and
-        // two drafts, enough spread for the columns fit to notice drafting starting to pay again.
+        // 2026-10-21), so once the size is fitted the probe thins to every kProbeLossFactor'th cycle.
+        // Until then it probes every cycle, so a size's fit forms within a few hundred rounds instead
+        // of thousands. The probes alternate one and two drafts: the columns fit needs their spread.
         const std::uint64_t round = ++batch_policy_rounds_;
         if (best == 0) {
-            const std::uint64_t cycle = round % (2 * kProbeInterval * kProbeLossFactor);
-            if (cycle == 0) { return static_cast<std::int32_t>(round / (2 * kProbeInterval) % 2U) + 1; }
+            const std::uint64_t period = 2 * kProbeInterval * (fitted ? kProbeLossFactor : 1);
+            if (round % period == 0) { return static_cast<std::int32_t>(std::min<std::uint64_t>(round / period % 2U + 1, most)); }
             return 0;
         }
         const std::uint64_t cycle = round % (2 * kProbeInterval);
