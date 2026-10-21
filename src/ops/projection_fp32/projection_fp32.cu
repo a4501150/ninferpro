@@ -160,6 +160,10 @@ constexpr int kSliceChunks     = 32; // chunks per K slice: one per lane
 constexpr int kStageWords      = (kWideRows + kWideColumns) * kSliceChunks; // 16-byte words per stage
 constexpr int kWideSharedBytes = 2 * kStageWords * 16;
 constexpr int kWideMinColumns  = 64; // narrower calls keep the narrow mapping (same bits)
+// Calls up to this many columns give each warp one row (one CTA per four rows and eight columns): a
+// 12-column DFlash2 verification round's 513-row router took 27 us in the four-rows-per-warp mapping's
+// 34 CTAs (RTX PRO 6000, 2026-10-21). Same bits as the other mapping.
+constexpr int kRowMappingMaxColumns = 32;
 static_assert(kWideThreads == 512 && kStageWords % kWideThreads == 0);
 
 // The address of chunk `chunk` (8 elements) of output row `row`.
@@ -587,7 +591,7 @@ void detail::projection_fp32_route(const Tensor& x, std::span<const Tensor* cons
         projection_wide_kernel<<<dim3((rows + kWideRows - 1) / kWideRows, (columns + kWideColumns - 1) / kWideColumns),
                                  kWideThreads, kWideSharedBytes, stream>>>(
             static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
-    } else if (columns <= kColumns) {
+    } else if (columns <= kRowMappingMaxColumns) {
         constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
         CUDA_CHECK(pdl::launch_consumer({dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups.y), dim3(threads),
                                          staged, stream},

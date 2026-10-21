@@ -18,11 +18,12 @@
 //
 //   infernix_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
 //                                   [--activation a4|a16|a16x2] [--cold] [--warmup 3] [--repeat 10] [--seed N]
-//                                   [--columns-per-expert C] [--split-scales]
+//                                   [--columns-per-expert C] [--split-scales] [--route overlap|fork]
 //
 // --columns-per-expert C routes uniformly instead (every used expert gets exactly C columns while
 // 10 T / C <= 512); --split-scales gives every expert distinct gate and up input scales, which keeps
-// experts of more than eight columns off the wide route (W4A4 only).
+// experts of more than eight columns off the wide route (W4A4 only). --route fork times the decode
+// route instead (calls of at most eight columns: one pass, the misses staged on a side stream).
 
 #include "infernix/ops/offloaded_sparse_moe.h"
 
@@ -67,6 +68,7 @@ struct Options {
     bool cold             = false;
     int columns_per_expert = 0;     // > 0: uniform routing, every used expert has exactly this many columns
     bool split_scales      = false; // distinct gate and up input scales: no expert takes the wide route
+    bool fork              = false; // --route fork: the decode route (one pass, misses staged on a side stream)
 };
 
 std::vector<int> parse_list(const std::string& text) {
@@ -113,6 +115,10 @@ Options parse_options(int argc, char** argv) {
             if (options.columns_per_expert < 1) { throw std::invalid_argument("--columns-per-expert must be positive"); }
         } else if (arg == "--split-scales") {
             options.split_scales = true;
+        } else if (arg == "--route") {
+            const std::string v = value();
+            if (v != "overlap" && v != "fork") { throw std::invalid_argument("--route takes overlap or fork"); }
+            options.fork = v == "fork";
         } else {
             throw std::invalid_argument("unknown option " + arg);
         }
@@ -233,7 +239,7 @@ struct Fixture {
     Fixture(const Fixture&)            = delete;
     Fixture& operator=(const Fixture&) = delete;
 
-    ops::MoeExpertSource source(bool staged) const {
+    ops::MoeExpertSource source(bool staged, bool fork) const {
         ops::MoeExpertSource s{.frame_base    = static_cast<const std::uint8_t*>(frames_memory.p),
                                .frames        = static_cast<const std::int32_t*>(staged ? resident_none.p : frames_table.p),
                                .host_records  = host_device,
@@ -242,6 +248,12 @@ struct Fixture {
                                .activation    = a16 ? moe::ExpertActivation::kA16 : moe::ExpertActivation::kA4,
                                .staging_base  = static_cast<std::uint8_t*>(staging.p),
                                .staging_slots = kStagingSlots};
+        if (fork) {
+            s.fork_stream    = overlap;
+            s.fork_events[0] = events[0];
+            s.fork_events[1] = events[1];
+            return s;
+        }
         s.overlap_stream = overlap;
         for (int i = 0; i < 5; ++i) { s.overlap_events[i] = events[i]; }
         return s;
@@ -285,7 +297,7 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
         options.a4_residual ? moe::WideA16::kA4Residual : moe::WideA16::kExact));
     for (const bool staged : {false, true}) {
         if ((staged && options.placement == "frames") || (!staged && options.placement == "staged")) { continue; }
-        ops::MoeExpertSource source = fixture.source(staged);
+        ops::MoeExpertSource source = fixture.source(staged, options.fork);
         source.wide_a16             = options.a4_residual ? moe::WideA16::kA4Residual : moe::WideA16::kExact;
         Tensor tx(x.p, DType::BF16, {moe::kHidden, tokens});
         Tensor out(outputs.p, DType::BF16, {moe::kHidden, entries});

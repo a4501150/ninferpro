@@ -120,6 +120,13 @@ shared abstractions that add indirection, branching or virtual dispatch on the h
 only where the shared piece is already a zero-cost primitive (core, ops, runtime contracts), and
 never make one family's fast path slower to accommodate another.
 
+A planned product change: load Hugging Face safetensors (BF16, FP8, ModelOpt NVFP4, AWQ/GPTQ) and
+GGUF (Q4_K, Q8_0 and similar block formats) directly, next to `.infernix`. Until it lands, design
+for it: kernels take the weight format as a compile-time trait (tile load, scale handling, MMA
+variant) around shared grouping and scheduling, so a new stored format adds a trait, not a new
+kernel. A future loader maps each source format either to an existing trait or, once at load time,
+to a native layout; it never repacks per request.
+
 Detailed model/runtime responsibilities and source ownership are defined in
 [Engine architecture](docs/maintainer/engine-architecture.md). Read the relevant boundary before
 changing it. Prefer explicit implementations for supported architectures. Do not introduce generic model

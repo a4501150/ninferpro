@@ -3521,6 +3521,20 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   (-1.7 % at 4; eight rows from different requests route apart, an MTP row's drafts alike). W4A16
   calls of at most four columns take the one-column kernels again; prefill keeps the multi-column
   ones.
+- **W4A16 narrow kernels by row group (2026-10-21, RTX PRO 6000, this fork).** The C = 6 decode
+  round (15.6 ms) spent 9.7 ms in `gate_up_kernel_a16<4>`/`down_kernel_a16<4>` at 771 GB/s: a
+  46 KB staged slice per CTA left one CTA per SM, so no weights loaded while it computed, and every
+  CTA re-encoded its columns' whole x. Now every token's x is encoded once per call
+  (`encode_x_acts_kernel`, workspace `x_acts`), a gate/up CTA takes one row group, and both passes
+  stream their weights into registers (lane 8q + i: code word (q, i), rows i and i + 8; its int64
+  shares sum to the same exact row sums). The one-column form runs every W4A16 narrow job: at op
+  level it beat four-column passes at every width measured (1-3 columns per expert, 6-48 per call).
+  `infernix_offloaded_moe_wide_bench --activation a16 --cold --route fork` (the decode route), T = 6,
+  one column per expert: 215 -> 131 us; resident gate/up 1.40 TB/s and down 1.30 TB/s (82 % and
+  76 % of DRAM peak). Outputs bit-identical (bench hashes; layer and wide tests; greedy text of
+  plain decode at C = 1 and C = 6 identical to the previous binary). End to end on the uncensored
+  artifact, DFlash2 auto, FP8 KV: C = 1 210 -> 232 tok/s, C = 6 366 -> 434 (decode round 15.6 ->
+  13.3 ms).
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.
