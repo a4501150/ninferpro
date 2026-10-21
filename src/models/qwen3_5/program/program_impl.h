@@ -1,0 +1,813 @@
+#pragma once
+#include "models/qwen3_5/program/internal.h"
+
+#include "core/arena.h"
+#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/speculative_tree.h"
+#include "core/decode_graph.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
+
+#include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
+#include "models/qwen3_5/program/speculative/tree_width_controller.h"
+#include "models/qwen3_5/program/storage/draft_context.h"
+#include "models/qwen3_5/program/storage/kv_address_space.h"
+#include "models/qwen3_5/program/storage/state_store.h"
+#include "models/qwen3_5/program/ledger_splits.h"
+#include "models/qwen3_5/execution/text.h"
+#include "models/qwen3_5/execution/vision.h"
+#include "models/qwen3_5/program/vision_prefill.h"
+#include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen3_5/program/prefix/hybrid_cache.h"
+#include "runtime/prefix_cache/cost.h"
+#include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/tap_planner.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <array>
+#include <chrono>
+#include <filesystem>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace infernix::models::qwen3_5::detail {
+using execution::dimension;
+using PreparedPromptData = qwen3_5::PreparedPromptData;
+
+enum class MtpBridgeMode : std::uint8_t {
+    None,
+    BeforeSuffix,
+    AfterExactHit,
+};
+
+struct PreparedNgramIndex {
+    std::unique_ptr<NgramProposer> index;
+};
+
+// A TokenConstraint compiled for ops::constrain_logits: its distinct multi-token sets (written
+// into the lane's set columns when the request binds) and each step's descriptor relative to
+// the lane (a set index, or the forced-token encoding -2 - token), and each step's observed
+// tokens (empty when the request observes nothing).
+struct RequestConstraintPlan {
+    std::vector<std::vector<TokenId>> sets;
+    std::vector<std::int32_t> step_descriptors;
+    std::vector<std::vector<TokenId>> observe;
+    // Unique per planned request, so a lane's uploaded sets are never mistaken for a later
+    // request's.
+    std::uint64_t serial = 0;
+
+    [[nodiscard]] bool empty() const noexcept { return step_descriptors.empty(); }
+};
+
+struct RequestBasePlanImpl {
+    std::shared_ptr<const PreparedPromptData> prompt;
+    runtime::RequestPlanSummary summary;
+    ops::SamplingConfig sampling;
+    // Tokens whose prompt-frontier log-probabilities complete the request's prefill.
+    std::vector<TokenId> readout_tokens;
+    RequestConstraintPlan constraint;
+    std::shared_ptr<const VisionControlPlan> vision_control_plan;
+    bool allow_prefix_reuse = false;
+    // The prepared ngram index moves out of the immutable prompt into this one-shot slot; the
+    // request's single fresh binding takes it (a resumed binding keeps its saved proposer).
+    std::shared_ptr<PreparedNgramIndex> ngram_index;
+};
+enum class PendingKind : std::uint8_t { None, Begin, Ordinary, Speculative };
+
+struct PendingCandidate {
+    PendingKind kind            = PendingKind::None;
+    std::uint32_t base_E        = 0;
+    std::uint32_t base_S        = 0;
+    std::uint32_t prompt_tokens = 0;
+    std::uint32_t produced      = 0;
+    // Draft columns the speculative round verified: its egress/frame row stride is this + 1 and
+    // its ReplaySSM records use the matching record view.
+    std::uint32_t verify_drafts = 0;
+};
+enum class Lifecycle : std::uint8_t {
+    Empty,
+    Binding,
+    Prefilling,
+    Replaying,
+    Active,
+    Pending,
+    Finishable,
+    Pausing
+};
+
+struct UnitDemand {
+    ExecutionUnitKind kind         = ExecutionUnitKind::Decode;
+    std::uint32_t tokens           = 0;
+    std::uint32_t main_frontier    = 0;
+    std::uint32_t backend_frontier = 0;
+};
+
+struct RecoveryPermit {
+    // The active KV addresses hold the physical reservation through this coverage.
+    // These frontiers distinguish reconstructed work from committed new progress.
+    UnitDemand coverage;
+    std::uint32_t frontier    = 0;
+    std::size_t ledger_tokens = 0;
+};
+
+struct SequenceKVBundle {
+    KVAddressSpaceHandle text;
+    std::optional<KVAddressSpaceHandle> backend;
+};
+
+// The KV address spaces of one active sequence; cached prefix blocks share only physical pages.
+struct KVHistory {
+    ProgramImpl* owner = nullptr;
+    KVAddressSpaceHandle text;
+    std::optional<KVAddressSpaceHandle> backend;
+    ~KVHistory();
+};
+
+struct DecodeGraphProfile {
+    std::uint32_t batch_size             = 1;
+    std::uint32_t min_execution_frontier = 0;
+    std::uint32_t max_execution_frontier = 0;
+    std::uint32_t topology_class         = 0;
+    DecodeGraphDefinition definition;
+};
+
+struct DecodeGraphTopology {
+    std::uint32_t topology_class = 0;
+    DecodeGraphExecutable executable;
+    std::optional<std::size_t> installed_profile;
+};
+
+struct DecodeGraphFamily {
+    std::vector<DecodeGraphProfile> profiles;
+    std::vector<DecodeGraphTopology> topologies;
+    DecodeGraphProfile& select(std::uint32_t batch_size, std::uint32_t frontier);
+    DecodeGraphExecutable& install(DecodeGraphProfile& profile);
+};
+
+// A Forward stage publishes these IDs before target execution finishes. Program owns the
+// pinned storage and external event together; both outlive the graphs that reference them.
+struct DFlashDraftHandoff {
+    PinnedHostBuffer ids;
+    CudaCompletionEvent ready;
+
+    DFlashDraftHandoff(const DeviceContext& device, std::size_t count)
+        : ids(count * sizeof(TokenId)), ready(device) {}
+
+    [[nodiscard]] std::span<TokenId> tokens() const noexcept {
+        return {static_cast<TokenId*>(ids.data()), ids.size() / sizeof(TokenId)};
+    }
+};
+
+// A speculative round family (see SpeculativeRoundShape) and its captured Forward/Finish graphs.
+struct SpeculativeRoundFamily {
+    SpeculativeRoundShape shape;
+    DecodeGraphFamily forward;
+    DecodeGraphFamily finish;
+};
+
+// ReplaySSM records viewed densely at a width narrower than the frame's, with the fold bound to
+// that view. Rounds verified at the narrower width record and fold only through it.
+struct NarrowReplayView {
+    GdnReplayRecords records;
+    ops::GdnReplayFoldPlan fold;
+};
+struct SequenceState {
+    std::shared_ptr<KVHistory> kv;
+    ActiveStateBinding state;
+    Tensor tail_hidden;
+    std::uint32_t lane = 0;
+
+    std::uint32_t execution_frontier = 0;
+    std::uint32_t ledger_frontier    = 0;
+    std::vector<TokenId> ledger;
+    // Execution frontiers (rewrite splits) of the ledger, which replay reproduces.
+    LedgerSplits ledger_splits;
+    std::int32_t rope_delta               = 0;
+    std::uint32_t text_kv_valid           = 0;
+    std::uint32_t mtp_kv_valid            = 0;
+    std::uint32_t dflash_context_frontier = 0;
+    std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
+    std::uint32_t mtp_draft_count = 0;
+    // adaptive-mtp: the request's learned draft acceptance and draft-length memory. It moves with
+    // the sequence into a paused request's ResumeState and back at its resume binding.
+    MtpLaneDraftState mtp_draft;
+    bool tail_hidden_valid        = false;
+    bool endpoint_valid           = false;
+};
+
+struct RequestControl {
+    std::unique_ptr<NgramProposer> ngram;
+    std::shared_ptr<const NgramSnapshot> ngram_snapshot;
+    std::uint64_t ngram_copy_source = 0;
+    std::uint32_t ngram_copy_offset = 0;
+    std::size_t ngram_copy_ledger   = 0;
+    std::size_t ngram_indexed       = 0;
+    Lifecycle lifecycle             = Lifecycle::Empty;
+    PendingCandidate pending;
+    ops::SamplingConfig sampling_host;
+    GenerationTimings timings;
+    SpeculativeStats speculative_stats;
+    std::shared_ptr<const RequestBasePlanImpl> base;
+    std::optional<UnitDemand> permit;
+    std::optional<RecoveryPermit> recovery;
+    std::uint32_t replay_target = 0;
+    std::uint32_t replay_cursor = 0;
+    Lifecycle resume_lifecycle  = Lifecycle::Empty;
+    // Without the preemption fast path, the KV extent the request holds from binding to release,
+    // so no unit of it waits for pages or pauses another resident (a replay recomputes generated
+    // tokens as prefill, which another request's arrival must not cause). Zero otherwise.
+    UnitDemand held_extent;
+    // Constrained requests: the draws of the pending candidate (one per produced token, in
+    // order) and the committed trace they move into.
+    std::vector<ConstrainedDraw> constraint_round;
+    std::vector<ConstrainedDraw> constraint_trace;
+
+    struct Prefill {
+        PreparedPromptData prompt;
+        std::optional<VisionPrefillPlan> vision_plan;
+        std::unique_ptr<execution::VisionPrefillSession> vision;
+        std::uint32_t base               = 0;
+        std::uint32_t cursor             = 0;
+        std::uint32_t prompt_tokens      = 0;
+        std::uint32_t initial_mtp_extent = 0;
+        double elapsed_seconds           = 0.0;
+        double retired_vision_seconds    = 0.0;
+        bool prepare_mtp                 = false;
+        PrefixReusePath reuse            = PrefixReusePath::Root;
+        MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+    };
+
+    std::optional<Prefill> prefill;
+    std::optional<Prefill> replay;
+};
+
+// A paused request: its ledger, frontier and request-level state. Its lane's state and KV were
+// released at the pause.
+struct ResumeStateImpl {
+    SequenceState sequence;
+    RequestControl control;
+    std::uint32_t frontier = 0;
+};
+
+// Hybrid prefix cache admission decision (docs/maintainer/hybrid-prefix-cache-spec.md §6): the
+// snapshot to resume from (invalid: a root start) and the facts the binding logs.
+struct HybridQuoteImpl {
+    runtime::prefix_cache::SnapshotRef snapshot;
+    std::uint32_t reuse_frontier = 0;
+    // Longest prompt prefix held as cached full blocks, reusable or not.
+    std::uint32_t cached_prefix_tokens = 0;
+};
+
+// A prefill tap whose StateImage is captured but whose snapshot waits for the blocks it anchors
+// on: a frontier inside a block needs that block complete, and an MTP backend trails the text
+// frontier by one token, so even a page-aligned frontier waits for its last block's backend page.
+// A snapshot a lane superseded on the way to a deeper one (its resume snapshot, or its previous
+// tap), so that the deeper one's slot could come from the lineage. If the deeper snapshot is not
+// published after all, the supersession is undone (hybrid_undo_supersession).
+struct HybridSuperseded {
+    runtime::prefix_cache::SnapshotRef snapshot; // invalid: nothing was superseded
+    std::uint32_t frontier = 0;
+    bool index_changed     = false; // the index marked it superseded (not already, not shared)
+};
+
+struct HybridSupersession {
+    HybridSuperseded resume;
+    HybridSuperseded tap;
+};
+
+struct HybridPendingTap {
+    std::uint32_t frontier = 0;
+    StateImageHandle image;
+    std::uint32_t slot = 0; // staging device snapshot slot
+    bool boundary      = false;
+    HybridSupersession superseded; // undone if this tap is dropped
+};
+
+// Per-lane hybrid bookkeeping for the active sequence.
+struct HybridLaneState {
+    bool active  = false;
+    bool publish = false;
+    // Root path of full blocks this sequence pins, in prompt order. Blocks past the reuse
+    // frontier are appended as the sequence commits them.
+    std::vector<runtime::prefix_cache::NodeRef> path;
+    std::uint64_t path_hash = runtime::prefix_cache::kRootLookupHash;
+    // Extra key of every full prompt block (Vision identity), empty for text-only prompts.
+    std::vector<std::uint64_t> prompt_extras;
+    // Extra key of blocks after the last full prompt block: every Vision item precedes them.
+    std::uint64_t trailing_extra = 0;
+    std::vector<runtime::prefix_cache::PlannedTap> taps;
+    std::size_t next_tap = 0;
+    std::vector<runtime::prefix_cache::TapExclusion> exclusions;
+    std::vector<HybridPendingTap> pending;
+    // Most recent snapshot frontier this sequence reused or captured.
+    std::uint32_t last_capture = 0;
+    // Deepest snapshot frontier known on this path (reused or created by this sequence).
+    std::uint32_t deepest_snapshot = 0;
+    // The snapshot this sequence resumed from (invalid: root). Once the sequence publishes a
+    // deeper snapshot, its lineage resumes from that one and this one is superseded.
+    runtime::prefix_cache::SnapshotRef resume_snapshot;
+    std::uint32_t resume_frontier = 0;
+    // The newest Tap (not Boundary) this sequence published. A deeper tap of the same prompt
+    // supersedes it: the lineage resumes from the deeper one, and it only serves a request
+    // diverging between them. The endpoint does not, since a next turn whose template re-renders
+    // the reply resumes from the prompt-end tap.
+    runtime::prefix_cache::SnapshotRef tap_snapshot;
+    std::uint32_t tap_frontier = 0;
+    // The deepest snapshot this sequence resumed from or published, of any kind: what a
+    // tool-call hold keeps when the finish publishes no endpoint (a reply too short for one).
+    runtime::prefix_cache::SnapshotRef latest_snapshot;
+    std::uint32_t latest_frontier = 0;
+    // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
+    // queues behind the restore's per-layer events; releasing the lane queues behind the whole
+    // restore if it may still be landing.
+    std::uint64_t restore_ticket = 0;
+    bool restore_layers_pending  = false;
+    // Without free cache resume, blocks publish only below this frontier: the last chunk-grid
+    // position prefill reached (state computed on the grid equals any other request's cold
+    // computation of the same prefix). Unbounded otherwise.
+    std::uint32_t publish_frontier = std::numeric_limits<std::uint32_t>::max();
+};
+
+class ProgramImpl {
+public:
+    ProgramImpl(const execution::Parameters&, const SequencePlanImpl&, DeviceContext&,
+                const StartupObserver&);
+    ~ProgramImpl() noexcept;
+    [[nodiscard]] RequestBasePlan plan_request(PreparedPromptData&&,
+                                               const runtime::ResolvedExecutionOptions&);
+    [[nodiscard]] ScoreResult causal_score(PreparedPromptData&&, std::uint32_t first_target,
+                                           const ScoreOptions& options);
+    [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit>);
+    void release_units(std::span<const SequenceHandle>) noexcept;
+    [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,
+                                                   const SourceCandidate&, ResumeState*,
+                                                   ExecutionUnitKind, std::uint32_t);
+    [[nodiscard]] bool start_pause(SequenceHandle, runtime::ExecutionTiming*);
+    [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);
+
+    [[nodiscard]] bool has_context_transaction() const noexcept {
+        return context_transaction_.has_value();
+    }
+
+    [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
+    [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept;
+
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
+                                                  runtime::TokenMaskProvider*);
+    [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming*);
+    [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle>,
+                                      std::span<const runtime::RoundBudget>,
+                                      runtime::ExecutionTiming*, runtime::TokenMaskProvider*);
+    [[nodiscard]] runtime::ExecutionTiming
+    append_forced_tokens(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t,
+                         std::span<const std::optional<std::uint32_t>>, runtime::ExecutionTiming*);
+    [[nodiscard]] CommitResult commit(PendingBatch&&, std::span<const runtime::CommitDecision>,
+                                      runtime::CommitObservation, runtime::ExecutionTiming*);
+    [[nodiscard]] DiscardResult abort_pending(PendingBatch&&) noexcept;
+    [[nodiscard]] FinishResult finish(SequenceHandle) noexcept;
+    [[nodiscard]] AbortResult abort(SequenceHandle) noexcept;
+    [[nodiscard]] bool recover_after_failure() noexcept;
+    void fail_all_cleanup() noexcept;
+    void shutdown_cleanup() noexcept;
+    [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+
+    [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
+                                                              std::uint32_t maximum_frontier);
+    [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    // Holds what the last finished request's next turn resumes from until `deadline`, after every
+    // queued request's source (a tool-call hold).
+    void hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline);
+    // Whether the queue holds must be recomputed although the queue and the snapshots did not
+    // change: a tool-call hold was added, served or expired.
+    [[nodiscard]] bool hybrid_holds_stale() const noexcept;
+    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
+    void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
+
+    void set_hybrid_coalesce_wait_limit(double seconds) noexcept {
+        hybrid_coalesce_wait_seconds_ = seconds > 0.0 ? seconds : 0.0;
+    }
+
+    [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
+
+    [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
+        return hybrid_shutdown_save_;
+    }
+    [[nodiscard]] std::optional<HybridCachePersistence> save_hybrid_cache_now(const CancellationView& abandoned);
+    [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    void reset_memory_peaks() noexcept;
+
+    const execution::Parameters& parameters;
+    DeviceContext& device;
+    const std::uint32_t capacity;
+    const std::uint32_t kv_capacity;
+    const std::uint32_t max_concurrency;
+    const ContextCacheOptions context_cache;
+    const std::uint32_t prefill_chunk;
+    // The width a staged prefill step may take while no other lane waits to decode
+    // (FastPath::IdleWidePrefill): a multiple of prefill_chunk, and prefill_chunk itself when the
+    // fast path is off or no wider step fit the memory plan. prefill_hidden, the DFlash prefill
+    // features and the prefill workspace are planned at this width.
+    const std::uint32_t idle_prefill_width;
+    const ExecutionSchedule execution_schedule;
+    const std::uint32_t draft_window;
+    const std::uint32_t neural_draft_window;
+    // DFlash2 tree verification: the tree widths each batch size may verify and the most
+    // root-to-leaf paths a tree row holds. In automatic mode tree_controller picks each
+    // all-neural round's width.
+    const TreeWidthPlan tree_widths;
+    const std::uint32_t draft_tree_paths;
+    std::optional<TreeWidthController> tree_controller;
+    // The adaptive-mtp draft-length policy (FastPath::AdaptiveMtp): present when the plan captures
+    // a neural MTP family per draft length; each all-neural MTP round then runs the length it picks.
+    std::optional<MtpDraftPolicy> mtp_draft_policy;
+    // The last MTP round's start, all-neural draft length (0: not a policy round) and batch size,
+    // closing its start-to-start cycle for the policy's round-cost learning.
+    struct MtpCostRound {
+        std::chrono::steady_clock::time_point start{};
+        std::uint32_t drafts = 0;
+        std::uint32_t batch  = 0;
+    } mtp_cost_round;
+    const std::uint32_t ngram_draft_window;
+    const std::uint32_t ngram_min_match;
+    const SpeculativeBackend speculative_backend;
+    const KvCacheStorage kv_storage;
+    const ProposalHead proposal_head;
+    const bool vision_enabled;
+    const bool use_cuda_graph;
+    const bool causal_scoring;
+    const std::size_t kv_payload_bytes;
+    const std::size_t graph_allowance_bytes;
+    // Free Device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
+    // launch of every executable), for comparison with graph_allowance_bytes.
+    std::size_t graph_measured_bytes = 0;
+    const WorkspacePlan workspace_plan;
+
+    DeviceArena persistent;
+    DeviceArena workspace_storage;
+    WorkspaceArena work;
+    std::unique_ptr<qwen3_5::DecoderState> decoder;
+    std::unique_ptr<LogicalKVPageStore> text_kv_pages;
+    std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
+    std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
+    std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
+    std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
+    std::unique_ptr<StateImageStore> state_store;
+    std::optional<GdnReplayRecords> replay_records;
+    std::optional<ops::GdnReplayFoldPlan> replay_fold;
+    // One view per round-family width below draft_window: rounds of a narrower family verify at
+    // their own width for every batch size and record/fold through the dense view of that width.
+    std::vector<NarrowReplayView> narrow_replay_views;
+    std::optional<DFlashPersistentState> dflash;
+    qwen3_5::RoundState io;
+    Tensor prefill_hidden;
+    std::optional<Tensor> score_hidden;
+    Tensor sampling_config;
+    Tensor grammar_masks_device;
+    std::optional<PinnedHostBuffer> grammar_masks_host;
+    std::optional<DFlashDraftHandoff> dflash_draft_handoff;
+    std::array<std::uint64_t, kMaximumConcurrency> grammar_dead_positions{};
+    ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
+    ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
+                                        std::span<const TokenId> drafts);
+    Tensor token_counts;
+
+    VisionHandoffState vision_handoff;
+    std::array<SequenceState, kMaximumConcurrency> sequences;
+    // Constrained generation: the host mirror of the device descriptors, how many leading device
+    // columns may hold a constraint, and which plan each lane's set columns were written for.
+    std::vector<std::int32_t> constraint_descriptors_host_;
+    std::size_t constraint_device_columns_ = 0;
+    // The host mirror of the device observe lists (staged only for rounds that observe).
+    std::vector<std::int32_t> constraint_observe_host_;
+    std::array<std::uint64_t, kMaximumConcurrency> constraint_bound_serials_{};
+    std::uint64_t next_constraint_serial_ = 1;
+    std::array<RequestControl, kMaximumConcurrency> requests;
+    std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
+
+    std::optional<PinnedHostBuffer> round_host;
+    std::optional<PinnedHostBuffer> score_logprobs_host;
+    TokenId* host_tokens = nullptr;
+    std::optional<PinnedHostBuffer> ordinary_host;
+    qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
+    qwen3_5::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
+    std::optional<PinnedHostBuffer> mtp_host;
+    qwen3_5::MtpDecodeIngress* mtp_host_ingress = nullptr;
+    qwen3_5::MtpDecodeEgress* mtp_host_egress   = nullptr;
+    std::optional<PinnedHostBuffer> dflash_host;
+    qwen3_5::DFlashDecodeIngress* dflash_host_ingress          = nullptr;
+    qwen3_5::DFlashDecodeEgress* dflash_host_egress            = nullptr;
+    qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
+
+    std::size_t workspace_logical_peak_bytes = 0;
+    std::size_t vision_handoff_peak_bytes    = 0;
+
+    struct PendingTransaction {
+        std::uint64_t id = 0;
+        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        std::array<std::uint64_t, kMaximumConcurrency> epochs{};
+        std::size_t size = 0;
+    };
+
+    std::optional<PendingTransaction> pending_transaction_;
+    std::uint64_t next_transaction_id_ = 1;
+
+    // A binding from a prefix cache source, or a pause.
+    struct ContextTransaction {
+        ContextOperationKind kind = ContextOperationKind::Bind;
+        std::uint32_t lane        = 0;
+        std::uint64_t epoch       = 0;
+        std::shared_ptr<const RequestBasePlanImpl> base;
+        ResumeState* resume = nullptr;
+        std::optional<ResumeState> paused;
+        std::optional<KVActivationReservation> text_activation;
+        std::optional<KVActivationReservation> backend_activation;
+        std::optional<StateImageHandle> reserved_state;
+        std::uint32_t reuse_frontier   = 0;
+        std::uint32_t backend_frontier = 0;
+        UnitDemand first_unit;
+        UnitDemand reservation_demand;
+        std::optional<RecoveryPermit> recovery;
+        std::optional<SequenceKVBundle> reserved_kv;
+        runtime::ContextOperationCounts operations;
+        bool adopted = false;
+
+        // The binding's source: the pinned tree path and snapshot, the forks that share its
+        // pages, and the Host restore the source needs.
+        struct HybridBinding {
+            std::shared_ptr<const HybridQuoteImpl> quote;
+            std::vector<runtime::prefix_cache::NodeRef> path;
+            std::vector<std::uint64_t> extras;
+            bool snapshot_pinned = false;
+            bool state_restored  = false;
+            // This binding opened the cache's staged restore batch.
+            bool restore_staged = false;
+            std::optional<KVPagePrefixForkReservation> text_fork;
+            std::optional<KVPagePrefixForkReservation> backend_fork;
+            std::uint64_t restore_bytes = 0;
+        };
+
+        std::optional<HybridBinding> hybrid;
+    };
+
+    std::optional<ContextTransaction> context_transaction_;
+    CudaEventTimer prefill_gpu_timer_;
+
+    // Captured transfers and external events reference the buffers and events declared above.
+    // Families are destroyed first, including when startup throws.
+    DecodeGraphFamily ordinary_graphs;
+    // Speculative round families in plan order; fixed after construction, so references into it
+    // stay valid.
+    std::vector<SpeculativeRoundFamily> round_families;
+
+    [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
+    [[nodiscard]] UnitDemand held_extent(const RequestBasePlanImpl&) const;
+    // The KV coverage of a staged prefill step of up to `step_tokens` prompt tokens from `cursor`.
+    [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
+                                          std::uint32_t mtp_extent,
+                                          std::uint32_t step_tokens) const;
+    // The tokens the lane's next staged prefill step is reserved for: prefill_chunk, or the idle
+    // width when idle-wide-prefill is selected and no other lane waits to decode (request_plan.cpp).
+    [[nodiscard]] std::uint32_t prefill_step_tokens(const SequenceState&,
+                                                    const RequestControl&) const;
+    // Whether a lane other than `lane` is generating (Active or Pending): its next decode or
+    // control round waits behind any prefill step.
+    [[nodiscard]] bool other_lane_generating(std::uint32_t lane) const noexcept;
+    [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
+                                       ExecutionUnitKind, std::uint32_t tokens) const;
+    void require_unit(std::uint32_t lane, ExecutionUnitKind, std::uint32_t tokens = 0) const;
+    void settle_unit(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool valid_sequence(SequenceHandle) const noexcept;
+    [[nodiscard]] bool valid_pending(const PendingBatch&) const noexcept;
+    void abort_context() noexcept;
+    void plan_binding_units(ContextTransaction&, const RequestBasePlan&, ResumeState*,
+                            ExecutionUnitKind, std::uint32_t);
+    void install_binding(ContextTransaction&);
+    [[nodiscard]] ResumeState complete_pause(ContextTransaction&);
+    void install_resume_sampling(SequenceState&, RequestControl&);
+    void initialize_prefill(std::uint32_t lane, std::uint32_t base);
+    void preencode_overlay_vision(execution::VisionPrefillSession&, const PreparedPromptData&,
+                                  const VisionPrefillPlan&, std::uint32_t base);
+    [[nodiscard]] SequenceHandle sequence_handle(std::uint32_t lane) const noexcept;
+    void invalidate_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] SequenceState& active_sequence(std::uint32_t lane);
+    [[nodiscard]] const SequenceState& active_sequence(std::uint32_t lane) const;
+    void clear_lane(SequenceState&, RequestControl&) noexcept;
+    void clear_execution_failure_lanes(std::span<const std::uint32_t>) noexcept;
+    void ordered_reset(SequenceState&);
+    void refresh_state_views(SequenceState&);
+    [[nodiscard]] StateImageSelectors state_selectors(const SequenceState&) const;
+    void release_sequence_state(SequenceState&) noexcept;
+    void release_sequence_kv(SequenceState&) noexcept;
+    void ensure_sequence_kv_mapped(SequenceState&, std::uint32_t main, std::uint32_t backend = 0);
+    void trim_sequence_kv(SequenceState&, std::uint32_t main, std::uint32_t backend = 0);
+    void commit_sequence_kv(SequenceState&, std::uint32_t main, std::uint32_t backend = 0);
+    [[nodiscard]] PagedKVCache* backend_kv_cache() noexcept;
+    [[nodiscard]] const PagedKVCache* backend_kv_cache() const noexcept;
+    [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState&) const noexcept;
+    [[nodiscard]] PagedKVCacheView text_kv_view(const SequenceState&) const;
+    [[nodiscard]] PagedKVCacheView mtp_kv_view(const SequenceState&) const;
+    [[nodiscard]] PrefillProgress wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult);
+    [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t>,
+                                            const runtime::BatchedGeneratedRound&);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill_raw(std::uint32_t,
+                                                                 runtime::ExecutionTiming*);
+    [[nodiscard]] runtime::ExecutionTiming resolve_prefill_raw(std::uint32_t, bool,
+                                                               runtime::ExecutionTiming*);
+    [[nodiscard]] runtime::ExecutionTiming
+    resolve_pending_raw(std::span<const std::uint32_t>, std::span<const std::uint32_t>,
+                        std::span<const std::uint8_t>, std::span<const std::uint8_t>,
+                        std::span<const std::optional<std::uint32_t>>, runtime::ExecutionTiming*);
+    [[nodiscard]] runtime::BatchedGeneratedRound decode_raw(std::span<const std::uint32_t>,
+                                                            std::span<const runtime::RoundBudget>,
+                                                            runtime::ExecutionTiming*,
+                                                            runtime::TokenMaskProvider*);
+    void prepare_graphs();
+    void install_sampling(SequenceState& sequence, RequestControl& request,
+                          const ops::SamplingConfig& config);
+    void set_device_i32(Tensor& tensor, std::int32_t value);
+    void copy_tail(SequenceState& sequence, const Tensor& source);
+    void copy_round_token();
+    void commit_generated_splits(SequenceState& sequence, std::uint32_t base_ledger_frontier,
+                                 std::span<const TokenId> accepted_tokens,
+                                 std::optional<std::uint32_t> prefix_execution_split_after);
+    [[nodiscard]] runtime::ExecutionTiming
+    resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
+                                    std::uint32_t accepted_tokens, bool terminal,
+                                    std::optional<std::uint32_t> prefix_execution_split_after,
+                                    runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] runtime::PrefillStepResult
+    advance_prefill(SequenceState& sequence, RequestControl& request,
+                    runtime::ExecutionTiming* failed_timing);
+    // Log-probabilities of `tokens` and the unrestricted top token at the position after the
+    // final-normalized `hidden`, from the same output-head projection the first token samples.
+    [[nodiscard]] PromptReadout read_prompt_frontier(const Tensor& hidden,
+                                                     std::span<const TokenId> tokens);
+
+    // ---- constrained generation (constraint.cpp) ----
+    // One row of a round: the lane, its request's compiled constraint (null when
+    // unconstrained) and the output step its first logits column samples.
+    struct ConstraintRow {
+        std::uint32_t lane                 = 0;
+        const RequestConstraintPlan* plan  = nullptr;
+        std::uint32_t first_step           = 0;
+    };
+    // Writes the round's descriptors (row-major, `width` columns per row) for every
+    // constrain_logits call the round makes, and resets columns an earlier round constrained.
+    void stage_constraint_columns(std::span<const ConstraintRow> rows, std::uint32_t width);
+    void stage_constraint_observations(std::span<const ConstraintRow> rows, std::uint32_t width);
+    void bind_constraint_sets(std::uint32_t lane, const RequestConstraintPlan* plan);
+    // After the round completed: the draws of `tokens`, produced by consecutive columns from
+    // `first_column` for output steps from `first_step`.
+    [[nodiscard]] std::vector<ConstrainedDraw>
+    read_constraint_draws(const RequestConstraintPlan& plan, std::uint32_t first_step,
+                          std::size_t first_column, std::span<const TokenId> tokens);
+    [[nodiscard]] const RequestConstraintPlan* constraint_plan(std::uint32_t lane) const noexcept;
+    // The output step the lane's next sampled token is: its generated-token count.
+    [[nodiscard]] std::uint32_t constraint_first_step(std::uint32_t lane) const;
+    [[nodiscard]] ConstraintRow constraint_row(std::uint32_t lane) const {
+        const RequestConstraintPlan* plan = constraint_plan(lane);
+        return ConstraintRow{.lane       = lane,
+                             .plan       = plan,
+                             .first_step = plan != nullptr ? constraint_first_step(lane) : 0U};
+    }
+    void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
+                                       std::span<const std::uint32_t> starts,
+                                       std::span<const std::uint32_t> counts);
+    void validate_licensed_tokens(std::span<const TokenId> tokens) const;
+    void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    // ReplaySSM record view and fold plan for a speculative round verified at verify_drafts.
+    [[nodiscard]] const GdnReplayRecords* round_replay_records(std::uint32_t verify_drafts) const;
+    [[nodiscard]] const ops::GdnReplayFoldPlan& round_replay_fold(std::uint32_t verify_drafts) const;
+    // The narrowest family of `kind` that verifies at least `drafts` proposals per row.
+    [[nodiscard]] SpeculativeRoundFamily& round_family(SpeculativeRoundKind kind,
+                                                       std::uint32_t drafts = 0);
+    [[nodiscard]] std::vector<NgramProposer::Match>
+    propose_ngram(std::span<const std::uint32_t> lanes,
+                  std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
+                                                         const runtime::RoundBudget& budget);
+    // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
+    static void take_ngram_index(RequestControl& request, const RequestBasePlanImpl& base);
+    [[nodiscard]] runtime::BatchedGeneratedRound decode_ordinary_batch(
+        std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
+        runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_mtp_batch(std::span<const std::uint32_t> lanes,
+                     std::span<const runtime::RoundBudget> budgets,
+                     runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_dflash_batch(std::span<const std::uint32_t> lanes,
+                        std::span<const runtime::RoundBudget> budgets,
+                        runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
+
+    // ---- prefix cache (null when the context cache is disabled) --------------------------------
+    std::unique_ptr<HybridPrefixCache> hybrid_;
+    std::array<HybridLaneState, kMaximumConcurrency> hybrid_lanes_;
+    runtime::prefix_cache::CacheCostModel hybrid_cost_;
+    double hybrid_coalesce_wait_seconds_ = 0.0;
+    std::filesystem::path hybrid_file_;
+    std::string hybrid_fingerprint_;
+    std::optional<HybridCachePersistence> hybrid_shutdown_save_;
+    std::uint64_t hybrid_saved_writes_ = 0; // host_write_bytes at the last save or load
+    // What the last finished lane's next turn resumes from, for a tool-call hold: its endpoint
+    // (an echoing client) and its prompt's last tap (a client re-rendering the reply). Invalid
+    // where none was published.
+    std::array<runtime::prefix_cache::SnapshotRef, 2> hybrid_finished_sources_{};
+    // Tool-call holds: endpoints held after every queued request's source until their deadline,
+    // the earliest deadline first.
+    struct HybridToolHold {
+        std::array<runtime::prefix_cache::SnapshotRef, 2> sources{};
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::vector<HybridToolHold> hybrid_tool_holds_;
+    // Whether the tool-call holds changed since the queue holds were last computed.
+    bool hybrid_tool_holds_changed_ = false;
+
+    void create_hybrid_prefix_cache(const StartupObserver& observer);
+    // Stages a binding: pins the quoted path and snapshot, makes room by evicting unpinned
+    // cached blocks, submits the Host restores the source needs and reserves the forks. Returns
+    // the remaining shortage when room cannot be made from the cache. Without a prefix cache
+    // every source is a root start.
+    [[nodiscard]] BindingReservation
+    start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lane,
+                         const SourceCandidate& candidate, ResumeState* resume,
+                         ExecutionUnitKind resume_kind, std::uint32_t resume_tokens);
+    // Activates the staged binding: the lane's KV shares the tree's pages, its state is the
+    // snapshot image (or a reset), and the lane starts publishing its own blocks and taps.
+    void complete_hybrid_binding(ContextTransaction& tx, ContextProgress& out);
+    // Returns everything a staged hybrid binding holds. Safe on a partially staged binding.
+    void abort_hybrid_binding(ContextTransaction& tx) noexcept;
+    // The per-layer events the lane's first prefill pass waits on, consumed by this call; empty
+    // once the batch has landed. The view is valid only until the cache's next poll(), which every
+    // KV commit runs, so only PrefillContext::take_layer_ready calls it, inside the chunk function.
+    [[nodiscard]] std::span<const cudaEvent_t> hybrid_take_restore_layers(std::uint32_t lane);
+    // True when a sibling lane still prefilling a prompt that shares more with this one than the
+    // cache offers will publish a snapshot where they diverge soon enough to wait for. Plans that
+    // snapshot as an exact tap of the sibling when none is planned near the divergence.
+    [[nodiscard]] bool hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse);
+    // Writes the Host tier to the attached file once every Host write has landed. Called by the
+    // shutdown cleanup after the lanes wrote their blocks through.
+    void save_hybrid_cache_for_shutdown() noexcept;
+    [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages);
+    // The backend KV frontier restored with a snapshot at `frontier` (MTP trails by one token).
+    [[nodiscard]] std::uint32_t hybrid_backend_frontier(std::uint32_t frontier) const noexcept;
+    // Inserts every newly committed full block of the lane's sequence into the tree, then
+    // publishes the pending taps those blocks complete.
+    void hybrid_publish_blocks(SequenceState& sequence);
+    // Snapshots the lane's committed state at the prefill frontier `frontier`; a boundary tap is
+    // published as SnapshotKind::Boundary.
+    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary);
+    // Realizes the planned taps a completed prefill chunk reached.
+    void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
+                                    std::uint32_t prompt_tokens);
+    // The tokens a prefill step wider than prefill_chunk may take from `cursor` (at most
+    // `tokens`): it ends no later than the chunk boundary where a chunk-wide prefill would
+    // realize the lane's next flexible tap, so idle-wide-prefill snapshots where it does.
+    [[nodiscard]] std::uint32_t hybrid_wide_step_limit(std::uint32_t lane, std::uint32_t cursor,
+                                                       std::uint32_t prompt_tokens,
+                                                       std::uint32_t tokens) const;
+    // Publishes pending taps whose blocks are committed; a finishing lane hands its own last
+    // pages to the remaining ones or drops them.
+    void hybrid_publish_pending(SequenceState& sequence, bool finishing);
+    // Copies a tail bundle into cache-owned pages; absent when no Device page can be freed.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_copy_tail(const HybridBlockPages& source,
+                                                                std::uint32_t columns);
+    // Terminal publication: committed blocks and, when useful, an endpoint snapshot whose image
+    // moves out of the lane; the snapshot the lane resumed from is superseded once a deeper one
+    // exists. The caller then clears the lane.
+    void hybrid_finish_lane(SequenceState& sequence, bool endpoint) noexcept;
+    // The publication of hybrid_finish_lane without the release: returns the snapshot now at the
+    // lane's committed frontier (created or an identical existing one), invalid when none was
+    // published, for a tool-call hold.
+    [[nodiscard]] runtime::prefix_cache::SnapshotRef
+    hybrid_publish_endpoint(SequenceState& sequence, bool endpoint) noexcept;
+    // Drops the lane's index pins and pending taps. Safe on any lane state.
+    void hybrid_release_lane(std::uint32_t lane) noexcept;
+    // Supersedes the snapshot the sequence resumed from once it snapshots past it at
+    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3). Each returns
+    // what it superseded, for hybrid_undo_supersession.
+    HybridSuperseded hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,
+                                             std::span<const TokenId> ledger);
+    HybridSuperseded hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
+    // The deeper snapshot was not published (no slot, no image, a dropped tap, a failed
+    // publication): what it superseded is the lineage's resume point again, unless the lane has
+    // published a deeper snapshot since.
+    void hybrid_undo_supersession(HybridLaneState& lane, const HybridSupersession& superseded);
+};
+} // namespace infernix::models::qwen3_5::detail

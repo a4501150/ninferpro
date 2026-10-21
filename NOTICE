@@ -1,0 +1,22 @@
+ninferpro
+Copyright 2026 a4501150
+
+This product is derived from Infernix (https://github.com/Wallawalla47/Infernix),
+itself a fork of NInfer by Neroued (https://github.com/Neroued/ninfer), both
+licensed under the Apache License, Version 2.0. The starting point is Infernix
+commit 7dbe99a ("feat(qwen4_exp): DFlash2 drafter for Qwen3.8-Flash-Next
+(--draft-model)").
+
+Modifications made in this product (summary; see README.md for details):
+- Exclusive three-tier expert placement for Qwen3.8-Flash-Next (VRAM, RAM and
+  SSD by share or count), runtime placement switching through
+  /admin/expert-placement, and expert swapping within the placement's counts.
+- A frame limit that holds every routed expert in VRAM.
+- --served-model-name aliases.
+- A prefix-cache tail snapshot for single-chunk prompts on artifacts without
+  free cache resume.
+- Batched DFlash2 drafting at any round size with an online cost fit.
+- Linux VRAM spill detection fix (no WDDM budget).
+
+Third-party components keep their own licenses; see third_party/ and
+packaging/windows/THIRD_PARTY_NOTICES.md.

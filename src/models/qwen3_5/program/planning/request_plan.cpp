@@ -1,0 +1,520 @@
+#include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/execution_context.h"
+#include "core/paged_kv_cache.h"
+#include <algorithm>
+#include <cmath>
+#include <iterator>
+#include <limits>
+#include <stdexcept>
+#include <tuple>
+
+namespace infernix::models::qwen3_5::detail {
+namespace {
+
+void validate_sampling(const ResolvedSamplingParameters& sampling) {
+    if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
+        !std::isfinite(sampling.min_p) || !std::isfinite(sampling.presence_penalty) ||
+        !std::isfinite(sampling.frequency_penalty)) {
+        throw std::invalid_argument("sampling parameters must be finite");
+    }
+    if (sampling.top_p < 0.0F || sampling.top_p > 1.0F) {
+        throw std::invalid_argument("top_p must be in [0,1]");
+    }
+    if (sampling.min_p < 0.0F || sampling.min_p > 1.0F) {
+        throw std::invalid_argument("min_p must be in [0,1]");
+    }
+}
+
+ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source) {
+    ops::SamplingConfig out;
+    out.temperature       = source.temperature;
+    out.top_k             = source.top_k;
+    out.top_p             = source.top_p;
+    out.min_p             = source.min_p;
+    out.presence_penalty  = source.presence_penalty;
+    out.frequency_penalty = source.frequency_penalty;
+    out.seed              = source.seed;
+    out.token_counts      = nullptr;
+    return out;
+}
+
+} // namespace
+
+RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
+                                          const runtime::ResolvedExecutionOptions& options) {
+    if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
+    if (prompt.token_ids.size() > capacity) {
+        throw std::invalid_argument("prompt exceeds configured context capacity");
+    }
+    if (prompt.token_ids.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("prompt token count exceeds uint32");
+    }
+    for (const TokenId id : prompt.token_ids) {
+        if (id < 0 || id >= execution::dimension(parameters.model.resources().public_token_count)) {
+            throw std::invalid_argument("prompt contains token outside the public token domain");
+        }
+    }
+    if (prompt.token_types.size() != prompt.token_ids.size() ||
+        prompt.positions.size() != 3ULL * prompt.token_ids.size()) {
+        throw std::invalid_argument("prepared prompt token metadata has an invalid shape");
+    }
+    if (prompt.has_media() != !prompt.media_payloads.empty() ||
+        prompt.media_payloads.size() != prompt.vision_items.size()) {
+        throw std::invalid_argument("prepared prompt media payload is incomplete");
+    }
+    for (std::size_t i = 0; i < prompt.media_payloads.size(); ++i) {
+        if (!prompt.media_payloads[i] ||
+            prompt.media_payloads[i]->patch_elements !=
+                prompt.vision_items[i].patch_count * kPreparedVisionPatchFeatures) {
+            throw std::invalid_argument("prepared prompt media item payload has an invalid shape");
+        }
+    }
+    if (prompt.has_media() && !vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
+    validate_sampling(options.sampling);
+    for (const TokenId id : options.readout_tokens) {
+        if (id < 0 || id >= execution::dimension(parameters.model.resources().public_token_count)) {
+            throw std::invalid_argument("readout token is outside the public token domain");
+        }
+    }
+    RequestConstraintPlan constraint;
+    for (const std::vector<TokenId>& step : options.constraint.steps) {
+        if (step.empty() || step.size() > kMaximumConstraintChoices) {
+            throw std::invalid_argument("constraint step has an invalid token count");
+        }
+        for (const TokenId id : step) {
+            if (id < 0 ||
+                id >= execution::dimension(parameters.model.resources().public_token_count)) {
+                throw std::invalid_argument("constraint token is outside the public token domain");
+            }
+        }
+        if (step.size() == 1) {
+            constraint.step_descriptors.push_back(-2 - step.front());
+            continue;
+        }
+        auto set = std::find(constraint.sets.begin(), constraint.sets.end(), step);
+        if (set == constraint.sets.end()) {
+            if (constraint.sets.size() == kMaximumConstraintSets) {
+                throw std::invalid_argument("constraint uses too many distinct token sets");
+            }
+            set = constraint.sets.insert(constraint.sets.end(), step);
+        }
+        constraint.step_descriptors.push_back(
+            static_cast<std::int32_t>(set - constraint.sets.begin()));
+    }
+    for (const std::vector<TokenId>& observed : options.constraint.observe) {
+        if (observed.size() > ops::kTokenObserveTokens) {
+            throw std::invalid_argument("constraint step observes too many tokens");
+        }
+        for (const TokenId id : observed) {
+            if (id < 0 ||
+                id >= execution::dimension(parameters.model.resources().public_token_count)) {
+                throw std::invalid_argument("observed token is outside the public token domain");
+            }
+        }
+    }
+    constraint.observe = options.constraint.observe;
+    if (const auto& rewrite = prompt.identity.rewrite_checkpoint;
+        rewrite &&
+        (rewrite->recovery_frontier == 0 || rewrite->recovery_frontier > rewrite->frontier ||
+         rewrite->frontier > prompt.token_ids.size())) {
+        throw std::invalid_argument("input recovery is outside its typed rewrite prefix");
+    }
+
+    auto base                             = std::make_shared<RequestBasePlanImpl>();
+    base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
+    base->summary.requested_output_tokens = options.requested_output_tokens;
+    const std::uint32_t capacity_output =
+        capacity - base->summary.prompt_tokens + static_cast<std::uint32_t>(1);
+    base->summary.effective_output_tokens =
+        std::min(options.requested_output_tokens, capacity_output);
+    base->summary.effective_limit_reason = options.requested_output_tokens <= capacity_output
+                                               ? FinishReason::OutputLimit
+                                               : FinishReason::ContextCapacity;
+    base->sampling                       = translate_sampling(options.sampling);
+    base->readout_tokens                 = options.readout_tokens;
+    if (!constraint.empty()) { constraint.serial = next_constraint_serial_++; }
+    base->constraint = std::move(constraint);
+    base->allow_prefix_reuse             = options.allow_prefix_reuse && prompt.identity.reusable;
+    base->summary.publish_continuation =
+        options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    if (prompt.has_media()) {
+        if (!workspace_plan.vision) {
+            throw std::logic_error("Vision prompt has no startup workspace plan");
+        }
+        auto vision = std::make_shared<qwen3_5::VisionControlPlan>(
+            qwen3_5::plan_vision_control(prompt, *parameters.model.config().vision));
+        std::uint32_t previous_end = 0;
+        for (std::size_t index = 0; index < vision->items.size(); ++index) {
+            const qwen3_5::VisionItemControlPlan& item = vision->items[index];
+            const std::uint32_t begin =
+                speculative_backend == SpeculativeBackend::Mtp && item.token_begin != 0
+                    ? item.token_begin - 1
+                    : item.token_begin;
+            if (begin < previous_end) {
+                throw std::invalid_argument("vision item consumer spans overlap");
+            }
+            if (item.merged_count > workspace_plan.vision->max_merged_tokens ||
+                execution::VisionContext::workspace_bytes(
+                    *parameters.model.config().vision, *parameters.vision,
+                    prompt.vision_items[index].patch_count, item.merged_count,
+                    *workspace_plan.vision) > workspace_plan.vision->encode_peak_bytes) {
+                throw std::invalid_argument("vision item exceeds the Program workspace envelope");
+            }
+            previous_end = item.token_end;
+        }
+        if (parameters.model.overlay_vision()) {
+            // The overlay window borrows staging + encode lease from the evictable weight tail;
+            // admit only requests whose borrow fits the ladder.
+            const auto& overlay = *parameters.model.overlay_vision();
+            std::size_t max_patches = 0;
+            std::uint32_t max_merged = 0;
+            for (std::size_t index = 0; index < vision->items.size(); ++index) {
+                const qwen3_5::VisionItemControlPlan& item = vision->items[index];
+                max_patches = std::max(max_patches, prompt.vision_items[index].patch_count);
+                max_merged  = std::max(max_merged, static_cast<std::uint32_t>(item.merged_count));
+            }
+            const auto window = execution::VisionContext::plan_overlay_window(
+                *parameters.model.config().vision, *parameters.vision, max_patches, max_merged);
+            const std::size_t borrow =
+                (overlay.layout.staging_bytes + 255) / 256 * 256 + window.capacity_bytes;
+            if (borrow > overlay.ladder_bytes) {
+                throw std::invalid_argument(
+                    "vision overlay window exceeds the evictable weight ladder");
+            }
+        }
+        base->vision_control_plan = std::move(vision);
+    }
+
+    std::uint32_t previous = 0;
+    for (const auto frontier : prompt.identity.rewrite_execution_frontiers) {
+        if (frontier <= previous || frontier > base->summary.prompt_tokens) {
+            throw std::invalid_argument(
+                "rewrite execution frontiers must be ordered prompt positions");
+        }
+        previous = frontier;
+    }
+    if (prompt.ngram_index.index) {
+        base->ngram_index = std::make_shared<PreparedNgramIndex>(
+            PreparedNgramIndex{.index = std::move(prompt.ngram_index.index)});
+    }
+    base->prompt = std::make_shared<const PreparedPromptData>(std::move(prompt));
+    return RequestBasePlan(std::move(base));
+}
+
+std::uint32_t ProgramImpl::initial_mtp_extent(const RequestBasePlanImpl& base) const {
+    const auto prompt = base.summary.prompt_tokens;
+    return speculative_backend == SpeculativeBackend::Mtp
+               ? std::min({neural_draft_window,
+                           base.summary.effective_output_tokens > 1
+                               ? base.summary.effective_output_tokens - 2U
+                               : 0U,
+                           capacity > prompt ? capacity - prompt - 1U : 0U})
+               : 0U;
+}
+
+UnitDemand ProgramImpl::held_extent(const RequestBasePlanImpl& base) const {
+    if (!execution_schedule.held_extent) { return {}; }
+    // The prompt, the output budget and one verify window past it bound every unit's frontier
+    // (next_unit), capped at what one lane and the pool can hold, less a page for a binding's
+    // copied tail: a request beyond that grows its last pages per unit, as without the hold.
+    const std::uint64_t pool_pages = text_kv_pages->physical_pool().capacity_pages();
+    const std::uint64_t pool_tokens =
+        (pool_pages > 1 ? pool_pages - 1 : 0) * static_cast<std::uint64_t>(kPagedKVPageSize);
+    const auto limit = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(capacity, pool_tokens));
+    const std::uint64_t main = static_cast<std::uint64_t>(base.summary.prompt_tokens) +
+                               base.summary.effective_output_tokens + draft_window;
+    UnitDemand extent{.kind = ExecutionUnitKind::Decode};
+    extent.main_frontier = static_cast<std::uint32_t>(std::min<std::uint64_t>(main, limit));
+    if (backend_kv_cache()) {
+        std::uint64_t backend = extent.main_frontier;
+        if (speculative_backend == SpeculativeBackend::Mtp) { backend += draft_window; }
+        std::uint64_t backend_limit = capacity;
+        if (backend_kv_pages) {
+            const std::uint64_t pages = backend_kv_pages->physical_pool().capacity_pages();
+            backend_limit             = std::min<std::uint64_t>(
+                backend_limit,
+                (pages > 1 ? pages - 1 : 0) * static_cast<std::uint64_t>(kPagedKVPageSize));
+        }
+        extent.backend_frontier = static_cast<std::uint32_t>(std::min(backend, backend_limit));
+    }
+    return extent;
+}
+
+UnitDemand ProgramImpl::prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
+                                     std::uint32_t mtp_extent, std::uint32_t step_tokens) const {
+    UnitDemand demand{.kind = ExecutionUnitKind::Prefill};
+    demand.main_frontier    = std::min(prompt, cursor + step_tokens);
+    demand.backend_frontier = backend_kv_cache() ? demand.main_frontier : 0;
+    if (speculative_backend == SpeculativeBackend::Mtp && demand.main_frontier == prompt &&
+        mtp_extent != 0) {
+        demand.backend_frontier = std::min(capacity, prompt + mtp_extent - 1U);
+    }
+    return demand;
+}
+
+bool ProgramImpl::other_lane_generating(std::uint32_t lane) const noexcept {
+    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+        const Lifecycle lifecycle = requests[other].lifecycle;
+        if (other != lane && (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Pending)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uint32_t ProgramImpl::prefill_step_tokens(const SequenceState& sequence,
+                                               const RequestControl& request) const {
+    // idle-wide-prefill: a step beside a lane that waits to decode stays one chunk, which bounds
+    // that lane's stall; with none waiting it may take the idle width. A Vision prompt keeps the
+    // chunk (its media is staged per chunk), and so does a recovering request, whose resume
+    // coverage was planned in chunks.
+    if (idle_prefill_width <= prefill_chunk || !request.prefill || request.prefill->vision ||
+        request.recovery || !sequence.kv || other_lane_generating(sequence.lane)) {
+        return prefill_chunk;
+    }
+    const RequestControl::Prefill& staged = *request.prefill;
+    const std::uint32_t tokens =
+        hybrid_wide_step_limit(sequence.lane, staged.cursor, staged.prompt_tokens,
+                               idle_prefill_width);
+    if (tokens <= prefill_chunk || staged.prompt_tokens - staged.cursor <= prefill_chunk) {
+        return prefill_chunk;
+    }
+    // The wider step takes only KV pages that are free or that the prefix cache can give up, so
+    // a request that could advance by a chunk is never paused or failed for the width.
+    const UnitDemand wide =
+        prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent, tokens);
+    const std::uint64_t evictable = hybrid_ ? hybrid_->index().device_evictable_blocks() : 0U;
+    const auto fits = [evictable](const KVAddressSpaceStore& addresses,
+                                  const LogicalKVPageStore& pages, KVAddressSpaceHandle handle,
+                                  std::uint32_t frontier) {
+        const std::uint32_t needed = addresses.growth_pages_for_tokens(handle, frontier);
+        const std::uint32_t held   = addresses.reserved_growth_pages(handle);
+        return needed <= held ||
+               static_cast<std::uint64_t>(needed - held) <=
+                   pages.physical_pool().available_pages() + evictable;
+    };
+    if (!fits(*text_kv_addresses, *text_kv_pages, sequence.kv->text, wide.main_frontier) ||
+        (sequence.kv->backend && !fits(*backend_kv_addresses, *backend_kv_pages,
+                                       *sequence.kv->backend, wide.backend_frontier))) {
+        return prefill_chunk;
+    }
+    return tokens;
+}
+
+UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestControl& request,
+                                  ExecutionUnitKind kind, std::uint32_t tokens) const {
+    UnitDemand demand{.kind = kind, .tokens = tokens};
+    const auto frontier = sequence.execution_frontier;
+    switch (kind) {
+    case ExecutionUnitKind::Prefill: {
+        if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
+            throw std::logic_error("prefill demand requires a prefill cursor");
+        }
+        const auto& staged = *request.prefill;
+        // idle-wide-prefill: a held permit keeps the width it was reserved with until its step
+        // runs, since whether another lane waits to decode can change in between.
+        if (idle_prefill_width > prefill_chunk && request.permit &&
+            request.permit->kind == ExecutionUnitKind::Prefill) {
+            return *request.permit;
+        }
+        return prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent,
+                            prefill_step_tokens(sequence, request));
+    }
+    case ExecutionUnitKind::Replay:
+        if (request.lifecycle != Lifecycle::Replaying) {
+            throw std::logic_error("request is not replaying");
+        }
+        demand.main_frontier =
+            std::min(request.replay_target, request.replay_cursor + prefill_chunk);
+        demand.backend_frontier = backend_kv_cache() ? demand.main_frontier : 0;
+        break;
+    case ExecutionUnitKind::Decode: {
+        if (request.lifecycle != Lifecycle::Active || tokens == 0 || frontier >= capacity) {
+            throw std::logic_error("decode demand requires an active token and output budget");
+        }
+        const auto available    = std::min(tokens - 1U, capacity - frontier - 1U);
+        auto extent             = speculative_backend == SpeculativeBackend::None
+                                      ? 0U
+                                      : std::min({available, draft_window,
+                                            // An MTP row may verify an n-gram copy instead of its
+                                            // own drafts (decode.cpp), up to the copy window.
+                                            speculative_backend == SpeculativeBackend::Mtp &&
+                                                    ngram_draft_window == 0
+                                                ? sequence.mtp_draft_count
+                                                : draft_window});
+        // A DFlash2 tree row verifies its whole tree whatever output budget it has left: a round
+        // widens a row whose neural extent is full to the tree's width (decode.cpp row_extent),
+        // so the unit covers the widest tree that fits before the capacity. Fixed-width rounds
+        // verify no trees (decode.cpp).
+        if (is_masked_draft_backend(speculative_backend) && available >= neural_draft_window &&
+            !execution_schedule.fixed_speculation) {
+            std::uint32_t tree_columns = 0;
+            for (const std::uint32_t columns : tree_widths.automatic) {
+                tree_columns = std::max(tree_columns, columns);
+            }
+            for (const std::uint32_t columns : tree_widths.fixed) {
+                tree_columns = std::max(tree_columns, columns);
+            }
+            if (tree_columns > extent + 1U && capacity - frontier - 1U >= tree_columns - 1U) {
+                extent = tree_columns - 1U;
+            }
+        }
+        demand.main_frontier    = frontier + extent + 1U;
+        demand.backend_frontier = speculative_backend == SpeculativeBackend::Mtp
+                                      ? std::min(capacity, frontier + extent + draft_window)
+                                  : speculative_backend == SpeculativeBackend::DFlash
+                                      ? demand.main_frontier
+                                      : 0U;
+        break;
+    }
+    case ExecutionUnitKind::Control:
+        if (request.lifecycle != Lifecycle::Active || tokens == 0 || tokens > capacity - frontier) {
+            throw std::logic_error("control demand is outside the available context");
+        }
+        demand.main_frontier    = frontier + tokens;
+        demand.backend_frontier = backend_kv_cache() ? demand.main_frontier : 0;
+        break;
+    case ExecutionUnitKind::Normalize:
+        demand.main_frontier    = sequence.text_kv_valid;
+        demand.backend_frontier = backend_kv_cache() ? frontier : 0;
+        break;
+    }
+    return demand;
+}
+
+runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const ExecutionUnit> units) {
+    std::array<UnitDemand, kMaximumConcurrency> demands{};
+    std::array<UnitDemand, kMaximumConcurrency> coverage{};
+    std::array<std::uint32_t, kMaximumConcurrency> old_main{}, old_backend{};
+    std::array<bool, kMaximumConcurrency> seen{};
+    std::uint64_t main_needed = 0, backend_needed = 0;
+    for (std::size_t index = 0; index < units.size(); ++index) {
+        const auto& unit = units[index];
+        if (!valid_sequence(unit.sequence)) {
+            throw std::logic_error("execution unit has a stale lane");
+        }
+        const auto lane = ContractAccess::lane(unit.sequence).value;
+        if (seen[lane]) { throw std::logic_error("duplicate lane in unit reservation"); }
+        seen[lane]        = true;
+        auto& request     = requests[lane];
+        const auto& state = active_sequence(lane);
+        demands[lane]     = next_unit(state, request, unit.kind, unit.tokens);
+        coverage[lane]    = request.recovery ? request.recovery->coverage : demands[lane];
+        coverage[lane].main_frontier =
+            std::max(coverage[lane].main_frontier, request.held_extent.main_frontier);
+        coverage[lane].backend_frontier =
+            std::max(coverage[lane].backend_frontier, request.held_extent.backend_frontier);
+        if (demands[lane].main_frontier > coverage[lane].main_frontier ||
+            demands[lane].backend_frontier > coverage[lane].backend_frontier) {
+            throw std::logic_error("execution exceeds the retained recovery capacity");
+        }
+        if (request.permit) {
+            if (request.permit->kind != unit.kind || request.permit->tokens != unit.tokens ||
+                request.permit->main_frontier != demands[lane].main_frontier ||
+                request.permit->backend_frontier != demands[lane].backend_frontier) {
+                throw std::logic_error("an existing execution permit cannot be replaced");
+            }
+            continue;
+        }
+        const auto main = text_kv_addresses->growth_pages_for_tokens(state.kv->text,
+                                                                     coverage[lane].main_frontier);
+        old_main[lane]  = text_kv_addresses->reserved_growth_pages(state.kv->text);
+        main_needed += main > old_main[lane] ? main - old_main[lane] : 0;
+        if (state.kv->backend) {
+            const auto backend = backend_kv_addresses->growth_pages_for_tokens(
+                *state.kv->backend, coverage[lane].backend_frontier);
+            old_backend[lane] = backend_kv_addresses->reserved_growth_pages(*state.kv->backend);
+            backend_needed += backend > old_backend[lane] ? backend - old_backend[lane] : 0;
+        }
+    }
+    const auto main_available = text_kv_pages->physical_pool().available_pages();
+    const auto backend_available =
+        backend_kv_pages ? backend_kv_pages->physical_pool().available_pages() : 0;
+    if (main_needed > main_available || backend_needed > backend_available) {
+        return {.reserved = false,
+                .shortage = {.main_kv_pages = static_cast<std::uint32_t>(
+                                 main_needed > main_available ? main_needed - main_available : 0),
+                             .backend_kv_pages =
+                                 static_cast<std::uint32_t>(backend_needed > backend_available
+                                                                ? backend_needed - backend_available
+                                                                : 0)}};
+    }
+    std::array<bool, kMaximumConcurrency> added{};
+    try {
+        for (const auto& unit : units) {
+            const auto lane = ContractAccess::lane(unit.sequence).value;
+            if (requests[lane].permit) { continue; }
+            auto& state = active_sequence(lane);
+            added[lane] = true;
+            text_kv_addresses->reserve_growth(state.kv->text,
+                                              text_kv_addresses->growth_pages_for_tokens(
+                                                  state.kv->text, coverage[lane].main_frontier));
+            if (state.kv->backend) {
+                backend_kv_addresses->reserve_growth(
+                    *state.kv->backend, backend_kv_addresses->growth_pages_for_tokens(
+                                            *state.kv->backend, coverage[lane].backend_frontier));
+            }
+            requests[lane].permit = demands[lane];
+        }
+    } catch (...) {
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (!added[lane]) { continue; }
+            auto& state = active_sequence(lane);
+            text_kv_addresses->reserve_growth(state.kv->text, old_main[lane]);
+            if (state.kv->backend) {
+                backend_kv_addresses->reserve_growth(*state.kv->backend, old_backend[lane]);
+            }
+            requests[lane].permit.reset();
+        }
+        throw;
+    }
+    return {.reserved = true};
+}
+
+void ProgramImpl::release_units(std::span<const SequenceHandle> handles) noexcept {
+    for (const auto handle : handles) {
+        if (!valid_sequence(handle)) { continue; }
+        settle_unit(ContractAccess::lane(handle).value);
+    }
+}
+
+void ProgramImpl::require_unit(std::uint32_t lane, ExecutionUnitKind kind,
+                               std::uint32_t tokens) const {
+    if (!requests[lane].permit || requests[lane].permit->kind != kind ||
+        requests[lane].permit->tokens != tokens) {
+        throw std::logic_error("execution does not match its reserved unit");
+    }
+}
+
+void ProgramImpl::settle_unit(std::uint32_t lane) noexcept {
+    auto& state   = sequences[lane];
+    auto& request = requests[lane];
+    if (request.recovery && request.lifecycle != Lifecycle::Replaying &&
+        request.lifecycle != Lifecycle::Pending &&
+        (request.lifecycle == Lifecycle::Finishable ||
+         state.execution_frontier > request.recovery->frontier ||
+         state.ledger.size() > request.recovery->ledger_tokens ||
+         (request.prefill && request.prefill->cursor > request.recovery->frontier))) {
+        request.recovery.reset();
+    }
+    if (state.kv) {
+        try {
+            text_kv_addresses->settle_growth(
+                state.kv->text, state.text_kv_valid,
+                std::max(request.recovery ? request.recovery->coverage.main_frontier : 0U,
+                         request.held_extent.main_frontier));
+            if (state.kv->backend) {
+                backend_kv_addresses->settle_growth(
+                    *state.kv->backend, backend_kv_valid(state),
+                    std::max(request.recovery ? request.recovery->coverage.backend_frontier : 0U,
+                             request.held_extent.backend_frontier));
+            }
+        } catch (...) { std::terminate(); }
+    }
+    request.permit.reset();
+}
+} // namespace infernix::models::qwen3_5::detail
