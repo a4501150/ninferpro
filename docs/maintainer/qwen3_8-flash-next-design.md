@@ -3534,7 +3534,9 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   76 % of DRAM peak). Outputs bit-identical (bench hashes; layer and wide tests; greedy text of
   plain decode at C = 1 and C = 6 identical to the previous binary). End to end on the uncensored
   artifact, DFlash2 auto, FP8 KV: C = 1 210 -> 232 tok/s, C = 6 366 -> 434 (decode round 15.6 ->
-  13.3 ms).
+  13.3 ms). A lane then keeps all 20 of its units' words in registers for every column of its job
+  (a job of n columns reads its weights once; capped at two CTAs per SM): two columns per expert at
+  T = 12 214 -> 173 us; C = 6 with DFlash2 one draft per row 463 -> 488 tok/s, two 438 -> 484.
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.
