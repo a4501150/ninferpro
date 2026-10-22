@@ -58,9 +58,15 @@ def stable_name(name: str) -> str:
                     end = candidate
                     out.append(name[pos:match.start(1) + k])
                     break
-        if end is None:
+        if end is None and re.match(r"_[0-9a-f]{8}", name[file_end:]):
             # A namespace with no id after the file's hash (`..._6_qsa_cu_940f13ef11pool_kernel`):
-            # only the per-build hash before the file's name is dropped.
+            # the hash is always 8 digits and changes with the file, so the identifier ends after it.
+            for k in range(len(digits)):
+                if digits[k] != "0" and start + int(digits[k:]) == file_end + 9:
+                    end = file_end + 9
+                    out.append(name[pos:match.start(1) + k])
+                    break
+        if end is None:
             out.append(name[pos:start])
             out.append(f"_GLOBAL__N__{name[match.end():file_end]}")
             pos = file_end

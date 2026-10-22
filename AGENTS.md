@@ -275,13 +275,16 @@ CUDA 13.4 at `/usr/local/cuda-13.4`, a Gen5 NVMe (T710) holding the models.
   plus tests and benchmarks), holds the production server and the tests. Export
   `CPATH=/usr/local/cuda-13.4/include` for the plain C++ test targets. Build only what the task
   needs (`--target infernix-serve`, or the affected tests). Wrap builds as
-  `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=14G cmake --build
-  build -j8 ...` (the `Makefile` targets do): an unbounded nvcc build has run the host out of memory.
+  `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=32G cmake --build
+  build -j16 ...` (the `Makefile` targets do, `JOBS=` and `MEM=` override): an unbounded nvcc build
+  has run the host out of memory. A build peaks near 1.75 GiB per job; use `-j8` at 14G when
+  production holds experts in host RAM.
   `build/` links with mold and compiles through ccache (`CMAKE_LINKER_TYPE=MOLD`,
   `CMAKE_{CXX,CUDA}_COMPILER_LAUNCHER=ccache`, set in its cache, not in the presets); a header
   that every CUDA file includes (`core/pdl.cuh`, `ops/common/*.cuh`) still recompiles about 180 of
-  them (about 8 minutes at the 14 GiB cap, which a full build reaches). Its Python tests run with
-  `.venv-convert/bin/python` (`Python3_EXECUTABLE`; the system interpreter has no torch).
+  them (about 8 minutes at `-j8`). Its Python tests run with
+  `.venv-convert/bin/python` (`Python3_EXECUTABLE`; it holds torch and jsonschema, the system
+  interpreter has no torch).
 - GPU: one model boot fits at a time. Hold `flock ~/.cache/super-quant/gpu.lock` for any boot, and
   the build lock as well while measuring. Production stops for a test boot and must be restarted
   afterwards.

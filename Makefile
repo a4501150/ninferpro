@@ -13,12 +13,15 @@
 #                                both locks, so nothing else builds or boots while it measures)
 
 BUILD     ?= build
-JOBS      ?= 8
+# A build peaks near 1.75 GiB per nvcc job; MEM caps the whole build (an unbounded one has run the
+# host out of memory). Lower both when production holds experts in host RAM.
+JOBS      ?= 16
+MEM       ?= 32G
 ARGS      ?=
 R         ?=
 LOCKS     := $(HOME)/.cache/super-quant
 CUDA_INC  := /usr/local/cuda-13.4/include
-BUILD_CMD  = env CPATH=$(CUDA_INC) flock $(LOCKS)/build.lock systemd-run --user --scope -q -p MemoryMax=14G \
+BUILD_CMD  = env CPATH=$(CUDA_INC) flock $(LOCKS)/build.lock systemd-run --user --scope -q -p MemoryMax=$(MEM) \
              cmake --build $(BUILD) -j$(JOBS)
 GPU       := flock $(LOCKS)/gpu.lock
 ROUND     := $(BUILD)/bench/infernix_qwen4_exp_round_bench
