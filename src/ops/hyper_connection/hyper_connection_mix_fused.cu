@@ -372,7 +372,9 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
 // below is the one K1a/K1b compute, in the same order, so the outputs are bit-identical. RTX 5090,
 // Q8 mixer, 2026-10-16: per call -7.6 % (T 2) to -17.8 % (T 5), +2.2 % at T 1 (which keeps
 // K1a/K1b); Flash-Next Dense8 MTP 4 decode +0.9 %, plain decode +0.6 %. Two rows per warp in K1a
-// (v4's other change) spilled 120-160 bytes of stack and was slower (-0 to +20 % per call).
+// (v4's other change) spilled 120-160 bytes of stack and was slower (-0 to +20 % per call); with
+// the pass width a template argument and 4 warps per CTA it did not spill but was slower still
+// (RTX PRO 6000, T 6: 17.9 us against 12.7): the kernel is latency bound, not shared-memory bound.
 //
 // K1a/K1b already had v4's weights-first loads (every weight chunk in registers before the PDL
 // wait), the residual read through __ldg, its lane-chunk K mapping (k = 8 lane + 256 m) and, in
@@ -389,6 +391,9 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
 //     gather) = 448, and each m read feeds 8 rows instead of 4; m is staged in two planes; partials,
 //     inv and R are read through __ldg. The collapse runs after the token loop, one thread per
 //     (token, feature), from the row sums in shared memory, with K1b's own expressions in its order.
+//     The partials are read as float4s, every load of a batch issued before any is used, and the
+//     token groups are sized to the call (6 columns run 4 + 2, not 4 + 4 with two repeated):
+//     RTX PRO 6000, Q8, per call -4 % (T 2) to -12 % (T 12).
 // Not adopted: v4's deferred RMS scale (Strata multiplies unscaled partials by inv in up, another
 // rounding) and its collapse (it rounds each sigmoid(u) Rn product before the stream sum, where
 // K1b's chain may fuse each product into the sum).
@@ -603,6 +608,58 @@ constexpr int kUpV4Threads = kUpV4Warps * 32;
 constexpr int kUpV4Rows    = 8; // a warp's rows: features warp and warp + 8, 4 streams each
 constexpr int kUpTokens    = 4; // tokens per decoded weight chunk
 
+// K1b's dot products for Tokens tokens from t0: the warp's 8 rows in the lane-chunk order (each
+// chunk decoded once for the group), one transposed butterfly per token, and lane 4q stores row q's
+// sum. A token's products and sums do not depend on the group it shares.
+template <class Codec, int Tokens>
+__device__ __forceinline__ void hc_up_v4_tokens(const typename Codec::Chunk (&chunk)[kUpV4Rows][2], const float* m,
+                                                float* u, int t0, int rank, int lane, int warp) {
+    const int chunks = rank / 8;
+    float acc[Tokens][kUpV4Rows];
+#pragma unroll
+    for (int t = 0; t < Tokens; ++t) {
+#pragma unroll
+        for (int q = 0; q < kUpV4Rows; ++q) { acc[t][q] = 0.0F; }
+    }
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int c = lane + 32 * h;
+        if (c < chunks) {
+            float4 a[Tokens], b[Tokens];
+#pragma unroll
+            for (int t = 0; t < Tokens; ++t) {
+                const float4* mt = reinterpret_cast<const float4*>(m + (t0 + t) * rank);
+                a[t] = mt[c];
+                b[t] = mt[chunks + c];
+            }
+#pragma unroll
+            for (int q = 0; q < kUpV4Rows; ++q) {
+                float wv[8];
+                Codec::decode(chunk[q][h], wv);
+#pragma unroll
+                for (int t = 0; t < Tokens; ++t) {
+                    acc[t][q] = fmaf(wv[0], a[t].x, acc[t][q]);
+                    acc[t][q] = fmaf(wv[1], a[t].y, acc[t][q]);
+                    acc[t][q] = fmaf(wv[2], a[t].z, acc[t][q]);
+                    acc[t][q] = fmaf(wv[3], a[t].w, acc[t][q]);
+                    acc[t][q] = fmaf(wv[4], b[t].x, acc[t][q]);
+                    acc[t][q] = fmaf(wv[5], b[t].y, acc[t][q]);
+                    acc[t][q] = fmaf(wv[6], b[t].z, acc[t][q]);
+                    acc[t][q] = fmaf(wv[7], b[t].w, acc[t][q]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < Tokens; ++t) {
+        const float total = warp_sum8_transposed(acc[t], lane);
+        if ((lane & 3) == 0) {
+            const int q = lane >> 2;
+            u[((t0 + t) * kStreams + (q >> 1)) * kUpFeatures + warp + kUpV4Warps * (q & 1)] = total;
+        }
+    }
+}
+
 template <class Codec>
 __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
@@ -653,74 +710,61 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     }
 
     // 2. z = sum_s partial[s] in order s = 0..S-1; m = SiLU(z / S) into plane (k / 4) % 2 at
-    // 4 (k / 8) + k % 4; CTA 0 writes the injects.
+    // 4 (k / 8) + k % 4; CTA 0 writes the injects. A stream's partials are down_rows * columns
+    // contiguous floats (a multiple of 4: down_rows is rank or rank + S), read as float4s, and a
+    // thread issues every load of a batch before any is used.
     const float inv_streams = 1.0F / static_cast<float>(kStreams);
     const int half          = rank / 2;
-#pragma unroll 4
-    for (int i = tid; i < down_rows * columns; i += kUpV4Threads) {
-        const int k = i / columns, t = i - k * columns;
-        float z     = 0.0F;
+    const int quads         = down_rows * columns / 4;
+    const auto* partial4    = reinterpret_cast<const float4*>(partial);
+    constexpr int kZBatch   = 2;
+#pragma unroll 1
+    for (int j0 = tid; j0 < quads; j0 += kZBatch * kUpV4Threads) {
+        float4 p[kZBatch][kStreams];
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) {
-            z += __ldg(partial + (static_cast<std::int64_t>(s) * down_rows + k) * columns + t);
+        for (int b = 0; b < kZBatch; ++b) {
+            const int j = j0 + b * kUpV4Threads;
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) {
+                p[b][s] = j < quads ? __ldg(partial4 + static_cast<std::int64_t>(s) * quads + j)
+                                    : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            }
         }
-        const float v = z * inv_streams;
-        if (k < rank) {
-            m[t * rank + ((k >> 2) & 1) * half + (k >> 3) * 4 + (k & 3)] = v * sigmoidf(v);
-        } else if (inject != nullptr && blockIdx.x == 0) {
-            inject[static_cast<std::int64_t>(t) * kStreams + (k - rank)] = 2.0F * sigmoidf(v);
+#pragma unroll
+        for (int b = 0; b < kZBatch; ++b) {
+            const int j = j0 + b * kUpV4Threads;
+            if (j < quads) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int i = 4 * j + e, k = i / columns, t = i - k * columns;
+                    float z     = 0.0F;
+#pragma unroll
+                    for (int s = 0; s < kStreams; ++s) {
+                        z += e == 0 ? p[b][s].x : e == 1 ? p[b][s].y : e == 2 ? p[b][s].z : p[b][s].w;
+                    }
+                    const float v = z * inv_streams;
+                    if (k < rank) {
+                        m[t * rank + ((k >> 2) & 1) * half + (k >> 3) * 4 + (k & 3)] = v * sigmoidf(v);
+                    } else if (inject != nullptr && blockIdx.x == 0) {
+                        inject[static_cast<std::int64_t>(t) * kStreams + (k - rank)] = 2.0F * sigmoidf(v);
+                    }
+                }
+            }
         }
     }
     for (int i = tid; i < kStreams * columns; i += kUpV4Threads) { inv[i] = __ldg(inv_in + i); }
     __syncthreads();
 
-    // 3. Per group of kUpTokens tokens, the warp's 8 rows in the lane-chunk order (each chunk decoded
-    // once for the group), one transposed butterfly per token, and lane 4q stores row q's sum.
+    // 3. Groups of up to kUpTokens tokens sized to the call (6 columns run 4 + 2), each group's
+    // tokens computed as one.
+    int t0 = 0;
 #pragma unroll 1
-    for (int t0 = 0; t0 < columns; t0 += kUpTokens) {
-        float acc[kUpTokens][kUpV4Rows];
-#pragma unroll
-        for (int t = 0; t < kUpTokens; ++t) {
-#pragma unroll
-            for (int q = 0; q < kUpV4Rows; ++q) { acc[t][q] = 0.0F; }
-        }
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int c = lane + 32 * h;
-            if (c < chunks) {
-                float4 a[kUpTokens], b[kUpTokens];
-#pragma unroll
-                for (int t = 0; t < kUpTokens; ++t) {
-                    const float4* mt = reinterpret_cast<const float4*>(m + min(t0 + t, columns - 1) * rank);
-                    a[t] = mt[c];
-                    b[t] = mt[chunks + c];
-                }
-#pragma unroll
-                for (int q = 0; q < kUpV4Rows; ++q) {
-                    float wv[8];
-                    Codec::decode(chunk[q][h], wv);
-#pragma unroll
-                    for (int t = 0; t < kUpTokens; ++t) {
-                        acc[t][q] = fmaf(wv[0], a[t].x, acc[t][q]);
-                        acc[t][q] = fmaf(wv[1], a[t].y, acc[t][q]);
-                        acc[t][q] = fmaf(wv[2], a[t].z, acc[t][q]);
-                        acc[t][q] = fmaf(wv[3], a[t].w, acc[t][q]);
-                        acc[t][q] = fmaf(wv[4], b[t].x, acc[t][q]);
-                        acc[t][q] = fmaf(wv[5], b[t].y, acc[t][q]);
-                        acc[t][q] = fmaf(wv[6], b[t].z, acc[t][q]);
-                        acc[t][q] = fmaf(wv[7], b[t].w, acc[t][q]);
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int t = 0; t < kUpTokens; ++t) {
-            const float total = warp_sum8_transposed(acc[t], lane);
-            if ((lane & 3) == 0 && t0 + t < columns) {
-                const int q = lane >> 2;
-                u[((t0 + t) * kStreams + (q >> 1)) * kUpFeatures + warp + kUpV4Warps * (q & 1)] = total;
-            }
-        }
+    for (; t0 + kUpTokens <= columns; t0 += kUpTokens) { hc_up_v4_tokens<Codec, kUpTokens>(chunk, m, u, t0, rank, lane, warp); }
+    switch (columns - t0) {
+    case 3: hc_up_v4_tokens<Codec, 3>(chunk, m, u, t0, rank, lane, warp); break;
+    case 2: hc_up_v4_tokens<Codec, 2>(chunk, m, u, t0, rank, lane, warp); break;
+    case 1: hc_up_v4_tokens<Codec, 1>(chunk, m, u, t0, rank, lane, warp); break;
+    default: break;
     }
     __syncthreads();
 

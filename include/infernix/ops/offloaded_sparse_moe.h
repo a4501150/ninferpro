@@ -255,14 +255,20 @@ struct MoeExpertSource {
 /// With wait_for_cpu == false the call returns before placing CPU-served outputs; the caller may
 /// enqueue unrelated work (the shared expert) and must call moe_experts_cpu_wait with the same
 /// arguments before reading `outputs`. The workspace stays reserved until then.
+/// What moe_route_dispatch_plan did for the moe_experts call it was given: nothing beyond the route
+/// (None), its CPU plan (Cpu), or, for a call that stages nothing, its records and encoded x
+/// (InPlace). That moe_experts call passes the same value.
+enum class MoeRoutePlan : std::uint8_t { None, Cpu, InPlace };
+
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu = true, bool cpu_planned = false);
+                 cudaStream_t stream, bool wait_for_cpu = true, MoeRoutePlan plan = MoeRoutePlan::None);
 
-/// moe_route_dispatch and, for a CPU-served call of decode or verification width, the CPU plan of
-/// the moe_experts call with these x, source, max_jobs, workspace and outputs, in one kernel.
-/// Returns true when it planned; that moe_experts call then passes cpu_planned = true.
-[[nodiscard]] bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRouting& routing,
+/// moe_route_dispatch and, at decode or verification width, the plan of the moe_experts call with
+/// these x, source, max_jobs, workspace and outputs, in one kernel: the CPU plan of a CPU-served
+/// call, or every job's record and every column's encoded x for a call of an NVFP4 A16 bank that
+/// stages nothing (no staging slots, CPU or fetch channel, overlap or streamed ring).
+[[nodiscard]] MoeRoutePlan moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRouting& routing,
                                            MoeDispatch& dispatch, std::int32_t* route_log, const Tensor& x,
                                            const MoeExpertSource& source, std::int32_t max_jobs, void* workspace,
                                            const Tensor& outputs, cudaStream_t stream);

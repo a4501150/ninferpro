@@ -3564,6 +3564,21 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   one volume call for every row of the round brought that to 11 us (`queue_ngram`,
   `read_queued_ngram`, verification rows too). In-process six requests of 256 tokens
   (`make t2-bench`, five sets): 464.1 -> 493.1 tok/s median; T1 and T2 hashes and tokens unchanged.
+- **In-place route plan (2026-10-22, RTX PRO 6000, this fork).** On the resident route a MoE layer
+  spent about 20 us between the hyper-connection output and the first expert kernel: router
+  projection, route-dispatch (one CTA), the A16 x encode (a plain launch after it) and a one-CTA
+  stage kernel that only resolved each job's frame. `moe_route_dispatch_plan` now returns
+  `MoeRoutePlan::InPlace` for a call that stages nothing: one kernel whose CTA 0 routes, dispatches
+  and resolves the records and whose CTA 1 + t encodes column t, so `moe_experts` launches neither
+  the encode nor the stage kernel (12 us per layer). The encode first ran inside CTA 0 and made the
+  kernel 18 us at 12 columns (one SM encoding every column); it keeps a CTA per column. T1 forward:
+  1 x 1 6.06 -> 5.89 ms, 6 x 1 11.67 -> 11.44 ms, 1 x 4 9.40 -> 9.11, 6 x 2 16.77 -> 16.61, 6 x 3
+  22.93 -> 22.79; `make t2-bench` 488.3 -> 499.2 tok/s median (five sets); hashes and tokens
+  unchanged. That left the shared expert (on its own stream, forked after the route) starting
+  only once the gate/up kernel held the SMs. It now forks at the top of `Forward::moe`, beside the
+  router and the route, every routed buffer allocated before it (its scoped workspace past them);
+  prefill chunks keep it after the routed experts. T1: 1 x 1 5.89 -> 5.85 ms, 6 x 1 11.44 -> 11.30,
+  1 x 4 9.11 -> 9.02, 6 x 2 16.61 -> 16.52, 6 x 3 22.79 -> 22.74; `make t2-bench` 505.9 tok/s.
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.
