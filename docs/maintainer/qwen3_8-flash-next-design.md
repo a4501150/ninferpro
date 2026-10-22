@@ -3537,6 +3537,18 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   13.3 ms). A lane then keeps all 20 of its units' words in registers for every column of its job
   (a job of n columns reads its weights once; capped at two CTAs per SM): two columns per expert at
   T = 12 214 -> 173 us; C = 6 with DFlash2 one draft per row 463 -> 488 tok/s, two 438 -> 484.
+- **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
+  determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
+  replays from one state differed. The first wrong values were always one warp's 16 output rows of
+  one column of the shared expert's down projection (`fp8_a16_tma_mma_kernel`, `Fp8A16TmaT32R64S3`),
+  close to the right ones, in a layer chosen at random; it needed the shared expert's own stream (the
+  routed experts on the main stream beside it), and serializing the shared expert, or the whole graph,
+  hid it. The TMA tiles' consumers read a stage with generic-proxy loads (`ldmatrix`, `ld.shared`)
+  and released it to the producer, whose next `cp.async.bulk.tensor` write is an async-proxy access,
+  with no `fence.proxy.async` between them; a refill could land in a stage a slower lane was still
+  reading. Every TMA pipeline (FP8 A16, A8 and pair, BF16 A16, NVFP4 A4) now releases through
+  `cta_mbarrier_release_stage`, which fences each lane before the arrive: 0 of 300 replays differ, and
+  the majority hashes are unchanged (the fence changes no arithmetic).
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.
