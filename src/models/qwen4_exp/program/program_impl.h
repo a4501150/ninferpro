@@ -3470,6 +3470,7 @@ public:
                            DiagnosticLevel::Error);
             }
         }
+        reset_round_costs("the expert placement switched"); // a failed switch may still have moved experts
     }
 
     // Starts the resident refill after a placement grow: the usage-rank order to walk (the
@@ -3565,6 +3566,7 @@ public:
                    " experts into " + std::to_string(residency_->frames()) + " frames in " +
                    std::to_string(seconds) + " s (" + std::to_string(residency_->resident_count()) +
                    " resident)");
+        reset_round_costs("the placement's resident refill completed");
         // The switch this fill served named no RAM tier and every key is now in VRAM: the tier
         // served as the fill's reader, and with nothing left to demote or fetch it releases.
         if (placement_wants_no_tier_ && residency_->resident_count() + 1 >= residency_->frames() &&
@@ -5204,6 +5206,21 @@ private:
     std::array<BatchCostFit, kMaximumConcurrency + 1> batch_cost_{};
     std::int32_t last_round_batch_ = 0; // the previous decode round's size (0: none yet)
     std::int32_t last_round_extra_ = -1; // its extra verify columns; -1: not a sample (set by the round)
+
+    // The round cost fits describe the expert placement they were measured under: a plain round
+    // timed with half the experts on the SSD (24 ms at six rows) priced drafts at a twentieth of
+    // the 11 ms all-VRAM round after a switch back, and the plain EMA, sampled only by the probes
+    // while drafting wins, would take ~800 rounds to correct (T3, 2026-10-22: C6 444 -> 351
+    // tok/s). A placement switch, and the resident refill that completes a grow, start them again
+    // from the priors.
+    void reset_round_costs(const char* why) {
+        round_cost_       = {};
+        batch_cost_       = {};
+        last_round_steps_ = -1;
+        last_round_batch_ = 0;
+        last_round_extra_ = -1;
+        diagnostic(std::string("speculation cost fits reset: ") + why);
+    }
 
     // The plain round time a_p, the drafting round's fixed overhead `fixed` (seconds) and marginal
     // per column `b` for rounds of `batch` rows; false while either side is not determined (the

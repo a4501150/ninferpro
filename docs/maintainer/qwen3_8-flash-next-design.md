@@ -3579,6 +3579,16 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   router and the route, every routed buffer allocated before it (its scoped workspace past them);
   prefill chunks keep it after the routed experts. T1: 1 x 1 5.89 -> 5.85 ms, 6 x 1 11.44 -> 11.30,
   1 x 4 9.11 -> 9.02, 6 x 2 16.61 -> 16.52, 6 x 3 22.79 -> 22.74; `make t2-bench` 505.9 tok/s.
+- **Speculation cost fits reset on a placement switch (2026-10-22, RTX PRO 6000, this fork).** T3's
+  placement matrix (all VRAM; 50/50 VRAM/RAM; 65/15/20; 50/50 VRAM/SSD; all VRAM) ended at C6 351
+  tok/s against 444 for the same all-VRAM placement at its start: the DFlash2 batch fit still held
+  the 24 ms plain six-row round of the SSD placement, priced a draft at 0.05-0.32 plain rounds and
+  drafted 5-10 times more per request at 20-25 % acceptance (per-request decode 91 -> 70 tok/s);
+  its plain EMA, sampled only by probes while drafting wins, needed ~800 rounds to recover. A
+  placement switch, and the resident refill completing a grow, now reset the fits
+  (`reset_round_costs`). Same matrix: the closing all-VRAM row 351 -> 436 tok/s (64.7 % acceptance;
+  the opening row 465); the tiered rows 364 -> 367, 343 -> 360, 189 -> 203. Within the matrix's short
+  phases the six-row fit no longer forms in the tiered rows, so they run on the plain prior.
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.
