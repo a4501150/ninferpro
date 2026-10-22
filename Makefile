@@ -17,8 +17,8 @@
 BUILD     ?= build
 # A build peaks near 1.75 GiB per nvcc job; MEM caps the whole build (an unbounded one has run the
 # host out of memory). Lower both when production holds experts in host RAM.
-JOBS      ?= 12
-MEM       ?= 24G
+JOBS      ?= 16
+MEM       ?= 32G
 ARGS      ?=
 R         ?=
 LOCKS     := $(HOME)/.cache/super-quant

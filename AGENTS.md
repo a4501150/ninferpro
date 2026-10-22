@@ -276,8 +276,8 @@ CUDA 13.4 at `/usr/local/cuda-13.4`, a Gen5 NVMe (T710) holding the models.
   plus tests and benchmarks), holds the production server and the tests. Export
   `CPATH=/usr/local/cuda-13.4/include` for the plain C++ test targets. Build only what the task
   needs (`--target infernix-serve`, or the affected tests). Wrap builds as
-  `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=24G cmake --build
-  build -j12 ...` (the `Makefile` targets do, `JOBS=` and `MEM=` override): an unbounded nvcc build
+  `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=32G cmake --build
+  build -j16 ...` (the `Makefile` targets do, `JOBS=` and `MEM=` override): an unbounded nvcc build
   has run the host out of memory. A build peaks near 1.75 GiB per job; use `-j8` at 16G when
   production holds experts in host RAM.
   `build/` links with mold and compiles through ccache (`CMAKE_LINKER_TYPE=MOLD`,
