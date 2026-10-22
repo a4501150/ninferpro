@@ -9,7 +9,7 @@
 //   infernix_qwen4_exp_round_bench [--artifact PATH] [--ngram-volume PATH] [--shape RxW[,RxW...]]
 //       [--context N] [--replays N] [--kv bf16|int8|fp8|nvfp4|k8v4] [--experts N|all]
 //       [--accept K] [--sections] [--layers] [--exact] [--profile] [--check FILE | --record FILE]
-//       [--determinism N] [--no-fork] [--no-shared-stream]
+//       [--determinism N] [--no-fork] [--no-shared-stream] [--miss-route] [--staging-slots N]
 //
 // A shape R x W is R rows of W columns: W = 1 a plain decode round, W >= 2 a verification round of
 // W - 1 drafts per row followed by the commit of K columns per row (--accept, default W). Each row
@@ -24,7 +24,11 @@
 // hash differs from the one FILE records for the same artifact and options; --record FILE writes them.
 // Every shape replays N times (--determinism, default 2) from the same state and fails unless all
 // give the same bits. --no-fork and --no-shared-stream run the MoE's miss fork and the shared expert
-// in order on the main stream (to tell which overlap a nondeterminism needs).
+// in order on the main stream (to tell which overlap a nondeterminism needs). Every expert holds a
+// frame, so the calls take the resident route (ForwardExperts::resident) as the Program's do at
+// `--experts vram=100%`; --miss-route runs them as a partial placement's calls run with no miss to
+// serve: the miss staging of --staging-slots N (default 80, production's top_k x (1 + 7 DFlash2
+// drafts) without the SSD tier), the fork route of calls of at most N jobs, and the landing tables.
 //
 // Not included: the DFlash2 drafter's calls and catch-up, the acceptance kernels, sampling and the
 // host's round work (the server's GPU is busy about 98% of a round, the drafter included).
@@ -87,6 +91,7 @@ namespace {
 constexpr std::int32_t kPrefillChunk = 512;
 constexpr double kWarmSeconds       = 0.5;
 constexpr std::int32_t kLanes       = 8;
+constexpr std::int32_t kLandingSlots = 16; // ExpertResidency::kLandingSlots
 constexpr const char* kDefaultArtifact = "models/infernix/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix";
 constexpr const char* kDefaultNgram    = "models/infernix/Qwen3.8-Flash-Next-BF16.ngram";
 
@@ -121,6 +126,8 @@ struct Options {
     bool sections = false, layers = false, exact = false, profile = false;
     std::filesystem::path check, record; // golden hashes: compare with, or write into
     bool no_fork = false, no_shared_stream = false; // run the MoE fork / the shared expert in order
+    std::int32_t staging_slots = 80;
+    bool miss_route = false;
 };
 
 std::vector<Shape> parse_shapes(const std::string& text) {
@@ -187,6 +194,10 @@ Options parse(int argc, char** argv) {
             o.no_fork = true;
         } else if (arg == "--no-shared-stream") {
             o.no_shared_stream = true;
+        } else if (arg == "--staging-slots") {
+            o.staging_slots = std::max(0, std::stoi(value()));
+        } else if (arg == "--miss-route") {
+            o.miss_route = true;
         } else if (arg == "--check") {
             o.check = value();
         } else if (arg == "--record") {
@@ -294,7 +305,7 @@ struct ExpertFrames {
 struct Harness {
     Harness(const q4::execution::Parameters& parameters, DeviceContext& device, const ExpertFrames& frames,
             std::int32_t context, std::int32_t columns, std::int32_t rows, std::int32_t max_width, KvCacheStorage storage,
-            q4::execution::ForwardFastPaths fast, bool no_fork, bool no_shared_stream)
+            q4::execution::ForwardFastPaths fast, bool no_fork, bool no_shared_stream, bool miss_route, std::int32_t staging_slots)
         : config(parameters.model.config().text), rows(rows) {
         const auto& c = config;
         LayoutBuilder builder;
@@ -406,13 +417,30 @@ struct Harness {
             qsa_records     = DeviceBuffer(2ULL * di * max_width * rows * c.attention_layers);
         }
 
-        // Expert sources and streams as the Program sets them for a resident placement.
+        // Expert sources and streams as the Program sets them: its miss staging and landing tables
+        // (none landing) exist for every placement, and a resident one's calls do not use them.
         q4::execution::ForwardExperts experts;
+        experts.resident = !miss_route;
+        std::size_t pitch = 0;
         for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
             experts.frame_bases.push_back(static_cast<const std::uint8_t*>(frames.pools[l].p));
             experts.frame_pitches.push_back(parameters.layers[l].moe.bank->planes.record_stride);
             experts.frames.push_back(static_cast<const std::int32_t*>(frames.tables.p) + l * c.moe.experts);
             experts.host_tables.push_back(static_cast<const std::uint8_t* const*>(frames.host_tables.p) + l * c.moe.experts);
+            pitch = std::max<std::size_t>(pitch, parameters.layers[l].moe.bank->planes.record_stride);
+        }
+        if (staging_slots > 0) {
+            staging = DeviceBuffer(static_cast<std::size_t>(staging_slots) * pitch);
+            experts.staging_base  = static_cast<std::uint8_t*>(staging.p);
+            experts.staging_slots = staging_slots;
+            const std::size_t landing_bytes = sizeof(std::int32_t) * kLandingSlots * c.num_hidden_layers;
+            landing = DeviceBuffer(landing_bytes);
+            landed  = DeviceBuffer(landing_bytes);
+            landing.fill(0xFF);
+            landed.fill(0xFF);
+            experts.landing       = static_cast<const std::int32_t*>(landing.p);
+            experts.landed        = static_cast<std::int32_t*>(landed.p);
+            experts.landing_slots = kLandingSlots;
         }
         check(cudaStreamCreateWithFlags(&overlap_stream, cudaStreamNonBlocking), "stream");
         for (auto& event : overlap_events) { check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
@@ -461,6 +489,7 @@ struct Harness {
     std::int32_t rows = 0, width = 0, span = 0, di = 0, r = 0, pages_per_row = 0;
     DeviceBuffer state_backing, ple_backing, tails_backing, kv_backing, window_backing;
     DeviceBuffer records_backing, ple_records, qsa_records;
+    DeviceBuffer staging, landing, landed; // the miss staging and landing tables (--staging-slots)
     DeviceBuffer snapshot[3];
     GdnReplayRecords records;
     q4::prefix::KvWindowGeometry window_geometry;
@@ -866,7 +895,7 @@ int main(int argc, char** argv) {
 
         const q4::NgramVolume volume(o.ngram, q4::resolve_ngram_volume(o.ngram, c.ple));
         Harness h(parameters, device, frames, context, std::max(max_columns, kPrefillChunk), rows, max_width, storage,
-                  selection.forward(), o.no_fork, o.no_shared_stream);
+                  selection.forward(), o.no_fork, o.no_shared_stream, o.miss_route, o.staging_slots);
 
         // Each row: its own slice of the corpus, prefilled in chunks.
         const auto corpus = read_corpus(INFERNIX_BENCH_CORPUS);

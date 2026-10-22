@@ -331,6 +331,7 @@ void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
     // the route log keeps that chunk's columns, the span's last as walk_step downloads them.
     const execution::ForwardBatch fb = walk_batch(end - 1);
     forward_->begin_call(fb, nullptr);
+    set_expert_route();
     forward_->layer_moe(l, fb, xm, inject, residual, walk_.widths[end - 1]);
     if (dflash2_) { dflash2_walk_features(first, end, l, residual); }
     if (l + 1 < L) { return; }

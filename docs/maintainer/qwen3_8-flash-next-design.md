@@ -3549,6 +3549,21 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   reading. Every TMA pipeline (FP8 A16, A8 and pair, BF16 A16, NVFP4 A4) now releases through
   `cta_mbarrier_release_stage`, which fences each lane before the arrive: 0 of 300 replays differ, and
   the majority hashes are unchanged (the fence changes no arithmetic).
+- **Resident expert route and batched n-gram reads (2026-10-22, RTX PRO 6000, this fork).** A
+  profile of six concurrent requests (DFlash2 auto, FP8 KV, every expert in VRAM) showed the decode
+  graph 1.5 ms per 6 x 1 round slower than T1's, from two costs with nothing to serve. (1) The
+  Program allocates the miss staging for every placement, so every decode and verification call of
+  up to 80 jobs took the fork route (a stage kernel and a staged expert pass of the full grid on the
+  side stream, beside the resident pass) and wider calls split into staging passes of 80 jobs: T1
+  with production's staging, 6 x 1 11.78 -> 12.14 ms and 6 x 2 17.05 -> 17.62 ms. While the device
+  table gives every expert a frame (`ExpertResidency::every_key_ready`, scanned at each table
+  upload), calls now run without staging, fork, landing, CPU or fetch channel
+  (`ForwardExperts::resident`), and a captured graph whose route differs from the current one is
+  captured again. (2) The plain round's n-gram rows were read lane by lane behind the gate, so six
+  lanes' NVMe misses added up: the GPU waited in `upload_pinned_when` a median 489 us per round;
+  one volume call for every row of the round brought that to 11 us (`queue_ngram`,
+  `read_queued_ngram`, verification rows too). In-process six requests of 256 tokens
+  (`make t2-bench`, five sets): 464.1 -> 493.1 tok/s median; T1 and T2 hashes and tokens unchanged.
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.
