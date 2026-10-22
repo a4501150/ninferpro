@@ -776,10 +776,42 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
     Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
-    const Tensor* rows[] = {&p.router, &p.shared_score};
-    ops::projection_fp32(x, rows, logits, s);
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
+    const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
+    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+    Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
+    const std::int32_t max_jobs = std::min(E, K * T);
+    // The two-term route exists for NVFP4 W4A16 banks only; its layout carries no x limbs, which the
+    // GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the flag.
+    // ggml-bf16-prefill takes a GGUF bank's wide jobs in prefill calls onto the BF16 planes.
+    const QType gate_up_format = p.bank->planes.gate_up_format;
+    const bool ggml_bank       = gate_up_format != QType::NVFP4_MUL && gate_up_format != QType::FP8_E4M3FN_B128;
+    const auto wide_a16 = fast_.expert_a4_residual && gate_up_format == QType::NVFP4_MUL
+                              ? ops::offloaded_moe::WideA16::kA4Residual
+                          : ggml_bank && ops::has_route(dense_routes(), ops::LinearRoutes::GgmlBf16Wide)
+                              ? ops::offloaded_moe::WideA16::kGgmlBf16
+                              : ops::offloaded_moe::WideA16::kExact;
+    const DeviceSpan expert_ws =
+        work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, p.bank->activation, wide_a16));
+    const std::int32_t I = dim(m.shared_intermediate);
+    Tensor product = work_.alloc(DType::BF16, {I, T});
+    Tensor shared  = work_.alloc(DType::BF16, {H, T});
+    // The shared expert reads only x. In decode and verification calls it runs on its own stream from
+    // here, beside the router, the route and the routed experts; every buffer the routed experts use
+    // is allocated above, so its scoped workspace lies past them, and this stream allocates nothing
+    // more until the join. Otherwise (prefill chunks) it runs after the routed experts are enqueued,
+    // while the host computes the CPU-served misses.
+    const bool side = !eager_chunk_ && experts_.shared_stream != nullptr;
+    if (side) {
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
+        CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
+        shared_swiglu(x, p.shared_gate_up, product, work_, experts_.shared_stream, dense_routes());
+        project(product, p.shared_down, shared, work_, experts_.shared_stream, dense_routes());
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], experts_.shared_stream));
+    }
+    const Tensor* rows[] = {&p.router, &p.shared_score};
+    ops::projection_fp32(x, rows, logits, s);
     // The route log holds the call's last `logged` columns: all of them (written by the dispatch), or
     // the trailing ones (a layer walk's grouped call logs its last chunk), copied from the routing.
     const std::int32_t logged = route_columns < 0 ? T : std::min(route_columns, T);
@@ -796,8 +828,6 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             log_tail = log;
         }
     }
-    const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
-    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
     // Without a route tap or a streamed prefill chunk (whose host-side split reads the dispatch), the
     // route waits until the experts' source is known, so its kernel also plans the CPU-served misses.
     const bool streamed_chunk = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
@@ -976,20 +1006,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     if (pitch != 0 && pitch != source.record_stride) {
         throw std::invalid_argument("Qwen4Exp MoE: the layer's frame pitch differs from its bank's record stride");
     }
-    Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
-    const std::int32_t max_jobs = std::min(E, K * T);
-    // The two-term route exists for NVFP4 W4A16 banks only; its layout carries no x limbs, which the
-    // GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the flag.
-    // ggml-bf16-prefill takes a GGUF bank's wide jobs in prefill calls onto the BF16 planes.
-    const bool ggml_bank = source.ggml.gate_up_format != QType::NVFP4_MUL &&
-                           source.ggml.gate_up_format != QType::FP8_E4M3FN_B128;
-    source.wide_a16 = fast_.expert_a4_residual && source.ggml.gate_up_format == QType::NVFP4_MUL
-                          ? ops::offloaded_moe::WideA16::kA4Residual
-                      : ggml_bank && ops::has_route(dense_routes(), ops::LinearRoutes::GgmlBf16Wide)
-                          ? ops::offloaded_moe::WideA16::kGgmlBf16
-                          : ops::offloaded_moe::WideA16::kExact;
-    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation,
-                                                                                 source.wide_a16));
+    source.wide_a16 = wide_a16;
     const ops::MoeRoutePlan planned =
         route_plans ? ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source, max_jobs,
                                                    expert_ws.data, outputs, s)
@@ -998,29 +1015,14 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         CUDA_CHECK(cudaMemcpyAsync(log_tail, static_cast<const std::int32_t*>(routing.ids.data) + static_cast<std::size_t>(K) * (T - logged),
                                    static_cast<std::size_t>(K) * logged * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
     }
-    const std::int32_t I = dim(m.shared_intermediate);
-    Tensor product = work_.alloc(DType::BF16, {I, T});
-    Tensor shared  = work_.alloc(DType::BF16, {H, T});
-    // The shared expert runs while the host computes the CPU-served misses, and in decode and
-    // verification calls on its own stream while the routed experts compute too. It reads only x,
-    // and its scoped workspace lies past every buffer the routed experts use; this stream allocates
-    // nothing more until the join.
-    const bool side = !eager_chunk_ && experts_.shared_stream != nullptr;
-    cudaStream_t shared_s = s;
-    if (side) {
-        CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
-        CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
-        shared_s = experts_.shared_stream;
-    }
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned);
     if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
-    shared_swiglu(x, p.shared_gate_up, product, work_, shared_s, dense_routes());
-    project(product, p.shared_down, shared, work_, shared_s, dense_routes());
-    ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
-    if (side) {
-        CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], shared_s));
-        CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[1], 0));
+    if (!side) {
+        shared_swiglu(x, p.shared_gate_up, product, work_, s, dense_routes());
+        project(product, p.shared_down, shared, work_, s, dense_routes());
     }
+    ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
+    if (side) { CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[1], 0)); }
     if (inject != nullptr) {
         ops::moe_combine_inject(outputs, routing, shared, *inject, *residual, s);
         return Tensor{};

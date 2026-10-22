@@ -3574,7 +3574,11 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   kernel 18 us at 12 columns (one SM encoding every column); it keeps a CTA per column. T1 forward:
   1 x 1 6.06 -> 5.89 ms, 6 x 1 11.67 -> 11.44 ms, 1 x 4 9.40 -> 9.11, 6 x 2 16.77 -> 16.61, 6 x 3
   22.93 -> 22.79; `make t2-bench` 488.3 -> 499.2 tok/s median (five sets); hashes and tokens
-  unchanged.
+  unchanged. That left the shared expert (on its own stream, forked after the route) starting
+  only once the gate/up kernel held the SMs. It now forks at the top of `Forward::moe`, beside the
+  router and the route, every routed buffer allocated before it (its scoped workspace past them);
+  prefill chunks keep it after the routed experts. T1: 1 x 1 5.89 -> 5.85 ms, 6 x 1 11.44 -> 11.30,
+  1 x 4 9.11 -> 9.02, 6 x 2 16.61 -> 16.52, 6 x 3 22.79 -> 22.74; `make t2-bench` 505.9 tok/s.
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.
