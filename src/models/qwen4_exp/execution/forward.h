@@ -104,6 +104,11 @@ struct ForwardExperts {
     // --expert-tail-skip (approximate, 0: off): the generation rounds' ops::MoeExpertSource::
     // tail_skip_rank.
     std::int32_t tail_skip_rank = 0;
+    // Every routed expert is READY in a frame, so no call can miss: calls run without the staging,
+    // the fork, the landing, the CPU and the fetch channels above (a cost per layer with no miss to serve:
+    // 0.37 ms of a 6 x 1 round, 0.57 ms of a 6 x 2). The Program sets it while its placement holds
+    // every expert (Forward::set_experts_resident) and captures its graphs again when it changes.
+    bool resident = false;
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It
@@ -374,6 +379,9 @@ public:
         std::uint64_t streamed_experts = 0;
     };
     [[nodiscard]] SplitStats split_stats() const noexcept { return {split_cpu_experts_, split_streamed_experts_}; }
+    // ForwardExperts::resident, between calls; a captured graph keeps the route it was captured with.
+    [[nodiscard]] bool experts_resident() const noexcept { return experts_.resident; }
+    void set_experts_resident(bool resident) noexcept { experts_.resident = resident; }
 };
 
 } // namespace infernix::models::qwen4_exp::execution

@@ -196,6 +196,9 @@ public:
     [[nodiscard]] std::size_t pinned_keys_total() const;
     // Keys resident in frames now, over every pool.
     [[nodiscard]] std::size_t resident_count() const;
+    // Whether the device table gives every key a frame, so no call can miss: false while a change
+    // to it is not uploaded yet (the next round's upload decides).
+    [[nodiscard]] bool every_key_ready() const noexcept { return every_key_ready_ && !table_dirty_; }
     // Whether the policy holds `key` in a frame (published or still loading): the one view the
     // placement counts are taken from, so a key mid-move is never counted in two tiers.
     [[nodiscard]] bool has_frame(std::uint32_t key) const { return pool_of(key).controller->policy().resident(key); }
@@ -332,6 +335,7 @@ private:
     DeviceBuffer route_device_;
     PinnedHostBuffer route_host_{1};
     bool table_dirty_ = true;
+    bool every_key_ready_ = false; // the last uploaded table gives every key a frame
     DeviceBuffer landing_device_;
     PinnedHostBuffer landing_host_{1};
     DeviceBuffer landed_device_;

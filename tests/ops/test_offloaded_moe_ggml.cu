@@ -196,6 +196,8 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
     auto* d_x = device_copy(x);
     std::vector<std::int32_t> ids(static_cast<std::size_t>(top_k) * columns);
     cuda_check(cudaMemcpy(ids.data(), d_ids, ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
+    // The CPU serves misses only: a call whose routed experts are all resident gives it none.
+    const bool misses = std::any_of(ids.begin(), ids.end(), [&](std::int32_t e) { return frames[static_cast<std::size_t>(e)] < 0; });
     std::vector<std::uint16_t> expected(static_cast<std::size_t>(H) * top_k * columns);
     {
         // The oracle over (token, slot) pairs on every host thread.
@@ -280,7 +282,7 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
         const std::uint64_t served = service.served_experts();
         infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
-        if (config.cpu) {
+        if (config.cpu && misses) {
             char none[128];
             std::snprintf(none, sizeof none, "ggml experts (%d, %d) at %d columns, %s: the CPU served no expert",
                           static_cast<int>(gu), static_cast<int>(down), columns, config.name);

@@ -826,8 +826,15 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     source.error = experts_.error;
     // --expert-tail-skip acts in generation rounds only; prefill, forced and scored tokens stay exact.
     if (batch != nullptr && batch->decode_round) { source.tail_skip_rank = experts_.tail_skip_rank; }
-    // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
-    if (eager_chunk_ && experts_.overlap_stream != nullptr) {
+    // Every expert holds a frame (ForwardExperts::resident): no call can miss, so it runs as one pass
+    // over every job, with no staging, fork, landing, CPU or fetch channel (the same arithmetic per
+    // expert, so the same bits).
+    if (experts_.resident) {
+        source.staging_slots = 0;
+        source.cpu           = ops::MoeCpuChannel{};
+        source.fetch         = ops::MoeFetchChannel{};
+    } else if (eager_chunk_ && experts_.overlap_stream != nullptr) {
+        // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
         source.overlap_stream = experts_.overlap_stream;
         for (int i = 0; i < 5; ++i) { source.overlap_events[i] = experts_.overlap_events[static_cast<std::size_t>(i)]; }
     } else if (experts_.overlap_stream != nullptr) {

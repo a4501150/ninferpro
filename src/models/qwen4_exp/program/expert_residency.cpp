@@ -489,6 +489,9 @@ void ExpertResidency::upload_table(cudaStream_t compute) {
     // SM-read, not a copy engine: the table must not wait behind this round's promotion copies.
     upload_pinned(table_device_.p, table_host_.data(), table_device_.bytes, compute);
     table_dirty_ = false;
+    const auto* table = static_cast<const std::int32_t*>(table_host_.data());
+    every_key_ready_  = std::all_of(table, table + table_device_.bytes / sizeof(std::int32_t),
+                                    [](std::int32_t frame) { return frame >= 0; });
 }
 
 void ExpertResidency::tier_step(cudaStream_t compute) {

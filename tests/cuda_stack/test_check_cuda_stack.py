@@ -35,15 +35,18 @@ def main() -> int:
     nested = "_ZN8infernix3ops6detail16kernelILi2044_GLOBAL__N__2cce7e46_6_abc_cu_05678a3e_239882EEEvv"
     assert tool.stable_name(nested) == "_ZN8infernix3ops6detail16kernelILi20_GLOBAL__N__abc_cu2EEEvv", \
         tool.stable_name(nested)
-    # A file with no id after its hash: the per-build path hash before the file's name leaves the key
-    # (two checkouts of the same tree), the file hash after it stays.
+    # A file with no id after its hash: neither the path hash before the file's name (two checkouts
+    # of the same tree) nor the hash after it (an edit to the file or its headers) stays in the key.
     here = ("__nv_static_27__fac0c9fe_6_qsa_cu_940f13ef__ZN8infernix3ops38_GLOBAL__N__fac0c9fe_6_qsa_cu_"
             "940f13ef11pool_kernelEv")
-    there = ("__nv_static_27__2f914340_6_qsa_cu_940f13ef__ZN8infernix3ops38_GLOBAL__N__2f914340_6_qsa_cu_"
-             "940f13ef11pool_kernelEv")
-    assert tool.stable_name(here) == tool.stable_name(there), "the checkout path must not change the key"
-    assert tool.stable_name(there) == ("__nv_static__qsa_cu__ZN8infernix3ops38_GLOBAL__N__qsa_cu_940f13ef"
+    there = ("__nv_static_27__2f914340_6_qsa_cu_b0d8788c__ZN8infernix3ops38_GLOBAL__N__2f914340_6_qsa_cu_"
+             "b0d8788c11pool_kernelEv")
+    assert tool.stable_name(here) == tool.stable_name(there), "the checkout and edits must not change the key"
+    assert tool.stable_name(there) == ("__nv_static__qsa_cu__ZN8infernix3ops_GLOBAL__N__qsa_cu"
                                        "11pool_kernelEv"), tool.stable_name(there)
+    templated = "_ZN8infernix3ops6kernelILi2038_GLOBAL__N__2f914340_6_qsa_cu_b0d8788c1XEEEvv"
+    assert tool.stable_name(templated) == "_ZN8infernix3ops6kernelILi20_GLOBAL__N__qsa_cu1XEEEvv", \
+        tool.stable_name(templated)
     plain = "_Z6kernelPf"
     assert tool.stable_name(plain) == plain, "names without internal linkage stay as they are"
     print("check_cuda_stack checks passed")

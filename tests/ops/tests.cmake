@@ -287,6 +287,9 @@ infernix_add_op_test(infernix_qsa_select_test
 infernix_add_op_test(infernix_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES infernix_ops)
+# It bounds the latency an idle CPU miss service adds to a call (10 ms), which tests sharing the
+# CPUs and the GPU exceed.
+set_tests_properties(infernix_offloaded_moe_layer_test PROPERTIES RUN_SERIAL TRUE)
 
 # The wide route (experts with more than eight columns) against its FP64 W4A4 oracle.
 infernix_add_op_test(infernix_offloaded_moe_wide_test

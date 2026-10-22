@@ -2241,8 +2241,9 @@ public:
                 if (width == 1) { return; }
                 for (std::int32_t b = 0; b < batch; ++b) {
                     staged[b] = from_ngram_[b] ? width : 1;
-                    stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
+                    queue_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
                 }
+                read_queued_ngram();
             });
             for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
                 if (!from_ngram_[b] && extents[b] > 0) {
@@ -2266,8 +2267,9 @@ public:
             const auto stage_rows = [&] {
                 for (std::int32_t b = 0; b < batch; ++b) {
                     staged[b] = from_ngram_[b] ? width : 1;
-                    stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
+                    queue_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
                 }
+                read_queued_ngram();
             };
             if (neural) {
                 dflash2_propose(std::span<const std::uint32_t>(lanes.data(), batch), stage_rows);
@@ -4070,13 +4072,64 @@ private:
         return j < d.size() ? d[j] : (d.empty() ? lane.history.back() : d.back());
     }
 
-    // The n-gram rows of verification row b's columns [from, to) (W columns from position p).
-    void stage_verify_ngram(Lane& lane, std::size_t b, std::int32_t p, std::int32_t W, std::int32_t from, std::int32_t to) {
+    // Queues the n-gram rows of verification row b's columns [from, to) (W columns from position p)
+    // for read_queued_ngram.
+    void queue_verify_ngram(Lane& lane, std::size_t b, std::int32_t p, std::int32_t W, std::int32_t from, std::int32_t to) {
         if (from >= to) { return; }
         const std::int32_t context = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
         window_.clear();
         for (std::int32_t q = p + from - context; q < p + to; ++q) { window_.push_back(verify_token(lane, b, p, q)); }
-        read_ngram(lane, to - from, b * static_cast<std::size_t>(W) + static_cast<std::size_t>(from));
+        queue_ngram(lane, to - from, b * static_cast<std::size_t>(W) + static_cast<std::size_t>(from));
+    }
+
+    // Queues the rows of the `count` positions whose tokens (with their context) are in window_ for io
+    // columns from `column`. read_queued_ngram reads every queued row in one volume call, so the
+    // misses of all a round's rows are in flight together: read row by row, their NVMe latencies
+    // add up behind the gate (about 0.6 ms of a six-lane decode round).
+    void queue_ngram(Lane& lane, std::int32_t count, std::size_t column) {
+        const std::size_t heads = hash_.heads(), at = queued_ids_.size(), rows = static_cast<std::size_t>(count) * heads;
+        queued_ids_.resize(at + rows);
+        hash_.row_ids(window_, static_cast<std::size_t>(count), queued_ids_.data() + at);
+        std::uint64_t misses = 0;
+        for (std::size_t r = at; r < at + rows; ++r) { misses += volume_.cached({queued_ids_.data() + r, 1}) ? 0 : 1; }
+        queued_.push_back({.lane = &lane, .column = column, .rows = rows, .misses = misses});
+    }
+
+    // Reads the queued rows into their io columns. Each segment's lane counts its rows and hits, and
+    // the call's block reads and read time in proportion to its misses.
+    void read_queued_ngram() {
+        if (queued_.empty()) { return; }
+        const nvtx::ScopedRange rows_range(nvtx::Name::PleRows, nvtx::Category::Control, queued_ids_.size());
+        const std::size_t heads = hash_.heads(), row_bytes = ngram_table().row_bytes;
+        queued_rows_.resize(queued_ids_.size() * row_bytes);
+        const NgramVolume::Counters before = volume_.counters();
+        volume_.read_rows(queued_ids_, queued_rows_);
+        const NgramVolume::Counters& after = volume_.counters();
+        std::uint64_t misses = 0;
+        for (const QueuedRows& q : queued_) { misses += q.misses; }
+        const std::uint64_t reads = after.reads - before.reads, read_ns = after.read_ns - before.read_ns;
+        std::uint64_t reads_left = reads, ns_left = read_ns, misses_left = misses;
+        std::size_t at = 0;
+        for (const QueuedRows& q : queued_) {
+            std::memcpy(host_io() + io_layout_.ngram + q.column * heads * row_bytes, queued_rows_.data() + at * row_bytes,
+                        q.rows * row_bytes);
+            at += q.rows;
+            auto& counters = q.lane->ngram;
+            counters.rows += q.rows;
+            counters.hits += q.rows - q.misses;
+            if (q.misses == 0) { continue; }
+            // The last segment with misses takes the remainders, so the lanes' sums equal the call's.
+            const bool last       = q.misses == misses_left;
+            const std::uint64_t r = last ? reads_left : reads * q.misses / misses;
+            const std::uint64_t t = last ? ns_left : read_ns * q.misses / misses;
+            counters.reads += r;
+            counters.read_ns += t;
+            reads_left -= r;
+            ns_left -= t;
+            misses_left -= q.misses;
+        }
+        queued_.clear();
+        queued_ids_.clear();
     }
 
     // Reads the rows of the `count` positions whose tokens (with their context) are in window_ into
@@ -4142,8 +4195,10 @@ private:
     void stage_decode_rows(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions) {
         for (std::size_t b = 0; b < lanes.size(); ++b) {
             Lane& lane = lanes_[lanes[b]];
-            stage_ngram(lane, lane.history, positions[b], 1, b);
+            ngram_window(lane.history, positions[b], 1);
+            queue_ngram(lane, 1, b);
         }
+        read_queued_ngram();
     }
 
     // Whether every n-gram row of a plain decode round is in the host row cache.
@@ -4490,13 +4545,31 @@ private:
     struct DecodeGraph {
         DecodeGraphDefinition definition;
         DecodeGraphExecutable executable;
-        bool warmed = false;
+        bool warmed   = false;
+        bool resident = false; // the expert route it was captured with (expert_route)
     };
+
+    // The expert route of the next Forward call (execution::ForwardExperts::resident): resident
+    // while the device table gives every expert a frame, so no call can miss. Read after the call's
+    // frame leases, which evict experts.
+    [[nodiscard]] bool expert_route() const noexcept { return residency_ && residency_->every_key_ready(); }
+    void set_expert_route() { forward_->set_experts_resident(expert_route()); }
+
+    // A captured graph keeps the expert route it was captured with: one whose route is not the
+    // current one is captured again (a placement grew to every expert, or a switch or lease took
+    // some away).
+    void follow_expert_route(DecodeGraph& graph) {
+        if (graph.executable.ready() && graph.resident != expert_route()) {
+            graph.executable.reset();
+            graph.definition.reset();
+        }
+    }
 
     // Runs a fixed-address round: the first time eagerly (the Ops' one-time setup), the second
     // captured, then by replay.
     void replay(DecodeGraph& graph, const std::function<void()>& body) {
         const cudaStream_t s = device_.stream;
+        follow_expert_route(graph);
         if (graph.executable.ready()) {
             graph.executable.launch(s);
         } else if (!graph.warmed) {
@@ -4509,6 +4582,7 @@ private:
                 throw std::logic_error("Qwen4Exp: a graph capture inside a wide call or with pending layer waits");
             }
             const std::size_t free_before = trace_ ? trace_free() : 0;
+            graph.resident = expert_route();
             graph.definition.capture(s, body);
             graph.executable.instantiate(graph.definition);
             graph.executable.launch(s);
@@ -4521,6 +4595,7 @@ private:
     void replay_gated(DecodeGraph& graph, std::int32_t steps, const std::function<void(std::int32_t)>& body,
                       const std::function<void(std::int32_t, cudaGraphConditionalHandle)>& gate) {
         const cudaStream_t s = device_.stream;
+        follow_expert_route(graph);
         if (graph.executable.ready()) {
             graph.executable.launch(s);
         } else if (!graph.warmed) {
@@ -4531,6 +4606,7 @@ private:
                 throw std::logic_error("Qwen4Exp: a graph capture inside a wide call or with pending layer waits");
             }
             const std::size_t free_before = trace_ ? trace_free() : 0;
+            graph.resident = expert_route();
             graph.definition.capture_gated_chain(s, steps, body, gate);
             graph.executable.instantiate(graph.definition);
             graph.executable.launch(s);
@@ -4585,6 +4661,7 @@ private:
                       const execution::VisionInput* vision = nullptr, const execution::NgramRowGate* gate = nullptr,
                       bool streamed = false, bool decode_round = false) {
         require_tier_round();
+        set_expert_route();
         execution::ForwardBatch fb = io_batch(static_cast<std::byte*>(io_device_.p), batch, width, logit_columns);
         fb.decode_round  = decode_round;
         fb.ngram_gate    = gate;
@@ -4709,8 +4786,9 @@ private:
         }
         const auto read_rows = [&] {
             for (std::int32_t b = 0; b < batch; ++b) {
-                stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], W, staged[b], W);
+                queue_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], W, staged[b], W);
             }
+            read_queued_ngram();
         };
         const std::uint32_t word = next_gate_word();
         DecodeGraph& graph = verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
@@ -5362,6 +5440,7 @@ private:
         Tensor anchors(mtp_device(mtp_io_.ids), DType::I32, {batch});
         if (unwritten) {
             // The pending cells' K/V (rewriting a written cell is idempotent).
+            set_expert_route();
             forward_->run_mtp({.residuals        = chain,
                                .ids              = anchors,
                                .positions        = Tensor(mtp_device(mtp_io_.cells), DType::I32, {batch}),
@@ -5409,6 +5488,7 @@ private:
                            : Tensor{};
             };
             constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
+            set_expert_route();
             forward_->run_mtp({.residuals    = chain,
                                .ids          = j == 0 ? anchors
                                                       : Tensor(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j - 1) * batch),
@@ -5504,6 +5584,7 @@ private:
         const Tensor block_rope(io + io_layout_.block_rope, DType::I32, {batch, 3});
         const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
         replay(mtp_catch_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)], [&] {
+        set_expert_route();
         forward_->run_mtp({.residuals   = Tensor(mtp_residuals_.p, DType::BF16, {width_, W * batch}),
                            .ids         = Tensor(mtp_device(mtp_io_.up_ids), DType::I32, {W * batch}),
                            .positions   = positions,
@@ -6380,6 +6461,17 @@ private:
     std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;
+    // queue_ngram's rows, read by read_queued_ngram: per segment its lane, first io column, row count
+    // and rows not in the host cache, then every segment's row ids and their codes.
+    struct QueuedRows {
+        Lane* lane          = nullptr;
+        std::size_t column  = 0;
+        std::size_t rows    = 0;
+        std::uint64_t misses = 0;
+    };
+    std::vector<QueuedRows> queued_;
+    std::vector<std::uint32_t> queued_ids_;
+    std::vector<std::byte> queued_rows_;
     std::optional<std::uint32_t> transaction_lane_;
     std::optional<ResumeState> pause_; // the open Pause transaction's result
     bool replaying_ = false;           // the open binding replays toward a paused frontier
