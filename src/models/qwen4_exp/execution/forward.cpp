@@ -990,8 +990,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                           : ops::offloaded_moe::WideA16::kExact;
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation,
                                                                                  source.wide_a16));
-    const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,
-                                                                     max_jobs, expert_ws.data, outputs, s);
+    const ops::MoeRoutePlan planned =
+        route_plans ? ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source, max_jobs,
+                                                   expert_ws.data, outputs, s)
+                    : ops::MoeRoutePlan::None;
     if (log_tail != nullptr) {
         CUDA_CHECK(cudaMemcpyAsync(log_tail, static_cast<const std::int32_t*>(routing.ids.data) + static_cast<std::size_t>(K) * (T - logged),
                                    static_cast<std::size_t>(K) * logged * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));

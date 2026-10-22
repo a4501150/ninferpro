@@ -574,14 +574,21 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             check(within, "an idle CPU miss service adds under 10 ms to a call beyond the GPU's own (median of 5)");
         }
         const std::uint64_t served_before = config.service != nullptr ? config.service->served_experts() : 0;
-        // A served call routes again through moe_route_dispatch_plan, which plans the CPU-served misses
-        // in its own kernel at decode and verification widths (and otherwise routes as before), so
-        // the checks below cover the fused plan.
-        bool planned = false;
-        if (config.service != nullptr) {
+        // A served call, and one that stages nothing, routes again through moe_route_dispatch_plan,
+        // which plans the CPU-served misses, or resolves the records and encodes x, in its own kernel
+        // at decode and verification widths (and otherwise routes as before), so the checks below
+        // cover the fused plans.
+        infernix::ops::MoeRoutePlan planned = infernix::ops::MoeRoutePlan::None;
+        const bool stages_nothing = slots == 0 && config.service == nullptr && !config.fetched;
+        if (config.service != nullptr || stages_nothing) {
             planned = infernix::ops::moe_route_dispatch_plan(Tensor(d_logits, DType::FP32, {experts + 1, columns}),
                                                              top_k, routing, dispatch, nullptr, tx, source, max_jobs,
                                                              d_workspace, out, nullptr);
+        }
+        if (stages_nothing && !config.streamed && !config.overlap &&
+            activation == moe::ExpertActivation::kA16 && columns <= 32 && columns * top_k <= 1024) {
+            check(planned == infernix::ops::MoeRoutePlan::InPlace,
+                  "a call that stages nothing takes the in-place route plan at decode width");
         }
         infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr, true, planned);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
@@ -883,7 +890,8 @@ void test_tail_skip(int experts, int columns, int top_k, int rank, std::uint32_t
                 source.fork_events[0] = fork_events[0];
                 source.fork_events[1] = fork_events[1];
             }
-            const bool planned = fused && infernix::ops::moe_route_dispatch_plan(t_logits, top_k, routing, dispatch, nullptr,
+            const infernix::ops::MoeRoutePlan planned =
+                !fused ? infernix::ops::MoeRoutePlan::None : infernix::ops::moe_route_dispatch_plan(t_logits, top_k, routing, dispatch, nullptr,
                                                                                  tx, source, max_jobs, d_workspace, out, nullptr);
             infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr, true, planned);
             cuda_check(cudaDeviceSynchronize(), "moe_experts");
@@ -901,7 +909,7 @@ void test_tail_skip(int experts, int columns, int top_k, int rank, std::uint32_t
             }
             std::printf("E=%d T=%d k=%d tail skip %d (%s, %s plan): %d entries skipped, %d misses computed, %ld "
                         "mismatches\n",
-                        experts, columns, top_k, rank, fork ? "forked" : "serial", planned ? "fused" : "own",
+                        experts, columns, top_k, rank, fork ? "forked" : "serial", planned != infernix::ops::MoeRoutePlan::None ? "fused" : "own",
                         skipped_entries, computed_misses, mismatches);
             check(mismatches == 0, "tail skip zeroes the skipped experts' outputs and keeps every other output exact");
         }
