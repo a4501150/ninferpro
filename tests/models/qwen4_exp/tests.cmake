@@ -144,3 +144,10 @@ set_tests_properties(infernix_qwen4_exp_decide_real_test PROPERTIES SKIP_RETURN_
 infernix_add_test(infernix_qwen4_exp_fast_paths_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
   LIBRARIES infernix_model_runtime)
+
+# The T2 start-up and correctness smoke test (AGENTS.md "Iteration tiers"): the Engine with
+# production's options on the real artifacts, then the exact route against golden tokens.
+infernix_add_test(infernix_qwen4_exp_smoke_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_smoke_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_smoke_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 900)

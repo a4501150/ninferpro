@@ -192,6 +192,29 @@ inventories, and exact probabilistic outputs are not default requirements. Use e
 exact outputs, and appropriate numerical or behavioral criteria otherwise. State checks that could
 not run and their implications.
 
+### Iteration tiers
+
+Iterate at the lowest tier that can answer the question; a full server boot is for promotion only.
+Each tier is one command from the repository root (`Makefile`); every target takes the build lock,
+the memory cap and the GPU lock itself.
+
+| Tier | Command | What it establishes | Time |
+|---|---|---|---|
+| T0 | `make t0 [R=regex]` | unit, Op and contract tests: CTest without the `real` label | minutes |
+| T1 | `make t1 [SHAPE=6x1,6x2]`, `make t1-exact`, `make t1-kernels [KSHAPE=6x2]` | one generation round of each shape on the real artifact through the production Forward and its CUDA Graph (`bench/models/qwen4_exp/round_bench.cpp`): device time, commit time, `--sections` per layer half, per-kernel table, and the logits and lane-state hashes against `bench/models/qwen4_exp/round_hashes.txt`; every shape also replays 2 or more times from one state and fails on differing bits (`--determinism N`) | about 10 s |
+| T2 | `make t2`, `make t2-record` | start-up and correctness smoke test (`tests/models/qwen4_exp/test_smoke_real.cpp`): the public Engine in process with production's options on the real artifacts (six concurrent requests, DFlash2 drafting, prefix-cache resume, an expert-placement switch and back), then the exact route's greedy tokens against `tests/models/qwen4_exp/smoke_golden.txt`, alone, six in flight, resumed and after the switch | about a minute |
+| T3 | `make t3 ARGS=...` | promotion: `bench_infernix.py` and the quality gate against the server build; the only tier for policy behaviour that depends on live timing (the DFlash2 cost fit, placement swaps, scheduling) | many minutes |
+
+- Kernel and Forward work: T1 for every change. A change meant to keep the bits must pass `make t1`
+  and `make t1-exact` unchanged; an intended numerical change records new hashes with
+  `make t1-record` in the same commit, and states why they changed. T1 leaves out the DFlash2
+  drafter, acceptance, sampling and host work; claim only Forward and commit time from it.
+- Op microbenchmarks (`build/bench/infernix_<op>_bench`) stay the tool for one Op's alternatives.
+- T1 and T2 place every expert in VRAM, so they need the GPU production uses: stop production first.
+  A T1 nondeterminism is a bug to fix, not noise; `--determinism N`, `--no-fork` and
+  `--no-shared-stream` narrow which overlap it needs.
+- T3 runs once a change is complete and its T0-T2 checks pass, before production is restarted on it.
+
 ## Reporting and completion
 
 Selective reporting and evidence gaming are prohibited, even when every disclosed
@@ -253,7 +276,12 @@ CUDA 13.4 at `/usr/local/cuda-13.4`, a Gen5 NVMe (T710) holding the models.
   `CPATH=/usr/local/cuda-13.4/include` for the plain C++ test targets. Build only what the task
   needs (`--target infernix-serve`, or the affected tests). Wrap builds as
   `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=14G cmake --build
-  build -j8 ...`: an unbounded nvcc build has run the host out of memory.
+  build -j8 ...` (the `Makefile` targets do): an unbounded nvcc build has run the host out of memory.
+  `build/` links with mold and compiles through ccache (`CMAKE_LINKER_TYPE=MOLD`,
+  `CMAKE_{CXX,CUDA}_COMPILER_LAUNCHER=ccache`, set in its cache, not in the presets); a header
+  that every CUDA file includes (`core/pdl.cuh`, `ops/common/*.cuh`) still recompiles about 180 of
+  them (about 8 minutes at the 14 GiB cap, which a full build reaches). Its Python tests run with
+  `.venv-convert/bin/python` (`Python3_EXECUTABLE`; the system interpreter has no torch).
 - GPU: one model boot fits at a time. Hold `flock ~/.cache/super-quant/gpu.lock` for any boot, and
   the build lock as well while measuring. Production stops for a test boot and must be restarted
   afterwards.

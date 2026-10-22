@@ -350,6 +350,14 @@ python3 tools/smoke/serve_thinking_preservation.py \
 The shared messages are in
 [`fixtures/serve/qwen3_6_thinking_preservation.json`](fixtures/serve/qwen3_6_thinking_preservation.json).
 
+## Start-up and correctness smoke test (T2)
+
+`infernix_qwen4_exp_smoke_real_test` starts the public Engine in process with production's options
+on the real artifacts (`INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_DFLASH2`, `INFERNIX_QWEN4_NGRAM`)
+and checks start-up, concurrent DFlash2 generation, a prefix-cache resume and an expert-placement
+switch, then the exact route's greedy tokens against `models/qwen4_exp/smoke_golden.txt`. `make t2`
+runs it with production's artifact paths, `make t2-record` rewrites the golden tokens.
+
 ## What belongs here
 
 A permanent test should protect one current risk, such as:

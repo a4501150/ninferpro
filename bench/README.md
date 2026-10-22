@@ -71,6 +71,16 @@ token count exact. All requests disable prefix reuse. When CUDA Graph is enabled
 contains decode work, a public generation batch with the selected grammar/concurrency settings
 primes the decode graphs before warmups and measured repetitions.
 
+## Qwen3.8-Flash-Next round harness (T1)
+
+`infernix_qwen4_exp_round_bench` runs one generation round of each `--shape RxW` (R rows of W
+columns: W = 1 plain decode, W >= 2 verification followed by the commit) through the production
+Forward and its CUDA Graph, every routed expert in its own VRAM frame, without the Engine. It
+prefills all eight lanes from `fixtures/bench_corpus.ids`, then reports per shape the forward and
+commit device times, the logits and lane-state hashes, and with `--sections` each layer half as its
+own graph. `make t1`, `make t1-exact`, `make t1-kernels` and `make t1-record` drive it (AGENTS.md
+"Iteration tiers"); the source header lists every option.
+
 ## CLI
 
 ```text
