@@ -9,6 +9,8 @@
 #   make t2                      start-up and correctness smoke test: the Engine with production's
 #                                options on the real artifacts, golden tokens on the exact route
 #   make t2-record               record the golden tokens after an intended numerical change
+#   make t2-bench                aggregate speed of concurrent requests through the Engine in process
+#                                (bench_infernix.py's C6 phase without the server)
 #   make t3 [PLACEMENTS=...]     promotion: bench_infernix.py against the server build (it holds
 #                                both locks, so nothing else builds or boots while it measures)
 
@@ -28,6 +30,7 @@ ROUND     := $(BUILD)/bench/infernix_qwen4_exp_round_bench
 HASHES    := bench/models/qwen4_exp/round_hashes.txt
 SMOKE     := $(BUILD)/tests/infernix_qwen4_exp_smoke_real_test
 GOLDEN    := tests/models/qwen4_exp/smoke_golden.txt
+ENGINE_BENCH := $(BUILD)/bench/infernix_qwen4_exp_engine_bench
 # Production's artifacts (~/src/super-quant/configs/Qwen3.8-Flash-Next/model.env).
 MODELS    ?= $(HOME)/models/infernix
 ARTIFACT  ?= $(MODELS)/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix
@@ -43,7 +46,7 @@ KSHAPE    ?= 6x2
 PLACEMENTS ?= vram=100%
 T3_OUT    ?= $(HOME)/src/super-quant/results/infernix_t3_$(shell git rev-parse --short HEAD)
 
-.PHONY: t0 t1 t1-exact t1-kernels t1-record t2 t2-record t3
+.PHONY: t0 t1 t1-exact t1-kernels t1-record t2 t2-record t2-bench t3
 
 t0:
 	$(BUILD_CMD)
@@ -73,6 +76,10 @@ t2:
 t2-record:
 	$(BUILD_CMD) --target infernix_qwen4_exp_smoke_real_test
 	$(GPU) env $(MODEL_ENV) $(SMOKE) --record $(GOLDEN) $(ARGS)
+
+t2-bench:
+	$(BUILD_CMD) --target infernix_qwen4_exp_engine_bench
+	$(GPU) env $(MODEL_ENV) $(ENGINE_BENCH) $(ARGS)
 
 t3:
 	$(BUILD_CMD) --target infernix-serve

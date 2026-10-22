@@ -81,6 +81,12 @@ commit device times, the logits and lane-state hashes, and with `--sections` eac
 own graph. `make t1`, `make t1-exact`, `make t1-kernels` and `make t1-record` drive it (AGENTS.md
 "Iteration tiers"); the source header lists every option.
 
+`infernix_qwen4_exp_engine_bench` (`make t2-bench`) runs the public Engine in process with
+production's options and `bench_infernix.py`'s concurrent phase: C requests at once (default 6) of N
+output tokens (default 256), one warm-up set and `--repeat` sets, each reported as aggregate tok/s
+with its DFlash2 drafting. It needs no server boot, so it measures the policy and host work that T1
+leaves out.
+
 ## CLI
 
 ```text

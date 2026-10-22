@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -49,6 +50,7 @@ def main() -> int:
     ap.add_argument("--shape", default="6x2")
     ap.add_argument("--replays", type=int, default=20)
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--keep", default=None, help="also copy the profile's SQLite export to this path")
     ap.add_argument("--bench", default="build/bench/infernix_qwen4_exp_round_bench")
     ap.add_argument("extra", nargs="*", help="further round-bench arguments (after --)")
     args = ap.parse_args()
@@ -70,6 +72,9 @@ def main() -> int:
                         report + ".nsys-rep"], check=True, capture_output=True)
         db = sqlite3.connect(report + ".sqlite")
         shares, busy = exclusive_times(db)
+        db.close()
+        if args.keep:
+            shutil.copyfile(report + ".sqlite", args.keep)
     rounds = args.replays
     print(f"\nkernels per round ({rounds} profiled replays; overlapping time split between kernels)")
     for name, t in sorted(shares.items(), key=lambda item: -item[1])[: args.top]:
