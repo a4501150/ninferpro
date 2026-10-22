@@ -3589,6 +3589,22 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   (`reset_round_costs`). Same matrix: the closing all-VRAM row 351 -> 436 tok/s (64.7 % acceptance;
   the opening row 465); the tiered rows 364 -> 367, 343 -> 360, 189 -> 203. Within the matrix's short
   phases the six-row fit no longer forms in the tiered rows, so they run on the plain prior.
+- **The placement returns to its named counts when the engine idles (2026-10-22, RTX PRO 6000,
+  this fork).** Between switches a placement drifted. A long prompt's lease evicts the
+  lowest-ranked VRAM experts without demoting them, and its returned frames stayed empty until use
+  promoted into them: at 50/50 VRAM/RAM after one 22k-token prompt, 9557 of 12288 frames held an
+  expert and 3383 experts were SSD-only, still so 6 s later. The swapper's promotions keep their
+  RAM copies (shadows) while VRAM victims past a boundary's demotion allowance leave RAM for the
+  artifact (T3 at 50/50: 87 SSD-only experts and 87 shadows). At the end of a request
+  `placement_drifted` asks for maintenance; when the engine idles, `settle_placement` refills empty
+  frames with the grow's refill (RAM experts move up and free their slots), then lands the
+  finished promotions, releases the unpinned shadows and reads the ranking's best SSD-only keys
+  into the free slots, up to the tier's capacity. Probe (boot all VRAM, switch to 50/50, bursts
+  of six 256-token requests and a 22k-token prompt): 12288 / 12288 / 0 within 0.5 s of each burst
+  (the refill moved 3061-3272 experts back in 0.26 s); a promotion still queued keeps its shadow
+  pinned until a later settle (64 after the first burst, 0 after the next). T3's closing GET is
+  read within a millisecond of the last request, before the settle, so its counts still show the
+  drift (76 at 50/50); its speeds match the runs before.
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.

@@ -2507,6 +2507,7 @@ public:
             report_ngram(lanes_[index]);
             prefix_finish(lanes_[index], index);
             release(index);
+            if (placement_drifted()) { wake_maintenance(); } // settled when the engine idles (settle_placement)
             out.status = runtime::ConsumeStatus::Consumed;
         } catch (const std::exception& error) {
             // The Engine fails a terminal sequence that does not finish; say why.
@@ -3111,6 +3112,7 @@ public:
         // RAM target the switch named is restored when the fill finishes.
         bool restore_tier = false;
         std::uint32_t tier_after = 0;
+        bool after_switch = false; // a placement switch's grow (else frames a lease left empty)
     } placement_fill_;
     static constexpr std::uint32_t kRefillBatch = 512; // keys read per tick (~0.1 s of artifacts)
     // The last applied switch's outcome for GET (placement_mutex_).
@@ -3426,6 +3428,7 @@ public:
                     const bool staging        = tier_ != nullptr && tier_resident_slots() < kRefillBatch;
                     if (staging) { ensure_tier(kRefillBatch); }
                     start_placement_fill(request.order);
+                    placement_fill_.after_switch = true;
                     placement_fill_.restore_tier = staging;
                     placement_fill_.tier_after   = named;
                 }
@@ -3566,7 +3569,11 @@ public:
                    " experts into " + std::to_string(residency_->frames()) + " frames in " +
                    std::to_string(seconds) + " s (" + std::to_string(residency_->resident_count()) +
                    " resident)");
-        reset_round_costs("the placement's resident refill completed");
+        if (placement_fill_.after_switch) {
+            reset_round_costs("the placement's resident refill completed");
+        } else {
+            wake_maintenance(); // a lease's refill: the RAM tier settles next (settle_placement)
+        }
         // The switch this fill served named no RAM tier and every key is now in VRAM: the tier
         // served as the fill's reader, and with nothing left to demote or fetch it releases.
         if (placement_wants_no_tier_ && residency_->resident_count() + 1 >= residency_->frames() &&
@@ -3672,12 +3679,64 @@ public:
             std::span<const std::int32_t>(residency_->host_table(), keys), ram, state.counts, error);
     }
 
+    // A placement drifts from its named counts between switches. A long prompt's lease evicts the
+    // lowest-ranked VRAM experts without demoting them, and when it returns its frames stay empty
+    // until use promotes into them; the swapper's promotions keep their RAM copies (shadows) while
+    // the VRAM victims it does not demote (past a boundary's allowance) leave RAM for the artifact.
+    // VRAM then holds fewer experts than its frames, RAM fewer distinct ones than its slots, and
+    // the SSD more than the placement named (50/50 VRAM/RAM after a 22k-token prompt: 9557 of
+    // 12288 frames held, 3383 SSD-only experts; 2026-10-22). True when a frame is empty with no
+    // lease out, or the tier holds a shadow or a free slot.
+    [[nodiscard]] bool placement_drifted() const {
+        if (tier_ == nullptr || residency_ == nullptr || tier_backfill_.active || placement_fill_.active) { return false; }
+        if (residency_->stats().lent_frames == 0 && residency_->resident_count() + 1 < residency_->frames()) { return true; }
+        auto& tier = tier_->controller();
+        return tier.shadow_count() > 0 || tier.has_free_resident();
+    }
+
+    // When the engine idles, the placement returns to its named counts: empty frames are refilled
+    // in the usage ranking (the grow's refill, which moves RAM experts up and frees their slots),
+    // then the unpinned shadows give their slots back and the tier fill reads the ranking's best
+    // SSD-only keys into the free slots, up to the tier's capacity (a placement with an SSD share
+    // keeps it).
+    void settle_placement() {
+        if (!placement_drifted()) { return; }
+        const std::size_t resident = residency_->resident_count();
+        if (residency_->stats().lent_frames == 0 && resident + 1 < residency_->frames()) {
+            diagnostic("expert placement: refilling " + std::to_string(residency_->frames() - resident) +
+                           " empty VRAM frames (a lease evicted their experts)",
+                       DiagnosticLevel::Info);
+            start_placement_fill({}); // the tier settles at the next idle tick after the refill
+            return;
+        }
+        const std::uint32_t keys  = c_.num_hidden_layers * c_.moe.experts;
+        const std::int32_t* table = residency_->host_table();
+        bool ssd_only = false;
+        for (std::uint32_t key = 0; key < keys && !ssd_only; ++key) {
+            ssd_only = table[key] < 0 && tier_->record(key) == nullptr;
+        }
+        if (!ssd_only) { return; }
+        // Promotions pin their RAM source until they are published, and an idle engine runs no
+        // round boundary: land and publish the finished ones here. A promotion still queued keeps
+        // its shadow pinned until a later settle (at most one boundary's batch, 64 at 50/50).
+        residency_->quiesce_tier(device_.stream);
+        const std::uint32_t released = tier_->controller().release_shadows();
+        if (released == 0 && !tier_->controller().has_free_resident()) { return; } // the shadows are pinned
+        diagnostic("expert placement: RAM tier settling (" + std::to_string(released) +
+                       " shadow slots released for SSD-only experts)",
+                   DiagnosticLevel::Info);
+        start_tier_fill();
+    }
+
     // At a boundary (no round's kernels in flight; `idle`: no request active): applies a pending
     // expert-placement switch, then resizes the expert cache to the control law's decision.
     void apply_vram_target(bool idle) {
         apply_pending_placement();
         advance_placement_fill(); // the placement grow's refill: advances at every boundary and idle
         advance_tier_fill();      // the RAM tier's fill: the same cadence
+        if (idle && std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; })) {
+            settle_placement();
+        }
         if (options_.resident_experts) { return; } // the pools hold every expert: nothing resizes them
         if (placement_ceiling_ != 0) { return; } // an explicit placement: only its switches move the pool
         if (idle && kv_idle_due() &&
