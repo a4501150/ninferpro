@@ -10729,6 +10729,79 @@ every arm above passes `--ngram-residency volume`. The `ggml_gate_up_bf16` insta
 (half sub-scales) holds 40 bytes of stack for loop invariants outside its MMA loop (allow-listed,
 like the exact `gate_up_tile_ggml`'s 40 bytes).
 
+### 19.3.30 Six lanes with every expert in VRAM: where the round goes (2026-10-22)
+
+RTX PRO 6000 (188 SMs, 1.79 TB/s), the Uncensored NVFP4 artifact, T1 at context 1024, commit
+`0e71f3f`. This records the state for whoever continues the decode work; the changes that led
+here are the dated bullets of §19.2 (resident route, batched n-gram reads, in-place route plan,
+shared expert forked before the router) and the hyper-connection up kernel's partial reads and
+token groups (commit `6eaf01c`, described in `hyper_connection_mix_fused.cu`).
+
+| | 1 x 1 | 6 x 1 | 1 x 4 | 6 x 2 | 6 x 3 |
+|---|---|---|---|---|---|
+| T1 forward graph, session start (ms) | 6.06 | 11.76 | 9.39 | 17.05 | 22.96 |
+| T1 forward graph, now (ms) | 5.85 | 11.30 | 9.02 | 16.52 | 22.74 |
+
+`make t2-bench` (six concurrent 256-token requests in process, DFlash2 auto, five sets): median
+505.9 tok/s (range 499.2-506.5), from 488.3 at the session's start after a reboot. SGLang's 582
+tok/s (DFlash on its ring layout) is a server measurement; T3 was not run on this build. Plain
+6 x 1 decode is capped at 6 / 11.3 ms = 531 tok/s; the engine reaches 506 because the DFlash2
+policy serves most tokens (about 1,000-1,300 of 1,536) from plain rounds, a 6 x 2 round costing
+1.46 times a 6 x 1 (more columns touch more distinct experts). At about 60 % acceptance a perfect
+6 x 2 policy would give at most about 580 tok/s before the drafter's time, so passing 582 needs
+cheaper rounds as well as speculation.
+
+**Where a 6 x 1 round goes** (`make t1-kernels KSHAPE=6x1 METRICS=1`; device time split between
+overlapping kernels; DRAM is read plus write throughput, sampled every 5 us). Of 11.0 ms busy,
+3.9 ms (35 %) leaves DRAM bandwidth unused. Streaming kernels top out near 90 % (the routed
+gate/up kernel measured 89.9 %), so about 1.1 ms of that is not recoverable and about 2.8 ms is.
+
+| Kernel | Time per round | DRAM | Unused | What it is |
+|---|---|---|---|---|
+| `gate_up_rows_kernel_a16` | 3.02 ms | 89.9 % | 0.31 ms | routed experts, gate/up |
+| `fp8_a16_simt_kernel` | 2.15 ms | 63.5 % | 0.78 ms | dense FP8 projections (GDN qkvz and out, QSA qkvg and out, shared expert) |
+| `down_rows_kernel_a16` | 1.92 ms | 71.6 % | 0.55 ms | routed experts, down |
+| `hc_up_collapse_v4_kernel` | 0.86 ms | 41.3 % | 0.51 ms | hyper-connection mix, up |
+| `hc_down_partials_v4_kernel` | 0.48 ms | 28.1 % | 0.34 ms | hyper-connection mix, down |
+| `attention_kernel` | 0.27 ms | 11.2 % | 0.24 ms | QSA decode attention |
+| `projection_kernel` | 0.28 ms | 22.0 % | 0.22 ms | router (513 x 2560 BF16) |
+| `recurrent_batch_update_kernel` | 0.52 ms | 63.0 % | 0.19 ms | GDN state update |
+| `projection_q8_kernel` | 0.52 ms | 73.5 % | 0.14 ms | Q8 projections |
+| about 20 small kernels | about 0.7 ms | 1-60 % | about 0.6 ms | inject, combine, splits, norms, RoPE, KV append, QSA index and selection |
+
+Kernel boundaries do not show as idle time: under PDL a kernel is always running (no kernel ran
+for 47 us of an 11.5 ms round, 0.4 %), so their cost (the wait, the ramp, the tail) is time
+inside kernels at low bandwidth, and option H1's gate (§17: boundary and tail gaps above 10 % of
+the token) is read from the unused column, not from gaps in a trace. Per layer the chain is about
+25 kernels, 1,139 per round.
+
+**Candidates**, by the bandwidth they leave unused:
+
+- The dense FP8 projections (0.78 ms). Nsight Compute on the 2560 x 6144 projection at T = 6:
+  61 % of DRAM, 37 % of issue slots, 0.68 waves, about 13 warps per SM, 3.3 instructions per FMA:
+  latency and issue bound at this width. Every candidate of `infernix_fp8_flash_next_sweep` in the
+  current bits family is 16.4 us at T = 6 against an 8.8 us floor; `sliced_t16w8s2` is 14.3 us but
+  belongs to another bits family (a fast path with new hashes, §16; not pursued for now).
+- The hyper-connection mix (0.85 ms). Both kernels are latency bound (about 17 % occupancy, 226
+  registers, less than one wave).
+- Fusion of the GDN chain (split, gating, conv, recurrent update, norm: five kernels between the
+  two projections) and of the QSA small kernels (two norms, RoPE, KV append, pool, tail, index
+  query, score, selection, merge, gate), and the MoE tail into the next layer's mix (combine and
+  inject before `hc_down`).
+- The routing chain is now router (about 6 us own time per layer) and the in-place route plan
+  (about 6 us); the top-10 selection itself is under 1 us. Removing the remaining boundary means
+  routing in the router's last CTA.
+
+**Rejected** (each bit-identical, each slower):
+
+- Two rows of W_down per warp in `hc_down_partials_v4` with the pass width a template argument
+  (4 warps per CTA, no spills): 17.9 us per call at T = 6 against 12.7 (comment in
+  `hyper_connection_mix_fused.cu`).
+- A register ring keeping the weight codes of 2-8 K phases in flight in the FP8 SIMT tile: 16.4 us
+  at T = 6 became 18.4-22.5 us (depth 2-8); the tile is not waiting on DRAM phase by phase.
+- The in-place route plan's encode inside the routing CTA: the kernel took 18.3 us at 12 columns
+  (one SM encoding every column); it keeps a CTA per column.
+
 ---
 
 ## 20. Documentation and authority changes
