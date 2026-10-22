@@ -9664,7 +9664,7 @@ Bit-exact launch-boundary changes of the decode chain, chosen from the per-layer
 - `moe_route_dispatch_plan`: a CPU-served call of at most 32 columns plans its misses in the route
   and dispatch kernel. After a barrier of the whole 1024-thread CTA its first 256 threads run the
   plan body of `cpu_plan_kernel` (named barrier, same results), so the host's request follows the
-  dispatch with no kernel boundary; `moe_experts` then skips its plan (`cpu_planned`). The Program
+  dispatch with no kernel boundary; `moe_experts` then skips its plan (`MoeRoutePlan::Cpu`). The Program
   routes there unless a route tap or a streamed prefill chunk needs the dispatch first.
   `test_offloaded_moe_layer` routes its CPU-served calls through it.
 - `moe_combine_inject`: the combine keeps y in a register and injects it into the residual streams
