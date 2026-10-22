@@ -601,6 +601,7 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
 constexpr int kUpV4Warps   = 8;
 constexpr int kUpV4Threads = kUpV4Warps * 32;
 constexpr int kUpV4Rows    = 8; // a warp's rows: features warp and warp + 8, 4 streams each
+constexpr int kUpTokens    = 4; // tokens per decoded weight chunk
 
 template <class Codec>
 __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
@@ -673,38 +674,52 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     for (int i = tid; i < kStreams * columns; i += kUpV4Threads) { inv[i] = __ldg(inv_in + i); }
     __syncthreads();
 
-    // 3. Per token, the warp's 8 rows in the lane-chunk order, one transposed butterfly, and lane
-    // 4q stores row q's sum.
+    // 3. Per group of kUpTokens tokens, the warp's 8 rows in the lane-chunk order (each chunk decoded
+    // once for the group), one transposed butterfly per token, and lane 4q stores row q's sum.
 #pragma unroll 1
-    for (int t = 0; t < columns; ++t) {
-        const float4* mt = reinterpret_cast<const float4*>(m + t * rank);
-        float acc[kUpV4Rows];
+    for (int t0 = 0; t0 < columns; t0 += kUpTokens) {
+        float acc[kUpTokens][kUpV4Rows];
 #pragma unroll
-        for (int q = 0; q < kUpV4Rows; ++q) { acc[q] = 0.0F; }
+        for (int t = 0; t < kUpTokens; ++t) {
+#pragma unroll
+            for (int q = 0; q < kUpV4Rows; ++q) { acc[t][q] = 0.0F; }
+        }
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int c = lane + 32 * h;
             if (c < chunks) {
-                const float4 a = mt[c], b = mt[chunks + c];
+                float4 a[kUpTokens], b[kUpTokens];
+#pragma unroll
+                for (int t = 0; t < kUpTokens; ++t) {
+                    const float4* mt = reinterpret_cast<const float4*>(m + min(t0 + t, columns - 1) * rank);
+                    a[t] = mt[c];
+                    b[t] = mt[chunks + c];
+                }
 #pragma unroll
                 for (int q = 0; q < kUpV4Rows; ++q) {
                     float wv[8];
                     Codec::decode(chunk[q][h], wv);
-                    acc[q] = fmaf(wv[0], a.x, acc[q]);
-                    acc[q] = fmaf(wv[1], a.y, acc[q]);
-                    acc[q] = fmaf(wv[2], a.z, acc[q]);
-                    acc[q] = fmaf(wv[3], a.w, acc[q]);
-                    acc[q] = fmaf(wv[4], b.x, acc[q]);
-                    acc[q] = fmaf(wv[5], b.y, acc[q]);
-                    acc[q] = fmaf(wv[6], b.z, acc[q]);
-                    acc[q] = fmaf(wv[7], b.w, acc[q]);
+#pragma unroll
+                    for (int t = 0; t < kUpTokens; ++t) {
+                        acc[t][q] = fmaf(wv[0], a[t].x, acc[t][q]);
+                        acc[t][q] = fmaf(wv[1], a[t].y, acc[t][q]);
+                        acc[t][q] = fmaf(wv[2], a[t].z, acc[t][q]);
+                        acc[t][q] = fmaf(wv[3], a[t].w, acc[t][q]);
+                        acc[t][q] = fmaf(wv[4], b[t].x, acc[t][q]);
+                        acc[t][q] = fmaf(wv[5], b[t].y, acc[t][q]);
+                        acc[t][q] = fmaf(wv[6], b[t].z, acc[t][q]);
+                        acc[t][q] = fmaf(wv[7], b[t].w, acc[t][q]);
+                    }
                 }
             }
         }
-        const float total = warp_sum8_transposed(acc, lane);
-        if ((lane & 3) == 0) {
-            const int q = lane >> 2;
-            u[(t * kStreams + (q >> 1)) * kUpFeatures + warp + kUpV4Warps * (q & 1)] = total;
+#pragma unroll
+        for (int t = 0; t < kUpTokens; ++t) {
+            const float total = warp_sum8_transposed(acc[t], lane);
+            if ((lane & 3) == 0 && t0 + t < columns) {
+                const int q = lane >> 2;
+                u[((t0 + t) * kStreams + (q >> 1)) * kUpFeatures + warp + kUpV4Warps * (q & 1)] = total;
+            }
         }
     }
     __syncthreads();

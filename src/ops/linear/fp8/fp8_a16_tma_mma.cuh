@@ -163,9 +163,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_tm
             activation + stage * Schedule::kActivationStageBytes,
             reinterpret_cast<const std::uint8_t*>(weight + stage * Schedule::kWeightStageBytes),
             accumulators, warp, lane);
-        // Release only after every lane in this consumer warp has finished its shared reads.
-        __syncwarp();
-        if (lane == 0) cta_mbarrier_arrive(empty + stage);
+        cta_mbarrier_release_stage(empty + stage, lane);
     }
     // All consumers must finish reading staged inputs before the epilogue reuses the storage.
     __syncthreads();

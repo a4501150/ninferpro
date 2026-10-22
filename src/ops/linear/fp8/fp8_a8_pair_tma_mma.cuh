@@ -195,9 +195,7 @@ fp8_a8_pair_tma_mma_kernel(
         fp8_mma_pair_compute_stage<Schedule>(activation_hi + stage * BT * BK,
                                              activation_lo + stage * BT * BK,
                                              weight + stage * BR * BK, hi, lo, warp, lane);
-        // Release only after every lane in this consumer warp has finished its shared reads.
-        __syncwarp();
-        if (lane == 0) cta_mbarrier_arrive(empty + stage);
+        cta_mbarrier_release_stage(empty + stage, lane);
     }
 
     // Each term keeps its own column scale until the two are summed in FP32. The row scale and the

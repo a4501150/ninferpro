@@ -124,6 +124,9 @@ struct ExpertsWorkspace {
     std::uint8_t* h_rows;         // [entries][kA16HRowBytes]: BF16 h, rewritten as limbs for wide entries
     std::int32_t* x_emax;         // [columns]: column exponent of each token's x
     std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h
+    // W4A16 narrow route (both wide routes): every token's x in its dp4a layout, encoded once per call
+    std::uint8_t* x_acts;         // [columns][kA16XRowBytes]
+    std::int32_t* x_acts_emax;    // [columns]
     // W4A16, two-term A4 (h_rows holds the BF16 h)
     std::uint8_t* x_terms_plane;  // [entries][kXTermsRowBytes]
     float* x_row_scale;           // [columns]
