@@ -145,6 +145,10 @@ public:
     [[nodiscard]] std::uint32_t lease_layers(const FrameLease& lease) const noexcept {
         return lease.valid() ? static_cast<std::uint32_t>(pools_[lease.pool].layers.size()) : 0U;
     }
+    // Whether lend(bytes) would succeed: the residency lends whole frames, so the request needs
+    // its bytes plus one frame of rounding inside the lendable run (and a resident placement
+    // holds every expert and lends no frame at all).
+    [[nodiscard]] bool can_lend(std::uint64_t bytes) const noexcept;
     // Between rounds (no round in flight): evicts the experts of the lending pool's cheapest run of
     // frames covering `bytes` (avoiding frames that in-flight promotions target while it can),
     // uploads the table on `compute`, and makes `compute` and every `writers` stream wait for each

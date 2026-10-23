@@ -85,12 +85,31 @@ void ProgramImpl::vision_step(Lane& lane) {
         // waited for by compute and the weight stream's transfer stream.
         const cudaStream_t writers[] = {device_.transfer_stream};
         return_stream_lease(); // a prefill ring is lent again by the next streamed chunk
-        v.lease   = residency_->lend(window.lease_bytes, s, writers);
-        v.handoff = Tensor(v.lease.memory.data, DType::BF16, {out, static_cast<std::int32_t>(window.encoded_tokens)});
+        if (residency_->can_lend(window.lease_bytes)) {
+            v.lease = residency_->lend(window.lease_bytes, s, writers);
+        }
+        DeviceSpan span{};
+        if (v.lease.valid()) {
+            span = v.lease.memory;
+        } else {
+            // The resident placement holds every expert and lends no frame, and a window larger
+            // than the lendable bytes cannot be lent either: the handoff (W) or handoff and
+            // window (L) is allocated for the encode's lifetime instead (enter_wide's fallback
+            // pattern; a failed allocation fails this prompt's requests, not the Engine).
+            try {
+                v.fallback = DeviceBuffer(window.lease_bytes);
+            } catch (const std::exception& error) {
+                throw runtime::RecoverableExecutionError(
+                    "the Vision window (" + std::to_string(window.lease_bytes >> 20) +
+                        " MiB) could neither be lent from the expert cache nor allocated (" + error.what() + ")");
+            }
+            span = {v.fallback.p, window.lease_bytes};
+        }
+        v.handoff = Tensor(span.data, DType::BF16, {out, static_cast<std::int32_t>(window.encoded_tokens)});
         DeviceSpan memory;
         if (window.lease) {
             const std::size_t at = align(window.handoff_bytes);
-            memory = {static_cast<std::byte*>(v.lease.memory.data) + at, v.lease.memory.bytes - at};
+            memory = {static_cast<std::byte*>(span.data) + at, span.bytes - at};
         } else {
             // Placement W: the whole pass runs in this call from the prefill workspace, idle between
             // units and stream-ordered on compute.
@@ -137,7 +156,7 @@ void ProgramImpl::vision_step(Lane& lane) {
     if (!v.pass->done()) { return; }
     if (v.stream) { v.stream->finish(s); }
     v.timer->record_stop();
-    if (window.lease) {
+    if (v.lease.valid()) {
         // Only the handoff stays lent; the window's frames go back once compute reaches here.
         auto tail = residency_->split(v.lease, align(window.handoff_bytes));
         residency_->give_back(tail, s);
@@ -170,6 +189,12 @@ void ProgramImpl::vision_release(Lane& lane) noexcept {
         v.weights.reset();
         v.stream.reset();
         if (v.lease.valid()) { residency_->give_back(v.lease, s); }
+        if (v.fallback.p != nullptr) {
+            // The fallback's free is a blocking cudaFree: like return_wide_work, it waits for the
+            // enqueued compute that still reads the handoff.
+            device_.synchronize();
+            v.fallback = DeviceBuffer{};
+        }
     } catch (...) {}
     lane.vision.reset();
 }

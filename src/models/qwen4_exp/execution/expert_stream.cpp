@@ -70,6 +70,17 @@ void ExpertStream::set_staging(Staging staging) {
     }
 }
 
+void ExpertStream::retarget(RecordOf record_of, bool one_allocation, Hold hold, std::vector<std::uint64_t> host_strides,
+                            SsdReads ssd, Staging staging) {
+    if (active_) { throw std::logic_error("expert stream: retargeted during a chunk"); }
+    record_of_      = std::move(record_of);
+    one_allocation_ = one_allocation;
+    hold_          = std::move(hold);
+    host_strides_  = std::move(host_strides);
+    ssd_           = std::move(ssd);
+    set_staging(std::move(staging));
+}
+
 bool ExpertStream::takes(std::uint32_t layer, std::uint32_t e, std::uint32_t taken, std::uint32_t& staged) const {
     if (taken >= half_) { return false; }
     if (record_of_(layer, e) != nullptr) { return true; }

@@ -174,6 +174,127 @@ std::int64_t seek_packet(void* opaque, std::int64_t offset, int whence) {
     return static_cast<std::int64_t>(cursor.offset);
 }
 
+Image rotate_image(Image image, int orientation) {
+    if (orientation == 1) { return image; }
+    const int width  = image.width;
+    const int height = image.height;
+    Image rotated;
+    const bool swap = orientation >= 5;
+    rotated.width   = swap ? height : width;
+    rotated.height = swap ? width : height;
+    rotated.rgb.resize(image.rgb.size());
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int rx = 0;
+            int ry = 0;
+            if (orientation == 2) {
+                rx = width - 1 - x;
+                ry = y;
+            } else if (orientation == 3) {
+                rx = width - 1 - x;
+                ry = height - 1 - y;
+            } else if (orientation == 4) {
+                rx = x;
+                ry = height - 1 - y;
+            } else if (orientation == 5) {
+                rx = y;
+                ry = x;
+            } else if (orientation == 6) {
+                rx = height - 1 - y;
+                ry = x;
+            } else if (orientation == 7) {
+                rx = height - 1 - y;
+                ry = width - 1 - x;
+            } else { // orientation 8
+                rx = y;
+                ry = width - 1 - x;
+            }
+            const std::size_t src = (static_cast<std::size_t>(y) * width + x) * 3;
+            const std::size_t dst_index =
+                (static_cast<std::size_t>(ry) * rotated.width + rx) * 3;
+            std::copy_n(image.rgb.data() + src, 3, rotated.rgb.data() + dst_index);
+        }
+    }
+    return rotated;
+}
+
+// libjpeg's exact still-image color decode: the "fancy" triangle chroma upsampling of
+// jdsample.c and the fixed-point YCbCr->RGB tables of jdcolor.c. The reference image
+// processors of the served models (HF/PIL) decode JPEG through libjpeg, while swscale
+// upsamples subsampled chroma by nearest neighbour (SWS_POINT) and converts with its own
+// tables; on an ordinary 4:2:0 JPEG that colors every sharp edge by tens of levels.
+namespace jpeg_reference {
+
+constexpr int kScaleBits = 16;
+constexpr int kOneHalf   = 1 << (kScaleBits - 1);
+constexpr int kCenter    = 128;
+
+constexpr int fix(double value) {
+    return static_cast<int>(value * 65536.0 + 0.5);
+}
+
+struct Tables {
+    // R and B hold the rounded delta added to Y; G holds the 16.16 scaled sums
+    // (Cb carries the +OneHalf rounding of the pair).
+    int cr_r[256];
+    int cb_b[256];
+    int cb_g[256];
+    int cr_g[256];
+
+    Tables() {
+        constexpr int cr_r_factor = fix(1.40200);
+        constexpr int cb_b_factor = fix(1.77200);
+        constexpr int cr_g_factor = -fix(0.71414);
+        constexpr int cb_g_factor = -fix(0.34414);
+        for (int value = 0; value < 256; ++value) {
+            const int x = value - kCenter;
+            cr_r[value] = (cr_r_factor * x + kOneHalf) >> kScaleBits;
+            cb_b[value] = (cb_b_factor * x + kOneHalf) >> kScaleBits;
+            cb_g[value] = cb_g_factor * x + kOneHalf;
+            cr_g[value] = cr_g_factor * x;
+        }
+    }
+};
+
+const Tables& tables() {
+    static const Tables instance;
+    return instance;
+}
+
+std::uint8_t clamp_byte(int value) {
+    return value < 0 ? 0 : (value > 255 ? 255 : static_cast<std::uint8_t>(value));
+}
+
+// h2v1_fancy_upsample: one full-resolution row from one downsampled row. libjpeg alternates
+// the rounding bias between output columns instead of rounding every half up. Requires
+// width > 2; narrower chroma takes the box path in rgb_jpeg.
+void upsample_h2v1(const std::uint8_t* row, int width, std::uint8_t* out) {
+    out[0] = row[0];
+    out[1] = clamp_byte((row[0] * 3 + row[1] + 2) >> 2);
+    for (int x = 1; x < width - 1; ++x) {
+        out[2 * x]     = clamp_byte((row[x] * 3 + row[x - 1] + 1) >> 2);
+        out[2 * x + 1] = clamp_byte((row[x] * 3 + row[x + 1] + 2) >> 2);
+    }
+    out[2 * width - 2] = clamp_byte((row[width - 1] * 3 + row[width - 2] + 1) >> 2);
+    out[2 * width - 1] = row[width - 1];
+}
+
+// h2v2_fancy_upsample, one output row at a time: first the vertical (3,1)/4 sum of the two
+// nearest chroma rows, then the horizontal (3,1)/4 pass over those sums, /16 in total.
+// Requires width > 2; narrower chroma takes the box path in rgb_jpeg.
+void upsample_h2v2(const int* colsum, int width, std::uint8_t* out) {
+    out[0] = clamp_byte((colsum[0] * 4 + 8) >> 4);
+    out[1] = clamp_byte((colsum[0] * 3 + colsum[1] + 7) >> 4);
+    for (int x = 1; x < width - 1; ++x) {
+        out[2 * x]     = clamp_byte((colsum[x] * 3 + colsum[x - 1] + 8) >> 4);
+        out[2 * x + 1] = clamp_byte((colsum[x] * 3 + colsum[x + 1] + 7) >> 4);
+    }
+    out[2 * width - 2] = clamp_byte((colsum[width - 1] * 3 + colsum[width - 2] + 8) >> 4);
+    out[2 * width - 1] = clamp_byte((colsum[width - 1] * 4 + 7) >> 4);
+}
+
+} // namespace jpeg_reference
+
 class Decoder {
 public:
     Decoder(std::span<const std::uint8_t> input, std::uint64_t max_decoded_pixels)
@@ -331,45 +452,136 @@ public:
                 }
             }
         }
-        if (orientation == 1) { return out; }
-        Image rotated;
-        const bool swap = orientation >= 5;
-        rotated.width   = swap ? height : width;
-        rotated.height  = swap ? width : height;
-        rotated.rgb.resize(out.rgb.size());
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                int rx = 0;
-                int ry = 0;
-                if (orientation == 2) {
-                    rx = width - 1 - x;
-                    ry = y;
-                } else if (orientation == 3) {
-                    rx = width - 1 - x;
-                    ry = height - 1 - y;
-                } else if (orientation == 4) {
-                    rx = x;
-                    ry = height - 1 - y;
-                } else if (orientation == 5) {
-                    rx = y;
-                    ry = x;
-                } else if (orientation == 6) {
-                    rx = height - 1 - y;
-                    ry = x;
-                } else if (orientation == 7) {
-                    rx = height - 1 - y;
-                    ry = width - 1 - x;
-                } else { // orientation 8
-                    rx = y;
-                    ry = width - 1 - x;
-                }
-                const std::size_t src = (static_cast<std::size_t>(y) * width + x) * 3;
-                const std::size_t dst_index =
-                    (static_cast<std::size_t>(ry) * rotated.width + rx) * 3;
-                std::copy_n(out.rgb.data() + src, 3, rotated.rgb.data() + dst_index);
+        return rotate_image(std::move(out), orientation);
+    }
+
+    // Still images decoded by the JPEG codec take libjpeg's color path (jpeg_reference
+    // above); every other layout and codec keeps the swscale converter.
+    Image rgb_jpeg(const AVFrame* frame, int orientation) {
+        const AVPixFmtDescriptor* descriptor =
+            av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
+        if (descriptor == nullptr || (descriptor->flags & AV_PIX_FMT_FLAG_HWACCEL) != 0 ||
+            descriptor->nb_components == 0 || descriptor->comp[0].depth != 8 ||
+            descriptor->log2_chroma_w > 1 || descriptor->log2_chroma_h > 1 ||
+            (descriptor->nb_components != 1 && descriptor->nb_components != 3)) {
+            return rgb(frame, orientation);
+        }
+        for (int component = 0; component < descriptor->nb_components; ++component) {
+            if (descriptor->comp[component].plane != component ||
+                descriptor->comp[component].offset != 0 ||
+                descriptor->comp[component].step != 1) {
+                return rgb(frame, orientation);
             }
         }
-        return rotated;
+        const int width  = frame->width;
+        const int height = frame->height;
+        if (width <= 0 || height <= 0) { throw_invalid_media("decoded media dimensions are invalid"); }
+        if (static_cast<std::uint64_t>(width) * height > max_decoded_pixels_) {
+            throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
+        }
+        Image out;
+        out.width  = width;
+        out.height = height;
+        out.rgb.resize(static_cast<std::size_t>(width) * height * 3);
+        const std::uint8_t* y_plane = frame->data[0];
+        const int y_stride          = frame->linesize[0];
+        if (descriptor->nb_components == 1) {
+            // Grayscale: libjpeg passes Y to all three channels.
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* source = y_plane + static_cast<std::size_t>(y) * y_stride;
+                std::uint8_t* destination =
+                    out.rgb.data() + static_cast<std::size_t>(y) * width * 3;
+                for (int x = 0; x < width; ++x) {
+                    destination[3 * x] = destination[3 * x + 1] = destination[3 * x + 2] = source[x];
+                }
+            }
+            return rotate_image(std::move(out), orientation);
+        }
+        const int lw = descriptor->log2_chroma_w;
+        const int lh = descriptor->log2_chroma_h;
+        const int cw = AV_CEIL_RSHIFT(width, lw);
+        const int ch = AV_CEIL_RSHIFT(height, lh);
+        const std::uint8_t* cb_plane = frame->data[1];
+        const std::uint8_t* cr_plane = frame->data[2];
+        const int cb_stride          = frame->linesize[1];
+        const int cr_stride          = frame->linesize[2];
+        const jpeg_reference::Tables& tables = jpeg_reference::tables();
+        std::vector<std::uint8_t> cb_row(static_cast<std::size_t>(width));
+        std::vector<std::uint8_t> cr_row(static_cast<std::size_t>(width));
+        std::vector<int> cb_sums(static_cast<std::size_t>(cw));
+        std::vector<int> cr_sums(static_cast<std::size_t>(cw));
+        // libjpeg falls back from fancy to box upsampling when the downsampled width is
+        // at most two samples (jinit_upsampler's do_fancy guard).
+        const bool narrow = cw <= 2;
+        for (int y = 0; y < height; ++y) {
+            const std::uint8_t* y_row = y_plane + static_cast<std::size_t>(y) * y_stride;
+            std::uint8_t* destination = out.rgb.data() + static_cast<std::size_t>(y) * width * 3;
+            for (int plane = 0; plane < 2; ++plane) {
+                const std::uint8_t* source =
+                    (plane == 0 ? cb_plane : cr_plane) +
+                    static_cast<std::size_t>(y >> lh) * (plane == 0 ? cb_stride : cr_stride);
+                std::uint8_t* upsampled = plane == 0 ? cb_row.data() : cr_row.data();
+                int* sums               = plane == 0 ? cb_sums.data() : cr_sums.data();
+                if (lw == 0 && lh == 0) {
+                    std::copy_n(source, width, upsampled);
+                } else if (narrow) {
+                    for (int x = 0; x < cw; ++x) {
+                        upsampled[2 * x] = source[x];
+                        if (2 * x + 1 < width) { upsampled[2 * x + 1] = source[x]; }
+                    }
+                } else if (lw == 1 && lh == 0) {
+                    jpeg_reference::upsample_h2v1(source, cw, upsampled);
+                } else if (lw == 0 && lh == 1) {
+                    // h1v2_fancy_upsample: the vertical triangle only, with the same
+                    // alternating bias the h2v1 pass uses between its two output rows.
+                    const int r   = y >> 1;
+                    const int far = (y & 1) == 0 ? (r > 0 ? r - 1 : 0)
+                                                  : (r < ch - 1 ? r + 1 : ch - 1);
+                    const std::uint8_t* far_row =
+                        (plane == 0 ? cb_plane : cr_plane) +
+                        static_cast<std::size_t>(far) * (plane == 0 ? cb_stride : cr_stride);
+                    const int bias = (y & 1) == 0 ? 1 : 2;
+                    for (int x = 0; x < cw; ++x) {
+                        upsampled[x] = jpeg_reference::clamp_byte(
+                            (source[x] * 3 + far_row[x] + bias) >> 2);
+                    }
+                } else {
+                    // h2v2: vertical (3,1)/4 sums, then the horizontal pass, /16 overall.
+                    const int r   = y >> 1;
+                    const int far = (y & 1) == 0 ? (r > 0 ? r - 1 : 0)
+                                                  : (r < ch - 1 ? r + 1 : ch - 1);
+                    const std::uint8_t* far_row =
+                        (plane == 0 ? cb_plane : cr_plane) +
+                        static_cast<std::size_t>(far) * (plane == 0 ? cb_stride : cr_stride);
+                    for (int x = 0; x < cw; ++x) {
+                        sums[x] = source[x] * 3 + far_row[x];
+                    }
+                    jpeg_reference::upsample_h2v2(sums, cw, upsampled);
+                }
+            }
+            for (int x = 0; x < width; ++x) {
+                const int y_value = y_row[x];
+                const int cb      = cb_row[static_cast<std::size_t>(x)];
+                const int cr      = cr_row[static_cast<std::size_t>(x)];
+                destination[3 * x] =
+                    jpeg_reference::clamp_byte(y_value + tables.cr_r[cr]);
+                destination[3 * x + 1] = jpeg_reference::clamp_byte(
+                    y_value + ((tables.cb_g[cb] + tables.cr_g[cr]) >> jpeg_reference::kScaleBits));
+                destination[3 * x + 2] =
+                    jpeg_reference::clamp_byte(y_value + tables.cb_b[cb]);
+            }
+        }
+        return rotate_image(std::move(out), orientation);
+    }
+
+    [[nodiscard]] bool stream_is_jpeg() const noexcept {
+        return stream_ != nullptr && stream_->codecpar->codec_id == AV_CODEC_ID_MJPEG;
+    }
+
+    // The still-image entry: JPEG streams take the libjpeg color path, everything else the
+    // swscale converter. Video keeps swscale (its frames have no libjpeg reference).
+    Image still_rgb(const AVFrame* frame, int orientation) {
+        return stream_is_jpeg() ? rgb_jpeg(frame, orientation) : rgb(frame, orientation);
     }
 
 private:
@@ -709,7 +921,7 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     decoder.frames([&](int index, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
         if (index == 0) {
-            result = decoder.rgb(frame, orientation);
+            result = decoder.still_rgb(frame, orientation);
             return false;
         }
         return true;

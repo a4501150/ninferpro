@@ -172,6 +172,7 @@ struct LaneVision {
     std::vector<std::shared_ptr<const qwen3_5::PreparedMediaPayload>> payloads; // per encoded item
     std::vector<std::uint32_t> visual;         // the encoded visual tokens' positions, ascending
     ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
+    DeviceBuffer fallback;                     // the same bytes when the residency lends no frame
     Tensor handoff;                            // BF16 [out, V_encoded]
     std::unique_ptr<qwen3_5::execution::VisionWeightStream> stream;
     std::optional<qwen3_5::execution::VisionParameters> weights; // the stream's rebased view
@@ -433,6 +434,9 @@ public:
         ExpertResidency::Stats cache_at_admission;
         std::uint64_t cpu_served_at_admission = 0;
         HostExpertTier::Stats tier_at_admission{}; // SSD tier mode
+        // The Program's verification-round counters (rounds, columns, padded columns) at
+        // admission, for the request's share of the rounds' padding.
+        std::array<std::uint64_t, 3> verify_at_admission{};
         NgramVolume::Counters ngram; // this request's n-gram row traffic
         GateTraffic gate;            // its verification rounds' rows read behind the n-gram gate
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
@@ -982,6 +986,7 @@ public:
             host_strides.push_back(layer.moe.bank->planes.record_stride);
             record_stride = std::max(record_stride, layer.moe.bank->planes.record_stride);
         }
+        host_strides_ = host_strides; // the expert stream's retarget reads the member
         if (record_stride != plan_.record_stride ||
             (!c_.exact_experts && std::any_of(host_strides.begin(), host_strides.end(),
                                              [&](std::uint64_t s) { return s != record_stride; }))) {
@@ -1119,49 +1124,12 @@ public:
         // The prefill stream copies records into ring slots of the frame pitch; a GGUF import's
         // banks keep their own (smaller) strides.
         if (options_.prefill_stream && options_.expert_cache) {
-            execution::ExpertStream::RecordOf record_of;
-            if (tier_) {
-                record_of = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
-                    return tier->record(tier->key(layer, expert));
-                };
-            } else {
-                std::vector<const std::uint8_t*> banks; // device addresses: the stream batches its copies
-                for (const auto& layer : parameters_.layers) {
-                    banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
-                }
-                record_of = [banks = std::move(banks), host_strides](std::uint32_t layer, std::uint32_t expert) {
-                    return banks[layer] + static_cast<std::size_t>(expert) * host_strides[layer];
-                };
-            }
-            execution::ExpertStream::Hold hold;
-            execution::ExpertStream::SsdReads ssd;
-            if (tier_) {
-                hold = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
-                    tier->stream_pin(tier->key(layer, expert));
-                };
-                ssd.read = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
-                    return tier->stream_read(tier->key(layer, expert));
-                };
-                ssd.wait    = [tier = tier_.get()](std::int32_t slot) { return tier->stream_wait(slot); };
-                ssd.release = [tier = tier_.get()](std::int32_t slot) { tier->stream_release(slot); };
-                ssd.slots   = [tier = tier_.get()] { return tier->stream_slots(); };
-            }
+            StreamBindings bindings = stream_bindings();
             expert_stream_ = std::make_unique<execution::ExpertStream>(c_.num_hidden_layers, c_.moe.experts, record_stride,
-                                                                       std::move(record_of), !tier_, std::move(hold),
-                                                                       host_strides, std::move(ssd));
-            if (tier_ && tier_->stream_bounce_slots() > 0) {
-                // Unpinned records stream through the tier's bounce slots, still two layers ahead.
-                HostExpertTier* tier = tier_.get();
-                expert_stream_->set_staging(execution::ExpertStream::Staging{
-                    .unpinned = [tier](std::uint32_t layer, std::uint32_t expert) {
-                        return tier->unpinned_record(tier->key(layer, expert));
-                    },
-                    .slot     = [tier](std::uint32_t i) { return tier->stream_bounce_slot(i); },
-                    .copy     = [tier](std::span<const std::pair<std::uint8_t*, const std::uint8_t*>> copies) {
-                        tier->copy_records(copies);
-                    },
-                    .per_part = tier->stream_bounce_slots() / execution::ExpertStream::kBounceParts});
-            }
+                                                                       std::move(bindings.record_of), bindings.one_allocation,
+                                                                       std::move(bindings.hold), host_strides_,
+                                                                       std::move(bindings.ssd));
+            expert_stream_->set_staging(std::move(bindings.staging));
             experts.stream = expert_stream_.get();
         }
         // CPU-served misses for decode and verify calls, and for every call of at most
@@ -1555,6 +1523,7 @@ public:
         lane.cache_at_admission = residency_->stats();
         lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
         if (tier_) { lane.tier_at_admission = tier_->stats(); }
+        lane.verify_at_admission = {verify_rounds_, verify_columns_, verify_padded_};
         lane.ngram                   = {};
         lane.gate                    = {};
         lane.begin = runtime::BeginSummary{.prompt_tokens        = lane.prompt_tokens,
@@ -2505,8 +2474,10 @@ public:
             }
             report_cache(lanes_[index]);
             report_ngram(lanes_[index]);
+            report_verify_rounds(lanes_[index]);
             prefix_finish(lanes_[index], index);
             release(index);
+            if (placement_drifted()) { wake_maintenance(); } // settled when the engine idles (settle_placement)
             out.status = runtime::ConsumeStatus::Consumed;
         } catch (const std::exception& error) {
             // The Engine fails a terminal sequence that does not finish; say why.
@@ -3111,6 +3082,7 @@ public:
         // RAM target the switch named is restored when the fill finishes.
         bool restore_tier = false;
         std::uint32_t tier_after = 0;
+        bool after_switch = false; // a placement switch's grow (else frames a lease left empty)
     } placement_fill_;
     static constexpr std::uint32_t kRefillBatch = 512; // keys read per tick (~0.1 s of artifacts)
     // The last applied switch's outcome for GET (placement_mutex_).
@@ -3140,6 +3112,57 @@ public:
     // The resident slots the current tier holds records in (0 without a tier).
     [[nodiscard]] std::uint32_t tier_resident_slots() const {
         return tier_ != nullptr ? tier_->resident_capacity() : 0;
+    }
+
+    // The prefill expert stream's bindings for the tier as it is now: its records, stream slots and
+    // bounce buffers, or the artifact banks' records without a tier. The callbacks capture the tier
+    // object, so a tier rebuild (ensure_tier) retargets the stream with a fresh set; the banks'
+    // record strides come from host_strides_.
+    struct StreamBindings {
+        execution::ExpertStream::RecordOf record_of;
+        execution::ExpertStream::Hold hold;
+        execution::ExpertStream::SsdReads ssd;
+        execution::ExpertStream::Staging staging;
+        bool one_allocation = true;
+    };
+    [[nodiscard]] StreamBindings stream_bindings() const {
+        StreamBindings b;
+        if (tier_ == nullptr) {
+            std::vector<const std::uint8_t*> banks; // device addresses: the stream batches its copies
+            for (const auto& layer : parameters_.layers) {
+                banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
+            }
+            b.record_of = [banks = std::move(banks), strides = host_strides_](std::uint32_t layer,
+                                                                              std::uint32_t expert) {
+                return banks[layer] + static_cast<std::size_t>(expert) * strides[layer];
+            };
+            b.one_allocation = true;
+            return b;
+        }
+        HostExpertTier* tier = tier_.get();
+        b.record_of = [tier](std::uint32_t layer, std::uint32_t expert) { return tier->record(tier->key(layer, expert)); };
+        b.hold      = [tier](std::uint32_t layer, std::uint32_t expert) { tier->stream_pin(tier->key(layer, expert)); };
+        b.ssd.read    = [tier](std::uint32_t layer, std::uint32_t expert) {
+            return tier->stream_read(tier->key(layer, expert));
+        };
+        b.ssd.wait    = [tier](std::int32_t slot) { return tier->stream_wait(slot); };
+        b.ssd.release = [tier](std::int32_t slot) { tier->stream_release(slot); };
+        b.ssd.slots   = [tier] { return tier->stream_slots(); };
+        b.one_allocation = false;
+        // Unpinned records stream through the tier's bounce slots, still two layers ahead; a
+        // rebuilt tier holds none (its options clear the bounces), so its staging stays empty.
+        if (tier->stream_bounce_slots() > 0) {
+            b.staging = execution::ExpertStream::Staging{
+                .unpinned = [tier](std::uint32_t layer, std::uint32_t expert) {
+                    return tier->unpinned_record(tier->key(layer, expert));
+                },
+                .slot     = [tier](std::uint32_t i) { return tier->stream_bounce_slot(i); },
+                .copy     = [tier](std::span<const std::pair<std::uint8_t*, const std::uint8_t*>> copies) {
+                    tier->copy_records(copies);
+                },
+                .per_part = tier->stream_bounce_slots() / execution::ExpertStream::kBounceParts};
+        }
+        return b;
     }
 
     // Builds or rebuilds the tier to hold `residents` resident records beside its lists (the
@@ -3204,6 +3227,12 @@ public:
                        DiagnosticLevel::Info);
         }
         if (cpu_service_ != nullptr) { cpu_service_->set_record_provider(tier_.get()); }
+        // The stream's callbacks captured the tier a rebuild replaced: retarget them to this one.
+        if (expert_stream_ != nullptr) {
+            StreamBindings bindings = stream_bindings();
+            expert_stream_->retarget(std::move(bindings.record_of), bindings.one_allocation, std::move(bindings.hold),
+                                     host_strides_, std::move(bindings.ssd), std::move(bindings.staging));
+        }
         start_tier_fill();
     }
 
@@ -3426,6 +3455,7 @@ public:
                     const bool staging        = tier_ != nullptr && tier_resident_slots() < kRefillBatch;
                     if (staging) { ensure_tier(kRefillBatch); }
                     start_placement_fill(request.order);
+                    placement_fill_.after_switch = true;
                     placement_fill_.restore_tier = staging;
                     placement_fill_.tier_after   = named;
                 }
@@ -3470,6 +3500,7 @@ public:
                            DiagnosticLevel::Error);
             }
         }
+        reset_round_costs("the expert placement switched"); // a failed switch may still have moved experts
     }
 
     // Starts the resident refill after a placement grow: the usage-rank order to walk (the
@@ -3565,6 +3596,11 @@ public:
                    " experts into " + std::to_string(residency_->frames()) + " frames in " +
                    std::to_string(seconds) + " s (" + std::to_string(residency_->resident_count()) +
                    " resident)");
+        if (placement_fill_.after_switch) {
+            reset_round_costs("the placement's resident refill completed");
+        } else {
+            wake_maintenance(); // a lease's refill: the RAM tier settles next (settle_placement)
+        }
         // The switch this fill served named no RAM tier and every key is now in VRAM: the tier
         // served as the fill's reader, and with nothing left to demote or fetch it releases.
         if (placement_wants_no_tier_ && residency_->resident_count() + 1 >= residency_->frames() &&
@@ -3670,12 +3706,64 @@ public:
             std::span<const std::int32_t>(residency_->host_table(), keys), ram, state.counts, error);
     }
 
+    // A placement drifts from its named counts between switches. A long prompt's lease evicts the
+    // lowest-ranked VRAM experts without demoting them, and when it returns its frames stay empty
+    // until use promotes into them; the swapper's promotions keep their RAM copies (shadows) while
+    // the VRAM victims it does not demote (past a boundary's allowance) leave RAM for the artifact.
+    // VRAM then holds fewer experts than its frames, RAM fewer distinct ones than its slots, and
+    // the SSD more than the placement named (50/50 VRAM/RAM after a 22k-token prompt: 9557 of
+    // 12288 frames held, 3383 SSD-only experts; 2026-10-22). True when a frame is empty with no
+    // lease out, or the tier holds a shadow or a free slot.
+    [[nodiscard]] bool placement_drifted() const {
+        if (tier_ == nullptr || residency_ == nullptr || tier_backfill_.active || placement_fill_.active) { return false; }
+        if (residency_->stats().lent_frames == 0 && residency_->resident_count() + 1 < residency_->frames()) { return true; }
+        auto& tier = tier_->controller();
+        return tier.shadow_count() > 0 || tier.has_free_resident();
+    }
+
+    // When the engine idles, the placement returns to its named counts: empty frames are refilled
+    // in the usage ranking (the grow's refill, which moves RAM experts up and frees their slots),
+    // then the unpinned shadows give their slots back and the tier fill reads the ranking's best
+    // SSD-only keys into the free slots, up to the tier's capacity (a placement with an SSD share
+    // keeps it).
+    void settle_placement() {
+        if (!placement_drifted()) { return; }
+        const std::size_t resident = residency_->resident_count();
+        if (residency_->stats().lent_frames == 0 && resident + 1 < residency_->frames()) {
+            diagnostic("expert placement: refilling " + std::to_string(residency_->frames() - resident) +
+                           " empty VRAM frames (a lease evicted their experts)",
+                       DiagnosticLevel::Info);
+            start_placement_fill({}); // the tier settles at the next idle tick after the refill
+            return;
+        }
+        const std::uint32_t keys  = c_.num_hidden_layers * c_.moe.experts;
+        const std::int32_t* table = residency_->host_table();
+        bool ssd_only = false;
+        for (std::uint32_t key = 0; key < keys && !ssd_only; ++key) {
+            ssd_only = table[key] < 0 && tier_->record(key) == nullptr;
+        }
+        if (!ssd_only) { return; }
+        // Promotions pin their RAM source until they are published, and an idle engine runs no
+        // round boundary: land and publish the finished ones here. A promotion still queued keeps
+        // its shadow pinned until a later settle (at most one boundary's batch, 64 at 50/50).
+        residency_->quiesce_tier(device_.stream);
+        const std::uint32_t released = tier_->controller().release_shadows();
+        if (released == 0 && !tier_->controller().has_free_resident()) { return; } // the shadows are pinned
+        diagnostic("expert placement: RAM tier settling (" + std::to_string(released) +
+                       " shadow slots released for SSD-only experts)",
+                   DiagnosticLevel::Info);
+        start_tier_fill();
+    }
+
     // At a boundary (no round's kernels in flight; `idle`: no request active): applies a pending
     // expert-placement switch, then resizes the expert cache to the control law's decision.
     void apply_vram_target(bool idle) {
         apply_pending_placement();
         advance_placement_fill(); // the placement grow's refill: advances at every boundary and idle
         advance_tier_fill();      // the RAM tier's fill: the same cadence
+        if (idle && std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; })) {
+            settle_placement();
+        }
         if (options_.resident_experts) { return; } // the pools hold every expert: nothing resizes them
         if (placement_ceiling_ != 0) { return; } // an explicit placement: only its switches move the pool
         if (idle && kv_idle_due() &&
@@ -3862,6 +3950,43 @@ private:
                 line += text;
             }
             diagnostic(line, DiagnosticLevel::Debug);
+        } catch (...) {}
+    }
+
+    // The verification rounds' padding over the finished request, and since start: a padded
+    // column is one past its row's drafts, carried through every layer's MoE. The share is what
+    // a column mask (dispatching nothing for such columns) could keep off the expert path.
+    void report_verify_rounds(const Lane& lane) noexcept {
+        try {
+            const auto& a = lane.verify_at_admission;
+            const auto rounds = verify_rounds_ - a[0];
+            if (rounds == 0) { return; }
+            const auto columns = verify_columns_ - a[1];
+            const auto padded  = verify_padded_ - a[2];
+            char text[224];
+            std::snprintf(text, sizeof(text),
+                          "verify rounds: request %llu rounds, %llu of %llu columns past their row's drafts "
+                          "(%.1f%%); since start %llu of %llu (%.1f%%)",
+                          static_cast<unsigned long long>(rounds),
+                          static_cast<unsigned long long>(padded), static_cast<unsigned long long>(columns),
+                          columns ? 100.0 * static_cast<double>(padded) / static_cast<double>(columns) : 0.0,
+                          static_cast<unsigned long long>(verify_padded_),
+                          static_cast<unsigned long long>(verify_columns_),
+                          verify_columns_
+                              ? 100.0 * static_cast<double>(verify_padded_) / static_cast<double>(verify_columns_)
+                              : 0.0);
+            diagnostic(text);
+            std::string widths = "verify rounds by width, since start:";
+            for (std::size_t w = 2; w < verify_by_width_.size(); ++w) {
+                const auto& by_width = verify_by_width_[w];
+                if (by_width[0] == 0) { continue; }
+                std::snprintf(text, sizeof(text), " %zu: %llu rounds, %.1f%% padded", w,
+                              static_cast<unsigned long long>(by_width[0]),
+                              by_width[1] ? 100.0 * static_cast<double>(by_width[2]) / static_cast<double>(by_width[1])
+                                          : 0.0);
+                widths += text;
+            }
+            if (widths.back() != ':') { diagnostic(std::move(widths), DiagnosticLevel::Debug); }
         } catch (...) {}
     }
 
@@ -4443,7 +4568,7 @@ private:
             span = {stream_wide_lease_.memory.data, wide_work_};
         } else {
             if (!work_lease_.valid() && wide_fallback_.p == nullptr) {
-                if (residency_->frames() > 0 && wide_work_ + residency_->lend_pitch() <= residency_->lendable_bytes()) {
+                if (residency_->can_lend(wide_work_)) {
                     const cudaStream_t writers[] = {device_.stream};
                     work_lease_ = residency_->lend(wide_work_, device_.stream, writers);
                 } else {
@@ -4784,6 +4909,21 @@ private:
             spec_host(spec_layout_.lengths)[b] = p;
             spec_host(spec_layout_.anchors)[b] = lane.history.back();
         }
+        // The round is rectangular at its widest row, so a row with fewer drafts than W - 1
+        // carries columns past its drafts: they route through every layer's MoE today, and a
+        // column mask could keep them off that path. Counted here, host-side, per width.
+        std::int64_t padded = 0;
+        for (std::int32_t b = 0; b < batch; ++b) {
+            padded += std::max<std::int64_t>(0, W - 1 - static_cast<std::int32_t>(drafts_[b].size()));
+        }
+        ++verify_rounds_;
+        verify_columns_ += static_cast<std::uint64_t>(batch) * static_cast<std::uint64_t>(W);
+        verify_padded_ += static_cast<std::uint64_t>(padded);
+        verify_by_width_.resize(std::max(verify_by_width_.size(), static_cast<std::size_t>(W) + 1));
+        auto& by_width = verify_by_width_[static_cast<std::size_t>(W)];
+        ++by_width[0];
+        by_width[1] += static_cast<std::uint64_t>(batch) * static_cast<std::uint64_t>(W);
+        by_width[2] += static_cast<std::uint64_t>(padded);
         const auto read_rows = [&] {
             for (std::int32_t b = 0; b < batch; ++b) {
                 queue_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], W, staged[b], W);
@@ -5204,6 +5344,21 @@ private:
     std::array<BatchCostFit, kMaximumConcurrency + 1> batch_cost_{};
     std::int32_t last_round_batch_ = 0; // the previous decode round's size (0: none yet)
     std::int32_t last_round_extra_ = -1; // its extra verify columns; -1: not a sample (set by the round)
+
+    // The round cost fits describe the expert placement they were measured under: a plain round
+    // timed with half the experts on the SSD (24 ms at six rows) priced drafts at a twentieth of
+    // the 11 ms all-VRAM round after a switch back, and the plain EMA, sampled only by the probes
+    // while drafting wins, would take ~800 rounds to correct (T3, 2026-10-22: C6 444 -> 351
+    // tok/s). A placement switch, and the resident refill that completes a grow, start them again
+    // from the priors.
+    void reset_round_costs(const char* why) {
+        round_cost_       = {};
+        batch_cost_       = {};
+        last_round_steps_ = -1;
+        last_round_batch_ = 0;
+        last_round_extra_ = -1;
+        diagnostic(std::string("speculation cost fits reset: ") + why);
+    }
 
     // The plain round time a_p, the drafting round's fixed overhead `fixed` (seconds) and marginal
     // per column `b` for rounds of `batch` rows; false while either side is not determined (the
@@ -6111,6 +6266,7 @@ private:
     bool clear_prefix_on_release_ = false;
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::ExpertStream> expert_stream_;
+    std::vector<std::uint64_t> host_strides_; // each bank's own record stride (a GGUF import's vary)
     // The stream's leases: the ring, the wide arena and a walk's area (each a run of one pool).
     ExpertResidency::FrameLease stream_lease_, stream_wide_lease_, stream_walk_lease_;
     std::size_t stream_ring_bytes_ = 0, stream_wide_bytes_ = 0, stream_walk_bytes_ = 0;
@@ -6370,6 +6526,13 @@ private:
     std::uint64_t pair_policy_rounds_            = 0;
     std::uint64_t batch_policy_rounds_           = 0;
     bool plain_round_ = false;
+    // Verification rounds' shape, program-wide: rounds, columns, columns past their row's
+    // drafts; verify_by_width_[W] holds the same per round width. Report_verify_rounds reads
+    // them against a lane's admission snapshot.
+    std::uint64_t verify_rounds_  = 0;
+    std::uint64_t verify_columns_ = 0;
+    std::uint64_t verify_padded_  = 0;
+    std::vector<std::array<std::uint64_t, 3>> verify_by_width_;
 
     // The neural drafter's most drafts per round (MTP's or DFlash2's), and whether a lane drafts.
     [[nodiscard]] std::int32_t neural_k() const noexcept { return mtp_ ? mtp_k_ : dflash_k_; }

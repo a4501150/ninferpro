@@ -4,7 +4,8 @@
 #   make t0 [R=regex]            unit and Op tests (ctest, everything but the real-artifact entries)
 #   make t1 [SHAPE=6x1,6x2]      one round per shape on the real artifact: time and golden hashes
 #   make t1-exact                the same on the exact route (--disable-fast-paths)
-#   make t1-kernels [KSHAPE=6x2] per-kernel device time of one round (Nsight Systems)
+#   make t1-kernels [KSHAPE=6x2] [METRICS=1]  per-kernel device time of one round (Nsight Systems);
+#                                METRICS=1 adds the DRAM bandwidth left unused, per kernel
 #   make t1-record               record the golden hashes after an intended numerical change
 #   make t2                      start-up and correctness smoke test: the Engine with production's
 #                                options on the real artifacts, golden tokens on the exact route
@@ -42,6 +43,7 @@ T1_FAST   := 1x1,6x1,1x4,6x2,6x3
 T1_EXACT  := 6x1,6x2
 SHAPE     ?= $(T1_FAST)
 KSHAPE    ?= 6x2
+METRICS   ?=
 # T3: the placements bench_infernix.py walks in one boot, and where its tables go.
 PLACEMENTS ?= vram=100%
 T3_OUT    ?= $(HOME)/src/super-quant/results/infernix_t3_$(shell git rev-parse --short HEAD)
@@ -62,7 +64,7 @@ t1-exact:
 
 t1-kernels:
 	$(BUILD_CMD) --target infernix_qwen4_exp_round_bench
-	$(GPU) python3 tools/flash_next/t1_kernels.py --shape $(KSHAPE) --bench $(ROUND) -- --artifact $(ARTIFACT) --ngram-volume $(NGRAM) $(ARGS)
+	$(GPU) python3 tools/flash_next/t1_kernels.py --shape $(KSHAPE) $(if $(METRICS),--gpu-metrics) --bench $(ROUND) -- --artifact $(ARTIFACT) --ngram-volume $(NGRAM) $(ARGS)
 
 t1-record:
 	$(BUILD_CMD) --target infernix_qwen4_exp_round_bench

@@ -3579,6 +3579,32 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   router and the route, every routed buffer allocated before it (its scoped workspace past them);
   prefill chunks keep it after the routed experts. T1: 1 x 1 5.89 -> 5.85 ms, 6 x 1 11.44 -> 11.30,
   1 x 4 9.11 -> 9.02, 6 x 2 16.61 -> 16.52, 6 x 3 22.79 -> 22.74; `make t2-bench` 505.9 tok/s.
+- **Speculation cost fits reset on a placement switch (2026-10-22, RTX PRO 6000, this fork).** T3's
+  placement matrix (all VRAM; 50/50 VRAM/RAM; 65/15/20; 50/50 VRAM/SSD; all VRAM) ended at C6 351
+  tok/s against 444 for the same all-VRAM placement at its start: the DFlash2 batch fit still held
+  the 24 ms plain six-row round of the SSD placement, priced a draft at 0.05-0.32 plain rounds and
+  drafted 5-10 times more per request at 20-25 % acceptance (per-request decode 91 -> 70 tok/s);
+  its plain EMA, sampled only by probes while drafting wins, needed ~800 rounds to recover. A
+  placement switch, and the resident refill completing a grow, now reset the fits
+  (`reset_round_costs`). Same matrix: the closing all-VRAM row 351 -> 436 tok/s (64.7 % acceptance;
+  the opening row 465); the tiered rows 364 -> 367, 343 -> 360, 189 -> 203. Within the matrix's short
+  phases the six-row fit no longer forms in the tiered rows, so they run on the plain prior.
+- **The placement returns to its named counts when the engine idles (2026-10-22, RTX PRO 6000,
+  this fork).** Between switches a placement drifted. A long prompt's lease evicts the
+  lowest-ranked VRAM experts without demoting them, and its returned frames stayed empty until use
+  promoted into them: at 50/50 VRAM/RAM after one 22k-token prompt, 9557 of 12288 frames held an
+  expert and 3383 experts were SSD-only, still so 6 s later. The swapper's promotions keep their
+  RAM copies (shadows) while VRAM victims past a boundary's demotion allowance leave RAM for the
+  artifact (T3 at 50/50: 87 SSD-only experts and 87 shadows). At the end of a request
+  `placement_drifted` asks for maintenance; when the engine idles, `settle_placement` refills empty
+  frames with the grow's refill (RAM experts move up and free their slots), then lands the
+  finished promotions, releases the unpinned shadows and reads the ranking's best SSD-only keys
+  into the free slots, up to the tier's capacity. Probe (boot all VRAM, switch to 50/50, bursts
+  of six 256-token requests and a 22k-token prompt): 12288 / 12288 / 0 within 0.5 s of each burst
+  (the refill moved 3061-3272 experts back in 0.26 s); a promotion still queued keeps its shadow
+  pinned until a later settle (64 after the first burst, 0 after the next). T3's closing GET is
+  read within a millisecond of the last request, before the settle, so its counts still show the
+  drift (76 at 50/50); its speeds match the runs before.
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.
@@ -9638,7 +9664,7 @@ Bit-exact launch-boundary changes of the decode chain, chosen from the per-layer
 - `moe_route_dispatch_plan`: a CPU-served call of at most 32 columns plans its misses in the route
   and dispatch kernel. After a barrier of the whole 1024-thread CTA its first 256 threads run the
   plan body of `cpu_plan_kernel` (named barrier, same results), so the host's request follows the
-  dispatch with no kernel boundary; `moe_experts` then skips its plan (`cpu_planned`). The Program
+  dispatch with no kernel boundary; `moe_experts` then skips its plan (`MoeRoutePlan::Cpu`). The Program
   routes there unless a route tap or a streamed prefill chunk needs the dispatch first.
   `test_offloaded_moe_layer` routes its CPU-served calls through it.
 - `moe_combine_inject`: the combine keeps y in a register and injects it into the residual streams
@@ -10728,6 +10754,79 @@ runs (read from its volume, or 27.8 GiB pinned while the first test ran), costin
 every arm above passes `--ngram-residency volume`. The `ggml_gate_up_bf16` instance of the IQ formats
 (half sub-scales) holds 40 bytes of stack for loop invariants outside its MMA loop (allow-listed,
 like the exact `gate_up_tile_ggml`'s 40 bytes).
+
+### 19.3.30 Six lanes with every expert in VRAM: where the round goes (2026-10-22)
+
+RTX PRO 6000 (188 SMs, 1.79 TB/s), the Uncensored NVFP4 artifact, T1 at context 1024, commit
+`0e71f3f`. This records the state for whoever continues the decode work; the changes that led
+here are the dated bullets of §19.2 (resident route, batched n-gram reads, in-place route plan,
+shared expert forked before the router) and the hyper-connection up kernel's partial reads and
+token groups (commit `6eaf01c`, described in `hyper_connection_mix_fused.cu`).
+
+| | 1 x 1 | 6 x 1 | 1 x 4 | 6 x 2 | 6 x 3 |
+|---|---|---|---|---|---|
+| T1 forward graph, session start (ms) | 6.06 | 11.76 | 9.39 | 17.05 | 22.96 |
+| T1 forward graph, now (ms) | 5.85 | 11.30 | 9.02 | 16.52 | 22.74 |
+
+`make t2-bench` (six concurrent 256-token requests in process, DFlash2 auto, five sets): median
+505.9 tok/s (range 499.2-506.5), from 488.3 at the session's start after a reboot. SGLang's 582
+tok/s (DFlash on its ring layout) is a server measurement; T3 was not run on this build. Plain
+6 x 1 decode is capped at 6 / 11.3 ms = 531 tok/s; the engine reaches 506 because the DFlash2
+policy serves most tokens (about 1,000-1,300 of 1,536) from plain rounds, a 6 x 2 round costing
+1.46 times a 6 x 1 (more columns touch more distinct experts). At about 60 % acceptance a perfect
+6 x 2 policy would give at most about 580 tok/s before the drafter's time, so passing 582 needs
+cheaper rounds as well as speculation.
+
+**Where a 6 x 1 round goes** (`make t1-kernels KSHAPE=6x1 METRICS=1`; device time split between
+overlapping kernels; DRAM is read plus write throughput, sampled every 5 us). Of 11.0 ms busy,
+3.9 ms (35 %) leaves DRAM bandwidth unused. Streaming kernels top out near 90 % (the routed
+gate/up kernel measured 89.9 %), so about 1.1 ms of that is not recoverable and about 2.8 ms is.
+
+| Kernel | Time per round | DRAM | Unused | What it is |
+|---|---|---|---|---|
+| `gate_up_rows_kernel_a16` | 3.02 ms | 89.9 % | 0.31 ms | routed experts, gate/up |
+| `fp8_a16_simt_kernel` | 2.15 ms | 63.5 % | 0.78 ms | dense FP8 projections (GDN qkvz and out, QSA qkvg and out, shared expert) |
+| `down_rows_kernel_a16` | 1.92 ms | 71.6 % | 0.55 ms | routed experts, down |
+| `hc_up_collapse_v4_kernel` | 0.86 ms | 41.3 % | 0.51 ms | hyper-connection mix, up |
+| `hc_down_partials_v4_kernel` | 0.48 ms | 28.1 % | 0.34 ms | hyper-connection mix, down |
+| `attention_kernel` | 0.27 ms | 11.2 % | 0.24 ms | QSA decode attention |
+| `projection_kernel` | 0.28 ms | 22.0 % | 0.22 ms | router (513 x 2560 BF16) |
+| `recurrent_batch_update_kernel` | 0.52 ms | 63.0 % | 0.19 ms | GDN state update |
+| `projection_q8_kernel` | 0.52 ms | 73.5 % | 0.14 ms | Q8 projections |
+| about 20 small kernels | about 0.7 ms | 1-60 % | about 0.6 ms | inject, combine, splits, norms, RoPE, KV append, QSA index and selection |
+
+Kernel boundaries do not show as idle time: under PDL a kernel is always running (no kernel ran
+for 47 us of an 11.5 ms round, 0.4 %), so their cost (the wait, the ramp, the tail) is time
+inside kernels at low bandwidth, and option H1's gate (§17: boundary and tail gaps above 10 % of
+the token) is read from the unused column, not from gaps in a trace. Per layer the chain is about
+25 kernels, 1,139 per round.
+
+**Candidates**, by the bandwidth they leave unused:
+
+- The dense FP8 projections (0.78 ms). Nsight Compute on the 2560 x 6144 projection at T = 6:
+  61 % of DRAM, 37 % of issue slots, 0.68 waves, about 13 warps per SM, 3.3 instructions per FMA:
+  latency and issue bound at this width. Every candidate of `infernix_fp8_flash_next_sweep` in the
+  current bits family is 16.4 us at T = 6 against an 8.8 us floor; `sliced_t16w8s2` is 14.3 us but
+  belongs to another bits family (a fast path with new hashes, §16; not pursued for now).
+- The hyper-connection mix (0.85 ms). Both kernels are latency bound (about 17 % occupancy, 226
+  registers, less than one wave).
+- Fusion of the GDN chain (split, gating, conv, recurrent update, norm: five kernels between the
+  two projections) and of the QSA small kernels (two norms, RoPE, KV append, pool, tail, index
+  query, score, selection, merge, gate), and the MoE tail into the next layer's mix (combine and
+  inject before `hc_down`).
+- The routing chain is now router (about 6 us own time per layer) and the in-place route plan
+  (about 6 us); the top-10 selection itself is under 1 us. Removing the remaining boundary means
+  routing in the router's last CTA.
+
+**Rejected** (each bit-identical, each slower):
+
+- Two rows of W_down per warp in `hc_down_partials_v4` with the pass width a template argument
+  (4 warps per CTA, no spills): 17.9 us per call at T = 6 against 12.7 (comment in
+  `hyper_connection_mix_fused.cu`).
+- A register ring keeping the weight codes of 2-8 K phases in flight in the FP8 SIMT tile: 16.4 us
+  at T = 6 became 18.4-22.5 us (depth 2-8); the tile is not waiting on DRAM phase by phase.
+- The in-place route plan's encode inside the routing CTA: the kernel took 18.3 us at 12 columns
+  (one SM encoding every column); it keeps a CTA per column.
 
 ---
 

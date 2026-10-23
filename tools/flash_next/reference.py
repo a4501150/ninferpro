@@ -10,7 +10,8 @@ artifact or converter:
 - every dense and BF16 tensor is widened exactly and every product is formed in binary64;
 - routed experts use NVIDIA's NVFP4 words, decoded exactly, with activations quantized to A4 by the
   ModelOpt rule (design §16.2) on BF16 inputs with each matrix's own ``input_scale``;
-- the PLE n-gram rows are the checkpoint's FP8 codes times its BF16 scale, rounded to BF16.
+- the PLE n-gram rows are read as stored: BF16 rows (the BF16 PLE) exactly, or NVIDIA's FP8 codes
+  times the layer's BF16 scale, rounded to BF16.
 
 ``--bf16-boundaries`` (default on) rounds the activations that deployed BF16 runtimes store in
 BF16 -- the residual streams, every block input and output -- so differences against Infernix are
@@ -78,14 +79,19 @@ def softplus(x):
 
 
 def rope(x: torch.Tensor, positions: torch.Tensor, theta: float, rotary: int) -> torch.Tensor:
-    """Text-token MRoPE: every section uses the same position, so it is plain half-split RoPE on
-    the first ``rotary`` dimensions. x: [T, H, D]."""
+    """Token RoPE over the first ``rotary`` dimensions of x [T, H, D], half-split. ``positions`` is
+    [T] (all axes equal: text) or [T, 3] (interleaved MRoPE: dimension pair d takes axis d % 3,
+    its mirror d + rotary/2 the same axis). All axes equal reduces to text RoPE exactly."""
+    half = rotary // 2
     inv = 1.0 / (theta ** (torch.arange(0, rotary, 2, dtype=F64) / rotary))
-    freqs = positions.to(F64)[:, None] * inv[None, :]
+    pos = positions.to(F64)
+    if pos.dim() == 1:
+        pos = pos[:, None].expand(-1, 3)
+    axis = torch.arange(half, dtype=torch.long) % 3
+    freqs = pos[:, axis] * inv[None, :]
     emb = torch.cat((freqs, freqs), dim=-1)
     cos, sin = emb.cos()[:, None, :], emb.sin()[:, None, :]
     xr, xp = x[..., :rotary], x[..., rotary:]
-    half = rotary // 2
     rotated = torch.cat((-xr[..., half:], xr[..., :half]), dim=-1)
     return torch.cat((xr * cos + rotated * sin, xp), dim=-1)
 
@@ -158,6 +164,164 @@ class Experts:
         return bf16(a4_dequantized(h, sd) @ wd.T)
 
 
+# ---------------------------------------------------------------------------- vision
+
+
+def layer_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+              eps: float = 1e-6) -> torch.Tensor:
+    mu = x.mean(-1, keepdim=True)
+    x = x - mu
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight + bias
+
+
+def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
+    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x.pow(3))))
+
+
+def gelu_exact(x: torch.Tensor) -> torch.Tensor:
+    return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
+
+def patch_grid_positions(t: int, h: int, w: int) -> torch.Tensor:
+    """(y, x) patch coordinates in the engine's payload order: merge blocks row-major, the 2x2
+    inner patches consecutive (processor.cpp prepare_image), temporal groups outermost."""
+    coords = []
+    for _ in range(t):
+        for block_y in range(h // 2):
+            for block_x in range(w // 2):
+                for inner_y in range(2):
+                    for inner_x in range(2):
+                        coords.append((block_y * 2 + inner_y, block_x * 2 + inner_x))
+    return torch.tensor(coords, dtype=torch.int64)
+
+
+class Vision:
+    """The Qwen4Exp vision tower and merger over the checkpoint's BF16 tensors in binary64.
+
+    The patch layout, the 48x48 position-table bilinear interpolation (align-corners), the
+    LayerNorms, the 2-D rope (per-axis theta 1e4 over 36 dims each, dims 0..35 mirroring
+    36..71), the per-frame non-causal attention, the 2x2 merger and its exact GELU follow the
+    checkpoint's vision_config and Infernix's contract notes (design §19.3.2), written from
+    those definitions, not from Infernix's kernels."""
+
+    def __init__(self, weights: Weights, *, bf16_boundaries: bool = True):
+        self.w = weights
+        c = weights.store.config["vision_config"]
+        self.depth = int(c["depth"])
+        self.hidden = int(c["hidden_size"])
+        self.heads = int(c["num_heads"])
+        self.d = self.hidden // self.heads
+        self.patch = int(c["patch_size"])
+        self.temporal = int(c["temporal_patch_size"])
+        self.merge = int(c["spatial_merge_size"])
+        self.out = int(c["out_hidden_size"])
+        self.table_side = int(round(math.sqrt(int(c["num_position_embeddings"]))))
+        self.act = c["hidden_act"]
+        self.round = bf16 if bf16_boundaries else (lambda v: v)
+        inv = 10000.0 ** (-(torch.arange(18, dtype=F64) / 18.0))
+        self.inv_freq = inv
+
+    def v(self, name: str) -> torch.Tensor:
+        return self.w.get("model.visual." + name)
+
+    def rope_2d(self, x: torch.Tensor, yx: torch.Tensor) -> torch.Tensor:
+        """x: [P, heads, 72]. Dimensions 0..17 rotate by y, 18..35 by x, 36..71 mirror."""
+        angle = torch.cat((yx[:, 0][:, None] * self.inv_freq, yx[:, 1][:, None] * self.inv_freq),
+                          dim=-1)                                     # [P, 36]
+        emb = torch.cat((angle, angle), dim=-1)                       # [P, 72]
+        cos, sin = emb.cos()[:, None, :], emb.sin()[:, None, :]
+        rotated = torch.cat((-x[..., 36:], x[..., :36]), dim=-1)
+        return x * cos + rotated * sin
+
+    def position_embeddings(self, yx: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        table = self.v("pos_embed.weight")                            # [2304, 1152] rows y*48+x
+        side = self.table_side
+        coords = yx.to(F64)
+        coords[:, 0] *= (side - 1) / max(h - 1, 1)
+        coords[:, 1] *= (side - 1) / max(w - 1, 1)
+        y0 = coords[:, 0].floor().long().clamp(0, side - 1)
+        x0 = coords[:, 1].floor().long().clamp(0, side - 1)
+        y1 = (y0 + 1).clamp(0, side - 1)
+        x1 = (x0 + 1).clamp(0, side - 1)
+        wy = coords[:, 0] - y0.to(F64)
+        wx = coords[:, 1] - x0.to(F64)
+        rows = torch.stack((y0 * side + x0, y0 * side + x1, y1 * side + x0, y1 * side + x1))
+        weights = torch.stack(((1 - wy) * (1 - wx), (1 - wy) * wx, wy * (1 - wx), wy * wx), dim=1)
+        return (table[rows.T] * weights[:, :, None]).sum(1)
+
+    def forward(self, patches: torch.Tensor, grid) -> torch.Tensor:
+        """patches: [P, 3*temporal*patch*patch] of BF16 values widened to binary64; grid
+        (t, h, w) in patches. Returns merged embeddings [t*h/2*w/2, out_hidden], rounded."""
+        t, h, w = grid
+        P = t * h * w
+        if tuple(patches.shape) != (P, 3 * self.temporal * self.patch * self.patch):
+            raise ValueError(f"patch payload {tuple(patches.shape)} does not match grid {grid}")
+        yx = patch_grid_positions(t, h, w)
+        weight = self.v("patch_embed.proj.weight").reshape(self.hidden, -1)
+        x = self.round(patches @ weight.T + self.v("patch_embed.proj.bias"))
+        x = self.round(x + self.position_embeddings(yx, h, w))
+        segment = h * w
+        for layer in range(self.depth):
+            p = f"blocks.{layer}."
+            n = self.round(layer_norm(x, self.v(p + "norm1.weight"), self.v(p + "norm1.bias")))
+            qkv = self.round(n @ self.v(p + "attn.qkv.weight").T) + self.v(p + "attn.qkv.bias")
+            qkv = self.round(qkv)
+            q, k, v = qkv.reshape(P, 3, self.heads, self.d).permute(1, 0, 2, 3)
+            q = self.round(self.rope_2d(q, yx))
+            k = self.round(self.rope_2d(k, yx))
+            out = torch.zeros(P, self.heads, self.d, dtype=F64)
+            for s in range(t):
+                sl = slice(s * segment, (s + 1) * segment)
+                scores = torch.einsum("phd,qhd->hpq", q[sl], k[sl]) / math.sqrt(self.d)
+                prob = torch.softmax(scores, dim=-1)
+                out[sl] = torch.einsum("hpq,qhd->phd", prob, v[sl])
+            out = self.round(out.reshape(P, self.hidden) @ self.v(p + "attn.proj.weight").T +
+                             self.v(p + "attn.proj.bias"))
+            x = self.round(x + out)
+            n = self.round(layer_norm(x, self.v(p + "norm2.weight"), self.v(p + "norm2.bias")))
+            up = self.round(n @ self.v(p + "mlp.linear_fc1.weight").T + self.v(p + "mlp.linear_fc1.bias"))
+            up = self.round(gelu_tanh(up))
+            down = self.round(up @ self.v(p + "mlp.linear_fc2.weight").T + self.v(p + "mlp.linear_fc2.bias"))
+            x = self.round(x + down)
+        merged = self.round(layer_norm(x, self.v("merger.norm.weight"), self.v("merger.norm.bias")))
+        merged = merged.reshape(P // 4, 4 * self.hidden)
+        hidden = self.round(merged @ self.v("merger.linear_fc1.weight").T +
+                            self.v("merger.linear_fc1.bias"))
+        hidden = self.round(gelu_exact(hidden))
+        return self.round(hidden @ self.v("merger.linear_fc2.weight").T +
+                          self.v("merger.linear_fc2.bias"))
+
+
+def get_rope_index(ids: list[int], items: list[tuple[int, int, int]], image_id: int,
+                   video_id: int) -> torch.Tensor:
+    """The Qwen3.5 interleaved M-RoPE prompt positions, ported from the upstream convention:
+    text tokens advance all three axes, an image's merged tokens take (cur, cur+y, cur+x)
+    raster over the merged grid and the cursor advances by max(gh, gw) per frame run.
+    items: (t, gh, gw) merged grids per media item, in prompt order."""
+    positions = torch.zeros(len(ids), 3, dtype=torch.int64)
+    cur = 0
+    i = 0
+    item = 0
+    while i < len(ids):
+        if ids[i] not in (image_id, video_id):
+            positions[i] = cur
+            cur += 1
+            i += 1
+            continue
+        t, gh, gw = items[item]
+        item += 1
+        runs = 1 if ids[i] == image_id else t
+        for _ in range(runs):
+            for y in range(gh):
+                for x in range(gw):
+                    positions[i] = torch.tensor((cur, cur + y, cur + x))
+                    i += 1
+            cur += max(gh, gw)
+    if item != len(items):
+        raise ValueError(f"media items {item} do not cover the token runs")
+    return positions
+
+
 # ---------------------------------------------------------------------------- model
 
 
@@ -170,6 +334,10 @@ class Reference:
         self.H = int(self.c["hidden_size"])
         self.experts = Experts(self.w)
         self.round = bf16 if bf16_boundaries else (lambda x: x)
+        top = self.w.store.config
+        self.image_id = int(top.get("image_token_id", 248056))
+        self.video_id = int(top.get("video_token_id", 248057))
+        self.vision = Vision(self.w, bf16_boundaries=bf16_boundaries)
         rope = self.c["rope_parameters"]
         self.theta = float(rope["rope_theta"])
         self.rotary = int(self.c["head_dim"] * rope["partial_rotary_factor"])
@@ -332,7 +500,7 @@ class Reference:
         _, _, padded = head_tables(spec, ple_index)
         parts = c["split_ngram_parts"]
         per = padded // parts
-        scale = w.text(p + "ple_embedding.ngram_embedding.weight_scale")
+        scale = None
         T = R.shape[0]
         emb = []
         for t in range(T):
@@ -340,9 +508,16 @@ class Reference:
             for r in rows[t]:
                 shard, local = divmod(r, per)
                 name = f"{w.prefix}{p}ple_embedding.ngram_embedding.shard_{shard}.weight"
-                width = w.store.describe(name).shape[1]
-                raw = w.store.read_flat(name, local * width, (local + 1) * width).view(torch.float8_e4m3fn)
-                vals.append(bf16(raw.to(F64) * scale))
+                info = w.store.describe(name)
+                raw = w.store.read_flat(name, local * info.shape[1], (local + 1) * info.shape[1])
+                if info.dtype == "BF16":
+                    # Our checkpoints store the PLE rows as BF16 values (the BF16 PLE).
+                    vals.append(bf16(raw.to(F64)))
+                else:
+                    # NVIDIA's FP8 PLE: E4M3FN codes times the layer's BF16 scale.
+                    if scale is None:
+                        scale = w.text(p + "ple_embedding.ngram_embedding.weight_scale")
+                    vals.append(bf16(raw.view(torch.float8_e4m3fn).to(F64) * scale))
             emb.append(torch.cat(vals))
         e = torch.stack(emb)  # [T, 2560]
         key = rmsnorm_1p(e @ w.text(p + "key_proj.weight").T, w.text(p + "norm_key.weight"), self.eps, group=self.H)
@@ -360,12 +535,25 @@ class Reference:
         return self.round(gated + silu(conv)), rows
 
     # -- full forward
-    def forward(self, ids: list[int], *, layers: int | None = None, log=print) -> dict:
+    def forward(self, ids: list[int], *, layers: int | None = None, log=print,
+                patches: torch.Tensor | None = None,
+                grids: list[tuple[int, int, int]] | None = None) -> dict:
         c, w = self.c, self.w
         T = len(ids)
-        positions = torch.arange(T)
         name = w.prefix + "embed_tokens.weight"
         x = torch.stack([w.store.read_flat(name, i * self.H, (i + 1) * self.H) for i in ids]).to(F64)
+        if patches is not None:
+            if grids is None or len(grids) != 1:
+                raise ValueError("the multimodal reference currently takes exactly one media item")
+            merged = self.vision.forward(patches, grids[0])
+            slots = [i for i, token in enumerate(ids) if token in (self.image_id, self.video_id)]
+            if len(slots) != merged.shape[0]:
+                raise ValueError(f"{len(slots)} media tokens do not cover {merged.shape[0]} embeddings")
+            for row, slot in enumerate(slots):
+                x[slot] = merged[row]
+        positions = (get_rope_index(ids, [(g[0], g[1] // 2, g[2] // 2) for g in (grids or [])],
+                                   self.image_id, self.video_id)
+                     if patches is not None else torch.arange(T))
         R = x.repeat(1, self.hc)
         count = c["num_hidden_layers"] if layers is None else layers
         record = {"layer_residual_rms": [], "layer_residuals": [], "routed": [], "ngram_rows": None}
@@ -406,7 +594,10 @@ class Reference:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--tokens", required=True, help="comma-separated token ids")
+    parser.add_argument("--tokens", required=True, help="comma-separated token ids, or @FILE")
+    parser.add_argument("--patches", type=Path,
+                        help="npz with 'patches' (uint16 BF16 bits [P, 1536]) and 'grid' "
+                             "(t,h,w in patches) from the engine's prepared prompt")
     parser.add_argument("--layers", type=int, help="stop after this many layers (no logits)")
     parser.add_argument("--no-bf16-boundaries", action="store_true")
     parser.add_argument("--threads", type=int, default=0)
@@ -414,9 +605,19 @@ def main() -> int:
     args = parser.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
-    ids = [int(v) for v in args.tokens.split(",") if v]
+    if args.tokens.startswith("@"):
+        ids = [int(v) for v in Path(args.tokens[1:]).read_text().replace(",", " ").split()]
+    else:
+        ids = [int(v) for v in args.tokens.split(",") if v]
+    patches = None
+    grids = None
+    if args.patches is not None:
+        data = np.load(args.patches)
+        bits = (data["patches"].astype(np.uint32) << 16).view(np.float32)
+        patches = torch.from_numpy(bits).to(F64)
+        grids = [tuple(int(v) for v in data["grid"])]
     ref = Reference(args.model, bf16_boundaries=not args.no_bf16_boundaries)
-    record = ref.forward(ids, layers=args.layers)
+    record = ref.forward(ids, layers=args.layers, patches=patches, grids=grids)
     arrays = {"tokens": np.array(ids, dtype=np.int64), "final_residual": record["final_residual"]}
     if "logits" in record:
         arrays["logits"] = record["logits"]

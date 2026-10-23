@@ -4,8 +4,9 @@
 // §19.3.2, "The encode window and its memory"): the pure planning the Program and its host tests
 // share. Items to encode are those ending past the reused prefix; one layer-major pass encodes
 // them all into one token-ordered handoff, BF16 [out, V_encoded], which lives in lent expert
-// frames until the lane's prefill ends. Placement W runs the whole pass from the prefill
-// workspace in one admission step; placement L lends one run of frames for handoff and pass and
+// frames (or, when the residency lends no frame — every expert resident — a device allocation
+// of the same bytes) until the lane's prefill ends. Placement W runs the whole pass from the
+// prefill workspace in one admission step; placement L lends one run of frames for handoff and pass and
 // runs the pass in steps of several layers, so other lanes keep decoding between them.
 
 #include <cstddef>

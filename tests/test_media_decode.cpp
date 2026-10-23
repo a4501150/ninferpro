@@ -146,6 +146,64 @@ void test_issue_20_unaligned_jpeg() {
     }
 }
 
+// A 48x32 red/blue split with a white/black band, saved as quality-90 4:2:0 JPEG: sharp
+// chroma edges in every direction.
+constexpr std::string_view jpeg_chroma_base64 = R"jpeg(
+/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQ
+ERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU
+FBQUFBQUFBQUFBQUFBT/wAARCAAgADADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAA
+AgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6
+Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG
+x8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREA
+AgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5
+OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPE
+xcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD50or93qK+G/1Y/wCn3/kv/wBsf1T/AMRz
+/wCpb/5V/wDuR+ENeBV/S3X8q9fuPhlxN/xDn65+5+sfWPZ/a5OXk5/7s735/K1ut9Px3xD4w/19+q/7P7D2HP8Aa5+bn5P7
+sbW5fO9+lj02ivMqK/cf+I5/9S3/AMq//cj8c/sz+/8Ah/wT+qiivwhor+Hf9Z/+nP8A5N/9qf2L/wAQM/6mX/lL/wC6n7vV
+/KvX2VXgVfuPhlwz/wARG+ufvvq/1f2f2efm5+f+9C1uTzvfpbX8d8Q+D/8AUL6r/tHt/b8/2eTl5OT+9K9+bytbrc8yor02
+iv3H/iBn/Uy/8pf/AHU/HP7T/ufj/wAA/9k=
+)jpeg";
+
+// FFmpeg's swscaler upsamples 4:2:0 chroma with nearest-neighbour (SWS_POINT), which colors
+// every sharp edge of an ordinary JPEG by tens of levels relative to the libjpeg decode the
+// served models' reference processors (HF/PIL) produce. decode_image follows libjpeg's fancy
+// (triangle) upsampling and fixed-point YCbCr->RGB instead (decode.cpp jpeg_reference); the
+// residual against PIL is only the IDCT difference between the two decoders. The golden below
+// is PIL's own decode of the fixture above (libjpeg, quality 90, 4:2:0 subsampling): a
+// regression to nearest-neighbour upsampling misses the edge columns by tens of levels, while
+// the IDCT floor stays within a small tolerance.
+constexpr std::string_view jpeg_chroma_golden_base64 = R"golden(
+/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/gAD/QAD/QAD+wED+gID+gIC/QEAyQ1IMgCyAAH8AQD8AQD7AAH7AAL7AAL7AAL7AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/gAC/QAC/QAC+wEC+wEC+wIA/QEAyQ1IMwCyAAD+AAH8AAH7AQD8AAH7AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/QEA/QEA/QEA/QEA/QIA/QIA/QIAygxINgCyAgD+AAD+AAH8AgD+BAD8AgD+AQD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/QEA/QEA/QIA/QIA/gEA/gEA/QIAygxINgCyAgD+AAD+AAH+AQD+AgD+AgD8AgD8AQD8AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8/QAC+wEC/QAC+wEC/QAC+wEC/QAC+wEC/QAC+wEC/QAC+wEC/QAC+wEC/QAC/QAC/QAC/gAA/gEA/gEA/gEA/gEA/gAAyQ1KMgCwAAH8AAH+AAH+AAL+AAL8AAH7AQD7AQD7AQD7AQD8AQD7AQD8AQD7AQD8AQD7AQD8AQD7AQD8AQD7AQD8AQD7AQD8AQD7/QEA+wIA/QEA+wIA/QEA+wIA/QEA+wIA/QEA+wIA/QEA+wIA/QEA+wIA/QEA/QEA/gAC/gAA/QEA/QIA/gEA/gEA/gAAyQ1IMQCwAAP8AAH+AAH+AAL+AAP8AAL7AAH7AAH7AAH7AQD8AAH7AQD8AAH7AQD8AAH7AQD8AAH7AQD8AAH7AQD8AAH7AQD8AAH7/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/gAA/gAA/QAC+wEC+wED/QAD/gAC/gEAyQ1HLwCwAAL+AAH+AAD+AAD+AQD+AQD8AAH8AAH8AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH80RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RMT0RMT0RMV0BMX0BMX0BQT0BUQqR5HKwGJBQnEBwjFCAfFCAfECAfECAfFCAfFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjF/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zs/+zq/+zq/+vs/+vs/+7o/+/o/+7s//D9BwAeAAAyAAA1AAA3AAAzAAAzAAA1AAA3AAA3AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5///////////////////////////////////////////////////////////////////7///7//7///7/+//7+P/7+////v//AwAABgAABwAABAAAAAIAAAIAAAEAAAAAAAAAAAAAAQAAAAAAAQAAAAAAAQAAAAAAAQAAAAAAAQAAAAAAAQAAAAAAAQAAAAAA//7///7///7///7///7///7///7///7///7///7///7///7///7///7///7////9///7///9/P//+///+f//+P//+////v//AwACBAACBgAABgAAAwAAAQAAAAAEAAAFAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAAC///9///9///9///9///9///9///9///9///9///9///9///9///9///9///9///9///9/v///P//+f//+P//+P//+////v//AAAEAwAEBgAABgAAAwAAAQAAAAAEAAAFAAACAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEA/v///v///v///v///v///v///v///v///v///v///v///v///v///v///v///v/9///9//7///z//v7/+P//+P///v//////AAECAAEABAAABAAAAAIAAAMAAAIAAAECAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/v///v///v///v///v///v///v///v///v///v///v///v///v///v///v///v/////9//7///z///3/+f//+f////7///7/AAEAAAEABAAABAAAAAMAAAQAAAEAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA///////////////////////////////////////////////////////////////9///7///9//3///3//v/9/P/9//7///7/AAAAAQAABAACAwACAAEAAAIAAAACAQAEAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//7///7///7///7///7///7///7///7///7///7///7///7///7///7///7////9///7///7//3///3////7///7///9//7/AQAAAQACBAAEAwAEAAEAAAEAAwAEAwAEAQAEAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAAC//7///7///7///7///7///7///7///7///7///7///7///7///7///7///7////9///7///7//3///3////7///7///9//7/AQAAAQACBAAEAwAEAAEAAAEAAwAEAwAEAQAEAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAAC///////////////////////////////////////////////////////////////9///7///9//3///3//v/9/P/9//7///7/AAAAAQAABAACAwACAAEAAAIAAAACAQAEAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/v///v///v///v///v///v///v///v///v///v///v///v///v///v///v///v/////9//7///z///3/+f//+f////7///7/AAEAAAEABAAABAAAAAMAAAQAAAEAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/v///v///v///v///v///v///v///v///v///v///v///v///v///v///v///v/9///9//7///z//v7/+P//+P///v//////AAECAAEABAAABAAAAAIAAAMAAAIAAAECAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA///9///9///9///9///9///9///9///9///9///9///9///9///9///9///9///9///9/v///P//+f//+P//+P//+////v//AAAEAwAEBgAABgAAAwAAAQAAAAAEAAAFAAACAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEAAAEA//7///7///7///7///7///7///7///7///7///7///7///7///7///7///7////9///7///9/P//+///+f//+P//+////v//AwACBAACBgAABgAAAwAAAQAAAAAEAAAFAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAACAAAC///////////////////////////////////////////////////////////////////7///7//7///7/+//7+P/7+////v//AwAABgAABwAABAAAAAIAAAIAAAEAAAAAAAAAAAAAAQAAAAAAAQAAAAAAAQAAAAAAAQAAAAAAAQAAAAAAAQAAAAAAAQAAAAAA/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zt/+zs/+zq/+zq/+vs/+vs/+7o/+/o/+7s//D9BwAeAAAyAAA1AAA3AAAzAAAzAAA1AAA3AAA3AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA5AAA50RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RQS0RMT0RMT0RMV0BMX0BMX0BQT0BUQqR5HKwGJBQnEBwjFCAfFCAfECAfECAfFCAfFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjFBwjF/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/gAA/gAA/QAC+wEC+wED/QAD/gAC/gEAyQ1HLwCwAAL+AAH+AAD+AAD+AQD+AQD8AAH8AAH8AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8/QEA+wIA/QEA+wIA/QEA+wIA/QEA+wIA/QEA+wIA/QEA+wIA/QEA+wIA/QEA/QEA/gAC/gAA/QEA/QIA/gEA/gEA/gAAyQ1IMQCwAAP8AAH+AAH+AAL+AAP8AAL7AAH7AAH7AAH7AQD8AAH7AQD8AAH7AQD8AAH7AQD8AAH7AQD8AAH7AQD8AAH7AQD8AAH7/QAC+wEC/QAC+wEC/QAC+wEC/QAC+wEC/QAC+wEC/QAC+wEC/QAC+wEC/QAC/QAC/QAC/gAA/gEA/gEA/gEA/gEA/gAAyQ1KMgCwAAH8AAH+AAH+AAL+AAL8AAH7AQD7AQD7AQD7AQD8AQD7AQD8AQD7AQD8AQD7AQD8AQD7AQD8AQD7AQD8AQD7AQD8AQD7/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/gAA/QEA/QEA/QEA/QIA/QIA/gEA/gEA/QIAygxINgCyAgD+AAD+AAH+AQD+AgD+AgD8AgD8AQD8AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8AAD+AAH8/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/gAA/QEA/QEA/QEA/QEA/QIA/QIA/QIAygxINgCyAgD+AAD+AAH8AgD+BAD8AgD+AQD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+AAD+/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/gAC/QAC/QAC+wEC+wEC+wIA/QEAyQ1IMwCyAAD+AAH8AAH7AQD8AAH7AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/QEA/gAD/QAD/QAD+wED+gID+gIC/QEAyQ1IMgCyAAH8AQD8AQD7AAH7AAL7AAL7AAL7AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8AAH8
+)golden";
+
+void test_jpeg_chroma_upsampling() {
+    constexpr int tolerance = 4;
+    const std::vector<std::uint8_t> encoded = decode_base64(jpeg_chroma_base64);
+    const infernix::media::decode::Image image = infernix::media::decode::decode_image(encoded, {});
+    if (image.width != 48 || image.height != 32 ||
+        image.rgb.size() != 48U * 32U * 3U) {
+        throw std::runtime_error("decoded chroma fixture dimensions mismatch");
+    }
+    const std::vector<std::uint8_t> golden_pixels = decode_base64(jpeg_chroma_golden_base64);
+    if (golden_pixels.size() != image.rgb.size()) {
+        throw std::runtime_error("chroma golden size mismatch");
+    }
+    int max_diff = 0;
+    std::size_t over = 0;
+    for (std::size_t i = 0; i < golden_pixels.size(); ++i) {
+        const int actual   = image.rgb[i];
+        const int expected = golden_pixels[i];
+        const int diff     = actual > expected ? actual - expected : expected - actual;
+        if (diff > max_diff) { max_diff = diff; }
+        if (diff > tolerance) { ++over; }
+    }
+    if (over != 0) {
+        throw std::runtime_error("JPEG chroma decode differs from the libjpeg golden: max diff " +
+                                 std::to_string(max_diff) + ", " + std::to_string(over) +
+                                 " values over tolerance " + std::to_string(tolerance));
+    }
+}
+
 // FFmpeg's swscaler reports the yuvj420p input of every such JPEG. With a handler installed the
 // line reaches it whole, without FFmpeg's "[name @ address]" prefix or line break, instead of
 // stderr; clearing the handler hands back the one installed.
@@ -167,7 +225,10 @@ void test_library_log_routing() {
         throw std::runtime_error("an FFmpeg log handler was installed before the test");
     }
     try {
-        (void)decode::decode_image(decode_base64(issue_20_jpeg_base64), {});
+        // The still-image JPEG route no longer converts through swscale (libjpeg semantics in
+        // decode.cpp), so this fixture's deprecated-format warning now comes from the video
+        // route, which still does.
+        (void)decode::decode_video(decode_base64(issue_20_jpeg_base64), {}, 2.0, 1, 16);
     } catch (...) {
         (void)decode::set_library_log_handler({});
         throw;
@@ -400,6 +461,7 @@ void test_png_row_width_guard() {
 int main() {
     try {
         test_issue_20_unaligned_jpeg();
+        test_jpeg_chroma_upsampling();
         test_library_log_routing();
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
         test_png_decoders();

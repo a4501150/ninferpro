@@ -248,8 +248,7 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
                     }
                 }
             }
-            __syncwarp();
-            if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
+            cta_mbarrier_release_stage(&shared.empty[stage], lane); // the shared reads before the bulk refills
         }
         // Registers and global memory only, so the producer already fills the next tile's stages.
         epilogue(sums, ctx);
