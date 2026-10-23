@@ -19,6 +19,7 @@
 #include "infernix/engine.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -237,6 +238,15 @@ int production(const Setup& setup, std::uint32_t tokens) {
                       "a media request in the boot's placement encodes its image (prompt " +
                           std::to_string(media.prompt.prompt_tokens) + " tokens over the text's " +
                           std::to_string(media_text) + ")");
+    {
+        std::string lowered;
+        for (const char c : media.content) {
+            lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        failures += check(lowered.find("red") != std::string::npos,
+                          "the media request answers the red image with red (content: '" +
+                              media.content.substr(0, 80) + "')");
+    }
     std::string message;
     const std::uint32_t half = status.total_experts / 2, all = status.total_experts;
     bool switched = switch_placement(engine, half, message);
