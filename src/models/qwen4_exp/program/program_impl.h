@@ -986,6 +986,7 @@ public:
             host_strides.push_back(layer.moe.bank->planes.record_stride);
             record_stride = std::max(record_stride, layer.moe.bank->planes.record_stride);
         }
+        host_strides_ = host_strides; // the expert stream's retarget reads the member
         if (record_stride != plan_.record_stride ||
             (!c_.exact_experts && std::any_of(host_strides.begin(), host_strides.end(),
                                              [&](std::uint64_t s) { return s != record_stride; }))) {
@@ -1123,49 +1124,12 @@ public:
         // The prefill stream copies records into ring slots of the frame pitch; a GGUF import's
         // banks keep their own (smaller) strides.
         if (options_.prefill_stream && options_.expert_cache) {
-            execution::ExpertStream::RecordOf record_of;
-            if (tier_) {
-                record_of = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
-                    return tier->record(tier->key(layer, expert));
-                };
-            } else {
-                std::vector<const std::uint8_t*> banks; // device addresses: the stream batches its copies
-                for (const auto& layer : parameters_.layers) {
-                    banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
-                }
-                record_of = [banks = std::move(banks), host_strides](std::uint32_t layer, std::uint32_t expert) {
-                    return banks[layer] + static_cast<std::size_t>(expert) * host_strides[layer];
-                };
-            }
-            execution::ExpertStream::Hold hold;
-            execution::ExpertStream::SsdReads ssd;
-            if (tier_) {
-                hold = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
-                    tier->stream_pin(tier->key(layer, expert));
-                };
-                ssd.read = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
-                    return tier->stream_read(tier->key(layer, expert));
-                };
-                ssd.wait    = [tier = tier_.get()](std::int32_t slot) { return tier->stream_wait(slot); };
-                ssd.release = [tier = tier_.get()](std::int32_t slot) { tier->stream_release(slot); };
-                ssd.slots   = [tier = tier_.get()] { return tier->stream_slots(); };
-            }
+            StreamBindings bindings = stream_bindings();
             expert_stream_ = std::make_unique<execution::ExpertStream>(c_.num_hidden_layers, c_.moe.experts, record_stride,
-                                                                       std::move(record_of), !tier_, std::move(hold),
-                                                                       host_strides, std::move(ssd));
-            if (tier_ && tier_->stream_bounce_slots() > 0) {
-                // Unpinned records stream through the tier's bounce slots, still two layers ahead.
-                HostExpertTier* tier = tier_.get();
-                expert_stream_->set_staging(execution::ExpertStream::Staging{
-                    .unpinned = [tier](std::uint32_t layer, std::uint32_t expert) {
-                        return tier->unpinned_record(tier->key(layer, expert));
-                    },
-                    .slot     = [tier](std::uint32_t i) { return tier->stream_bounce_slot(i); },
-                    .copy     = [tier](std::span<const std::pair<std::uint8_t*, const std::uint8_t*>> copies) {
-                        tier->copy_records(copies);
-                    },
-                    .per_part = tier->stream_bounce_slots() / execution::ExpertStream::kBounceParts});
-            }
+                                                                       std::move(bindings.record_of), bindings.one_allocation,
+                                                                       std::move(bindings.hold), host_strides_,
+                                                                       std::move(bindings.ssd));
+            expert_stream_->set_staging(std::move(bindings.staging));
             experts.stream = expert_stream_.get();
         }
         // CPU-served misses for decode and verify calls, and for every call of at most
@@ -3150,6 +3114,57 @@ public:
         return tier_ != nullptr ? tier_->resident_capacity() : 0;
     }
 
+    // The prefill expert stream's bindings for the tier as it is now: its records, stream slots and
+    // bounce buffers, or the artifact banks' records without a tier. The callbacks capture the tier
+    // object, so a tier rebuild (ensure_tier) retargets the stream with a fresh set; the banks'
+    // record strides come from host_strides_.
+    struct StreamBindings {
+        execution::ExpertStream::RecordOf record_of;
+        execution::ExpertStream::Hold hold;
+        execution::ExpertStream::SsdReads ssd;
+        execution::ExpertStream::Staging staging;
+        bool one_allocation = true;
+    };
+    [[nodiscard]] StreamBindings stream_bindings() const {
+        StreamBindings b;
+        if (tier_ == nullptr) {
+            std::vector<const std::uint8_t*> banks; // device addresses: the stream batches its copies
+            for (const auto& layer : parameters_.layers) {
+                banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
+            }
+            b.record_of = [banks = std::move(banks), strides = host_strides_](std::uint32_t layer,
+                                                                              std::uint32_t expert) {
+                return banks[layer] + static_cast<std::size_t>(expert) * strides[layer];
+            };
+            b.one_allocation = true;
+            return b;
+        }
+        HostExpertTier* tier = tier_.get();
+        b.record_of = [tier](std::uint32_t layer, std::uint32_t expert) { return tier->record(tier->key(layer, expert)); };
+        b.hold      = [tier](std::uint32_t layer, std::uint32_t expert) { tier->stream_pin(tier->key(layer, expert)); };
+        b.ssd.read    = [tier](std::uint32_t layer, std::uint32_t expert) {
+            return tier->stream_read(tier->key(layer, expert));
+        };
+        b.ssd.wait    = [tier](std::int32_t slot) { return tier->stream_wait(slot); };
+        b.ssd.release = [tier](std::int32_t slot) { tier->stream_release(slot); };
+        b.ssd.slots   = [tier] { return tier->stream_slots(); };
+        b.one_allocation = false;
+        // Unpinned records stream through the tier's bounce slots, still two layers ahead; a
+        // rebuilt tier holds none (its options clear the bounces), so its staging stays empty.
+        if (tier->stream_bounce_slots() > 0) {
+            b.staging = execution::ExpertStream::Staging{
+                .unpinned = [tier](std::uint32_t layer, std::uint32_t expert) {
+                    return tier->unpinned_record(tier->key(layer, expert));
+                },
+                .slot     = [tier](std::uint32_t i) { return tier->stream_bounce_slot(i); },
+                .copy     = [tier](std::span<const std::pair<std::uint8_t*, const std::uint8_t*>> copies) {
+                    tier->copy_records(copies);
+                },
+                .per_part = tier->stream_bounce_slots() / execution::ExpertStream::kBounceParts};
+        }
+        return b;
+    }
+
     // Builds or rebuilds the tier to hold `residents` resident records beside its lists (the
     // read ring, prefetch and demotion -- the boot derivation's). Engine thread, at a maintenance
     // boundary: no round in flight, the device synced, no stream slots lent. An existing tier's
@@ -3212,6 +3227,12 @@ public:
                        DiagnosticLevel::Info);
         }
         if (cpu_service_ != nullptr) { cpu_service_->set_record_provider(tier_.get()); }
+        // The stream's callbacks captured the tier a rebuild replaced: retarget them to this one.
+        if (expert_stream_ != nullptr) {
+            StreamBindings bindings = stream_bindings();
+            expert_stream_->retarget(std::move(bindings.record_of), bindings.one_allocation, std::move(bindings.hold),
+                                     host_strides_, std::move(bindings.ssd), std::move(bindings.staging));
+        }
         start_tier_fill();
     }
 
@@ -6245,6 +6266,7 @@ private:
     bool clear_prefix_on_release_ = false;
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::ExpertStream> expert_stream_;
+    std::vector<std::uint64_t> host_strides_; // each bank's own record stride (a GGUF import's vary)
     // The stream's leases: the ring, the wide arena and a walk's area (each a run of one pool).
     ExpertResidency::FrameLease stream_lease_, stream_wide_lease_, stream_walk_lease_;
     std::size_t stream_ring_bytes_ = 0, stream_wide_bytes_ = 0, stream_walk_bytes_ = 0;

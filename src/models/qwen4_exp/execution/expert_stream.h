@@ -85,6 +85,12 @@ public:
     static constexpr std::uint32_t kBounceParts = 4;
     void set_staging(Staging staging);
 
+    // A tier rebuild (an expert placement switch) rebinds every record source and slot channel to
+    // the new tier: the callbacks capture the tier object, which a rebuild replaces. The ring, the
+    // events and the stats stay. No chunk is active at the maintenance boundary a rebuild runs at.
+    void retarget(RecordOf record_of, bool one_allocation, Hold hold, std::vector<std::uint64_t> host_strides,
+                  SsdReads ssd, Staging staging);
+
     // The stream that writes the ring (a writer for the lender to order after its promotions).
     [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
     // Records per ring of `bytes`: what is left after the slot tables, an even number.
