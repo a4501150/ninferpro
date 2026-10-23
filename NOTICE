@@ -13,8 +13,9 @@ Modifications made in this product (summary; see README.md for details):
   /admin/expert-placement, and expert swapping within the placement's counts.
 - A frame limit that holds every routed expert in VRAM.
 - --served-model-name aliases.
-- A prefix-cache tail snapshot for single-chunk prompts on artifacts without
-  free cache resume.
+- A prefix-cache tail snapshot for fresh one-call spans, in both resume modes
+  (the finish endpoint covers continuations only; without the tap, repeats of
+  a prompt that fits one call start from the root).
 - Batched DFlash2 drafting at any round size with an online cost fit.
 - Linux VRAM spill detection fix (no WDDM budget).
 

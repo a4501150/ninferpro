@@ -22,7 +22,9 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
     KV, free memory and the last switch's outcome; within the counts the engine swaps hot experts
     in and cold ones out; the frame limit covers every expert;
   - `--served-model-name` aliases;
-  - the prefix-cache tail snapshot for single-chunk prompts on artifacts without free cache resume;
+  - the prefix-cache tail snapshot for fresh one-call spans, in both resume modes (the finish
+    endpoint covers continuations only; without the tap, repeats of a prompt that fits one call
+    start from the root);
   - batched DFlash2 drafting at any round size with an online cost fit;
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
 

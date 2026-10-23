@@ -103,10 +103,6 @@ int main() {
             failures += check(q::fast_path_qualified(path, config),
                               "the request-coupling paths are qualified on every KV format");
         }
-        for (const FastPath path : {FastPath::FreeCacheResume, FastPath::Preemption}) {
-            failures += check(!q::fast_path_qualified(path, {DenseKernels::Fp8Row, false, kv}),
-                              "cache resume and preemption are not qualified on recipe C");
-        }
         // Recipe C (FP8 dense, W4A16 experts -- the orcarouter NVFP4 import) runs the multi-row
         // speculation path: its DFlash2 drafter proposes every row in one pass, and the policy
         // measures each round size's cost online.
@@ -197,10 +193,10 @@ int main() {
             failures += check(q::fast_path_qualified(FastPath::SampledMtpDrafts, config),
                               "sampled-mtp-drafts is qualified on every Flash-Next configuration");
         }
-        for (const FastPathConfiguration& config : {iq3s, fp8, recipe_a}) {
+        for (const FastPathConfiguration& config : {iq3s, fp8, recipe_a, FastPathConfiguration{DenseKernels::Fp8Row, false, kv}}) {
             for (const FastPath path : {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
                 failures += check(q::fast_path_qualified(path, config),
-                                  "the coupling paths are qualified on IQ3_S, FP8 and recipe A");
+                                  "the coupling paths are qualified on IQ3_S, FP8, recipe A and recipe C");
             }
         }
         // FP16 GDN: faster on IQ3_S and FP8 prefill, not on Dense8's; IQ3_S with BF16 KV fails its gates.

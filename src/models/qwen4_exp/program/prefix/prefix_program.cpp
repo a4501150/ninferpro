@@ -658,34 +658,47 @@ prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& pr
                                           return a.position == b.position;
                                       }),
                           planned.end());
-            // The finish endpoint is published only with free cache resume, and a flexible tap
-            // realizes at an inner call boundary: a prompt that fits one chunk has none, so
-            // without a tap cutting near its tail it publishes no snapshot at all, and every
-            // repeat, fork and continuation starts from the root. The protocol's automatic
-            // marker tap is the natural cut, but the grid flooring leaves its tail call one of
-            // kResumeGrid widths, all but the narrowest beyond the call planner's served_columns
-            // budget, and a demoted tap never realizes on a single chunk. An exact boundary tap
-            // at the grid frontier at or before the prompt's last token splits a final call of
-            // at most kResumeGrid tokens off the plan instead: its snapshot is the prompt's own
-            // tail, which any later prompt sharing the prefix resumes from at the cost of one
-            // short tail call. Taps it covers (they realize at the boundary at or past their
-            // position, never deeper) are dropped; an exact boundary tap within one separation
-            // below it already cuts there (an explicit client breakpoint).
-            const std::uint32_t tail = (n - 1U) / kResumeGrid * kResumeGrid;
-            const auto tail_cut = [&](const pc::PlannedTap& tap) {
-                return tap.placement == pc::TapPlacement::Exact && tap.boundary &&
-                       tap.position + pc::kMinimumTapSeparation > tail;
-            };
-            if (tail > frontier && tail >= frontier + kBlock && !prefix::inside_exclusion(tail, spans) &&
-                !std::any_of(planned.begin(), planned.end(), tail_cut)) {
-                std::erase_if(planned, [&](const pc::PlannedTap& tap) {
-                    return tap.position + pc::kMinimumTapSeparation > tail &&
-                           !(tap.placement == pc::TapPlacement::Exact && tap.boundary);
-                });
-                planned.push_back(pc::PlannedTap{.position  = tail,
-                                                 .placement = pc::TapPlacement::Exact,
-                                                 .boundary  = true});
-            }
+        }
+        // The single-chunk tail tap, in both resume modes. A flexible tap (the protocol's
+        // generation opener, demoted by its cost) realizes at the start of its final call, so a
+        // span of two or more calls publishes a snapshot at its last inner boundary — at most
+        // one chunk short of the end — that repeats, forks and continuations resume from; with
+        // free cache resume that is the opener's realization, and a tail tap beside it would
+        // only absorb it (the opener would realize at the tail split instead, stranding sharers
+        // that diverge before it). A span that fits one call has no inner boundary for the
+        // opener to realize at, and the finish endpoint (free cache resume only) covers the
+        // whole generated turn, so a continuation takes it but a repeat of the prompt alone
+        // cannot (the endpoint sits past the prompt's own length): such a prompt publishes
+        // nothing a repeat or fork could resume from and starts from the root. Without free
+        // cache resume the opener is grid-floored and demoted, and never realizes at all, so
+        // every span needs the tail tap; with it, only a fresh one-call span does (a resumed
+        // request's tail was published by its original prefill, and splitting the resumed span
+        // would change the arithmetic path its preemption and replay equivalences are checked
+        // on). An exact boundary tap at the grid frontier at or before the prompt's last token
+        // splits a final call of at most kResumeGrid tokens off the plan: its snapshot is the
+        // prompt's own tail, which
+        // any later prompt sharing the prefix resumes from at the cost of one short tail call.
+        // Taps it covers (they realize at the boundary at or past their position, never deeper)
+        // are dropped; an exact boundary tap within one separation below it already cuts there
+        // (an explicit client breakpoint).
+        const std::uint32_t tail = (n - 1U) / kResumeGrid * kResumeGrid;
+        const bool single_call   = n - frontier <= static_cast<std::uint32_t>(chunk_);
+        const auto tail_cut = [&](const pc::PlannedTap& tap) {
+            return tap.placement == pc::TapPlacement::Exact && tap.boundary &&
+                   tap.position + pc::kMinimumTapSeparation > tail;
+        };
+        if ((!options_.free_cache_resume || (single_call && frontier == 0U)) && tail > frontier &&
+            tail >= frontier + kBlock && !prefix::inside_exclusion(tail, spans) &&
+            !std::any_of(planned.begin(), planned.end(), tail_cut) &&
+            !std::any_of(existing.begin(), existing.end(),
+                         [&](std::uint32_t f) { return f + pc::kMinimumTapSeparation > tail; })) {
+            std::erase_if(planned, [&](const pc::PlannedTap& tap) {
+                return tap.position + pc::kMinimumTapSeparation > tail &&
+                       !(tap.placement == pc::TapPlacement::Exact && tap.boundary);
+            });
+            planned.push_back(pc::PlannedTap{.position  = tail,
+                                             .placement = pc::TapPlacement::Exact,
+                                             .boundary  = true});
         }
     }
     return prefix::plan_calls(frontier, n, static_cast<std::uint32_t>(chunk_), planned, call_cost());
