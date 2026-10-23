@@ -244,6 +244,22 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     failures += check(again.generated_token_ids == s2.generated_token_ids,
                       "X3 the opener resume equals the capturing run (" +
                           first_difference(again.generated_token_ids, s2.generated_token_ids) + ")");
+
+    // Single-chunk tail snapshot: a prompt that fits one call has no inner boundary for its
+    // opener to realize at, and the finish endpoint serves continuations only, so the tail tap
+    // publishes the prompt's own tail (grid 16) and the repeat resumes there instead of from the
+    // root.
+    {
+        const std::vector<infernix::TokenId> p = synthetic_tokens(400, 26);
+        const Run first = generate(engine, p, 32, true);
+        const Run repeat = generate(engine, p, 32, true);
+        const std::uint32_t tail = 399U / 16U * 16U;
+        failures += check(repeat.reused == tail, "a single-chunk repeat resumes at the tail snapshot " +
+                                                     std::to_string(tail) + " (got " +
+                                                     std::to_string(repeat.reused) + ")");
+        failures += check(repeat.tokens == first.tokens, "the tail-snapshot repeat equals the first run (" +
+                                                            first_difference(repeat.tokens, first.tokens) + ")");
+    }
     return failures;
 }
 

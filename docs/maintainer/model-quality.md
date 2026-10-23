@@ -451,6 +451,32 @@ every format, though: noise the format already carries absorbs part of it (two-t
 `expert-a4-residual` showed KL 6.8e-3 against recipe C's exact route on BF16 KV, floor 0, and
 7.8e-4 on INT8 KV), which is why its decode is measured where the floor is lowest.
 
+**A failed gate** (owner, 2026-10-20) does not end a path in that configuration; what follows depends
+on how it failed:
+- A *near pass*: every failing bounded criterion's point estimate is within its budget (only the
+  sample's uncertainty fails it), and every failing point criterion (the p99.9 KL ratio, the decode
+  KL and NLL caps, a prompt bucket) is within 10 % of its cap. A decode gate of the reduced protocol
+  that near-passes goes straight to the 1,024-segment run of the same path, whose verdict replaces
+  the 256-segment one; no slower, more precise variant is tried before it decides.
+- A *clear fail*, or a 1,024-segment run that fails: the next more precise variant of the path that
+  keeps most of its speed (more residual terms, a narrower width range, the fast arithmetic only where
+  its gain is measured, a more precise reduction) is implemented, gated with the same protocol and
+  timed.
+
+The 1,024-segment run computes only segments 256-1,023. Segments lie back to back from the corpus
+start and cycle through the prompt lengths, so the first 256 segments of the 1,024 set are the 256
+set: `infernix_decode_quality_forced --first-segment 256 --segments 768` computes the rest, with every
+offset and prompt length as in the whole set, for the reference and both runs, and `fast_path_gate.py
+concat-forced` joins each with its 256-segment file (it refuses parts whose headers differ or that
+leave a gap), and the joined files are gated as one run. That is the run a fresh 1,024 set would
+make: the reference is computed per segment in one pass, the exact route is request-invariant, and a
+concurrent run's groups stay aligned because 256 is a multiple of every concurrency. Before the join
+is relied on, the tool computing the extension's reference must reproduce segments 254-255 of the
+256-segment reference bit for bit (a two-segment run from `--first-segment 254`); if it does not
+(another build of the reference route), the reference and both runs compute the 1,024 set in one
+piece. A run whose tool predates `--first-segment` also computes the 1,024 set in one piece, against
+the joined reference.
+
 **Flash-Next's forced-preemption arm judges `preemption` by its increment** (since 2026-10-16): the
 default role is a fast run with the configuration's qualified paths alone, the fast role the same
 run with `preemption` added, under the same conditions and budgets. Its workload (256 contiguous
@@ -732,7 +758,7 @@ experts' 4-bit activations cost; pass `--ngram-volume` to the gate when the volu
 `<artifact>.ngram`. Its Engine scoring is checked against the Forward's own teacher-forced logits
 (`infernix_qwen4_exp_score_real_test`): on 3,000 tokens the perplexity matches, top-1 agrees at
 every position, and the RAM and SSD expert tiers give the same output. Its qualified paths are
-the three request-coupling paths (every configuration but recipe C), sampled MTP drafts, the three
+the three request-coupling paths (every configuration), sampled MTP drafts, the three
 Q8 dense-kernel paths (Dense8), FP16 GDN (IQ3_S and FP8) and recipe C's expert and FP8 pair paths
 (6.7).
 
@@ -853,7 +879,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8 and recipe A, every format; not recipe C (its exact route is not request-invariant, below) |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A and recipe C, every format (recipe C since 2026-10-23, the TMA proxy fence closing its exact-route defect; below) |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail, BF16 its prefill; below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
@@ -889,8 +915,7 @@ run ahead, code 46.1 -> 40.1 (-13.0 %, overlapping: one exact run at 52.5 agains
 other three; FP8 decode is SSD-bound and its runs vary by up to 30 %). Tokens per round did not
 rise with it (IQ3_S math 2.84 and 2.63 exact against 2.42 and 2.78 with the path), so the gain is
 not explained by acceptance alone and was not attributed further. Recipe A and recipe C are
-registered by the rule for a path that changes no logit (6.1), with these as the nearest timings;
-recipe C's exact-route defect (below) does not bear on such a path.
+registered by the rule for a path that changes no logit (6.1), with these as the nearest timings.
 
 **`gdn-f16-accumulate`: FP16-accumulate chunked GDN (qualified on the 27B, 2026-10-17).** See
 `ops::GdnChunkArithmetic::Fp16Accumulate`. Op: 1.20x at the 27B's shapes, and closer to the FP64
@@ -1128,10 +1153,32 @@ Recipe A (BF16 dense, 4-bit experts) is registered for the three coupling paths 
 without runs of its own, at the owner's request (2026-10-18): `free-cache-resume` takes FP8's timing
 (the same dense kernels), `adaptive-speculation` Dense8's and IQ3_S's (4-bit experts streamed as
 Dense8's), `preemption` IQ3_S's and FP8's, and the quality verdicts Dense8's. Its exact-route
-equivalences were not run on the artifact. Recipe C fails: its real tests diverge on the exact
-route at token 29 (a resumed request against a cold one, and concurrent against solo), so its exact
-route is not request-invariant, and its joint gate fails the p99.9 KL ratio (1.33); no coupling
-path is registered on it, and the exact-route defect is open.
+equivalences were not run on the artifact. Recipe C first failed (2026-10-18): its real tests
+diverged on the exact route at token 29 (a resumed request against a cold one, and concurrent
+against solo), so its exact route was not request-invariant, and its joint gate failed the p99.9
+KL ratio (1.33) against the 16-bit reference. The defect was the wide expert's unfenced TMA stage
+release; the proxy fence (2026-10-23) closed it, and the exact route's golden hashes are unchanged.
+The three coupling paths are registered on every format (2026-10-23): the prefix-cache and
+preemption real tests pass on the orcarouter artifact with the candidates, and the INT8 joint
+decode gate (MTP 4 at concurrency 2, every segment resuming from a warm 3,000-token entry,
+1,024 segments against the 16-bit reference, `adaptive-speculation` + `free-cache-resume`)
+passes: TV excess 8.1e-4 (bound 1.0e-3 of 4e-3), top-1 +0.22 points (bound 0.32 of 0.50), KL
+excess 5.9e-4, NLL 8.4e-4, p99.9 KL ratio 1.09, every prompt bucket within budget. At 256
+segments the top-1 criterion near-passed (estimate 4.8e-3 within its 5e-3 budget, bound 7.3e-3
+over), so the near-pass rule (6.1) extended the run to 1,024 — the extension computed segments
+256-1,023 (`--first-segment`, the reference reproducing segments 254-255 bit for bit first) and
+`concat-forced` joined the ranges; the 1,024 verdict replaces the 256 one. No fast run preempted,
+so `preemption` rests on the preemption real test's Replay equivalence and the kernel rule (item
+2: Replay runs the exact route's own prefill kernels), as on IQ3_S and FP8.
+`adaptive-speculation` was registered earlier from its own DFlash2 timing; `preemption`
+takes IQ3_S's and FP8's timings (rule 4d: requests admitted under a short pool, on the same GDN,
+attention and KV kernels). `free-cache-resume` is timed on the artifact itself (infernix-serve,
+production flags, DFlash2, FP8 KV, four boots alternating): second-turn continuations 76 -> 28 ms
+TTFT, 98.9 % resumed from the finish endpoint against ~93 % from the prompt-tail snapshot; repeats
+of single-chunk prompts stay at 16-17 ms and 99.4 % (the tail snapshot now planned beside the path
+— without it the path regressed them to 178 ms and 0 %, which is why the tap runs in both resume
+modes, for fresh one-call spans; hybrid-prefix-cache-spec's Taps entry records the accepted
+multi-call loss); a 5,121-token repeat resumed 5,120 of 5,121 (the opener kept exact at n-1).
 
 Every prompt-length bucket and p99.9 KL ratio passes too (largest ratio 1.13, 27B K8V4 spec). The
 closest bound is 27B NVFP4 spec's top-1 at 82 % of its budget. Speed (official 27B, INT8 KV, 2,048
@@ -1785,6 +1832,25 @@ NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
 ### 6.8 Exact-route numerics changes
 
 A change to exact-route bits (6.1) is recorded here with its gate.
+
+**Prefill head gather-before-mix (2026-10-23).** `Forward::finish` mixed the residual over the
+call's full width before gathering the logit columns, so the LM head's arithmetic depended on the
+call's width — the hyper-connection mix routes by column count (fused at most 16 columns with
+FP32 partials, composed above with BF16 intermediates), and a 4,096-column call's head differed
+from a one-column head by mean 2.8e-3, max 1.9e-2 logits. The logit columns are now gathered
+before the mix whenever they are fewer than the call's width, so the head runs the same function
+at the same width `head_logits` runs (the scoring route's head); at full width the old order
+stands, and decode and verify keep their kernels byte-for-byte. Evidence: the head byte-equality
+Op test (`infernix_qwen4_exp_forward_real_test --head-equality`: a 4,096-column call's
+last-column logits equal `head_logits` on the same residual column, bit for bit); the decode
+gate old-route-against-new at 256 segments (plain, concurrency 2, one shared 16-bit reference):
+TV excess 9.06 -> 9.05e-4, top-1 2.32 -> 2.26e-3 and KL 9.60 -> 9.56e-5 all fell, NLL excess rose
+1.30 -> 1.34e-3 (0.4 % of its 1e-2 budget, within its 3.8e-3 bound); both routes pass every
+criterion. `t1-record` and `t2-record` re-run unchanged: the round and golden routes do not
+observe the prefill's last-column head (rounds compute logits at full width; no greedy flip on
+the golden corpus). The FP64 checkpoint reference cannot read this artifact's expert layout (the
+orcarouter Uncensored export), so the model-level oracle is the 16-bit scoring route the gate
+uses — whose head arithmetic the construction now matches exactly.
 
 **35B-A3B Q8 shared-expert prefill (`4f0bb18f`, NInfer `610f79e9d`).** The Q8 gate/up and down
 prefill kernels of `Qwen3.6-35B-A3B` apply each 32-wide group's FP16 scale to the FP32 partial sum

@@ -22,7 +22,9 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
     KV, free memory and the last switch's outcome; within the counts the engine swaps hot experts
     in and cold ones out; the frame limit covers every expert;
   - `--served-model-name` aliases;
-  - the prefix-cache tail snapshot for single-chunk prompts on artifacts without free cache resume;
+  - the prefix-cache tail snapshot for fresh one-call spans, in both resume modes (the finish
+    endpoint covers continuations only; without the tap, repeats of a prompt that fits one call
+    start from the root);
   - batched DFlash2 drafting at any round size with an online cost fit;
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
 
@@ -277,7 +279,7 @@ CUDA 13.4 at `/usr/local/cuda-13.4`, a Gen5 NVMe (T710) holding the models.
   `CPATH=/usr/local/cuda-13.4/include` for the plain C++ test targets. Build only what the task
   needs (`--target infernix-serve`, or the affected tests). Wrap builds as
   `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=24G cmake --build
-  build -j12 ...` (the `Makefile` targets do, `JOBS=` and `MEM=` override): an unbounded nvcc build
+  build -j8 ...` (the `Makefile` targets do, `JOBS=` and `MEM=` override): an unbounded nvcc build
   has run the host out of memory. Never wrap a `Makefile` target (`make t0`, `make t2`, ...) in an
   outer `flock` of the same lock — the target takes the build and GPU locks itself, and a double
   lock waits on itself forever. A build peaks near 1.75 GiB per job; use `-j8` at 16G when

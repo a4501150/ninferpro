@@ -7,10 +7,13 @@
 //   infernix_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV]
 //       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --head-equality [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
 //
-// With --cpu-columns the test checks that calls the Program serves with the CPU expert service
+// With --head-equality the test checks that a single wide call's last-column logits equal
+// head_logits on the same residual column byte for byte (the head width-invariance gather-before-
+// mix gives finish). With --cpu-columns the test checks that calls the Program serves with the CPU expert service
 // (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
 // bit for bit (check_cpu_columns).
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
@@ -453,6 +456,47 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
     return ok;
 }
 
+// The head is width-invariant by construction (gather-before-mix in finish): a prefill call's
+// last-column logits equal head_logits on the same residual column, byte for byte, at any call
+// width. Needs more than 16 tokens so the call runs past the mix's fused/composed route split
+// (otherwise both paths take the fused route and the check is vacuous).
+bool check_head_equality(const q4::execution::Parameters& parameters, DeviceContext& device,
+                         const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
+                         std::int32_t context, KvCacheStorage kv) {
+    const auto& c = parameters.model.config().text;
+    const auto n  = static_cast<std::int32_t>(tokens.size());
+    if (n <= 16) { throw std::invalid_argument("--head-equality needs more than 16 tokens"); }
+    const auto W    = static_cast<std::int32_t>(c.residual_width());
+    const auto V    = static_cast<std::int32_t>(c.vocab_size);
+    Harness harness(parameters, device, context, n, 1, kv);
+    auto call = make_call(c, volume, {tokens}, 0, n, {0}, {0});
+    DeviceBuffer residual(static_cast<std::size_t>(W) * n * 2);
+    call.batch.residual_out = Tensor(residual.p, DType::BF16, {W, n});
+    DeviceBuffer wide(V * sizeof(float)), head(V * sizeof(float));
+    Tensor wide_logits(wide.p, DType::FP32, {V, 1});
+    harness.forward->run(call.batch, wide_logits);
+    const Tensor column(static_cast<std::byte*>(residual.p) + static_cast<std::size_t>(W) * (n - 1) * 2,
+                        DType::BF16, {W, 1});
+    Tensor head_logits(head.p, DType::FP32, {V, 1});
+    harness.forward->head_logits(column, head_logits);
+    device.synchronize();
+    const auto wide_bytes = to_float(wide, V);
+    const auto head_bytes = to_float(head, V);
+    bool ok = true;
+    for (std::size_t v = 0; v < wide_bytes.size(); ++v) {
+        if (wide_bytes[v] != head_bytes[v]) {
+            std::printf("FAIL: logits differ from head_logits at %zu (%.7f against %.7f)\n", v, wide_bytes[v],
+                        head_bytes[v]);
+            ok = false;
+            break;
+        }
+    }
+    std::printf(ok ? "a %d-column call's last-column logits equal head_logits bit for bit\n"
+                   : "FAIL: the head is not width-invariant\n",
+                n);
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -469,6 +513,7 @@ int main(int argc, char** argv) {
         std::int32_t dump_from = 0;
         KvCacheStorage kv      = KvCacheStorage::BFloat16;
         bool cpu_columns   = false;
+        bool head_equality = false;
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
@@ -489,6 +534,11 @@ int main(int argc, char** argv) {
             if (arg == "--cpu-columns") {
                 if (jobs.empty()) { throw std::invalid_argument("--cpu-columns needs a token list before it"); }
                 jobs.back().cpu_columns = true;
+                continue;
+            }
+            if (arg == "--head-equality") {
+                if (jobs.empty()) { throw std::invalid_argument("--head-equality needs a token list before it"); }
+                jobs.back().head_equality = true;
                 continue;
             }
             if (jobs.empty() || i + 1 >= argc) { throw std::invalid_argument(arg + " needs a token list before it and a value"); }
@@ -631,6 +681,9 @@ int main(int argc, char** argv) {
         const std::string& blocks_path    = job.blocks_path;
         if (job.cpu_columns) {
             return check_cpu_columns(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
+        }
+        if (job.head_equality) {
+            return check_head_equality(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
         }
         Harness harness(parameters, device, context, n, 3, job.kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));
