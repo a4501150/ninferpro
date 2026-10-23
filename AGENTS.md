@@ -278,7 +278,9 @@ CUDA 13.4 at `/usr/local/cuda-13.4`, a Gen5 NVMe (T710) holding the models.
   needs (`--target infernix-serve`, or the affected tests). Wrap builds as
   `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=24G cmake --build
   build -j12 ...` (the `Makefile` targets do, `JOBS=` and `MEM=` override): an unbounded nvcc build
-  has run the host out of memory. A build peaks near 1.75 GiB per job; use `-j8` at 16G when
+  has run the host out of memory. Never wrap a `Makefile` target (`make t0`, `make t2`, ...) in an
+  outer `flock` of the same lock — the target takes the build and GPU locks itself, and a double
+  lock waits on itself forever. A build peaks near 1.75 GiB per job; use `-j8` at 16G when
   production holds experts in host RAM.
   `build/` links with mold and compiles through ccache (`CMAKE_LINKER_TYPE=MOLD`,
   `CMAKE_{CXX,CUDA}_COMPILER_LAUNCHER=ccache`, set in its cache, not in the presets); a header

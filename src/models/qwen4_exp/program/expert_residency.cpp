@@ -831,6 +831,12 @@ std::uint64_t ExpertResidency::lendable_bytes() const noexcept {
     return static_cast<std::uint64_t>(pool_lendable(pool)) * pool.pitch;
 }
 
+bool ExpertResidency::can_lend(std::uint64_t bytes) const noexcept {
+    if (resident_) { return false; }
+    const std::uint64_t lendable = lendable_bytes();
+    return lendable > 0 && bytes + lend_pitch() <= lendable;
+}
+
 std::uint64_t ExpertResidency::lend_pitch() const noexcept { return pools_[lend_pool()].pitch; }
 
 std::uint64_t ExpertResidency::lend_capacity_bytes() const noexcept {

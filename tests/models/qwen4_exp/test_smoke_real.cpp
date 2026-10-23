@@ -6,8 +6,10 @@
 //
 //   production  The fast paths production selects: the engine starts; six concurrent greedy requests
 //               complete with DFlash2 drafting and accepting; a repeated prompt resumes from the
-//               prefix cache; an expert-placement switch to half the experts in VRAM applies and the
-//               engine keeps generating; the switch back applies.
+//               prefix cache; a media request encodes in the boot's placement (every expert in VRAM
+//               allocates its window) and in a switched placement (the window is lent); an
+//               expert-placement switch to half the experts in VRAM applies and the engine keeps
+//               generating; the switch back applies.
 //   exact       The exact route (--disable-fast-paths): each prompt's greedy tokens alone equal the
 //               golden tokens (--check FILE; --record FILE writes them), and equal them again with all
 //               six in flight, resumed from the prefix cache, and after the placement switch.
@@ -43,6 +45,16 @@ constexpr const char* kPrompts[] = {
     "The old lighthouse keeper climbed the stairs one last time before the storm. At the top, he",
 };
 constexpr std::size_t kLanes = std::size(kPrompts);
+
+constexpr const char* kMediaPrompt = "One word: what color dominates this image?";
+
+// A 64x64 solid red PPM (the P6 pattern of the other vision tests): the media request's fixed input.
+std::vector<std::uint8_t> red_ppm() {
+    std::vector<std::uint8_t> ppm;
+    for (const char byte : std::string("P6\n64 64\n255\n")) { ppm.push_back(static_cast<std::uint8_t>(byte)); }
+    for (int index = 0; index < 64 * 64; ++index) { ppm.insert(ppm.end(), {200, 30, 30}); }
+    return ppm;
+}
 
 // A prompt long enough to leave prefix-cache taps (calls of 512 tokens): a paragraph repeated.
 Tokens long_prompt(infernix::Engine& engine) {
@@ -92,6 +104,7 @@ infernix::EngineOptions production_options(const Setup& setup, bool fast_paths) 
     options.speculative.draft_model        = setup.drafter;
     options.speculative.draft_tokens_auto  = true;
     options.speculative.proposal_head      = infernix::ProposalHead::Optimized;
+    options.enable_vision                  = true; // production's --vision (serve_infernix.sh)
     return options;
 }
 
@@ -111,6 +124,30 @@ std::vector<infernix::GenerationResult> run_all(infernix::Engine& engine, const 
     std::vector<infernix::GenerationResult> out;
     for (auto& handle : handles) { out.push_back(handle.wait()); }
     return out;
+}
+
+// The media prompt with or without its image, through the same template and options.
+infernix::PromptInput media_input(const std::vector<std::uint8_t>* image) {
+    infernix::PromptInput input;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
+    message.parts.push_back({.kind = infernix::MessagePartKind::Text, .text = kMediaPrompt});
+    if (image != nullptr) {
+        message.parts.push_back({.kind = infernix::MessagePartKind::Media,
+                                 .media = infernix::OwnedMedia{.kind      = infernix::MediaKind::Image,
+                                                               .bytes    = *image,
+                                                               .media_type = "image/x-portable-pixmap"}});
+    }
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    return input;
+}
+
+// One media request with the fixed red image: its prompt carries the merged vision tokens, so
+// has_media and a prompt larger than the text alone prove the encode ran.
+infernix::GenerationResult media_request(infernix::Engine& engine, const std::vector<std::uint8_t>& image,
+                                         std::uint32_t tokens) {
+    return engine.generate(engine.prepare(media_input(&image)), greedy(tokens, false));
 }
 
 // Requests a placement switch and waits until it has applied: the report's last-switch message
@@ -193,12 +230,22 @@ int production(const Setup& setup, std::uint32_t tokens) {
                           std::to_string(again.reused_prompt_tokens) + ")");
     const auto status = engine.expert_placement_status();
     failures += check(status.supported, "the engine reports an expert placement");
+    const auto image       = red_ppm();
+    const std::uint32_t media_text = engine.count_tokens(media_input(nullptr));
+    const auto media = media_request(engine, image, tokens);
+    failures += check(media.prompt.has_media && media.prompt.prompt_tokens > media_text,
+                      "a media request in the boot's placement encodes its image (prompt " +
+                          std::to_string(media.prompt.prompt_tokens) + " tokens over the text's " +
+                          std::to_string(media_text) + ")");
     std::string message;
     const std::uint32_t half = status.total_experts / 2, all = status.total_experts;
     bool switched = switch_placement(engine, half, message);
     failures += check(switched, "the switch to " + std::to_string(half) + " VRAM experts applies (" + message + ")");
     const auto after = run_all(engine, {prompts[1]}, tokens, false).front();
     failures += check(after.generated_token_ids.size() == tokens, "the engine generates after the switch");
+    const auto lent = media_request(engine, image, tokens);
+    failures += check(lent.prompt.has_media && lent.prompt.prompt_tokens > media_text,
+                      "a media request in the switched placement encodes its image (lends its window)");
     switched = switch_placement(engine, all, message);
     failures += check(switched, "the switch back to every expert in VRAM applies (" + message + ")");
     return failures;

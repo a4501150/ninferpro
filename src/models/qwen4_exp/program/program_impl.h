@@ -172,6 +172,7 @@ struct LaneVision {
     std::vector<std::shared_ptr<const qwen3_5::PreparedMediaPayload>> payloads; // per encoded item
     std::vector<std::uint32_t> visual;         // the encoded visual tokens' positions, ascending
     ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
+    DeviceBuffer fallback;                     // the same bytes when the residency lends no frame
     Tensor handoff;                            // BF16 [out, V_encoded]
     std::unique_ptr<qwen3_5::execution::VisionWeightStream> stream;
     std::optional<qwen3_5::execution::VisionParameters> weights; // the stream's rebased view
@@ -4504,7 +4505,7 @@ private:
             span = {stream_wide_lease_.memory.data, wide_work_};
         } else {
             if (!work_lease_.valid() && wide_fallback_.p == nullptr) {
-                if (residency_->frames() > 0 && wide_work_ + residency_->lend_pitch() <= residency_->lendable_bytes()) {
+                if (residency_->can_lend(wide_work_)) {
                     const cudaStream_t writers[] = {device_.stream};
                     work_lease_ = residency_->lend(wide_work_, device_.stream, writers);
                 } else {
