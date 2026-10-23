@@ -431,11 +431,25 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
                                    column, cudaMemcpyDeviceToDevice, s));
     }
     if (logits == nullptr) { return; }
-    auto scope    = work_.scope();
-    Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
-    Tensor last    = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
-    ops::gather_columns(final_x, batch.logit_columns, last, s);
-    text_head_logits(parameters_, last, *logits, work_, s);
+    auto scope = work_.scope();
+    Tensor head;
+    if (batch.logit_columns.ne[0] < T) {
+        // Gather the logit columns before the final mix, so the head runs the mix at the
+        // logit width — the same function at the same width head_logits runs — instead of
+        // the call's full width: the hyper-connection mix routes by column count, and the
+        // wide composed route differs from the narrow fused one in low bits, so a call's
+        // logits would otherwise depend on the call's width.
+        Tensor columns = work_.alloc(DType::BF16, {W, batch.logit_columns.ne[0]});
+        ops::gather_columns(residual, batch.logit_columns, columns, s);
+        head = mix(parameters_.final_mixer, columns, nullptr);
+    } else {
+        // At full width the old order stands: decode and verify rounds keep their kernels
+        // byte-for-byte (gathering the whole residual would move the wider tensor instead).
+        Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
+        head           = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
+        ops::gather_columns(final_x, batch.logit_columns, head, s);
+    }
+    text_head_logits(parameters_, head, *logits, work_, s);
 }
 
 void Forward::head_logits(const Tensor& residuals, Tensor& logits) {

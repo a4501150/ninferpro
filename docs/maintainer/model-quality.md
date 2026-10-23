@@ -1833,6 +1833,25 @@ NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
 
 A change to exact-route bits (6.1) is recorded here with its gate.
 
+**Prefill head gather-before-mix (2026-10-23).** `Forward::finish` mixed the residual over the
+call's full width before gathering the logit columns, so the LM head's arithmetic depended on the
+call's width — the hyper-connection mix routes by column count (fused at most 16 columns with
+FP32 partials, composed above with BF16 intermediates), and a 4,096-column call's head differed
+from a one-column head by mean 2.8e-3, max 1.9e-2 logits. The logit columns are now gathered
+before the mix whenever they are fewer than the call's width, so the head runs the same function
+at the same width `head_logits` runs (the scoring route's head); at full width the old order
+stands, and decode and verify keep their kernels byte-for-byte. Evidence: the head byte-equality
+Op test (`infernix_qwen4_exp_forward_real_test --head-equality`: a 4,096-column call's
+last-column logits equal `head_logits` on the same residual column, bit for bit); the decode
+gate old-route-against-new at 256 segments (plain, concurrency 2, one shared 16-bit reference):
+TV excess 9.06 -> 9.05e-4, top-1 2.32 -> 2.26e-3 and KL 9.60 -> 9.56e-5 all fell, NLL excess rose
+1.30 -> 1.34e-3 (0.4 % of its 1e-2 budget, within its 3.8e-3 bound); both routes pass every
+criterion. `t1-record` and `t2-record` re-run unchanged: the round and golden routes do not
+observe the prefill's last-column head (rounds compute logits at full width; no greedy flip on
+the golden corpus). The FP64 checkpoint reference cannot read this artifact's expert layout (the
+orcarouter Uncensored export), so the model-level oracle is the 16-bit scoring route the gate
+uses — whose head arithmetic the construction now matches exactly.
+
 **35B-A3B Q8 shared-expert prefill (`4f0bb18f`, NInfer `610f79e9d`).** The Q8 gate/up and down
 prefill kernels of `Qwen3.6-35B-A3B` apply each 32-wide group's FP16 scale to the FP32 partial sum
 and pass the SiLU output as a BF16 high/low pair, where the old route rounded each code × scale to
