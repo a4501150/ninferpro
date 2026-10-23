@@ -434,6 +434,9 @@ public:
         ExpertResidency::Stats cache_at_admission;
         std::uint64_t cpu_served_at_admission = 0;
         HostExpertTier::Stats tier_at_admission{}; // SSD tier mode
+        // The Program's verification-round counters (rounds, columns, padded columns) at
+        // admission, for the request's share of the rounds' padding.
+        std::array<std::uint64_t, 3> verify_at_admission{};
         NgramVolume::Counters ngram; // this request's n-gram row traffic
         GateTraffic gate;            // its verification rounds' rows read behind the n-gram gate
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
@@ -1556,6 +1559,7 @@ public:
         lane.cache_at_admission = residency_->stats();
         lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
         if (tier_) { lane.tier_at_admission = tier_->stats(); }
+        lane.verify_at_admission = {verify_rounds_, verify_columns_, verify_padded_};
         lane.ngram                   = {};
         lane.gate                    = {};
         lane.begin = runtime::BeginSummary{.prompt_tokens        = lane.prompt_tokens,
@@ -2506,6 +2510,7 @@ public:
             }
             report_cache(lanes_[index]);
             report_ngram(lanes_[index]);
+            report_verify_rounds(lanes_[index]);
             prefix_finish(lanes_[index], index);
             release(index);
             if (placement_drifted()) { wake_maintenance(); } // settled when the engine idles (settle_placement)
@@ -3927,6 +3932,43 @@ private:
         } catch (...) {}
     }
 
+    // The verification rounds' padding over the finished request, and since start: a padded
+    // column is one past its row's drafts, carried through every layer's MoE. The share is what
+    // a column mask (dispatching nothing for such columns) could keep off the expert path.
+    void report_verify_rounds(const Lane& lane) noexcept {
+        try {
+            const auto& a = lane.verify_at_admission;
+            const auto rounds = verify_rounds_ - a[0];
+            if (rounds == 0) { return; }
+            const auto columns = verify_columns_ - a[1];
+            const auto padded  = verify_padded_ - a[2];
+            char text[224];
+            std::snprintf(text, sizeof(text),
+                          "verify rounds: request %llu rounds, %llu of %llu columns past their row's drafts "
+                          "(%.1f%%); since start %llu of %llu (%.1f%%)",
+                          static_cast<unsigned long long>(rounds),
+                          static_cast<unsigned long long>(padded), static_cast<unsigned long long>(columns),
+                          columns ? 100.0 * static_cast<double>(padded) / static_cast<double>(columns) : 0.0,
+                          static_cast<unsigned long long>(verify_padded_),
+                          static_cast<unsigned long long>(verify_columns_),
+                          verify_columns_
+                              ? 100.0 * static_cast<double>(verify_padded_) / static_cast<double>(verify_columns_)
+                              : 0.0);
+            diagnostic(text);
+            std::string widths = "verify rounds by width, since start:";
+            for (std::size_t w = 2; w < verify_by_width_.size(); ++w) {
+                const auto& by_width = verify_by_width_[w];
+                if (by_width[0] == 0) { continue; }
+                std::snprintf(text, sizeof(text), " %zu: %llu rounds, %.1f%% padded", w,
+                              static_cast<unsigned long long>(by_width[0]),
+                              by_width[1] ? 100.0 * static_cast<double>(by_width[2]) / static_cast<double>(by_width[1])
+                                          : 0.0);
+                widths += text;
+            }
+            if (widths.back() != ':') { diagnostic(std::move(widths), DiagnosticLevel::Debug); }
+        } catch (...) {}
+    }
+
     std::uint32_t* gate_ready() const { return static_cast<std::uint32_t*>(gate_host_.data()); }
 
     // The n-gram gate of a decode or verification graph: the pinned rows behind the round's word.
@@ -4846,6 +4888,21 @@ private:
             spec_host(spec_layout_.lengths)[b] = p;
             spec_host(spec_layout_.anchors)[b] = lane.history.back();
         }
+        // The round is rectangular at its widest row, so a row with fewer drafts than W - 1
+        // carries columns past its drafts: they route through every layer's MoE today, and a
+        // column mask could keep them off that path. Counted here, host-side, per width.
+        std::int64_t padded = 0;
+        for (std::int32_t b = 0; b < batch; ++b) {
+            padded += std::max<std::int64_t>(0, W - 1 - static_cast<std::int32_t>(drafts_[b].size()));
+        }
+        ++verify_rounds_;
+        verify_columns_ += static_cast<std::uint64_t>(batch) * static_cast<std::uint64_t>(W);
+        verify_padded_ += static_cast<std::uint64_t>(padded);
+        verify_by_width_.resize(std::max(verify_by_width_.size(), static_cast<std::size_t>(W) + 1));
+        auto& by_width = verify_by_width_[static_cast<std::size_t>(W)];
+        ++by_width[0];
+        by_width[1] += static_cast<std::uint64_t>(batch) * static_cast<std::uint64_t>(W);
+        by_width[2] += static_cast<std::uint64_t>(padded);
         const auto read_rows = [&] {
             for (std::int32_t b = 0; b < batch; ++b) {
                 queue_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], W, staged[b], W);
@@ -6447,6 +6504,13 @@ private:
     std::uint64_t pair_policy_rounds_            = 0;
     std::uint64_t batch_policy_rounds_           = 0;
     bool plain_round_ = false;
+    // Verification rounds' shape, program-wide: rounds, columns, columns past their row's
+    // drafts; verify_by_width_[W] holds the same per round width. Report_verify_rounds reads
+    // them against a lane's admission snapshot.
+    std::uint64_t verify_rounds_  = 0;
+    std::uint64_t verify_columns_ = 0;
+    std::uint64_t verify_padded_  = 0;
+    std::vector<std::array<std::uint64_t, 3>> verify_by_width_;
 
     // The neural drafter's most drafts per round (MTP's or DFlash2's), and whether a lane drafts.
     [[nodiscard]] std::int32_t neural_k() const noexcept { return mtp_ ? mtp_k_ : dflash_k_; }
