@@ -20,8 +20,8 @@
 //                The prompt-end capture is value-gated there (the opener realized within one tap
 //                separation of n), so the opener serves the repeat.
 //   The comparisons with cold runs need the artifact's exact route to be construction-exact
-//   (recipe C, int8 or fp8 KV; model-quality.md §6.8). Under MTP their draft counts are printed,
-//   not asserted: the drafter's own kernels are not column-invariant.
+//   (recipe C, bf16, int8 or fp8 KV; model-quality.md §6.8); under MTP the drafter's kernels are
+//   column-invariant there too, so the resumed run's drafted and accepted counts equal the cold run's.
 //   X12          (both modes) Engine 1 serves two chat turns and stops, saving its Host tier to a file;
 //                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
 //                Between the turns, Engine 1's periodic save writes the file once and, with the Host
@@ -114,15 +114,6 @@ std::string drafts_text(const infernix::SpeculativeStats& a, const infernix::Spe
 
 const char* mode_name(bool mtp) { return mtp ? "MTP" : "plain"; }
 
-// A resume against a cold run: the target model's bits are construction-exact, so the tokens must be
-// equal; the MTP drafter's own projections and experts keep their width-coupled routes, so its
-// drafts after a resume may differ from the cold run's (never the tokens: every draft is verified).
-// The counts are printed as an observation.
-void observe_drafts(const char* what, const infernix::SpeculativeStats& resumed, const infernix::SpeculativeStats& cold) {
-    std::printf("        %s: %s (%s)\n", what, drafts_text(resumed, cold).c_str(),
-                drafts_equal(resumed, cold) ? "equal" : "differ");
-}
-
 // The MTP drafter as the mode runs it (3 drafts).
 void use_mode(infernix::EngineOptions& options, bool mtp) {
     if (!mtp) { return; }
@@ -133,6 +124,12 @@ void use_mode(infernix::EngineOptions& options, bool mtp) {
 int check(bool ok, const std::string& what) {
     std::printf("%s %s\n", ok ? "  ok  " : "  FAIL", what.c_str());
     return ok ? 0 : 1;
+}
+
+// A resume against a cold run: the target model and the MTP drafter are construction-exact, so the
+// resumed run drafts and accepts what the cold run does.
+int check_drafts(const char* what, const infernix::SpeculativeStats& resumed, const infernix::SpeculativeStats& cold) {
+    return check(drafts_equal(resumed, cold), std::string(what) + ": drafts equal (" + drafts_text(resumed, cold) + ")");
 }
 
 std::string first_difference(const std::vector<infernix::TokenId>& a, const std::vector<infernix::TokenId>& b) {
@@ -158,7 +155,7 @@ infernix::EngineOptions base_options(const char* artifact, const char* ngram) {
     options.context_cache.host_capacity_bytes = 2ULL << 30;
     // Resumes equal cold runs on the exact route (model-quality.md §6.1); the default route's
     // qualified paths make a column's bits depend on its call. The artifact's exact route is
-    // construction-exact (recipe C, int8 or fp8 KV; model-quality.md §6.8), so it resumes, taps and
+    // construction-exact (recipe C, bf16, int8 or fp8 KV; model-quality.md §6.8), so it resumes, taps and
     // publishes endpoints at any position itself, and every resume below equals a cold run.
     options.fast_paths           = false;
     return options;
@@ -223,7 +220,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     failures += check(warm_b.reused == 1024, "tap resume reuses 1024 tokens (got " + std::to_string(warm_b.reused) + ")");
     failures += check(warm_b.tokens == cold_b.tokens, "tap resume equals the cold run (" +
                                                           first_difference(warm_b.tokens, cold_b.tokens) + ")");
-    observe_drafts("tap resume against the cold run", warm_b.speculative, cold_b.speculative);
+    failures += check_drafts("tap resume against the cold run", warm_b.speculative, cold_b.speculative);
 
     // host blocks: pressure evicts the Device copies; B now resumes from its own prompt-tail tap
     // (1536) through Host block restores.
@@ -250,7 +247,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     const Run cold_t2 = generate(engine, t2, 48, false);
     failures += check(resident.tokens == cold_t2.tokens, "the endpoint resume equals the cold run (" +
                                                              first_difference(resident.tokens, cold_t2.tokens) + ")");
-    observe_drafts("the endpoint resume against the cold run", resident.speculative, cold_t2.speculative);
+    failures += check_drafts("the endpoint resume against the cold run", resident.speculative, cold_t2.speculative);
     // Re-create turn 1's endpoint, evict, then resume turn 2 through the Host image.
     (void)generate(engine, t1, 96, true);
     (void)generate(engine, pressure, 4, true);
@@ -294,7 +291,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
         failures += check(x5.generated_token_ids == cold.generated_token_ids,
                           "X5 the off-grid resume equals the cold run (" +
                               first_difference(x5.generated_token_ids, cold.generated_token_ids) + ")");
-        observe_drafts("X5 against the cold run", x5.speculative, cold.speculative);
+        failures += check_drafts("X5 against the cold run", x5.speculative, cold.speculative);
     }
 
     const infernix::RuntimeStats before_s2 = engine.runtime_stats();
@@ -337,7 +334,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
         failures += check(again.generated_token_ids == cold.generated_token_ids,
                           "X3 the opener resume equals the cold run (" +
                               first_difference(again.generated_token_ids, cold.generated_token_ids) + ")");
-        observe_drafts("X3 against the cold run", again.speculative, cold.speculative);
+        failures += check_drafts("X3 against the cold run", again.speculative, cold.speculative);
     }
 
     // Single-chunk tail snapshot: a prompt that fits one call has no inner boundary for its

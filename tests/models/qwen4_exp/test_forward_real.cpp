@@ -44,6 +44,7 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
+#include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/rope_positions.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
@@ -123,7 +124,7 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
 struct Harness {
     Harness(const q4::execution::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
             std::int32_t rows, KvCacheStorage storage)
-        : config(parameters.model.config().text) {
+        : config(parameters.model.config().text), exact_route(exact_route_of(parameters, storage)) {
         const auto& c = config;
         LayoutBuilder builder;
         const LinearAttentionStatePoolSpec gdn_spec{
@@ -236,7 +237,7 @@ struct Harness {
         experts_view  = experts;
         forward = std::make_unique<q4::execution::Forward>(parameters, device, *work, std::move(state), std::move(kv),
                                                            std::move(experts), context,
-                                                           q4::execution::ForwardFastPaths{});
+                                                           exact_route);
     }
 
     // Another Forward over the same state, KV and workspace, with other expert sources.
@@ -245,10 +246,20 @@ struct Harness {
                  q4::execution::ForwardExperts sources, std::int32_t context) const {
         return std::make_unique<q4::execution::Forward>(parameters, device, *work, state_view,
                                                         kv_view, std::move(sources), context,
-                                                        q4::execution::ForwardFastPaths{});
+                                                        exact_route);
+    }
+
+    // The artifact's exact route at this KV format (the Engine's --disable-fast-paths selection).
+    static q4::execution::ForwardFastPaths exact_route_of(const q4::execution::Parameters& parameters,
+                                                         KvCacheStorage storage) {
+        infernix::EngineOptions options;
+        options.kv_cache   = storage;
+        options.fast_paths = false;
+        return q4::select_fast_paths(parameters, options).forward();
     }
 
     const q4::TextConfig& config;
+    q4::execution::ForwardFastPaths exact_route;
     q4::execution::ForwardState state_view;
     q4::execution::ForwardKV kv_view;
     q4::execution::ForwardExperts experts_view;

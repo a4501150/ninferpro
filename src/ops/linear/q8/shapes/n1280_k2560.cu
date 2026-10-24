@@ -1,4 +1,5 @@
 #include "ops/linear/q8/q8_shapes.h"
+#include "ops/linear/q8/q8_sliced_k_invariant.cuh"
 #include "ops/linear/q8/q8_stream_launch.cuh"
 
 namespace infernix::ops::detail {
@@ -21,6 +22,13 @@ Q8Launch select_q8_n1280_k2560(std::int32_t tokens) {
     // identical (checked at every swept point); only speed differs.
     if (tokens <= 512) return launch_q8_a16_mma_r32_t64;
     return launch_q8_a16_mma_r64_t128;
+}
+
+// A16ColumnInvariant (the MTP shared expert gate/up): the 8-K-warp sliced-K contraction at every T
+// (2026-10-24, RTX PRO 6000: 5.2 against 20.2 us at T = 1 for the MMA tiles' single K chain over 20
+// CTAs (the width route 5.9); it runs at draft widths only).
+Q8Launch select_q8_n1280_k2560_invariant(std::int32_t tokens) {
+    return select_q8_sliced_k_invariant<2560, 8>(tokens);
 }
 
 } // namespace infernix::ops::detail

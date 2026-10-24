@@ -1194,6 +1194,19 @@ int main(int argc, char** argv) {
                              fp8_widths);
         section_linear_width("q8 linear [12800,2560] (PLE projection)", QType::Q8_G32_FP16, 12800, 2560, 83U,
                              {1, 2, 8, 9, 15, 16, 17, 32, 33, 64, 65, 255, 256, 257, 512});
+        // The MTP drafter's Q8 projections.
+        const std::vector<std::int32_t> q8_widths = {1, 2, 4, 5, 8, 9, 15, 16, 17, 32, 33, 48, 49, 64, 65, 96, 97,
+                                                     255, 256, 257, 512, 513};
+        section_linear_width("q8 linear [13952,2560] (MTP attention group)", QType::Q8_G32_FP16, 13952, 2560, 85U,
+                             q8_widths);
+        section_linear_width("q8 linear [2560,2560] (MTP embedding/hidden)", QType::Q8_G32_FP16, 2560, 2560, 87U,
+                             q8_widths);
+        section_linear_width("q8 linear [1280,2560] (MTP shared gate_up)", QType::Q8_G32_FP16, 1280, 2560, 89U,
+                             q8_widths);
+        section_linear_width("q8 linear [2560,6144] (MTP attention output)", QType::Q8_G32_FP16, 2560, 6144, 91U,
+                             q8_widths);
+        section_linear_width("q8 linear [2560,640] (MTP shared down)", QType::Q8_G32_FP16, 2560, 640, 93U,
+                             q8_widths);
         const std::vector<std::int32_t> cross_widths = {16, 32, 48, 64, 240, 256, 272, 512, 1024};
         section_linear_cross("fp8 cross [16384,2560] (GDN q/k/v/z)", QType::FP8_E4M3FN_ROW_BF16, 16384, 2560, 71U,
                              2048, cross_widths);

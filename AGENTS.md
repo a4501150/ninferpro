@@ -32,12 +32,13 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
     private page copy; the capture is value-gated — within one tap separation of the path's
     deepest published frontier it is skipped, so one-call spans keep their tail tap and only
     spans whose opener demoted to the last inner boundary capture);
-  - a construction-exact exact route on recipe C with INT8 or FP8 KV
-    (`FastPathSelection::construction_exact`): every projection, mixer and attention call takes its
-    column-invariant route and the GDN prefill runs the recurrent arithmetic at every width, so a
-    position's bits do not depend on how its prompt and output were split into prefill calls,
-    decode steps and verifications; the exact route there resumes, taps and publishes endpoints at
-    any position without the free-cache-resume path;
+  - a construction-exact exact route on recipe C with BF16, INT8 or FP8 KV
+    (`FastPathSelection::construction_exact`): every projection, mixer and attention call, the MTP
+    drafter's included, takes its column-invariant route and the GDN prefill runs the recurrent
+    arithmetic at every width, so a position's bits (and the drafter's drafts) do not depend on how
+    its prompt and output were split into prefill calls, decode steps and verifications; the exact
+    route there resumes, taps and publishes endpoints at any position without the
+    free-cache-resume path; other configurations keep their own routes bit for bit;
   - batched DFlash2 drafting at any round size with an online cost fit;
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
 

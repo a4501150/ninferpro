@@ -22,12 +22,19 @@
 // scale, NVFP4 values decoded exactly into a per-warp FP16 tile, or the stored FP16 values, into
 // FP32 accumulators; rotated values (NVFP4, K8V4) are rotated back after the merge. The FP64
 // oracle of qsa_attention qualifies it (tests/ops/test_qsa.cpp).
+//
+// A warp's tiles form a chain (tiles w, w + warps, ... with one online softmax), and only the chains'
+// merge combines them, in warp order. A narrow call whose chains fit one wave of the SMs (decode and
+// verification on the column-invariant route) runs each chain in its own one-warp CTA with a deeper
+// gather ring, writes its state to `partials`, and merges in a second kernel with the same arithmetic:
+// the split changes where a chain runs and how far its gathers run ahead, never a bit of the result.
 
 #include "infernix/ops/qsa.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace infernix::ops::detail {
@@ -54,11 +61,15 @@ struct QsaVqWindow {
 /// would otherwise run unsplit).
 [[nodiscard]] bool qsa_prompt_supported(const QsaKVLayer& layer, const QsaGeometry& geometry);
 
+/// The `partials` a call of `columns` columns splits into (0 when it runs unsplit).
+[[nodiscard]] std::size_t qsa_prompt_partial_bytes(std::int32_t columns, const QsaGeometry& geometry);
+
 /// q: BF16 [head_dim, heads, T]; selected/counts: qsa_select's output for the call's columns;
-/// `vq`: the vector-quantized storages' window and staging (unused otherwise).
+/// `vq`: the vector-quantized storages' window and staging (unused otherwise); `partials`: at least
+/// qsa_prompt_partial_bytes(T, geometry) bytes, or null to run unsplit.
 void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch,
                           const QsaGeometry& geometry, float scale, const std::int32_t* selected,
                           const std::int32_t* counts, Tensor& out, cudaStream_t stream,
-                          const QsaVqWindow& vq);
+                          const QsaVqWindow& vq, float* partials);
 
 } // namespace infernix::ops::detail

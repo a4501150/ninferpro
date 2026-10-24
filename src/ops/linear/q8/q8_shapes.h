@@ -61,6 +61,11 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n12800_k2560_invariant(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n324_k10240_invariant(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n320_k10240_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n13952_k2560_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k2560_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n1280_k2560_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k6144_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k640_invariant(std::int32_t tokens);
 // Qwen3.8-Flash-Next's dense Q8 classes (register-streamed route up to 64 columns).
 [[nodiscard]] Q8Launch select_q8_n16384_k2560(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n12800_k2560(std::int32_t tokens);

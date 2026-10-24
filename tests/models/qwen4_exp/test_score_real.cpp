@@ -2,8 +2,9 @@
 // an independent teacher-forced reference: the logits infernix_qwen4_exp_forward_real_test --dump-logits
 // writes from the Forward alone (every expert in RAM, no Program, tier, layer walk or logit tiles). Per
 // position: the target's log-probability against the reference's FP64 log-softmax, top-1 agreement,
-// and the top-k ids where the reference separates them. The Engine's prefill chunks may round
-// attention differently from the dump's, so the criteria are statistical, not bit equality.
+// and the top-k ids where the reference separates them. The Engine scores on the exact route, as the
+// dump does; outside a construction-exact configuration its prefill chunks may round differently from
+// the dump's, so the criteria are statistical, not bit equality.
 // Skips (77) unless INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
 //   INFERNIX_QWEN4_ARTIFACT=out.infernix [INFERNIX_QWEN4_NGRAM=v.ngram] [INFERNIX_EXPERT_RAM_MIB=N]
@@ -78,6 +79,9 @@ int main(int argc, char** argv) {
         options.max_context   = static_cast<std::uint32_t>(ids.size());
         options.prefill_chunk = chunk;
         options.kv_cache      = infernix::KvCacheStorage::Int8Group64;
+        // The dump is the exact route's; qualified fast paths (recipe C's A4-residual experts and FP8
+        // pairs) would add their own, budgeted error to the comparison.
+        options.fast_paths    = false;
         infernix::Engine engine(options);
         infernix::ScoreOptions score;
         score.top_k = top_k;

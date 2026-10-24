@@ -273,7 +273,8 @@ constexpr std::array kQualified{
     // to their taps and endpoints, so it barely reaches the zero-token path. The construction-exact
     // exact route (2026-10-24) moved the reference: the fast route then failed the 1,024-segment
     // tail (p99.9 KL ratio 1.34) and passes with the recurrent GDN prefill (TV 1.8e-3 bound
-    // 2.0e-3, top-1 1.9e-3 bound 2.9e-3, KL 1.0e-3, NLL 9.3e-5, p99.9 1.13; model-quality 6.8). The timing is
+    // 2.0e-3, top-1 1.9e-3 bound 2.9e-3, KL 1.0e-3, NLL 9.3e-5, p99.9 1.13; FP8 KV p99.9 1.02;
+    // model-quality 6.8). The timing is
     // on the artifact itself: second-turn continuations 76 -> 28 ms TTFT (98.9 % resumed from the
     // endpoint), repeats of single-chunk prompts kept at 16-17 ms by planning the tail tap beside
     // the path (hybrid-prefix-cache-spec, Taps; without it they regressed to 178 ms and 0 %),
@@ -428,7 +429,9 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
 // cold run (tests/models/qwen4_exp/test_forward_real.cpp --split-equality,
 // test_prefix_cache_real.cpp; docs/maintainer/model-quality.md section 6.8).
 constexpr std::array kConstructionExact{
-    // orcarouter Uncensored NVFP4, recipe C (2026-10-23).
+    // orcarouter Uncensored NVFP4, recipe C (2026-10-23; BF16 KV, the 16-bit reference's format,
+    // 2026-10-24).
+    FastPathConfiguration{DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16},
     FastPathConfiguration{DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64},
     FastPathConfiguration{DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256},
 };
@@ -466,13 +469,19 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     if (selected(FastPath::Q8SlicedK)) { routes = routes | ops::LinearRoutes::Q8SlicedK; }
     if (selected(FastPath::Fp8A8Pair)) { routes = routes | ops::LinearRoutes::Fp8A8Pair; }
     if (selected(FastPath::GgmlBf16Prefill)) { routes = routes | ops::LinearRoutes::GgmlBf16Wide; }
+    // The construction-exact arithmetic runs only in the configurations it was qualified on: there the
+    // exact route takes the column-invariant kernels and both routes the recurrent GDN prefill (the fast
+    // route's joint gates were measured with it). Elsewhere both routes keep the arithmetic their own
+    // gates qualified.
+    const bool invariant = qwen4_exp::construction_exact(configuration);
     return {.dense_routes       = routes,
             .gdn_conv_fused     = selected(FastPath::GdnConvFused),
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
             .expert_a4_residual = selected(FastPath::ExpertA4Residual),
             .gdn_arithmetic     = selected(FastPath::GdnF16Accumulate) ? ops::GdnChunkArithmetic::Fp16Accumulate
-                                                                       : ops::GdnChunkArithmetic::Recurrent,
-            .column_invariant   = request_invariant()};
+                                  : invariant                          ? ops::GdnChunkArithmetic::Recurrent
+                                                                       : ops::GdnChunkArithmetic::Exact,
+            .column_invariant   = invariant && request_invariant()};
 }
 
 bool FastPathSelection::construction_exact() const noexcept {
