@@ -128,6 +128,26 @@ int main() {
     }
     failures += check(!q::construction_exact(dense8), "Dense8 has no column-invariant route set");
 
+    // gdn-compensated replaces the recurrent GDN prefill where the exact route runs it, and couples a
+    // prompt to its calls' chunk grids.
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256}) {
+        const q::FastPathConfiguration recipe_c{DenseKernels::Fp8Row, false, kv};
+        failures += check(q::fast_path_applies(FastPath::GdnCompensated, recipe_c, options),
+                          "gdn-compensated applies where the exact route runs the recurrent GDN prefill");
+        const q::FastPathSelection compensated{.configuration = recipe_c, .paths = {FastPath::GdnCompensated}};
+        failures += check(compensated.forward().gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Compensated &&
+                              !compensated.forward().column_invariant && !compensated.request_invariant(),
+                          "gdn-compensated runs the compensated chunks and couples a prompt to its calls");
+        failures += check(q::fast_path_qualified(FastPath::GdnCompensated, recipe_c) == (kv != KvCacheStorage::BFloat16),
+                          "gdn-compensated is qualified on recipe C with INT8 and FP8 KV");
+    }
+    for (const FastPathConfiguration& config :
+         {dense8, FastPathConfiguration{DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16},
+          FastPathConfiguration{DenseKernels::Bf16, false, KvCacheStorage::Int8Group64}}) {
+        failures += check(!q::fast_path_applies(FastPath::GdnCompensated, config, options),
+                          "gdn-compensated does not apply where the exact route runs the chunked GDN prefill");
+    }
+
     q::FastPathSelection selection{.configuration = dense8, .paths = {}};
     const auto exact = selection.forward();
     failures += check(exact.dense_routes == infernix::ops::LinearRoutes::Exact && !exact.gdn_conv_fused &&

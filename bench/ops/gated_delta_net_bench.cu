@@ -60,6 +60,7 @@ struct Options {
     int repeat               = 100;
     std::size_t flush_bytes  = kDefaultFlushBytes;
     std::string qk_norm      = "fused";
+    ops::GdnChunkArithmetic arithmetic = ops::GdnChunkArithmetic::Exact;
 };
 
 struct Problem {
@@ -154,6 +155,17 @@ Options parse_options(int argc, char** argv) {
             if (options.qk_norm != "fused" && options.qk_norm != "composed") {
                 fail("--qk-norm must be fused or composed");
             }
+        } else if (arg == "--arithmetic") {
+            const std::string_view value = take("--arithmetic");
+            if (value == "exact") {
+                options.arithmetic = ops::GdnChunkArithmetic::Exact;
+            } else if (value == "fp16") {
+                options.arithmetic = ops::GdnChunkArithmetic::Fp16Accumulate;
+            } else if (value == "compensated") {
+                options.arithmetic = ops::GdnChunkArithmetic::Compensated;
+            } else {
+                fail("--arithmetic must be exact, fp16 or compensated");
+            }
         } else if (arg == "--breakdown") {
             options.breakdown = true;
         } else if (arg == "--warmup") {
@@ -203,6 +215,7 @@ void print_help(const char* program) {
         "  --recurrent-only   prefill recurrence with fused Q/K normalization\n"
         "  --recurrent-arithmetic  public Op with GdnChunkArithmetic::Recurrent (staged recurrence)\n"
         "  --breakdown        also time prepare and recurrence/output separately\n"
+        "  --arithmetic A     chunked arithmetic: exact, fp16 or compensated (default: exact)\n"
         "\n"
         "Workload:\n"
         "  --tokens N         exact token extent (running/chunked default: 1024)\n"
@@ -560,6 +573,7 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
     auto* control =
         chunked ? static_cast<chunked_detail::ControlChunk*>(layout.control.bind(backing).data)
                 : nullptr;
+    auto* qk_low = chunked ? static_cast<chunked_detail::QkChunk*>(layout.qk_low.bind(backing).data) : nullptr;
     const chunked_detail::Arguments args{static_cast<const __nv_bfloat16*>(q.data),
                                          static_cast<const __nv_bfloat16*>(k.data),
                                          static_cast<const __nv_bfloat16*>(v.data),
@@ -581,11 +595,11 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                                                          prep_io.intermediate + rec_io.intermediate}
                                           : TrafficBytes{running_logical_bytes(problem), 0};
     auto prepare                = [&](cudaStream_t stream) {
-        chunked_detail::launch_prepare(args, qk, control, normalize, stream, /*fp16=*/false);
+        chunked_detail::launch_prepare(args, qk, qk_low, control, normalize, stream, options.arithmetic);
     };
     auto recurrence = [&](cudaStream_t stream) {
-        chunked_detail::launch_recurrence(args, qk, control,
-                                          {stream, execution.multiprocessor_count}, /*fp16=*/false);
+        chunked_detail::launch_recurrence(args, qk, qk_low, control,
+                                          {stream, execution.multiprocessor_count}, options.arithmetic);
     };
     auto pipeline = [&](cudaStream_t stream) {
         if (force_chunked) {
@@ -599,7 +613,7 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                                  {stream, execution.multiprocessor_count}, ops::GdnChunkArithmetic::Recurrent);
         else
             ops::gated_delta_net(q, k, v, g, beta, gated_delta_net_scale(), normalize, workspace,
-                                 si, so, out, {stream, execution.multiprocessor_count});
+                                 si, so, out, {stream, execution.multiprocessor_count}, options.arithmetic);
     };
     std::vector<BenchRow> rows;
     auto measure = [&](const char* name, TrafficBytes io, auto& body, double logical) {

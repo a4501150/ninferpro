@@ -19,11 +19,12 @@ struct ForwardFastPaths {
     // expert-a4-residual: W4A16 experts' wide calls take the two-term A4 route
     // (ops::offloaded_moe::WideA16::kA4Residual, design §19.3.23); no effect on W4A4 experts.
     bool expert_a4_residual = false;
-    // The GDN prefill's arithmetic: gdn-f16-accumulate's FP16 chunked products; in a construction-exact
-    // configuration the recurrent arithmetic at every width (a call's bits do not depend on where a
-    // prompt's calls start, which decode, verification and resumes move), on the fast route too
-    // (against the recurrent reference the chunked route's state error failed its joint decode gate's
-    // tail, model-quality.md 6.8); the chunked route otherwise.
+    // The GDN prefill's arithmetic: gdn-f16-accumulate's FP16 chunked products; gdn-compensated's
+    // compensated chunked products; in a construction-exact configuration otherwise the recurrent
+    // arithmetic at every width (a call's bits do not depend on where a prompt's calls start, which
+    // decode, verification and resumes move; against that reference the chunked route's state error
+    // failed the fast route's joint decode gate's tail, model-quality.md 6.8); the chunked route
+    // elsewhere.
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
     // A construction-exact configuration's exact route: every projection and mix that registers an
     // A16ColumnInvariant route runs it, so a column's bits do not depend on its call's width or its

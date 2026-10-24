@@ -38,7 +38,8 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
     arithmetic at every width, so a position's bits (and the drafter's drafts) do not depend on how
     its prompt and output were split into prefill calls, decode steps and verifications; the exact
     route there resumes, taps and publishes endpoints at any position without the
-    free-cache-resume path; other configurations keep their own routes bit for bit;
+    free-cache-resume path, and its fast route runs the compensated chunked GDN prefill
+    (`gdn-compensated`); other configurations keep their own routes bit for bit;
   - batched DFlash2 drafting at any round size with an online cost fit;
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
 

@@ -274,8 +274,8 @@ constexpr std::array kQualified{
     // exact route (2026-10-24) moved the reference: the fast route then failed the 1,024-segment
     // tail (p99.9 KL ratio 1.34) and passes with the recurrent GDN prefill (TV 1.8e-3 bound
     // 2.0e-3, top-1 1.9e-3 bound 2.9e-3, KL 1.0e-3, NLL 9.3e-5, p99.9 1.13; FP8 KV p99.9 1.02;
-    // model-quality 6.8). The timing is
-    // on the artifact itself: second-turn continuations 76 -> 28 ms TTFT (98.9 % resumed from the
+    // model-quality 6.8; gdn-compensated, below, replaced that prefill and passes the same gates).
+    // The timing is on the artifact itself: second-turn continuations 76 -> 28 ms TTFT (98.9 % resumed from the
     // endpoint), repeats of single-chunk prompts kept at 16-17 ms by planning the tail tap beside
     // the path (hybrid-prefix-cache-spec, Taps; without it they regressed to 178 ms and 0 %),
     // repeats of multi-call prompts 125 -> 6 ms at 80 -> 100 % reuse by the value-gated
@@ -305,6 +305,17 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Q4KeyVq2Value}},
+    // Recipe C, the construction-exact configurations: the compensated chunked GDN prefill in place of
+    // the recurrent one, jointly with the qualified paths against the construction-exact reference
+    // (2026-10-24, model-quality.md 6.8). Decode (MTP 4 at concurrency 2, warm 3,000-token resumes),
+    // 1,024 segments: INT8 TV 1.8e-3 (bound 2.0e-3), top-1 2.5e-3 (bound 3.6e-3), p99.9 1.11; FP8
+    // TV 1.0e-3, top-1 2.0e-3, p99.9 1.06 (INT8 near-passed at 256 segments, top-1's bound and p99.9
+    // 1.27, as the recurrent prefill did at 1.26). Prefill (quick corpus, four chunks): INT8 KL 9.3e-4
+    // (bound 1.1e-3), FP8 6.6e-4, corpus NLL -5.6e-4 and -2.8e-4. Timed on the artifact: the fast
+    // route's prefill scoring 4-6 % faster than with the recurrent prefill. BF16 KV is the 16-bit
+    // reference's own exact route (floor 0) and is not registered.
+    Qualification{FastPath::GdnCompensated, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnCompensated, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -413,6 +424,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::ExpertA4Residual: return !configuration.a4_experts && configuration.dense == DenseKernels::Fp8Row;
     // The GGUF imports' dense projections (ops::ggml_linear's BF16 prefill tiles).
     case FastPath::GgmlBf16Prefill: return configuration.dense == DenseKernels::Ggml;
+    // It replaces the recurrent GDN prefill, which only the construction-exact configurations run.
+    case FastPath::GdnCompensated: return qwen4_exp::construction_exact(configuration);
     case FastPath::QsaPrepareFused:
         // ops::qsa_prepare_supports's KV formats (bf16, int8, fp8, nvfp4, k8v4); VQ2 and K4V2 append
         // inside qsa_attention and keep the composed prepare.
@@ -456,11 +469,12 @@ bool FastPathSelection::request_invariant() const noexcept {
         // depend on the other requests of its round.
         // expert-a4-residual routes an expert, and fp8-a8-pair a dense problem, by its column count in
         // the call, which batched rounds share between requests. ggml-bf16-prefill routes a prompt's
-        // GGUF projections by its calls' widths, whose boundaries prefix-cache resumes move.
+        // GGUF projections by its calls' widths, and gdn-compensated runs a prompt's GDN on its calls'
+        // chunk grids, whose boundaries prefix-cache resumes move.
         return path == FastPath::AdaptiveSpeculation || path == FastPath::FreeCacheResume ||
                path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
                path == FastPath::ExpertA4Residual || path == FastPath::Fp8A8Pair ||
-               path == FastPath::GgmlBf16Prefill;
+               path == FastPath::GgmlBf16Prefill || path == FastPath::GdnCompensated;
     });
 }
 
@@ -470,17 +484,19 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     if (selected(FastPath::Fp8A8Pair)) { routes = routes | ops::LinearRoutes::Fp8A8Pair; }
     if (selected(FastPath::GgmlBf16Prefill)) { routes = routes | ops::LinearRoutes::GgmlBf16Wide; }
     // The construction-exact arithmetic runs only in the configurations it was qualified on: there the
-    // exact route takes the column-invariant kernels and both routes the recurrent GDN prefill (the fast
-    // route's joint gates were measured with it). Elsewhere both routes keep the arithmetic their own
+    // exact route takes the column-invariant kernels and the recurrent GDN prefill, which the fast route
+    // keeps unless gdn-compensated is selected. Elsewhere both routes keep the arithmetic their own
     // gates qualified.
     const bool invariant = qwen4_exp::construction_exact(configuration);
+    const auto gdn       = selected(FastPath::GdnF16Accumulate) ? ops::GdnChunkArithmetic::Fp16Accumulate
+                           : selected(FastPath::GdnCompensated)  ? ops::GdnChunkArithmetic::Compensated
+                           : invariant                           ? ops::GdnChunkArithmetic::Recurrent
+                                                                 : ops::GdnChunkArithmetic::Exact;
     return {.dense_routes       = routes,
             .gdn_conv_fused     = selected(FastPath::GdnConvFused),
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
             .expert_a4_residual = selected(FastPath::ExpertA4Residual),
-            .gdn_arithmetic     = selected(FastPath::GdnF16Accumulate) ? ops::GdnChunkArithmetic::Fp16Accumulate
-                                  : invariant                          ? ops::GdnChunkArithmetic::Recurrent
-                                                                       : ops::GdnChunkArithmetic::Exact,
+            .gdn_arithmetic     = gdn,
             .column_invariant   = invariant && request_invariant()};
 }
 

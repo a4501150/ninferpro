@@ -2,6 +2,8 @@
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 
+#include <type_traits>
+
 namespace infernix::ops::detail::gated_delta_net::chunked {
 namespace {
 
@@ -46,6 +48,47 @@ __device__ __forceinline__ void load_bf16_b(const float* p, int k, int n, int la
     b0 = pack_bf16x2(p[value_index<DV>(k + 2 * t, col)], p[value_index<DV>(k + 2 * t + 1, col)]);
     b1 =
         pack_bf16x2(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)]);
+}
+
+// GdnChunkArithmetic::Compensated's helpers. An FP32 operand becomes a high/low pair whose sum
+// carries it to the precision of three products hi*hi + hi*lo + lo*hi.
+
+// TF32: the high part keeps the bits TF32 MMA reads; the low part is the exact remainder.
+__device__ __forceinline__ void split_tf32(float x, unsigned& high, unsigned& low) {
+    high = __float_as_uint(x) & 0xffffe000U;
+    low  = __float_as_uint(x - __uint_as_float(high));
+}
+
+// BF16 pairs of two adjacent elements (a in the low half): round to nearest, then the remainder.
+__device__ __forceinline__ void split_bf16x2(float a, float b, unsigned& high, unsigned& low) {
+    high = pack_bf16x2(a, b);
+    low  = pack_bf16x2(a - __uint_as_float(high << 16), b - __uint_as_float(high & 0xffff0000U));
+}
+
+template <int DV>
+__device__ __forceinline__ void load_split_bf16_b(const float* p, int k, int n, int lane, unsigned (&high)[2],
+                                                  unsigned (&low)[2]) {
+    const int t = lane & 3, col = n * 8 + lane / 4;
+    split_bf16x2(p[value_index<DV>(k + 2 * t, col)], p[value_index<DV>(k + 2 * t + 1, col)], high[0], low[0]);
+    split_bf16x2(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)], high[1], low[1]);
+}
+
+// hi*hi + hi*lo + lo*hi into acc, the small products first.
+__device__ __forceinline__ void mma_bf16_compensated(float (&acc)[4], const unsigned (&a)[4], const unsigned (&a_low)[4],
+                                                     const unsigned (&b)[2], const unsigned (&b_low)[2]) {
+    mma_bf16(acc[0], acc[1], acc[2], acc[3], a_low[0], a_low[1], a_low[2], a_low[3], b[0], b[1]);
+    mma_bf16(acc[0], acc[1], acc[2], acc[3], a[0], a[1], a[2], a[3], b_low[0], b_low[1]);
+    mma_bf16(acc[0], acc[1], acc[2], acc[3], a[0], a[1], a[2], a[3], b[0], b[1]);
+}
+
+__device__ __forceinline__ void mma_tf32_compensated(float (&acc)[4], const unsigned (&a)[4], const unsigned (&a_low)[4],
+                                                     float b0, float b1) {
+    unsigned h0, l0, h1, l1;
+    split_tf32(b0, h0, l0);
+    split_tf32(b1, h1, l1);
+    mma_tf32_bits(acc[0], acc[1], acc[2], acc[3], a_low[0], a_low[1], a_low[2], a_low[3], h0, h1);
+    mma_tf32_bits(acc[0], acc[1], acc[2], acc[3], a[0], a[1], a[2], a[3], l0, l1);
+    mma_tf32_bits(acc[0], acc[1], acc[2], acc[3], a[0], a[1], a[2], a[3], h0, h1);
 }
 
 // GdnChunkArithmetic::Fp16Accumulate's helpers. Its packet holds FP16 Q/K; the 16-bit ldmatrix
@@ -115,11 +158,18 @@ struct RecurrenceShared {
     float delta[kChunkSize * DV];
 };
 
+// GdnChunkArithmetic::Compensated: each stage's low Q/K packet as well.
+template <int DV>
+struct CompensatedRecurrenceShared : RecurrenceShared<DV> {
+    QkChunk qk_low[2];
+};
+
 template <int DV>
 __device__ __forceinline__ void load_stage(typename RecurrenceShared<DV>::Stage& stage,
                                            const Arguments& args, const QkChunk* qk_workspace,
                                            const ControlChunk* control_workspace, int head,
-                                           int value_start, int chunk, int tid) {
+                                           int value_start, int chunk, int tid,
+                                           QkChunk* low_stage = nullptr, const QkChunk* qk_low_workspace = nullptr) {
     const int qh       = head / (args.value_heads / args.qk_heads);
     const int chunks   = chunk_count(args.tokens);
     const auto* qk_src = reinterpret_cast<const uint4*>(
@@ -146,6 +196,13 @@ __device__ __forceinline__ void load_stage(typename RecurrenceShared<DV>::Stage&
         cp_async_zfill<16, Cache::cg>(stage.value + row * DV + col, args.v + off,
                                       token < args.tokens ? 16 : 0);
     }
+    if (low_stage != nullptr) {
+        const auto* low_src = reinterpret_cast<const uint4*>(qk_low_workspace + static_cast<std::int64_t>(qh) * chunks + chunk);
+        auto* low_dst       = reinterpret_cast<uint4*>(low_stage);
+#pragma unroll
+        for (int i = tid; i < sizeof(QkChunk) / 16; i += kThreads<DV>)
+            cp_async<16, Cache::cg>(low_dst + i, low_src + i);
+    }
     cp_commit();
 }
 
@@ -163,7 +220,7 @@ __device__ __forceinline__ void store_residual(float* delta, const __nv_bfloat16
                           v1.y - prefix[row + 8] * prediction[3]));
 }
 
-template <int DV>
+template <int DV, bool Compensated = false>
 __device__ __forceinline__ void matrix_delta(float (&acc)[4], const float* matrix,
                                              const float* delta, int n, int lane) {
     const int g = lane / 4, t = lane & 3;
@@ -173,9 +230,17 @@ __device__ __forceinline__ void matrix_delta(float (&acc)[4], const float* matri
         ldmatrix_x4(af[0], af[1], af[2], af[3],
                     smem_addr(matrix + square_index((lane & 7) + ((lane >> 3) & 1) * 8,
                                                     k + (lane >> 4) * 4)));
-        mma_tf32_bits(acc[0], acc[1], acc[2], acc[3], af[0], af[1], af[2], af[3],
-                      __float_as_uint(delta[value_index<DV>(k + t, n * 8 + g)]),
-                      __float_as_uint(delta[value_index<DV>(k + t + 4, n * 8 + g)]));
+        if constexpr (Compensated) {
+            unsigned high[4], low[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) split_tf32(__uint_as_float(af[i]), high[i], low[i]);
+            mma_tf32_compensated(acc, high, low, delta[value_index<DV>(k + t, n * 8 + g)],
+                                 delta[value_index<DV>(k + t + 4, n * 8 + g)]);
+        } else {
+            mma_tf32_bits(acc[0], acc[1], acc[2], acc[3], af[0], af[1], af[2], af[3],
+                          __float_as_uint(delta[value_index<DV>(k + t, n * 8 + g)]),
+                          __float_as_uint(delta[value_index<DV>(k + t + 4, n * 8 + g)]));
+        }
     }
 }
 
@@ -193,18 +258,25 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
     }
 }
 
-// Fp16 selects GdnChunkArithmetic::Fp16Accumulate (launch.h); without it the exact arithmetic.
-template <int DV, bool Fp16 = false>
+// Fp16 selects GdnChunkArithmetic::Fp16Accumulate, Compensated GdnChunkArithmetic::Compensated
+// (launch.h); without either the exact arithmetic.
+template <int DV, bool Fp16 = false, bool Compensated = false>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
-    Arguments args, const QkChunk* __restrict__ qk_workspace,
+    Arguments args, const QkChunk* __restrict__ qk_workspace, const QkChunk* __restrict__ qk_low_workspace,
     const ControlChunk* __restrict__ control_workspace) {
+    static_assert(!(Fp16 && Compensated));
+    using Shared = std::conditional_t<Compensated, CompensatedRecurrenceShared<DV>, RecurrenceShared<DV>>;
     constexpr int kWarps = kThreads<DV> / 32;
     constexpr int NT     = DV / 8;
     constexpr int MW     = NT < kWarps ? kWarps / NT : 1;
     constexpr int MPW    = (kStateDim / 16) / MW;
     constexpr int NPW    = NT > kWarps ? NT / kWarps : 1;
     extern __shared__ __align__(256) unsigned char backing[];
-    auto& sm      = *reinterpret_cast<RecurrenceShared<DV>*>(backing);
+    auto& sm      = *reinterpret_cast<Shared*>(backing);
+    const auto low_stage = [&](int slot) -> QkChunk* {
+        if constexpr (Compensated) return &sm.qk_low[slot];
+        else return nullptr;
+    };
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const int g = lane / 4, t = lane & 3;
     const int head        = blockIdx.x / (kStateDim / DV);
@@ -229,10 +301,11 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             state[ni][mi][3] = args.state_in[state_base + (value + 1) * kStateDim + key + 8];
         }
     }
-    load_stage<DV>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0, tid);
+    load_stage<DV>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0, tid, low_stage(0),
+                   qk_low_workspace);
     if (chunks > 1)
         load_stage<DV>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start, 1,
-                       tid);
+                       tid, low_stage(1), qk_low_workspace);
 
     for (int chunk = 0; chunk < chunks; ++chunk) {
         if (chunk + 1 < chunks)
@@ -260,7 +333,30 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
 
         if constexpr (NT >= kWarps) {
             float prediction[NPW][4]{};
-            if constexpr (!Fp16) {
+            if constexpr (Compensated) {
+                const QkChunk& low = sm.qk_low[chunk & 1];
+#pragma unroll
+                for (int k = 0; k < kStateDim; k += 16) {
+                    unsigned ka[4], kl[4], qa[4], ql[4];
+                    load_vector_bf16_a(qk.k, k, lane, ka);
+                    load_vector_bf16_a(low.k, k, lane, kl);
+                    load_vector_bf16_a(qk.q, k, lane, qa);
+                    load_vector_bf16_a(low.q, k, lane, ql);
+#pragma unroll
+                    for (int ni = 0; ni < NPW; ++ni) {
+                        const int n    = warp + ni * kWarps;
+                        const float b0 = sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)];
+                        const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
+                        const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
+                        const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
+                        unsigned sh[2], sl[2];
+                        split_bf16x2(b0, b1, sh[0], sl[0]);
+                        split_bf16x2(b2, b3, sh[1], sl[1]);
+                        mma_bf16_compensated(prediction[ni], ka, kl, sh, sl);
+                        mma_bf16_compensated(history[ni], qa, ql, sh, sl);
+                    }
+                }
+            } else if constexpr (!Fp16) {
 #pragma unroll
                 for (int k = 0; k < kStateDim; k += 16) {
                     unsigned ka0[4], ka1[4], qa[4];
@@ -316,7 +412,17 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                 const bool query = warp >= NT;
                 const int n      = warp % NT;
                 if (query) {
-                    if constexpr (!Fp16) {
+                    if constexpr (Compensated) {
+                        const QkChunk& low = sm.qk_low[chunk & 1];
+#pragma unroll
+                        for (int k = 0; k < kStateDim; k += 16) {
+                            unsigned af[4], al[4], bh[2], bl[2];
+                            load_vector_bf16_a(qk.q, k, lane, af);
+                            load_vector_bf16_a(low.q, k, lane, al);
+                            load_split_bf16_b<DV>(sm.snapshot, k, n, lane, bh, bl);
+                            mma_bf16_compensated(history[0], af, al, bh, bl);
+                        }
+                    } else if constexpr (!Fp16) {
 #pragma unroll
                         for (int k = 0; k < kStateDim; k += 16) {
                             unsigned af[4], b0, b1;
@@ -336,7 +442,17 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                         }
                     }
                 } else {
-                    if constexpr (Fp16) {
+                    if constexpr (Compensated) {
+                        const QkChunk& low = sm.qk_low[chunk & 1];
+#pragma unroll
+                        for (int k = 0; k < kStateDim; k += 16) {
+                            unsigned af[4], al[4], bh[2], bl[2];
+                            load_vector_bf16_a(qk.k, k, lane, af);
+                            load_vector_bf16_a(low.k, k, lane, al);
+                            load_split_bf16_b<DV>(sm.snapshot, k, n, lane, bh, bl);
+                            mma_bf16_compensated(history[0], af, al, bh, bl);
+                        }
+                    } else if constexpr (Fp16) {
                         unsigned part[2]{};
 #pragma unroll
                         for (int k = 0; k < kStateDim; k += 16) {
@@ -368,7 +484,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
 #pragma unroll
         for (int n = warp; n < NT; n += kWarps) {
             float delta[4]{};
-            matrix_delta<DV>(delta, p.solve, sm.delta, n, lane);
+            matrix_delta<DV, Compensated>(delta, p.solve, sm.delta, n, lane);
             const int col = n * 8 + t * 2;
             __syncwarp();
             store_vec(sm.delta + value_index<DV>(g, col), make_float2(delta[0], delta[1]));
@@ -384,7 +500,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                 history[ni][1] *= p.prefix[g];
                 history[ni][2] *= p.prefix[g + 8];
                 history[ni][3] *= p.prefix[g + 8];
-                matrix_delta<DV>(history[ni], p.mqk, sm.delta, n, lane);
+                matrix_delta<DV, Compensated>(history[ni], p.mqk, sm.delta, n, lane);
                 store_output(args, history[ni], chunk, head, value_start, n, lane);
             }
         } else if (warp >= NT && warp < 2 * NT) {
@@ -393,11 +509,42 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             history[0][1] *= p.prefix[g];
             history[0][2] *= p.prefix[g + 8];
             history[0][3] *= p.prefix[g + 8];
-            matrix_delta<DV>(history[0], p.mqk, sm.delta, n, lane);
+            matrix_delta<DV, Compensated>(history[0], p.mqk, sm.delta, n, lane);
             store_output(args, history[0], chunk, head, value_start, n, lane);
         }
 
-        if constexpr (!Fp16) {
+        if constexpr (Compensated) {
+            // The update of the exact arithmetic below with the scaled Delta and K as BF16 pairs.
+            unsigned delta_h[NPW][2], delta_l[NPW][2];
+#pragma unroll
+            for (int ni = 0; ni < NPW; ++ni) {
+                const int col = (n_start + ni * kWarps) * 8 + g;
+                split_bf16x2(p.suffix[2 * t] * sm.delta[value_index<DV>(2 * t, col)],
+                             p.suffix[2 * t + 1] * sm.delta[value_index<DV>(2 * t + 1, col)], delta_h[ni][0],
+                             delta_l[ni][0]);
+                split_bf16x2(p.suffix[2 * t + 8] * sm.delta[value_index<DV>(2 * t + 8, col)],
+                             p.suffix[2 * t + 9] * sm.delta[value_index<DV>(2 * t + 9, col)], delta_h[ni][1],
+                             delta_l[ni][1]);
+            }
+            const QkChunk& low = sm.qk_low[chunk & 1];
+#pragma unroll
+            for (int mi = 0; mi < MPW; ++mi) {
+                const int key     = (m_start + mi * MW) * 16 + g;
+                const float decay = p.prefix[kChunkSize - 1];
+#pragma unroll
+                for (int ni = 0; ni < NPW; ++ni) {
+                    state[ni][mi][0] *= decay;
+                    state[ni][mi][1] *= decay;
+                    state[ni][mi][2] *= decay;
+                    state[ni][mi][3] *= decay;
+                }
+                unsigned af[4], al[4];
+                load_transposed_bf16_a(qk.k, key - g, lane, af);
+                load_transposed_bf16_a(low.k, key - g, lane, al);
+#pragma unroll
+                for (int ni = 0; ni < NPW; ++ni) mma_bf16_compensated(state[ni][mi], af, al, delta_h[ni], delta_l[ni]);
+            }
+        } else if constexpr (!Fp16) {
             // S^T = gamma S^T + K^T diag(suffix) Delta. The master state stays FP32.
             // Convert Delta only for this MMA and reuse its fragment across all key tiles.
             // The output branch above consumes the original FP32 Delta through TF32 MMA.
@@ -469,7 +616,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         __syncthreads();
         if (chunk + 2 < chunks) {
             load_stage<DV>(sm.stage[chunk & 1], args, qk_workspace, control_workspace, head,
-                           value_start, chunk + 2, tid);
+                           value_start, chunk + 2, tid, low_stage(chunk & 1), qk_low_workspace);
         }
     }
 #pragma unroll
@@ -487,23 +634,25 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     }
 }
 
-template <int DV, bool Fp16>
-void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
+template <int DV, bool Fp16, bool Compensated>
+void launch(const Arguments& args, const QkChunk* qk, const QkChunk* qk_low, const ControlChunk* control,
             cudaStream_t stream) {
-    constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Fp16>,
+    using Shared               = std::conditional_t<Compensated, CompensatedRecurrenceShared<DV>, RecurrenceShared<DV>>;
+    constexpr int shared_bytes = sizeof(Shared);
+    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Fp16, Compensated>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-    chunk_recurrence_kernel<DV, Fp16>
-        <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
+    chunk_recurrence_kernel<DV, Fp16, Compensated>
+        <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk, qk_low,
                                                                                     control);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <int DV>
-void dispatch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
-              cudaStream_t stream, bool fp16) {
-    if (fp16) return launch<DV, true>(args, qk, control, stream);
-    return launch<DV, false>(args, qk, control, stream);
+void dispatch(const Arguments& args, const QkChunk* qk, const QkChunk* qk_low, const ControlChunk* control,
+              cudaStream_t stream, GdnChunkArithmetic arithmetic) {
+    if (arithmetic == GdnChunkArithmetic::Fp16Accumulate) return launch<DV, true, false>(args, qk, qk_low, control, stream);
+    if (arithmetic == GdnChunkArithmetic::Compensated) return launch<DV, false, true>(args, qk, qk_low, control, stream);
+    return launch<DV, false, false>(args, qk, qk_low, control, stream);
 }
 
 } // namespace
@@ -532,17 +681,17 @@ int value_tile(int value_heads, int multiprocessor_count) {
     return best;
 }
 
-void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
-                       DeviceExecutionView execution, bool fp16) {
+void launch_recurrence(const Arguments& args, const QkChunk* qk, const QkChunk* qk_low, const ControlChunk* control,
+                       DeviceExecutionView execution, GdnChunkArithmetic arithmetic) {
     switch (value_tile(args.value_heads, execution.multiprocessor_count)) {
     case 64:
-        return dispatch<64>(args, qk, control, execution.stream, fp16);
+        return dispatch<64>(args, qk, qk_low, control, execution.stream, arithmetic);
     case 32:
-        return dispatch<32>(args, qk, control, execution.stream, fp16);
+        return dispatch<32>(args, qk, qk_low, control, execution.stream, arithmetic);
     case 16:
-        return dispatch<16>(args, qk, control, execution.stream, fp16);
+        return dispatch<16>(args, qk, qk_low, control, execution.stream, arithmetic);
     default:
-        return dispatch<8>(args, qk, control, execution.stream, fp16);
+        return dispatch<8>(args, qk, qk_low, control, execution.stream, arithmetic);
     }
 }
 

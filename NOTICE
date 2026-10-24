@@ -27,8 +27,9 @@ Modifications made in this product (summary; see README.md for details):
   drafter routes and the recurrent GDN prefill at every width, so prefill
   splits, decode and verification give a position the same bits; prefix-cache
   resumes, taps and endpoints then run at any position without the
-  free-cache-resume path. Recipe C's fast route runs the recurrent GDN prefill
-  as well.
+  free-cache-resume path. Recipe C's fast route runs the compensated chunked
+  GDN prefill (gdn-compensated: every chunk product of high/low operand pairs,
+  the recurrent arithmetic's error order at chunked speed).
 - Batched DFlash2 drafting at any round size with an online cost fit.
 - Linux VRAM spill detection fix (no WDDM budget).
 

@@ -1,8 +1,8 @@
 # T1 golden hashes (infernix_qwen4_exp_round_bench --record): logits and lane state after one round.
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 1x1 context=1024 kv=fp8 experts=64 fast accept=1 = 57a3cf6826613615 0df5835f441b796c
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 1x4 context=1024 kv=fp8 experts=64 fast accept=4 = bb799b85628145d9 ba48ad20b98bdc2b
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 1x1 context=1024 kv=fp8 experts=64 fast accept=1 = 9844c542622e5915 89556f43b8d717d8
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 1x4 context=1024 kv=fp8 experts=64 fast accept=4 = bb02e29cfacd096b dfa47f75966efe92
 Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x1 context=1024 kv=fp8 experts=64 exact accept=1 = 76c82abc088f3952 e722e366a1f27f37
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x1 context=1024 kv=fp8 experts=64 fast accept=1 = 7543e98eab3a80a2 c00f5f0953bc060b
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x1 context=1024 kv=fp8 experts=64 fast accept=1 = dee9fa8f9576afcd a4f166daf5961d23
 Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2 context=1024 kv=fp8 experts=64 exact accept=2 = 9995cc291206e4ea 88a6e9704d9aec8c
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2 context=1024 kv=fp8 experts=64 fast accept=2 = 912eeae007ee7d9b da953340cd61af24
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x3 context=1024 kv=fp8 experts=64 fast accept=3 = 49777d4b1a8600bc 659f7c58869f25c4
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2 context=1024 kv=fp8 experts=64 fast accept=2 = 595f2bf41d4ee699 2dff418b8c277e7e
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x3 context=1024 kv=fp8 experts=64 fast accept=3 = 5c1c37ef32808bb0 0536c653963dfdfe

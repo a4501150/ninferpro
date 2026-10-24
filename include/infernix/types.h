@@ -156,9 +156,16 @@ enum class FastPath : std::uint8_t {
     // (a narrower tail call stays exact), which prefix-cache resumes share between requests. Without
     // it every GGUF projection and expert is exact.
     GgmlBf16Prefill,
+    // Qwen3.8-Flash-Next where the exact route is construction-exact (its GDN prefill runs the
+    // recurrent arithmetic at every width): GDN calls of 16 or more tokens run the compensated chunked
+    // arithmetic (ops::GdnChunkArithmetic::Compensated: every chunk product of high/low operand pairs,
+    // the recurrent arithmetic's error order at about 2.5 times its speed on prefill). A prompt's
+    // arithmetic then depends on where its calls start, which prefix-cache resumes share between
+    // requests. Without it those calls stay recurrent.
+    GdnCompensated,
 };
 
-inline constexpr std::array<FastPath, 22> kFastPaths{
+inline constexpr std::array<FastPath, 23> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -170,7 +177,7 @@ inline constexpr std::array<FastPath, 22> kFastPaths{
     FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
     FastPath::AdaptiveMtp,         FastPath::FreeCacheResume,
     FastPath::Preemption,          FastPath::IdleWidePrefill,
-    FastPath::GgmlBf16Prefill};
+    FastPath::GgmlBf16Prefill,     FastPath::GdnCompensated};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -196,6 +203,7 @@ inline constexpr std::array<FastPath, 22> kFastPaths{
     case FastPath::SampledMtpDrafts: return "sampled-mtp-drafts";
     case FastPath::GdnF16Accumulate: return "gdn-f16-accumulate";
     case FastPath::GgmlBf16Prefill: return "ggml-bf16-prefill";
+    case FastPath::GdnCompensated: return "gdn-compensated";
     }
     return "unknown";
 }
