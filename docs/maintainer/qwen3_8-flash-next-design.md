@@ -3563,6 +3563,23 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   item's 23 KB through shared memory (two CTAs per SM; 234 against 210 us at T = 12); three and four
   CTAs per SM with a quad per lane (spills: 49 and 60 us at T = 1). `L1::no_allocate` code loads in
   `fp8_a16_gemv_kernel` changed no T1 time (5.49 ms at 1x1 both ways) and were not kept.
+- **Hyper-connection mix: m formed once (2026-10-24, RTX PRO 6000, this fork).** A T1 kernel
+  profile with GPU metrics put the two fused HC kernels at 1.99 ms of the 6 x 2 round (15-29 % of
+  DRAM bandwidth) and 0.83 ms of 1 x 1. Each runs one 226-255-register CTA per SM, so per column
+  the down chain costs ~0.6 us and the up chain ~0.4 us of latency-bound issue (nsys chains at T 12:
+  down 10.2 us, up 8.6 us). A timing-only probe without K1b v4's z phase saved 3.3 us per call at T 12:
+  every one of its 160 CTAs read all S x down_rows x T partials and evaluated down_rows x T sigmoids.
+  K1a v4's four stream CTAs of a row block now form a cluster (`__cluster_dims__(1, 4, 1)`), and
+  stream 0's CTA sums their row sums from distributed shared memory in K1b's order and writes m and
+  the injects once; K1b v4 copies m and decodes its weights once instead of once per token group
+  (both exact). Bit-identical (bench hashes T 1-16, Q8 and BF16; hyper-connection and width-equality
+  tests; T1 and T1-exact). Per call, Q8: T 2-3 unchanged, T 4 / 8 / 12 / 16 10.6 / 14.3 / 19.0 / 23.2
+  -> 10.1 / 13.1 / 17.1 / 20.2 us; BF16 T 2-3 +0.6-0.8 us, T >= 4 faster. T1, same session, A/B
+  twice: 1 x 1 5.52 -> 5.50 ms, 6 x 1 10.63 -> 10.48, 1 x 4 8.61 -> 8.52, 6 x 2 15.93 -> 15.79, 6 x 3
+  21.71 -> 21.66 (18 columns take the composed route). Rejected, all bit-identical and slower:
+  columns split over the grid (more CTAs re-read weights and repeat the norm; T 12 20-34 us), two
+  warps per row in 512-thread CTAs (T 12 26.7 us), and `__launch_bounds__(256, 2)` so K1a and K1b
+  co-reside (at 128 registers the weights reload per pass; T 12 23-60 us).
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of

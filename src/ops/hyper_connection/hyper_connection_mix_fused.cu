@@ -28,6 +28,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -391,9 +392,15 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
 //     gather) = 448, and each m read feeds 8 rows instead of 4; m is staged in two planes; partials,
 //     inv and R are read through __ldg. The collapse runs after the token loop, one thread per
 //     (token, feature), from the row sums in shared memory, with K1b's own expressions in its order.
-//     The partials are read as float4s, every load of a batch issued before any is used, and the
-//     token groups are sized to the call (6 columns run 4 + 2, not 4 + 4 with two repeated):
+//     The token groups are sized to the call (6 columns run 4 + 2, not 4 + 4 with two repeated):
 //     RTX PRO 6000, Q8, per call -4 % (T 2) to -12 % (T 12).
+//   Since 2026-10-24 the v4 pair forms m once per call: K1a v4's four stream CTAs of a row block are a
+//     cluster, and stream 0's CTA sums their row sums from distributed shared memory in K1b's order
+//     and writes m and the injects. Every K1b CTA had formed all of m itself (S x down_rows x T
+//     partials through L2 and down_rows x T sigmoids per CTA); K1b v4 now copies m. K1b v4 also
+//     decodes its weight chunks once, not once per token group. RTX PRO 6000, Q8, per call T 2-3
+//     unchanged, T 4 / 8 / 12 / 16 10.6 / 14.3 / 19.0 / 23.2 -> 10.1 / 13.1 / 17.1 / 20.2 us (BF16
+//     weights: T 2-3 +0.6-0.8 us, T >= 4 -0.3 to -3.9 us).
 // Not adopted: v4's deferred RMS scale (Strata multiplies unscaled partials by inv in up, another
 // rounding) and its collapse (it rounds each sigmoid(u) Rn product before the stream sum, where
 // K1b's chain may fuse each product into the sum).
@@ -444,15 +451,20 @@ __device__ __forceinline__ void bf16x8_bits_to_floats(const uint4& bits, float (
 }
 
 // K1a with v4's staging (see above): one row of W_down per warp, 8 warps per CTA. Shared Rn:
-// [pass column][plane][kHidden / 2].
+// [pass column][plane][kHidden / 2]. The four stream CTAs of a row block form a cluster: each keeps
+// its row sums in shared memory, and stream 0's CTA forms K1b's z = 0 + p0 + p1 + p2 + p3 from them
+// and writes m = SiLU(z / S) (in K1b's plane layout, [T][2][rank / 2]) and the injects once for the
+// call, where every K1b CTA used to form them for itself.
 template <class Codec>
-__global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
+__global__ __cluster_dims__(1, kStreams, 1) __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
     const bf16* __restrict__ residual, const bf16* __restrict__ norm_weight, typename Codec::Params down, int rows,
-    int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out) {
+    int rank, int columns, float eps, float* __restrict__ m_out, float* __restrict__ inject,
+    float* __restrict__ inv_out) {
     constexpr int RowsPerWarp = 1;
     extern __shared__ __align__(16) float rn[]; // [kPassColumns][2][kHidden / 2]
     __shared__ float scratch[kDownThreads / 32][kPassColumns];
     __shared__ float inv[kPassColumns];
+    __shared__ float row_sums[kDownThreads / 32][kHcMixFusedMaxColumns]; // [row in block][column]
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
     const int s    = static_cast<int>(blockIdx.y);
     const int row0 = (static_cast<int>(blockIdx.x) * (kDownThreads / 32) + warp) * RowsPerWarp;
@@ -592,14 +604,39 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
             for (int c = 0; c < kPassColumns; ++c) {
                 if (c < pass) {
                     const float total = warp_sum(acc[r][c]);
-                    if (lane == 0 && row0 + r < rows) {
-                        partial[(static_cast<std::int64_t>(s) * rows + row0 + r) * columns + c0 + c] = total;
-                    }
+                    if (lane == 0) { row_sums[warp * RowsPerWarp + r][c0 + c] = total; }
                 }
             }
         }
         __syncthreads(); // the next pass overwrites rn
     }
+
+    // 4. Stream 0's CTA: K1b's z, m and injects for the block's rows, in its order and expressions.
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    cluster.sync();
+    if (cluster.block_rank() == 0) {
+        const float* sums[kStreams];
+#pragma unroll
+        for (int q = 0; q < kStreams; ++q) { sums[q] = cluster.map_shared_rank(&row_sums[0][0], q); }
+        const float inv_streams = 1.0F / static_cast<float>(kStreams);
+        const int half          = rank / 2;
+        for (int e = static_cast<int>(threadIdx.x); e < (kDownThreads / 32) * columns; e += kDownThreads) {
+            const int r = e / columns, t = e - r * columns;
+            const int k = static_cast<int>(blockIdx.x) * (kDownThreads / 32) + r;
+            if (k >= rows) { continue; }
+            float z = 0.0F;
+#pragma unroll
+            for (int q = 0; q < kStreams; ++q) { z += sums[q][r * kHcMixFusedMaxColumns + t]; }
+            const float v = z * inv_streams;
+            if (k < rank) {
+                m_out[t * rank + ((k >> 2) & 1) * half + (k >> 3) * 4 + (k & 3)] = v * sigmoidf(v);
+            } else if (inject != nullptr) {
+                inject[static_cast<std::int64_t>(t) * kStreams + (k - rank)] = 2.0F * sigmoidf(v);
+            }
+        }
+    }
+    cluster.sync(); // the other CTAs' row sums stay resident until stream 0 has read them
 }
 
 // K1b with v4's row map and transposed butterfly (see above).
@@ -608,12 +645,12 @@ constexpr int kUpV4Threads = kUpV4Warps * 32;
 constexpr int kUpV4Rows    = 8; // a warp's rows: features warp and warp + 8, 4 streams each
 constexpr int kUpTokens    = 4; // tokens per decoded weight chunk
 
-// K1b's dot products for Tokens tokens from t0: the warp's 8 rows in the lane-chunk order (each
-// chunk decoded once for the group), one transposed butterfly per token, and lane 4q stores row q's
-// sum. A token's products and sums do not depend on the group it shares.
-template <class Codec, int Tokens>
-__device__ __forceinline__ void hc_up_v4_tokens(const typename Codec::Chunk (&chunk)[kUpV4Rows][2], const float* m,
-                                                float* u, int t0, int rank, int lane, int warp) {
+// K1b's dot products for Tokens tokens from t0: the warp's 8 rows in the lane-chunk order (weights
+// decoded once per call), one transposed butterfly per token, and lane 4q stores row q's sum. A
+// token's products and sums do not depend on the group it shares.
+template <int Tokens>
+__device__ __forceinline__ void hc_up_v4_tokens(const float (&wq)[kUpV4Rows][2][8], const float* m, float* u, int t0,
+                                                int rank, int lane, int warp) {
     const int chunks = rank / 8;
     float acc[Tokens][kUpV4Rows];
 #pragma unroll
@@ -634,8 +671,7 @@ __device__ __forceinline__ void hc_up_v4_tokens(const typename Codec::Chunk (&ch
             }
 #pragma unroll
             for (int q = 0; q < kUpV4Rows; ++q) {
-                float wv[8];
-                Codec::decode(chunk[q][h], wv);
+                const float (&wv)[8] = wq[q][h];
 #pragma unroll
                 for (int t = 0; t < Tokens; ++t) {
                     acc[t][q] = fmaf(wv[0], a[t].x, acc[t][q]);
@@ -662,9 +698,8 @@ __device__ __forceinline__ void hc_up_v4_tokens(const typename Codec::Chunk (&ch
 
 template <class Codec>
 __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
-    const bf16* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
-    float* __restrict__ inject, bf16* __restrict__ x) {
+    const float* __restrict__ m_in, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
+    const bf16* __restrict__ norm_weight, typename Codec::Params up, int rank, int columns, bf16* __restrict__ x) {
     static_assert(kUpFeatures == 2 * kUpV4Warps && kUpV4Rows == 2 * kStreams);
     static_assert(kUpFeatures * kHcMixFusedMaxColumns <= kUpV4Threads);
     __shared__ __align__(16) float m[kHcMixFusedMaxColumns * kMaxRank];    // [T][2][rank / 2]
@@ -689,6 +724,14 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
             chunk[q][h] = c < chunks ? Codec::load(up, row, c * 8) : typename Codec::Chunk{};
         }
     }
+    // Decoded once: a weight is code * scale, exact in FP32, so these are the values every token
+    // group used to decode for itself.
+    float wq[kUpV4Rows][2][8];
+#pragma unroll
+    for (int q = 0; q < kUpV4Rows; ++q) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) { Codec::decode(chunk[q][h], wq[q][h]); }
+    }
     // The collapse thread of (token te, feature de) and its norm weights (1 + w).
     const int fe = tid % kUpFeatures, te = tid / kUpFeatures;
     const int de = d0 + fe;
@@ -709,48 +752,12 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
                          : 0.0F;
     }
 
-    // 2. z = sum_s partial[s] in order s = 0..S-1; m = SiLU(z / S) into plane (k / 4) % 2 at
-    // 4 (k / 8) + k % 4; CTA 0 writes the injects. A stream's partials are down_rows * columns
-    // contiguous floats (a multiple of 4: down_rows is rank or rank + S), read as float4s, and a
-    // thread issues every load of a batch before any is used.
+    // 2. m, formed once by the down CTAs (K1b's z and SiLU, its plane layout).
     const float inv_streams = 1.0F / static_cast<float>(kStreams);
-    const int half          = rank / 2;
-    const int quads         = down_rows * columns / 4;
-    const auto* partial4    = reinterpret_cast<const float4*>(partial);
-    constexpr int kZBatch   = 2;
-#pragma unroll 1
-    for (int j0 = tid; j0 < quads; j0 += kZBatch * kUpV4Threads) {
-        float4 p[kZBatch][kStreams];
-#pragma unroll
-        for (int b = 0; b < kZBatch; ++b) {
-            const int j = j0 + b * kUpV4Threads;
-#pragma unroll
-            for (int s = 0; s < kStreams; ++s) {
-                p[b][s] = j < quads ? __ldg(partial4 + static_cast<std::int64_t>(s) * quads + j)
-                                    : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-            }
-        }
-#pragma unroll
-        for (int b = 0; b < kZBatch; ++b) {
-            const int j = j0 + b * kUpV4Threads;
-            if (j < quads) {
-#pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const int i = 4 * j + e, k = i / columns, t = i - k * columns;
-                    float z     = 0.0F;
-#pragma unroll
-                    for (int s = 0; s < kStreams; ++s) {
-                        z += e == 0 ? p[b][s].x : e == 1 ? p[b][s].y : e == 2 ? p[b][s].z : p[b][s].w;
-                    }
-                    const float v = z * inv_streams;
-                    if (k < rank) {
-                        m[t * rank + ((k >> 2) & 1) * half + (k >> 3) * 4 + (k & 3)] = v * sigmoidf(v);
-                    } else if (inject != nullptr && blockIdx.x == 0) {
-                        inject[static_cast<std::int64_t>(t) * kStreams + (k - rank)] = 2.0F * sigmoidf(v);
-                    }
-                }
-            }
-        }
+    {
+        const auto* m4 = reinterpret_cast<const float4*>(m_in);
+        auto* ms       = reinterpret_cast<float4*>(m);
+        for (int i = tid; i < columns * rank / 4; i += kUpV4Threads) { ms[i] = __ldg(m4 + i); }
     }
     for (int i = tid; i < kStreams * columns; i += kUpV4Threads) { inv[i] = __ldg(inv_in + i); }
     __syncthreads();
@@ -759,11 +766,11 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     // tokens computed as one.
     int t0 = 0;
 #pragma unroll 1
-    for (; t0 + kUpTokens <= columns; t0 += kUpTokens) { hc_up_v4_tokens<Codec, kUpTokens>(chunk, m, u, t0, rank, lane, warp); }
+    for (; t0 + kUpTokens <= columns; t0 += kUpTokens) { hc_up_v4_tokens<kUpTokens>(wq, m, u, t0, rank, lane, warp); }
     switch (columns - t0) {
-    case 3: hc_up_v4_tokens<Codec, 3>(chunk, m, u, t0, rank, lane, warp); break;
-    case 2: hc_up_v4_tokens<Codec, 2>(chunk, m, u, t0, rank, lane, warp); break;
-    case 1: hc_up_v4_tokens<Codec, 1>(chunk, m, u, t0, rank, lane, warp); break;
+    case 3: hc_up_v4_tokens<3>(wq, m, u, t0, rank, lane, warp); break;
+    case 2: hc_up_v4_tokens<2>(wq, m, u, t0, rank, lane, warp); break;
+    case 1: hc_up_v4_tokens<1>(wq, m, u, t0, rank, lane, warp); break;
     default: break;
     }
     __syncthreads();
@@ -801,7 +808,8 @@ Bf16Codec::Params bf16_params(const Weight& w) { return {static_cast<const bf16*
 // Launches hc_down_partials_v4_kernel in K1a's place.
 template <class Codec>
 void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename Codec::Params down, int down_rows,
-                    int streams, float eps, float* partial, float* inv, std::size_t rn_bytes, cudaStream_t stream) {
+                    int rank, int streams, float eps, float* m, float* inject, float* inv, std::size_t rn_bytes,
+                    cudaStream_t stream) {
     static const bool configured = [] {
         const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_v4_kernel<Codec>,
                                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -816,7 +824,7 @@ void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename 
                                        rn_bytes, stream},
                                       hc_down_partials_v4_kernel<Codec>,
                                       static_cast<const bf16*>(residual.data), static_cast<const bf16*>(norm_weight.data),
-                                      down, down_rows, residual.ne[1], eps, partial, inv),
+                                      down, down_rows, rank, residual.ne[1], eps, m, inject, inv),
                  "down partials v4");
 }
 
@@ -848,7 +856,9 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     // 16-byte vectors.
     const bool v4 = columns >= 2 && reinterpret_cast<std::uintptr_t>(norm_weight.data) % 16 == 0;
     if (v4) {
-        launch_down_v4<Codec>(residual, norm_weight, down, down_rows, streams, eps, partial, inv, rn_bytes, stream);
+        // The partial workspace holds m (T x rank floats, fewer than S x down_rows x T).
+        launch_down_v4<Codec>(residual, norm_weight, down, down_rows, rank, streams, eps, partial,
+                              inject != nullptr ? static_cast<float*>(inject->data) : nullptr, inv, rn_bytes, stream);
     } else {
         check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams), dim3(kDownThreads),
                                            rn_bytes, stream},
@@ -861,8 +871,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
         check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpV4Threads), 0, stream},
                                           hc_up_collapse_v4_kernel<Codec>, static_cast<const float*>(partial),
                                           static_cast<const float*>(inv), static_cast<const bf16*>(residual.data),
-                                          static_cast<const bf16*>(norm_weight.data), up, rank, down_rows, columns,
-                                          inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
+                                          static_cast<const bf16*>(norm_weight.data), up, rank, columns,
                                           static_cast<bf16*>(x.data)),
                      "up collapse v4");
         return;
