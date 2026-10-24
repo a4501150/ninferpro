@@ -8,6 +8,7 @@
 //       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --head-equality [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --split-equality [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
 //
@@ -497,6 +498,196 @@ bool check_head_equality(const q4::execution::Parameters& parameters, DeviceCont
     return ok;
 }
 
+// Forward-level decomposition equality on the real artifact through the exact route: the same
+// prompt prefilled as one call against calls split at an off-grid point (1003), at 16-aligned
+// points (1024; the production tail tap (n-1)/16*16), and against prefill followed by decode of
+// the last tokens. Compares the final logits and, per layer, the residual and the block
+// inputs/outputs (mixer in / mixer out / MoE in / MoE out) column by column, and reports the
+// first divergent layer and which sub-block diverges. Sizes the width-coupling campaign: which
+// exact-route kernels make a resumed span's bits depend on the call decomposition.
+bool check_split_equality(const q4::execution::Parameters& parameters, DeviceContext& device,
+                          const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
+                          std::int32_t context, KvCacheStorage kv) {
+    const auto& c = parameters.model.config().text;
+    const auto n  = static_cast<std::int32_t>(tokens.size());
+    if (n < 1044) { throw std::invalid_argument("--split-equality needs at least 1044 tokens"); }
+    const auto V = static_cast<std::int32_t>(c.vocab_size);
+    const auto W = static_cast<std::int32_t>(c.residual_width());
+    const auto H = static_cast<std::int32_t>(c.hidden_size);
+    const auto K = static_cast<std::int32_t>(c.moe.top_k);
+    const auto blocks = static_cast<std::size_t>(c.num_hidden_layers);
+    const std::int32_t tail = (n - 1) / 16 * 16;  // the production tail tap's 16-aligned position
+    Harness harness(parameters, device, context, n, 8, kv);
+    DeviceBuffer logits_buf(static_cast<std::size_t>(V) * 4);
+
+    // One tap set, reused per run: [blocks] residual [W, n], [blocks] route [K, n],
+    // [blocks][4] block io [H, n]. A call writes its own columns at offset 0 of each tensor.
+    const std::size_t residual_bytes = static_cast<std::size_t>(W) * n * 2;
+    const std::size_t route_bytes = static_cast<std::size_t>(K) * n * 4;
+    const std::size_t io_bytes = static_cast<std::size_t>(H) * n * 2;
+    DeviceBuffer taps(blocks * (residual_bytes + route_bytes + 4 * io_bytes));
+    std::vector<Tensor> residual_taps, route_taps;
+    std::vector<Tensor> io_taps[4];
+    auto* base = static_cast<std::byte*>(taps.p);
+    const std::size_t io_offset = blocks * (residual_bytes + route_bytes);
+    for (std::size_t b = 0; b < blocks; ++b) {
+        residual_taps.emplace_back(base + b * residual_bytes, DType::BF16,
+                                   std::initializer_list<std::int32_t>{W, n});
+        route_taps.emplace_back(base + blocks * residual_bytes + b * route_bytes, DType::I32,
+                                std::initializer_list<std::int32_t>{K, n});
+        for (std::size_t kind = 0; kind < 4; ++kind) {
+            io_taps[kind].emplace_back(base + io_offset + (b * 4 + kind) * io_bytes, DType::BF16,
+                                       std::initializer_list<std::int32_t>{H, n});
+        }
+    }
+    q4::execution::ForwardTap tap{&residual_taps, &route_taps, &io_taps[0], &io_taps[1], &io_taps[2], &io_taps[3]};
+
+    // A spec's accumulated taps: every column's residual, routes and block io, by absolute
+    // column, plus the final call's logits.
+    struct SplitRun {
+        std::vector<std::vector<std::uint16_t>> residual;  // [blocks][W*n]
+        std::vector<std::vector<std::int32_t>> route;      // [blocks][K*n]
+        std::vector<std::array<std::vector<std::uint16_t>, 4>> io;  // [blocks][4][H*n]
+        std::vector<float> logits;
+    };
+    const auto run_spec = [&](std::int32_t slot, const std::vector<std::pair<std::int32_t, std::int32_t>>& calls) {
+        SplitRun out;
+        out.residual.assign(blocks, std::vector<std::uint16_t>(static_cast<std::size_t>(W) * n));
+        out.route.assign(blocks, std::vector<std::int32_t>(static_cast<std::size_t>(K) * n));
+        out.io.assign(blocks, {});
+        for (std::size_t b = 0; b < blocks; ++b) {
+            for (std::size_t kind = 0; kind < 4; ++kind) {
+                out.io[b][kind].resize(static_cast<std::size_t>(H) * n);
+            }
+        }
+        for (const auto& [begin, end] : calls) {
+            auto call = make_call(c, volume, {tokens}, begin, end - begin, {slot}, {slot});
+            Tensor out_logits(logits_buf.p, DType::FP32, {V, 1});
+            harness.forward->run(call.batch, out_logits, &tap);
+            device.synchronize();
+            const auto width = end - begin;
+            const std::size_t rc = static_cast<std::size_t>(W) * width, kc = static_cast<std::size_t>(K) * width,
+                            ic = static_cast<std::size_t>(H) * width;
+            std::vector<std::uint16_t> host_r(rc), host_i(ic);
+            std::vector<std::int32_t> host_k(kc);
+            for (std::size_t b = 0; b < blocks; ++b) {
+                cudaMemcpyAsync(host_r.data(), residual_taps[b].data, rc * 2, cudaMemcpyDeviceToHost, device.stream);
+                cudaMemcpyAsync(host_k.data(), route_taps[b].data, kc * 4, cudaMemcpyDeviceToHost, device.stream);
+                cudaStreamSynchronize(device.stream);
+                std::copy(host_r.begin(), host_r.end(),
+                          out.residual[b].begin() + static_cast<std::ptrdiff_t>(begin) * W);
+                std::copy(host_k.begin(), host_k.end(), out.route[b].begin() + static_cast<std::ptrdiff_t>(begin) * K);
+                for (std::size_t kind = 0; kind < 4; ++kind) {
+                    cudaMemcpyAsync(host_i.data(), io_taps[kind][b].data, ic * 2, cudaMemcpyDeviceToHost,
+                                   device.stream);
+                    cudaStreamSynchronize(device.stream);
+                    std::copy(host_i.begin(), host_i.end(),
+                              out.io[b][kind].begin() + static_cast<std::ptrdiff_t>(begin) * H);
+                }
+            }
+        }
+        out.logits = to_float(logits_buf, static_cast<std::size_t>(V));
+        return out;
+    };
+
+    struct Spec {
+        const char* name;
+        std::vector<std::pair<std::int32_t, std::int32_t>> calls;
+    };
+    const std::vector<Spec> specs = {
+        {"one-call (width n)", {{0, n}}},
+        {"grid split 1024 + 16-aligned tail", {{0, 1024}, {1024, tail}, {tail, n}}},
+        {"off-grid split 1003 + tail", {{0, 1003}, {1003, tail}, {tail, n}}},
+        {"grid split 1024, plain", {{0, 1024}, {1024, n}}},
+        {"grid splits 1024 + 1072 (a 48-wide middle call)", {{0, 1024}, {1024, 1072}, {1072, tail}, {tail, n}}},
+        {"grid splits 1024 + 1040 (a 16-wide middle call)", {{0, 1024}, {1024, 1040}, {1040, tail}, {tail, n}}},
+        {"production tail tap only", {{0, tail}, {tail, n}}},
+        {"prefill + 3 decode steps",
+         {{0, n - 3}, {n - 3, n - 2}, {n - 2, n - 1}, {n - 1, n}}},
+    };
+
+    // The reference decomposition: the one-call run in slot 0.
+    const SplitRun reference = run_spec(0, specs.front().calls);
+    bool all_equal = true;
+    for (std::size_t s = 1; s < specs.size(); ++s) {
+        const Spec& spec = specs[s];
+        std::printf("-- %s\n", spec.name);
+        const SplitRun got = run_spec(static_cast<std::int32_t>(s), spec.calls);
+        // Final logits.
+        {
+            std::size_t differ = 0;
+            double max_abs = 0;
+            std::size_t first = 0;
+            for (std::size_t v = 0; v < reference.logits.size(); ++v) {
+                if (std::memcmp(&reference.logits[v], &got.logits[v], 4) != 0) {
+                    if (differ == 0) { first = v; }
+                    ++differ;
+                    max_abs = std::max(max_abs, std::abs(double(reference.logits[v]) - double(got.logits[v])));
+                }
+            }
+            std::printf("   final logits: %s (%zu of %d rows differ, max_abs %.3e%s)\n",
+                        differ == 0 ? "byte-equal" : "DIFFER", differ, V, max_abs,
+                        differ == 0 ? "" : ("; first row " + std::to_string(first)).c_str());
+            all_equal = all_equal && differ == 0;
+        }
+        // The root divergence (residual taps): the first divergent column, then its first divergent
+        // layer (every earlier column and every earlier layer of this column are equal, so this is a
+        // cause, not a consequence), then the sub-block within the layer.
+        std::int32_t layer = -1, column = -1;
+        for (std::int32_t col = 0; col < n && layer < 0; ++col) {
+            for (std::size_t b = 0; b < blocks; ++b) {
+                const std::uint16_t* a = reference.residual[b].data() + static_cast<std::size_t>(col) * W;
+                const std::uint16_t* g = got.residual[b].data() + static_cast<std::size_t>(col) * W;
+                if (std::memcmp(a, g, static_cast<std::size_t>(W) * 2) != 0) {
+                    layer = static_cast<std::int32_t>(b);
+                    column = col;
+                    break;
+                }
+            }
+        }
+        if (layer < 0) {
+            std::printf("   residuals: byte-equal at every layer and column\n");
+            continue;
+        }
+        all_equal = false;
+        const bool gdn = c.layer_types[static_cast<std::size_t>(layer)] == q4::MixerKind::Gdn;
+        const bool ple = parameters.layers[static_cast<std::size_t>(layer)].ple.has_value();
+        std::printf("   first divergent layer %d (%s%s), column %d (of n=%d)\n", layer,
+                    gdn ? "GDN" : "QSA attention", ple ? ", PLE" : "", column, n);
+        const auto io_diffs = [&](std::size_t kind) {
+            const std::uint16_t* a = reference.io[layer][kind].data() + static_cast<std::size_t>(column) * H;
+            const std::uint16_t* g = got.io[layer][kind].data() + static_cast<std::size_t>(column) * H;
+            return std::memcmp(a, g, static_cast<std::size_t>(H) * 2) != 0;
+        };
+        const char* block = "hyper-connection inject";
+        if (io_diffs(0)) {
+            block = ple ? "PLE (gate/conv) or attention hc-mix" : "attention hc-mix (Q8 down/up + norm)";
+        } else if (io_diffs(1)) {
+            block = gdn ? "GDN mixer (projection/conv/recurrence/norm/output)" : "QSA attention mixer";
+        } else if (io_diffs(2)) {
+            block = "mlp hc-mix (Q8 down/up + norm)";
+        } else if (io_diffs(3)) {
+            const std::int32_t* ra = reference.route[layer].data() + static_cast<std::size_t>(column) * K;
+            const std::int32_t* rg = got.route[layer].data() + static_cast<std::size_t>(column) * K;
+            block = std::memcmp(ra, rg, static_cast<std::size_t>(K) * 4) != 0
+                        ? "MoE (routing flipped: expert choice differs)"
+                        : "MoE (experts/combine arithmetic; routing identical)";
+        }
+        std::printf("   first divergent sub-block: %s\n", block);
+        // How many columns of the final layer's residual differ.
+        std::int32_t differing_columns = 0;
+        for (std::int32_t col = 0; col < n; ++col) {
+            const std::uint16_t* a = reference.residual[blocks - 1].data() + static_cast<std::size_t>(col) * W;
+            const std::uint16_t* g = got.residual[blocks - 1].data() + static_cast<std::size_t>(col) * W;
+            differing_columns += std::memcmp(a, g, static_cast<std::size_t>(W) * 2) != 0;
+        }
+        std::printf("   final layer: %d of %d columns differ\n", differing_columns, n);
+    }
+    std::printf(all_equal ? "split-equality: every decomposition byte-equal\n"
+                          : "split-equality: decompositions diverge (see above)\n");
+    return all_equal;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -512,8 +703,9 @@ int main(int argc, char** argv) {
         std::int32_t chunk     = 256;
         std::int32_t dump_from = 0;
         KvCacheStorage kv      = KvCacheStorage::BFloat16;
-        bool cpu_columns   = false;
-        bool head_equality = false;
+        bool cpu_columns    = false;
+        bool head_equality  = false;
+        bool split_equality = false;
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
@@ -539,6 +731,11 @@ int main(int argc, char** argv) {
             if (arg == "--head-equality") {
                 if (jobs.empty()) { throw std::invalid_argument("--head-equality needs a token list before it"); }
                 jobs.back().head_equality = true;
+                continue;
+            }
+            if (arg == "--split-equality") {
+                if (jobs.empty()) { throw std::invalid_argument("--split-equality needs a token list before it"); }
+                jobs.back().split_equality = true;
                 continue;
             }
             if (jobs.empty() || i + 1 >= argc) { throw std::invalid_argument(arg + " needs a token list before it and a value"); }
@@ -684,6 +881,9 @@ int main(int argc, char** argv) {
         }
         if (job.head_equality) {
             return check_head_equality(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
+        }
+        if (job.split_equality) {
+            return check_split_equality(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
         }
         Harness harness(parameters, device, context, n, 3, job.kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));

@@ -43,6 +43,12 @@ struct FastPathConfiguration {
 // Whether the path passed the acceptance gate in this configuration (the registry, section 6.7).
 [[nodiscard]] bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration);
 
+// Whether the configuration's exact route is construction-exact (the registry,
+// docs/maintainer/model-quality.md section 6.8): every kernel it runs takes its column-invariant route
+// (ForwardFastPaths::column_invariant, the recurrent GDN prefill), so a request's bits do not depend
+// on how its prompt and output are split into prefill calls, decode steps and verifications.
+[[nodiscard]] bool construction_exact(const FastPathConfiguration& configuration);
+
 struct FastPathSelection {
     FastPathConfiguration configuration;
     // In kFastPaths order.
@@ -55,6 +61,10 @@ struct FastPathSelection {
     // expert-a4-residual, fp8-a8-pair, ggml-bf16-prefill) is selected:
     // a request's output depends only on the request, the artifact, the options and the build.
     [[nodiscard]] bool request_invariant() const noexcept;
+    // The exact route (no path selected) in a construction-exact configuration: prefix-cache resumes,
+    // taps, sibling coalescing and endpoints at any position give the bits a cold run gives
+    // (ProgramOptions::free_cache_resume without the free-cache-resume path).
+    [[nodiscard]] bool construction_exact() const noexcept;
 };
 
 // The qualified paths that apply when options.fast_paths is set, plus every

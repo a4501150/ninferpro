@@ -41,6 +41,7 @@ enum class Mode {
     ChunkedOnly,
     ForceChunked,
     RecurrentOnly,
+    RecurrentArithmetic,
 };
 
 struct Options {
@@ -135,6 +136,8 @@ Options parse_options(int argc, char** argv) {
             set_mode(options, Mode::ForceChunked, "--force-chunked");
         } else if (arg == "--recurrent-only") {
             set_mode(options, Mode::RecurrentOnly, "--recurrent-only");
+        } else if (arg == "--recurrent-arithmetic") {
+            set_mode(options, Mode::RecurrentArithmetic, "--recurrent-arithmetic");
         } else if (arg == "--tokens") {
             options.tokens          = parse_integer("--tokens", take("--tokens"), 1);
             options.tokens_explicit = true;
@@ -198,6 +201,7 @@ void print_help(const char* program) {
         "  --chunked-only     forced chunked with pre-normalized BF16 inputs\n"
         "  --force-chunked    forced chunked with fused Q/K normalization\n"
         "  --recurrent-only   prefill recurrence with fused Q/K normalization\n"
+        "  --recurrent-arithmetic  public Op with GdnChunkArithmetic::Recurrent (staged recurrence)\n"
         "  --breakdown        also time prepare and recurrence/output separately\n"
         "\n"
         "Workload:\n"
@@ -528,8 +532,9 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
     const bool force_chunked =
         options.mode == Mode::ChunkedOnly || options.mode == Mode::ForceChunked;
     const bool force_recurrent = options.mode == Mode::RecurrentOnly;
-    const bool chunked =
-        force_chunked || (!force_recurrent && tokens >= chunked_detail::kMinTokens);
+    const bool recurrent_arithmetic = options.mode == Mode::RecurrentArithmetic;
+    const bool chunked = !recurrent_arithmetic &&
+                         (force_chunked || (!force_recurrent && tokens >= chunked_detail::kMinTokens));
     const Problem problem{options.qk_heads, options.value_heads, tokens};
     Operands operands(problem, !normalize);
     const std::size_t state_elements = std::size_t(state_dim) * state_dim * problem.value_heads;
@@ -544,7 +549,7 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
     std::size_t bytes = 0;
     if (force_chunked) {
         bytes = layout.total_bytes;
-    } else if (!force_recurrent) {
+    } else if (!force_recurrent && !recurrent_arithmetic) {
         bytes = ops::gated_delta_net_workspace_capacity_bytes(problem.qk_heads, problem.value_heads,
                                                               tokens, tokens);
     }
@@ -589,6 +594,9 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
         } else if (force_recurrent)
             gated_delta_net_detail::launch_recurrent_inout(
                 q, k, v, g, beta, gated_delta_net_scale(), normalize, si, so, out, stream);
+        else if (recurrent_arithmetic)
+            ops::gated_delta_net(q, k, v, g, beta, gated_delta_net_scale(), normalize, workspace, si, so, out,
+                                 {stream, execution.multiprocessor_count}, ops::GdnChunkArithmetic::Recurrent);
         else
             ops::gated_delta_net(q, k, v, g, beta, gated_delta_net_scale(), normalize, workspace,
                                  si, so, out, {stream, execution.multiprocessor_count});
@@ -604,6 +612,7 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
     };
     measure(force_chunked     ? "forced.chunked"
             : force_recurrent ? "forced.recurrent"
+            : recurrent_arithmetic ? "public.recurrent_arithmetic"
                               : "public.total",
             total_io, pipeline, running_logical_bytes(problem));
     if (options.breakdown && chunked) {

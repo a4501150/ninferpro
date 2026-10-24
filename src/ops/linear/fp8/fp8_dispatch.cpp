@@ -50,6 +50,11 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
     return std::max(single, pair);
 }
 
+bool fp8_column_invariant_supported(std::int32_t n, std::int32_t k) noexcept {
+    return std::any_of(kShapes.begin(), kShapes.end(),
+                       [&](const Fp8LinearShape* shape) { return shape->n == n && shape->k == k && shape->invariant != nullptr; });
+}
+
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   LinearRoutes routes, WorkspaceArena* workspace, cudaStream_t stream) {
     validate_fp8_weight(weight, "fp8 linear");

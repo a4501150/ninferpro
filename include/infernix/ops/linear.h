@@ -171,8 +171,10 @@ enum class LinearRoutes : std::uint8_t {
  * activation quantization to NVFP4 at every positive T. The selected route depends only on the
  * registered problem, T and `routes`. A16ColumnInvariant selects one A16 route per registered problem for
  * every T, so each column's result is independent of the call's other columns. NVFP4 and FP8
- * register it for their text problems and Q8 for the [248320, 5120] vocabulary head; the other
- * formats and problems reject it.
+ * register it for their text problems (FP8's Qwen3.8-Flash-Next problems through the tensor-core
+ * tiles at every T), Q8 for the [248320, 5120] vocabulary head and Qwen3.8-Flash-Next's
+ * hyper-connection and PLE problems (the MMA tiles at every T), and BF16 for Qwen3.8-Flash-Next's
+ * GDN a/b and QSA index projections (one sliced-K family); the other formats and problems reject it.
  *
  * @par Routes
  * Under LinearRoutes::Q8SlicedK, Q8 `[16384,2560]` and `[2560,6144]` (Qwen3.8-Flash-Next's GDN q/k/v/z
@@ -202,6 +204,13 @@ enum class LinearRoutes : std::uint8_t {
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             WorkspaceArena& workspace, cudaStream_t stream,
             LinearRoutes routes = LinearRoutes::Exact);
+
+/**
+ * Whether the registered problem `[output_rows, input_rows]` of `qtype` has an A16ColumnInvariant
+ * route (one route at every T whose column bits do not depend on the call's other columns).
+ */
+[[nodiscard]] bool linear_column_invariant_supported(QType qtype, std::int32_t output_rows,
+                                                     std::int32_t input_rows) noexcept;
 
 /**
  * @brief Applies the A16-only form of the bias-free matrix projection.

@@ -22,6 +22,12 @@ Modifications made in this product (summary; see README.md for details):
   repeat regenerates its first token from it with no prefill (value-gated:
   skipped within one tap separation of the deepest published frontier, so
   only spans whose opener demoted to the last inner boundary capture).
+- A construction-exact exact route for Qwen3.8-Flash-Next recipe C (INT8 and
+  FP8 KV): column-invariant dense, hyper-connection and QSA attention routes
+  and the recurrent GDN prefill at every width, so prefill splits, decode and
+  verification give a position the same bits; prefix-cache resumes, taps and
+  endpoints then run at any position without the free-cache-resume path.
+  Qwen3.8-Flash-Next's fast route runs the recurrent GDN prefill as well.
 - Batched DFlash2 drafting at any round size with an online cost fit.
 - Linux VRAM spill detection fix (no WDDM budget).
 

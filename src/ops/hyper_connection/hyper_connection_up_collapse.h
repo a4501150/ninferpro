@@ -16,9 +16,12 @@
 
 namespace infernix::ops::detail {
 
-// Whether the fused up + collapse serves this call: W_up Q8_G32_FP16 RowSplit [streams * hidden, rank],
-// 4 streams, hidden a multiple of 16, and more than 96 columns (narrower calls are as fast unfused).
-[[nodiscard]] bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_t streams,
+// Whether the fused up + collapse can run: W_up Q8_G32_FP16 RowSplit [streams * hidden, rank], 4 streams,
+// hidden a multiple of 16; any column count.
+[[nodiscard]] bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_t streams) noexcept;
+
+// Whether the fast route takes it: supported and more than 96 columns (narrower calls are as fast unfused).
+[[nodiscard]] bool hc_up_collapse_preferred(const Weight& up, std::int32_t hidden, std::int32_t streams,
                                             std::int32_t columns) noexcept;
 
 // x[d, t] = bf16((1/S) * sum_s sigmoid(bf16((W_up m)[s*H + d, t])) * normalized[s*H + d, t]), the sum in

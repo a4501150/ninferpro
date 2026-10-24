@@ -47,13 +47,16 @@ ops::offloaded_moe::ExpertActivation expert_activation(const TextConfig& c) {
 // `routes` carries the selected fast paths' linear route flags (ForwardFastPaths::dense_routes) to the
 // projections they serve; a problem without a route for a flag runs its exact route. A GGUF import's
 // projection runs the ggml route (ggml-bf16-prefill's BF16 tiles at prefill widths, else exact).
+// `invariant` (the exact route, ForwardFastPaths::column_invariant) runs a problem that registers one
+// on its A16ColumnInvariant route, so a column's bits do not depend on its call.
 void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s,
-             ops::LinearRoutes routes = ops::LinearRoutes::Exact) {
+             ops::LinearRoutes routes, bool invariant) {
     if (p.is_ggml()) {
         ops::ggml_linear(x, p.ggml, out, p.input_perm, p.perm_block, work, s, routes);
         return;
     }
-    ops::linear(x, p.weight, out, p.policy, work, s, routes);
+    const bool column = invariant && ops::linear_column_invariant_supported(p.weight.qtype, p.weight.n, p.weight.k);
+    ops::linear(x, p.weight, out, column ? ops::LinearPolicy::A16ColumnInvariant : p.policy, work, s, routes);
 }
 
 // Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly.
@@ -80,7 +83,7 @@ void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& log
 // The shared expert's SiLU(gate) * up: one fused call for Q8 weights (gate and up stay FP32); BF16
 // weights (recipe A) project, split and multiply.
 void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out, WorkspaceArena& work,
-                   cudaStream_t s, ops::LinearRoutes routes = ops::LinearRoutes::Exact) {
+                   cudaStream_t s, ops::LinearRoutes routes, bool invariant) {
     // Q8 (Dense8) at every width; BF16 (the bit-exact artifact) on its register-streamed route at decode
     // and verification widths, the tuned GEMM then SwiGLU beyond.
     if (gate_up.weight.qtype == QType::Q8_G32_FP16 ||
@@ -101,7 +104,7 @@ void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out
         return;
     }
     Tensor projected = work.alloc(DType::BF16, {2 * I, T});
-    project(x, gate_up, projected, work, s, routes);
+    project(x, gate_up, projected, work, s, routes, invariant);
     Tensor gate = work.alloc(DType::BF16, {I, T});
     Tensor up   = work.alloc(DType::BF16, {I, T});
     {
@@ -479,8 +482,14 @@ Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, 
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
     Tensor x = into != nullptr ? *into : work_.alloc(DType::BF16, {H, T});
-    ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank, config_.rms_norm_eps,
-                              x, p.combine ? inject : nullptr, work_, s);
+    // The exact route mixes with one arithmetic at every width (A16ColumnInvariant: the composed route
+    // on the projections' invariant routes), so a column's mix does not depend on its call.
+    const bool column = fast_.column_invariant &&
+                        ops::linear_column_invariant_supported(p.down.weight.qtype, p.down.weight.n, p.down.weight.k) &&
+                        ops::linear_column_invariant_supported(p.up.weight.qtype, p.up.weight.n, p.up.weight.k);
+    ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight,
+                              column ? ops::LinearPolicy::A16ColumnInvariant : p.down.policy, S, rank,
+                              config_.rms_norm_eps, x, p.combine ? inject : nullptr, work_, s);
     return x;
 }
 
@@ -515,7 +524,7 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
         }
     }
     Tensor kv = work_.alloc(DType::BF16, {W + H, T});
-    project(e, p.projection, kv, work_, s);
+    project(e, p.projection, kv, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
     Tensor key = work_.alloc(DType::BF16, {W, T});
     Tensor value = work_.alloc(DType::BF16, {H, T});
     Tensor* parts[] = {&key, &value};
@@ -560,7 +569,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
                z_rows = z.view({VW, 1, T});
         ops::gdn_input_proj_conv_snapshot(x_rows, p.projection.weight, p.convolution, layer.conv, batch.slots,
                                           batch.slots, q_rows, k_rows, v_rows, z_rows, dense_routes(), s);
-        project(x, p.control, ab, work_, s);
+        project(x, p.control, ab, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
     } else if (ggml && p.control.is_ggml() && p.control.input_perm == nullptr) {
         // A GGUF import's two projections of x in one call (one encoding of x), each part written to
         // its own tensor.
@@ -585,11 +594,11 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
             ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, dense_routes());
         } else {
             Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
-            project(x, p.projection, projected, work_, s, dense_routes());
+            project(x, p.projection, projected, work_, s, dense_routes(), fast_.column_invariant);
             Tensor* parts[] = {&qkv, &z};
             ops::split_rows(projected, parts, s);
         }
-        project(x, p.control, ab, work_, s);
+        project(x, p.control, ab, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
     }
     // Verification and prefill chunks evaluate the gates once for their recurrence; decode evaluates
     // them inside the recurrent update, except a GGUF import's (its third input holds A itself), whose
@@ -662,7 +671,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
                        g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,
                        config_.rms_norm_eps, normed, device_.execution_view().on_stream(s));
     Tensor y = work_.alloc(DType::BF16, {H, T});
-    project(normed.view({VW, T}), p.output, y, work_, s, dense_routes());
+    project(normed.view({VW, T}), p.output, y, work_, s, dense_routes(), fast_.column_invariant);
     return y;
 }
 
@@ -699,11 +708,11 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
                          dense_routes());
     } else {
         Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + (p.index_projection ? 0 : index_rows), T});
-        project(x, p.projection, projected, work_, s, dense_routes());
+        project(x, p.projection, projected, work_, s, dense_routes(), fast_.column_invariant);
         Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
         if (p.index_projection) {
             Tensor indexed = work_.alloc(DType::BF16, {index_rows, T});
-            project(x, *p.index_projection, indexed, work_, s);
+            project(x, *p.index_projection, indexed, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
             Tensor* parts[]       = {&qf, &gate, &kf, &vf};
             Tensor* index_parts[] = {&iqf, &ik};
             ops::split_rows(projected, parts, s);
@@ -784,12 +793,14 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     const DeviceSpan span     = work_.alloc_bytes(scratch);
     ops::qsa_attention(qn, iq, layer, qsa_batch, geometry,
                        static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), max_context_, span.data,
-                       span.bytes, out, s, vq ? &append : nullptr);
+                       span.bytes, out, s, vq ? &append : nullptr,
+                       fast_.column_invariant ? ops::QsaAttentionRoute::ColumnInvariant
+                                              : ops::QsaAttentionRoute::ByWidth);
     // Output gate: out * sigmoid(gate), then o_proj.
     Tensor gated = out.view({QW, T});
     ops::sigmoid_mul(gate, gated, s);
     Tensor y = work_.alloc(DType::BF16, {H, T});
-    project(gated, p.output, y, work_, s, dense_routes());
+    project(gated, p.output, y, work_, s, dense_routes(), fast_.column_invariant);
     return y;
 }
 
@@ -829,8 +840,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     if (side) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
         CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
-        shared_swiglu(x, p.shared_gate_up, product, work_, experts_.shared_stream, dense_routes());
-        project(product, p.shared_down, shared, work_, experts_.shared_stream, dense_routes());
+        shared_swiglu(x, p.shared_gate_up, product, work_, experts_.shared_stream, dense_routes(), fast_.column_invariant);
+        project(product, p.shared_down, shared, work_, experts_.shared_stream, dense_routes(), fast_.column_invariant);
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], experts_.shared_stream));
     }
     const Tensor* rows[] = {&p.router, &p.shared_score};
@@ -1041,8 +1052,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned);
     if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
     if (!side) {
-        shared_swiglu(x, p.shared_gate_up, product, work_, s, dense_routes());
-        project(product, p.shared_down, shared, work_, s, dense_routes());
+        shared_swiglu(x, p.shared_gate_up, product, work_, s, dense_routes(), fast_.column_invariant);
+        project(product, p.shared_down, shared, work_, s, dense_routes(), fast_.column_invariant);
     }
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
     if (side) { CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[1], 0)); }
@@ -1090,13 +1101,13 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         Tensor e = work_.alloc(DType::BF16, {H, T});
         ops::rmsnorm(x0, p.embedding_norm, config_.rms_norm_eps, true, e, s);
         Tensor ep = work_.alloc(DType::BF16, {H, T});
-        project(e, p.embedding_projection, ep, work_, s);
+        project(e, p.embedding_projection, ep, work_, s, ops::LinearRoutes::Exact, false);
         Tensor hn = work_.alloc(DType::BF16, {W, T});
         ops::rmsnorm(rows, p.hidden_norm, config_.rms_norm_eps, true, hn, s);
         Tensor residual = work_.alloc(DType::BF16, {W, T});
         {
             Tensor per_stream = residual.view({H, S * T});
-            project(hn.view({H, S * T}), p.hidden_projection, per_stream, work_, s);
+            project(hn.view({H, S * T}), p.hidden_projection, per_stream, work_, s, ops::LinearRoutes::Exact, false);
         }
         ops::hyper_connection_inject(ep, state_.mtp_ones.slice(1, 0, T), residual, s);
 
@@ -1134,9 +1145,9 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
                                   expert_ws.bytes, outputs, s);
         const std::int32_t SI = dim(m.shared_intermediate);
         Tensor product = work_.alloc(DType::BF16, {SI, T});
-        shared_swiglu(xm, p.shared_gate_up, product, work_, s);
+        shared_swiglu(xm, p.shared_gate_up, product, work_, s, ops::LinearRoutes::Exact, false);
         Tensor shared = work_.alloc(DType::BF16, {H, T});
-        project(product, p.shared_down, shared, work_, s);
+        project(product, p.shared_down, shared, work_, s, ops::LinearRoutes::Exact, false);
         ops::moe_combine_inject(outputs, routing, shared, inject, residual, s);
         CUDA_CHECK(cudaMemcpyAsync(call.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
 

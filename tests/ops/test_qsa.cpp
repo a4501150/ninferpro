@@ -1252,6 +1252,44 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
         expect(same, tag + ": the last row alone equals its columns of the batched call bit for bit");
     }
 
+    // The column-invariant route (against the oracle below), and every column bit for bit the column computed
+    // alone (one sequence, width 1), so decode, verification and prefill of a position agree.
+    DeviceBuffer dinv(static_cast<std::size_t>(kD) * kHeads * columns * 2);
+    std::vector<double> inv;
+    {
+        Tensor inv_out(dinv.p, DType::BF16, {kD, kHeads, columns});
+        ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
+                           Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), layer, batch, kGeometry,
+                           1.0F / 16.0F, max_context, workspace.p, workspace_bytes, inv_out, nullptr, nullptr,
+                           ops::QsaAttentionRoute::ColumnInvariant);
+        synchronize("attention (column-invariant)");
+        inv = t::from_device_bf16(dinv, static_cast<std::size_t>(kD) * kHeads * columns);
+        const std::size_t column_elems = static_cast<std::size_t>(kD) * kHeads;
+        DeviceBuffer done(column_elems * 2);
+        Tensor one_out(done.p, DType::BF16, {kD, kHeads, 1});
+        bool same = true;
+        for (int col = 0; col < columns && same; ++col) {
+            const int r = col / width;
+            const ops::QsaBatch alone{.block_tables = Tensor(dtables.p, DType::I32, {pages_per_row, rows}),
+                                      .table_rows   = Tensor(static_cast<std::int32_t*>(drows.p) + r, DType::I32, {1}),
+                                      .positions  = Tensor(static_cast<std::int32_t*>(dpos.p) + col, DType::I32, {1}),
+                                      .tail_slots = Tensor(static_cast<std::int32_t*>(dslots.p) + r, DType::I32, {1}),
+                                      .batch      = 1,
+                                      .width      = 1};
+            ops::qsa_attention(
+                Tensor(static_cast<std::uint16_t*>(dq.p) + static_cast<std::size_t>(col) * column_elems, DType::BF16,
+                       {kD, kHeads, 1}),
+                Tensor(static_cast<std::uint16_t*>(diq.p) + static_cast<std::size_t>(col) * kDi * kIndexHeads,
+                       DType::BF16, {kDi, kIndexHeads, 1}),
+                layer, alone, kGeometry, 1.0F / 16.0F, max_context, workspace.p, workspace_bytes, one_out, nullptr,
+                nullptr, ops::QsaAttentionRoute::ColumnInvariant);
+            synchronize("attention (column-invariant, one column)");
+            const auto part = t::from_device_bf16(done, column_elems);
+            same = std::equal(part.begin(), part.end(), inv.begin() + static_cast<std::ptrdiff_t>(col) * column_elems);
+        }
+        expect(same, tag + ": column-invariant route: every column equals the column alone bit for bit");
+    }
+
     // Page spaces (design §19.3.11): the same KV with every page whose id is 1 mod 3 in a mapped host
     // plane and every page 2 mod 3 in a separate device ("lent") plane, their pool copies zeroed so
     // only the translated reads can find them; selection and attention must give the same bits.
@@ -1376,6 +1414,8 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
             });
     }
     g_failures += t::verify_reduction(tag, got, ref, kAttentionCriterion);
+
+    g_failures += t::verify_reduction(tag + " column-invariant", inv, ref, kAttentionCriterion);
 }
 
 // ----------------------------------------------------------------------------------- prepare

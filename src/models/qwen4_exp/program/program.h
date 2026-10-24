@@ -423,10 +423,11 @@ struct ProgramOptions {
     //   rounds with MTP (choose_pair_draft_length), rounds of any size with DFlash2
     //   (choose_batch_dflash_length, its cost measured online per round size); without it rounds of
     //   two or more rows decode plain;
-    // - free_cache_resume (free-cache-resume): prefill calls, taps and resumes at any position, sibling
-    //   coalescing, and endpoints and blocks holding decode-computed state; without it every call
-    //   boundary, tap and resume is a multiple of 16 tokens (the GDN prefill's sub-chunk) and only
-    //   prompt blocks and taps are published;
+    // - free_cache_resume (free-cache-resume, or a construction-exact exact route, where it changes no
+    //   bits: FastPathSelection::construction_exact): prefill calls, taps and resumes at any position,
+    //   sibling coalescing, and endpoints and blocks holding decode-computed state; without it every
+    //   call boundary, tap and resume is a multiple of 16 tokens (the chunked GDN prefill's sub-chunk)
+    //   and only prompt blocks and taps are published;
     // - preemption (preemption): KV pages grow per unit and a short pool pauses residents (replay
     //   recomputes generated tokens as prefill); without it a request holds its whole extent from
     //   admission.

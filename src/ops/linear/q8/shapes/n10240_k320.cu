@@ -22,4 +22,11 @@ Q8Launch select_q8_n10240_k320(std::int32_t tokens) {
     return launch_q8_a16_mma_r64_t128;
 }
 
+// A16ColumnInvariant: the MMA tiles at every T (each accumulates an output over K in the same order;
+// at decode widths the smallest tile runs with its unused columns masked).
+Q8Launch select_q8_n10240_k320_invariant(std::int32_t tokens) {
+    if (tokens <= 64) return launch_q8_a16_mma_r32_t64;
+    return select_q8_n10240_k320(tokens);
+}
+
 } // namespace infernix::ops::detail

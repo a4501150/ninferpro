@@ -36,8 +36,18 @@ bool uses_a8(std::int32_t, std::int32_t) { return false; }
 // The pair route's admission (2026-10-15 sweep, RTX 5090): 1.08-2.43 times the exact route up to
 // T=1024, 0.69-1.00 beyond.
 constexpr std::int32_t kPairMinTokens = 1025;
+
+// A16ColumnInvariant: the tensor-core tiles at every T. Each accumulates an output as one FP32 chain
+// of k16 MMA steps in K order and applies the row scale once, so a column's bits do not depend on the
+// tile, the call's width or the column's place in it; at or below 96 columns, where the A16 route
+// takes the CUDA-core or sliced-K reductions, the 32-column tile runs with its unused columns masked.
+void launch_invariant(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (x.ne[1] <= 16) return fp8_linear_a16_tma<Geometry, Fp8A16TmaT16R64>(x, weight, out, stream);
+    if (x.ne[1] <= 96) return fp8_linear_a16_tma<Geometry, Fp8A16TmaT32R64S3>(x, weight, out, stream);
+    launch_a16(x, weight, out, stream);
+}
 } // namespace
 
 const Fp8LinearShape kFp8N1280K2560{1280,    2560, launch_a16, nullptr, uses_a8, nullptr,
-                                    /*invariant*/ nullptr, launch_fp8_a8_pair<Geometry>, kPairMinTokens};
+                                    launch_invariant, launch_fp8_a8_pair<Geometry>, kPairMinTokens};
 } // namespace infernix::ops::detail

@@ -35,6 +35,7 @@ bool uses_a8(std::int32_t, std::int32_t) { return false; }
 constexpr std::int32_t kPairMinTokens = 513;
 } // namespace
 
+// A16ColumnInvariant: launch_a16 itself, whose tiles all accumulate an output as one in-order FP32 chain.
 const Fp8LinearShape kFp8N2560K640{2560,    640, launch_a16, nullptr, uses_a8, nullptr,
-                                   /*invariant*/ nullptr, launch_fp8_a8_pair<Geometry>, kPairMinTokens};
+                                   launch_a16, launch_fp8_a8_pair<Geometry>, kPairMinTokens};
 } // namespace infernix::ops::detail

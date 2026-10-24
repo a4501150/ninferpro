@@ -1,5 +1,6 @@
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_stream_launch.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -8,6 +9,21 @@ namespace {
 // splitting each row's K, x read through L1.
 template <int MaxCols, int ColsPerPass>
 using Stream = Q8A16StreamSchedule<10240, 2, 8, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
+
+// The column-invariant route: sixteen K warps of 64 at every width (each output's K split the same way and
+// its FP32 partials reduced in the same order whatever the token tile, row tiles or stages). Sixteen
+// against eight (2026-10-23, RTX PRO 6000): 10.2 against 14.3 us at T = 1, 152 against 125 us at
+// T = 2048.
+template <int Tokens, int RowTiles = 1, int Stages = (Tokens <= 16 && RowTiles == 1 ? 2 : 1)>
+using Invariant = Q8A16SlicedKMmaSchedule<Tokens, 16, Stages, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                                          Q8ActivationStage::PaddedZero, 10240, Tokens, false, RowTiles>;
+
+template <class Schedule>
+void sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    launch_q8_a16_sliced_k_mma<Schedule>(q8_linear_operands(x, weight),
+                                         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+                                         LinearIdentityEpilogue{}, stream);
+}
 } // namespace
 
 Q8Launch select_q8_n324_k10240(std::int32_t tokens) {
@@ -21,6 +37,17 @@ Q8Launch select_q8_n324_k10240(std::int32_t tokens) {
     // identical (checked at every swept point); only speed differs.
     if (tokens <= 1024) return launch_q8_a16_mma_r32_t64;
     return launch_q8_a16_mma_r48_t64;
+}
+
+// A16ColumnInvariant: the 16-K-warp sliced-K contraction at every T. The MMA tiles' single K chain
+// (640 dependent k16 steps over 11 to 21 CTAs) took 104 us at T = 1, 17 times the A16 route. Two row
+// tiles above 64 columns spill 8-48 bytes of stack; one row tile does not, but took 61 against 41 us at
+// T = 512 and 201 against 152 us at T = 2048.
+Q8Launch select_q8_n324_k10240_invariant(std::int32_t tokens) {
+    if (tokens <= 8) return sliced<Invariant<8>>;
+    if (tokens <= 16) return sliced<Invariant<16>>;
+    if (tokens <= 64) return sliced<Invariant<32>>;
+    return sliced<Invariant<32, 2>>;
 }
 
 } // namespace infernix::ops::detail
