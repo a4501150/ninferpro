@@ -722,7 +722,7 @@ __device__ __forceinline__ void e2m1x2_word_to_half2(std::uint32_t word, std::ui
         : "r"(word));
 }
 
-// Lane l = 8q + i's integer shares (P_q of rows i and i + 8) of one unit against one activation word.
+// The integer shares (P_q of rows i and i + 8) of one unit's code word (q, i) against one activation word.
 __device__ __forceinline__ void unit_shares(std::uint32_t code_word, std::uint32_t act_word, int& lo, int& hi) {
     std::uint32_t w[4], a[4];
     e2m1x2_word_to_half2(code_word, w);
@@ -740,25 +740,31 @@ __device__ __forceinline__ void unit_shares(std::uint32_t code_word, std::uint32
 // Exact sums of one column against `Groups` row groups: this warp's units over blocks b = warp,
 // warp + kWarps, ... of every group (the groups of a block share its activation word), the int64
 // sums of rows i and i + 8 per lane, then the four lanes of a row reduced so that lanes 0..15 hold
-// row (lane & 15) of each group.
+// row (lane & 15) of each group. Any order gives the same integers.
 template <int Groups>
 __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes* acts, std::int64_t (&s)[Groups]) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int q = lane >> 3, i = lane & 7;
+    const int slot = lane >> 3, i = lane & 7;
     std::int64_t lo[Groups], hi[Groups];
 #pragma unroll
     for (int g = 0; g < Groups; ++g) { lo[g] = hi[g] = 0; }
-    for (int b = warp; b < blocks; b += kWarps) {
+    // Lane 8 slot + i takes rows i and i + 8 of blocks b = warp + kWarps (4 n + slot), all four quads:
+    // |P_q| <= 576, so a row's block sum is at most 2304 and times Sw < 2^18 still fits int32.
+    for (int b = warp + kWarps * slot; b < blocks; b += 4 * kWarps) {
         const ActCodes& a = acts[b];
-        const std::uint32_t act_word = a.dup[q];
-        const std::int32_t sa        = a.scale;
+        const std::int32_t sa = a.scale;
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
             const std::uint8_t* unit = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
-            const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i);
-            int p_lo, p_hi;
-            unit_shares(code_word, act_word, p_lo, p_hi);
-            // |P_q| <= 576 and Sw < 2^18: P_q * Sw fits int32.
+            int p_lo = 0, p_hi = 0;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i);
+                int share_lo, share_hi;
+                unit_shares(code_word, a.dup[q], share_lo, share_hi);
+                p_lo += share_lo;
+                p_hi += share_hi;
+            }
             lo[g] += static_cast<std::int64_t>(p_lo * canon::e4m3_scaled(unit[128 + i])) * sa;
             hi[g] += static_cast<std::int64_t>(p_hi * canon::e4m3_scaled(unit[136 + i])) * sa;
         }
@@ -1103,60 +1109,72 @@ void launch_encode_x_acts(const Tensor& x, const moe::wide::ExpertsWorkspace& la
     check_launch("A16 encode x");
 }
 
-// Register-streamed A16 units. Lane l = 8q + i of a warp reads code word (q, i) of a unit (rows i in
-// the low nibbles and i + 8 in the high ones at k = 4q .. 4q+3) and the two rows' scale bytes
-// straight from the record, a batch of units ahead of the one it computes. Its shares P_bq * Sw of
-// the two rows are exact int64 terms, and the four lanes of a row sum to P_b * Sw, so the row
-// sums are the exact sums of design §16.2.1 (any order gives the same integers).
-struct UnitWord {
-    std::uint32_t codes;
-    std::uint32_t scales; // byte 0: row i's scale word, byte 1: row i + 8's
+// Register-streamed A16 units. A unit is 128 code bytes, word (q, i) at 32 q + 4 i holding rows i (low
+// nibbles) and i + 8 (high) at k = 4q .. 4q+3, then the 16 rows' scale bytes. A warp takes four units at a
+// time: lane l = 8 s + i reads rows i and i + 8 of unit s, its four code words and two scale bytes, a
+// batch of units ahead of the one it computes. A row's block product P_b (the doubled E2M1 codes times
+// the 16 X values) is below 2^29 in magnitude (design §16.2.1), so its dp4a partial sums wrap in 32 bits
+// to the exact P_b, which then takes the row's scale once: P_b * Sw is the exact int64 term, and the row
+// sums are the exact sums of §16.2.1 (any order gives the same integers).
+struct UnitRows {
+    std::uint32_t codes[4]; // words (q, i), q = 0..3
+    std::uint32_t scales;   // byte 0: row i's scale word, byte 1: row i + 8's
 };
 
-__device__ __forceinline__ UnitWord load_unit_word(const std::uint8_t* unit, int q, int i) {
-    UnitWord w;
-    w.codes  = __ldg(reinterpret_cast<const unsigned*>(unit + 32 * q + 4 * i));
+__device__ __forceinline__ UnitRows load_unit_rows(const std::uint8_t* unit, int i) {
+    UnitRows w;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) { w.codes[q] = __ldg(reinterpret_cast<const unsigned*>(unit + 32 * q + 4 * i)); }
     w.scales = static_cast<std::uint32_t>(__ldg(unit + 128 + i)) | (static_cast<std::uint32_t>(__ldg(unit + 136 + i)) << 8);
     return w;
 }
 
-__device__ __forceinline__ void a16_shares(const UnitWord& w, const A16Act& a, int q, std::int64_t& lo_row,
-                                           std::int64_t& hi_row) {
-    const int c0 = static_cast<int>(canon::e2m1_x2_quad(w.codes & 0x0F0F0F0FU));
-    const int c1 = static_cast<int>(canon::e2m1_x2_quad((w.codes >> 4) & 0x0F0F0F0FU));
-    const std::uint32_t l = a.lo[q], m = a.mid[q];
-    const std::int32_t h  = a.hi[q];
-    // Wrapping assembly: the true four-term sums fit int32.
-    const unsigned p0 = static_cast<unsigned>(dp4a_su(c0, l, 0)) + (static_cast<unsigned>(dp4a_su(c0, m, 0)) << 8) +
-                        (static_cast<unsigned>(__dp4a(c0, h, 0)) << 16);
-    const unsigned p1 = static_cast<unsigned>(dp4a_su(c1, l, 0)) + (static_cast<unsigned>(dp4a_su(c1, m, 0)) << 8) +
-                        (static_cast<unsigned>(__dp4a(c1, h, 0)) << 16);
+// P_b * Sw of rows i (lo) and i + 8 (hi) of one unit against its column block `a`.
+__device__ __forceinline__ void a16_unit_terms(const UnitRows& w, const A16Act& a, std::int64_t& lo_row,
+                                               std::int64_t& hi_row) {
+    int l0 = 0, m0 = 0, h0 = 0, l1 = 0, m1 = 0, h1 = 0;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int c0 = static_cast<int>(canon::e2m1_x2_quad(w.codes[q] & 0x0F0F0F0FU));
+        const int c1 = static_cast<int>(canon::e2m1_x2_quad((w.codes[q] >> 4) & 0x0F0F0F0FU));
+        l0 = dp4a_su(c0, a.lo[q], l0);
+        m0 = dp4a_su(c0, a.mid[q], m0);
+        h0 = __dp4a(c0, a.hi[q], h0);
+        l1 = dp4a_su(c1, a.lo[q], l1);
+        m1 = dp4a_su(c1, a.mid[q], m1);
+        h1 = __dp4a(c1, a.hi[q], h1);
+    }
+    // Wrapping assembly: the true block sums fit int32.
+    const unsigned p0 = static_cast<unsigned>(l0) + (static_cast<unsigned>(m0) << 8) + (static_cast<unsigned>(h0) << 16);
+    const unsigned p1 = static_cast<unsigned>(l1) + (static_cast<unsigned>(m1) << 8) + (static_cast<unsigned>(h1) << 16);
     lo_row += static_cast<std::int64_t>(static_cast<int>(p0)) * canon::e4m3_scaled(w.scales & 0xFFU);
     hi_row += static_cast<std::int64_t>(static_cast<int>(p1)) * canon::e4m3_scaled((w.scales >> 8) & 0xFFU);
 }
 
 constexpr int kA16WarpUnits = 20; // units per warp: a gate/up row group's 160 blocks or half of a down group's 40 x 4
+constexpr int kA16WarpSteps = kA16WarpUnits / 4;
 static_assert(moe::kGateUpBlocks == kWarps * kA16WarpUnits && 4 * moe::kDownBlocks == kWarps * kA16WarpUnits);
 
-// A lane's words of the warp's units j = 0..19, block base + j * stride of `matrix`, all in flight at
-// once (prefetching four or ten at a time measured slower). They stay in registers for every column
-// of the job, so a job of n columns reads its weights once.
-__device__ __forceinline__ void load_warp_units(const std::uint8_t* matrix, int base, int stride, int q, int i,
-                                                UnitWord (&w)[kA16WarpUnits]) {
+// A lane's rows of the warp's units j = 0..19 (unit j = 4 step + s), block base + j * stride of `matrix`,
+// all in flight at once. They stay in registers for every column of the job, so a job of n columns reads
+// its weights once.
+__device__ __forceinline__ void load_warp_units(const std::uint8_t* matrix, int base, int stride,
+                                                UnitRows (&w)[kA16WarpSteps]) {
+    const int lane = threadIdx.x % 32, s = lane >> 3, i = lane & 7;
 #pragma unroll
-    for (int j = 0; j < kA16WarpUnits; ++j) {
-        w[j] = load_unit_word(matrix + static_cast<std::size_t>(base + j * stride) * moe::kUnitBytes, q, i);
+    for (int step = 0; step < kA16WarpSteps; ++step) {
+        w[step] = load_unit_rows(matrix + static_cast<std::size_t>(base + (4 * step + s) * stride) * moe::kUnitBytes, i);
     }
 }
 
-// The warp's exact sums of rows i (lo) and i + 8 (hi) of one row group over its units for one
-// column's acts [blocks]. Lanes 0..7 hold the sums on return.
-__device__ __forceinline__ void a16_row_sums(const UnitWord (&w)[kA16WarpUnits], int base, int stride,
+// The warp's exact sums of rows i (lo) and i + 8 (hi) of one row group over its units for one column's
+// acts [blocks]. Lanes 0..7 hold the sums on return.
+__device__ __forceinline__ void a16_row_sums(const UnitRows (&w)[kA16WarpSteps], int base, int stride,
                                              const A16Act* acts, std::int64_t& lo, std::int64_t& hi) {
-    const int lane = threadIdx.x % 32, q = lane >> 3;
+    const int lane = threadIdx.x % 32, s = lane >> 3;
     lo = hi = 0;
 #pragma unroll
-    for (int j = 0; j < kA16WarpUnits; ++j) { a16_shares(w[j], acts[base + j * stride], q, lo, hi); }
+    for (int step = 0; step < kA16WarpSteps; ++step) { a16_unit_terms(w[step], acts[base + (4 * step + s) * stride], lo, hi); }
 #pragma unroll
     for (int offset = 8; offset <= 16; offset <<= 1) {
         lo += __shfl_xor_sync(0xFFFFFFFFU, lo, offset);
@@ -1164,9 +1182,12 @@ __device__ __forceinline__ void a16_row_sums(const UnitWord (&w)[kA16WarpUnits],
     }
 }
 
-// Two CTAs per SM: the register cap (at most 128) measured faster than 1 (136-146 registers) and 3
-// (80) at op level, most at two columns per expert (T = 12: 214 -> 173 us).
-constexpr int kA16RowsMinCtas = 2;
+// Three CTAs per SM (80 registers, no spills): with a row pair's four quads per lane (one scale and one
+// int64 product per unit) the passes took 33 / 109 / 191 us at T = 1 / 6 / 12 (decode route, frames, cold
+// L2, RTX PRO 6000, 2026-10-24), against 33 / 113 / 194 at two and 37 / 121 / 210 with a quad per lane.
+// A persistent variant (two CTAs per SM double-buffering each item's weights through shared memory)
+// was slower at T = 12 (234 us).
+constexpr int kA16RowsMinCtas = 3;
 
 struct GateUpRowShared16 {
     A16Act acts[moe::kGateUpBlocks];
@@ -1197,8 +1218,8 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
     if (moe::wide_route(count, scales)) { return; }
     const std::uint8_t* matrix = record + static_cast<std::size_t>(g) * moe::kGateUpBlocks * moe::kUnitBytes;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    UnitWord w[kA16WarpUnits];
-    load_warp_units(matrix, warp, kWarps, lane >> 3, lane & 7, w);
+    UnitRows w[kA16WarpSteps];
+    load_warp_units(matrix, warp, kWarps, w);
     for (int c = 0; c < count; ++c) {
         if (c > 0) { __syncthreads(); } // every warp has read the previous column's acts and y
         const int token = dispatch.entries[first + c] / top_k;
@@ -1227,6 +1248,58 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
                 canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
         }
     }
+}
+
+// The down pass's column encode: encode_a16_columns' exponent and blocks for one h row of
+// kIntermediate elements, with thread t < kIntermediate / 8 holding elements 8t .. 8t+7 in registers
+// for both the column's exponent and its two quads of block t / 2. Ends with a barrier.
+__device__ __forceinline__ void encode_a16_h(const std::uint16_t* column, A16Act* acts, int* emax,
+                                             unsigned (&key)[kWarps][1]) {
+    constexpr int kVectors = static_cast<int>(moe::kIntermediate) / 8;
+    static_assert(kVectors <= kThreads && moe::kIntermediate % 16 == 0);
+    const int t = static_cast<int>(threadIdx.x), lane = t % 32, warp = t / 32;
+    unsigned words[4] = {};
+    if (t < kVectors) {
+        const uint4 v = reinterpret_cast<const uint4*>(column)[t];
+        words[0] = v.x;
+        words[1] = v.y;
+        words[2] = v.z;
+        words[3] = v.w;
+    }
+    unsigned m = 0;
+#pragma unroll
+    for (int w = 0; w < 4; ++w) { m = max(m, max(words[w] & 0x7FFFU, (words[w] >> 16) & 0x7FFFU)); }
+    m = __reduce_max_sync(0xFFFFFFFFU, m);
+    if (lane == 0) { key[warp][0] = m; }
+    __syncthreads();
+    if (t == 0) {
+        unsigned k = 0;
+        for (int w = 0; w < kWarps; ++w) { k = max(k, key[w][0]); }
+        emax[0] = a16_column_exponent(k);
+    }
+    __syncthreads();
+    if (t < kVectors) {
+        const int e = emax[0];
+        A16Act& out = acts[t / 2];
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int q = 2 * (t % 2) + half;
+            std::uint32_t lo = 0, mid = 0, hi = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const unsigned word = words[2 * half + j / 2];
+                const auto h  = static_cast<std::uint16_t>(j % 2 == 0 ? word & 0xFFFFU : word >> 16);
+                const auto xv = static_cast<std::uint32_t>(e == canon::kA16NonFinite ? 0 : canon::a16_value(h, e));
+                lo |= (xv & 0xFFU) << (8 * j);
+                mid |= ((xv >> 8) & 0xFFU) << (8 * j);
+                hi |= ((xv >> 16) & 0xFFU) << (8 * j);
+            }
+            out.lo[q]  = lo;
+            out.mid[q] = mid;
+            out.hi[q]  = static_cast<std::int32_t>(hi);
+        }
+    }
+    __syncthreads();
 }
 
 struct DownRowShared16 {
@@ -1263,19 +1336,17 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
         if (moe::wide_route(count, scales)) { record = nullptr; }
     }
     const int group = kDownGroups * tile + warp / 2, base = (warp % 2) * kA16WarpUnits;
-    UnitWord w[kA16WarpUnits];
+    UnitRows w[kA16WarpSteps];
     if (record != nullptr) {
         load_warp_units(record + moe::kGateUpBytes + static_cast<std::size_t>(group) * moe::kDownBlocks * moe::kUnitBytes,
-                        base, 1, lane >> 3, lane & 7, w);
+                        base, 1, w);
     }
     pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
     for (int c = 0; c < count; ++c) {
         __syncthreads();
-        const auto column = [&](int) {
-            return h_plane + static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements;
-        };
-        encode_a16_columns<1>(column, 1, moe::kIntermediate, sm.acts, sm.emax, sm.key);
+        encode_a16_h(h_plane + static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements, sm.acts, sm.emax,
+                     sm.key);
         std::int64_t lo, hi;
         a16_row_sums(w, base, 1, sm.acts, lo, hi);
         if (lane < 8) {

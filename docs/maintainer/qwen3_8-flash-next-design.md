@@ -3537,6 +3537,32 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   13.3 ms). A lane then keeps all 20 of its units' words in registers for every column of its job
   (a job of n columns reads its weights once; capped at two CTAs per SM): two columns per expert at
   T = 12 214 -> 173 us; C = 6 with DFlash2 one draft per row 463 -> 488 tok/s, two 438 -> 484.
+- **A row pair's four quads per lane (2026-10-24, RTX PRO 6000, this fork).** Under Nsight Compute
+  both W4A16 passes ran at 128 registers, two CTAs per SM, 31 % occupancy, DRAM 54-63 % busy and
+  one instruction per 7-9 cycles per scheduler: the integer arithmetic, not the weight stream, set
+  their time. Lane 8 s + i now takes rows i and i + 8 of unit s, all four quads (a warp covers four
+  units per step): a row's block product P_b is below 2^29 (§16.2.1), so its dp4a partial sums chain
+  across the quads in 32 bits, and the scale decode and the int64 product run once per row and
+  unit instead of once per quad, with the same integer sums. The weights take 25 registers instead
+  of 40, so the passes run three CTAs per SM (80 registers, no spills), and the down pass encodes
+  its h column with each of 80 threads holding eight elements in registers (one global read, two
+  quads per thread) instead of 40 threads encoding whole blocks after a second read. The W4A4
+  one-column kernels (`unit_sums`) take the same lane layout (|P_q| <= 576, so a row's block sum
+  times Sw fits int32). `infernix_offloaded_moe_wide_bench --cold --route fork`, frames, before ->
+  after: W4A16 T = 1 / 4 / 6 / 12 / 16 36.9 / 90.2 / 120.9 / 210 / 270 -> 32.8 / 77.9 / 104.5 /
+  188 / 241 us, eight columns per expert at T = 64 594 -> 397, the prefill mix at T = 256 2183 ->
+  1733; W4A4 T = 6 / 12 / 64 (four per expert) / 256 119 / 216 / 775 / 2155 -> 113 / 203 / 703 /
+  1908 (T = 1 within the timer's 2 us step, 37-39); gate/up 63 -> 81 % and down 54 -> 68 % of DRAM
+  at T = 12. Every output hash equal (decode widths 1-48, 2-8 columns per expert, staged placement,
+  the wide mixes), T1 and T1-exact equal their records: fast 1x1 / 6x1 / 1x4 / 6x2 / 6x3 5.68 /
+  11.27 / 8.89 / 16.44 / 22.87 -> 5.51 / 10.65 / 8.49 / 15.11 / 20.65 ms, exact 6x1 / 6x2 11.93 /
+  17.13 -> 11.23 / 15.69 ms. T3 (`bench_infernix.py`, every expert in VRAM, two alternating runs
+  against `cbcead6`): short C1 338-339 -> 359-360 tok/s, C6 aggregate 448-450 -> 480-494, prefill
+  30k 11,700 -> 11,800-12,000; 30k-context C1 272-290 both ways. Rejected on the way: 16-byte code loads with `L1::no_allocate` and a
+  quad per lane (equal times: the loads were not the limit); a persistent pass double-buffering each
+  item's 23 KB through shared memory (two CTAs per SM; 234 against 210 us at T = 12); three and four
+  CTAs per SM with a quad per lane (spills: 49 and 60 us at T = 1). `L1::no_allocate` code loads in
+  `fp8_a16_gemv_kernel` changed no T1 time (5.49 ms at 1x1 both ways) and were not kept.
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of
