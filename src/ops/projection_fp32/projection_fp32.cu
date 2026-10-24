@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <limits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -364,21 +365,30 @@ __global__ void projection_q4_kernel(const bf16* __restrict__ x, int k, int padd
 // eight columns per CTA, so 9..16 columns read every weight twice, and it gives each warp one row at a
 // time, so each staged x chunk is widened again for every row: the BF16 head [248320, 2560] took
 // 1.04 ms at 8 columns and 1.5 ms at 9-16 against a 0.71 ms DRAM floor. Here a CTA stages all of a
-// call's columns (up to 16) once, each warp preloads all of its two rows' chunks before the first FMA,
-// and each x chunk is widened once for both rows. Lane l still accumulates chunks l, l + 32, ... in
-// order per (row, column) and the warp reduces by the same butterfly, so the bits equal the narrow
-// kernels' at every width.
+// pass's columns once, each warp preloads all of its two rows' chunks before the first FMA, and each x
+// chunk is widened once for both rows. Lane l still accumulates chunks l, l + 32, ... in order per
+// (row, column) and the warp reduces by the same butterfly, so the bits equal the narrow kernels' at
+// every width. A pass holds up to 16 columns, or 17..19 in one pass of a wider body; wider calls run
+// balanced passes, each reading the weights once, where the narrow mapping read them once per eight
+// columns (q8_g32_fp16 [248320, 2560], RTX PRO 6000, 2026-10-24: 18 / 24 / 32 columns 1871 / 2107 /
+// 2801 -> 1186 / 1810 / 2142 us). A persistent variant (one CTA per SM walking row pairs with the
+// next pair's chunks in a second register buffer) was slower at every width (705-1516 us at 1-16).
 constexpr int kTallThreads     = 256;
 constexpr int kTallWarps       = kTallThreads / 32;
 constexpr int kTallRowsPerWarp = 2;
-constexpr int kTallMaxColumns  = 16;
+constexpr int kTallMaxColumns  = 16; // per pass of the common body
+// 17..19 columns take a 19-column body in one pass (19 x 2560 BF16 columns fill a CTA's 99 KB);
+// its larger unrolled body costs ~5 % per call at 16 columns or fewer, so they keep the 16-column one.
+constexpr int kTallWideColumns = 19;
+constexpr int kTallMaxShared   = 101376;
 constexpr int kTallMinRows     = 32768;
+// The BF16 heads keep the tall mapping for 8..16 columns (tensor-core heads take 1..16).
+constexpr int kTallMaxColumnsBf16 = 16;
 // From these widths the tall mapping is faster (RTX 5090, [248320, 2560], 2026-10-08): BF16 840 vs
 // 1043 us at 8 columns and 869 vs 1500 at 9; q8_g32_fp16 841 vs 1209 at 9 but slower up to 8
 // (799 vs 762), where the narrow mapping stays near the DRAM floor.
 constexpr int kTallMinColumnsBf16 = 8;
 constexpr int kTallMinColumnsQ8   = 9;
-constexpr std::size_t kTallMaxSharedBytes = static_cast<std::size_t>(kTallMaxColumns) * kMaxK * sizeof(bf16);
 
 struct TallBf16 {
     Segments segments;
@@ -407,7 +417,7 @@ struct TallQ8 {
     }
 };
 
-template <class Codec>
+template <class Codec, int MaxColumns>
 __global__ void __launch_bounds__(kTallThreads, 1)
     projection_tall_kernel(const bf16* __restrict__ x, int k, int columns, int rows, Codec codec,
                            float* __restrict__ out) {
@@ -436,7 +446,7 @@ __global__ void __launch_bounds__(kTallThreads, 1)
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncthreads();
     // 2. Per chunk in lane order: widen both rows' weights, then each column's x once.
-    float sums[kTallRowsPerWarp][kTallMaxColumns] = {};
+    float sums[kTallRowsPerWarp][MaxColumns] = {};
 #pragma unroll
     for (int i = 0; i < kMaxLaneChunks; ++i) {
         const int chunk = lane + 32 * i;
@@ -445,7 +455,7 @@ __global__ void __launch_bounds__(kTallThreads, 1)
 #pragma unroll
         for (int r = 0; r < kTallRowsPerWarp; ++r) { Codec::decode(w[r][i], wf[r]); }
 #pragma unroll
-        for (int column = 0; column < kTallMaxColumns; ++column) {
+        for (int column = 0; column < MaxColumns; ++column) {
             if (column < columns) {
                 float xf[8];
                 widen8(staged[column * chunks + chunk], xf);
@@ -461,7 +471,7 @@ __global__ void __launch_bounds__(kTallThreads, 1)
     for (int r = 0; r < kTallRowsPerWarp; ++r) {
         const int row = first_row + r;
 #pragma unroll
-        for (int column = 0; column < kTallMaxColumns; ++column) {
+        for (int column = 0; column < MaxColumns; ++column) {
             if (column < columns) {
                 float v = sums[r][column];
                 for (int offset = 16; offset > 0; offset >>= 1) { v += __shfl_xor_sync(0xFFFFFFFFU, v, offset); }
@@ -471,17 +481,39 @@ __global__ void __launch_bounds__(kTallThreads, 1)
     }
 }
 
-template <class Codec>
-void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& codec, Tensor& out, cudaStream_t stream) {
+template <class Codec, int MaxColumns>
+void launch_tall_pass(const bf16* x, int k, int columns, int rows, const Codec& codec, float* out,
+                      cudaStream_t stream) {
     static const bool configured = [] {
-        return cudaFuncSetAttribute(projection_tall_kernel<Codec>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(kTallMaxSharedBytes)) == cudaSuccess;
+        return cudaFuncSetAttribute(projection_tall_kernel<Codec, MaxColumns>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, kTallMaxShared) == cudaSuccess;
     }();
     require(configured, "the tall kernel's shared memory could not be configured");
     const int rows_per_cta   = kTallWarps * kTallRowsPerWarp;
     const std::size_t staged = static_cast<std::size_t>(columns) * k * sizeof(bf16);
-    projection_tall_kernel<Codec><<<(rows + rows_per_cta - 1) / rows_per_cta, kTallThreads, staged, stream>>>(
-        static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
+    require(staged <= static_cast<std::size_t>(kTallMaxShared), "the tall pass's columns exceed shared memory");
+    projection_tall_kernel<Codec, MaxColumns>
+        <<<(rows + rows_per_cta - 1) / rows_per_cta, kTallThreads, staged, stream>>>(x, k, columns, rows, codec, out);
+}
+
+// 17..19 columns in one pass of the 19-column body when they fit; otherwise passes of at most 16
+// columns, balanced, each reading the weights once.
+template <class Codec>
+void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& codec, Tensor& out, cudaStream_t stream) {
+    const auto* xs = static_cast<const bf16*>(x.data);
+    auto* os       = static_cast<float*>(out.data);
+    if (columns > kTallMaxColumns && columns <= kTallWideColumns &&
+        static_cast<std::size_t>(columns) * k * sizeof(bf16) <= static_cast<std::size_t>(kTallMaxShared)) {
+        return launch_tall_pass<Codec, kTallWideColumns>(xs, k, columns, rows, codec, os, stream);
+    }
+    const int capacity = std::min(kTallMaxColumns, kTallMaxShared / (k * static_cast<int>(sizeof(bf16))));
+    const int passes   = (columns + capacity - 1) / capacity;
+    const int per_pass = (columns + passes - 1) / passes;
+    for (int c0 = 0; c0 < columns; c0 += per_pass) {
+        launch_tall_pass<Codec, kTallMaxColumns>(xs + static_cast<std::size_t>(c0) * k, k,
+                                                 std::min(per_pass, columns - c0), rows, codec,
+                                                 os + static_cast<std::size_t>(c0) * rows, stream);
+    }
 }
 
 // BF16 vocabulary heads at 1..16 columns: the tensor-core mapping, one route for every width, at the
@@ -495,10 +527,10 @@ bool mma_route(int rows, int columns, bool supported, detail::ProjectionRoute ro
            columns <= detail::kProjectionMmaMaxColumns;
 }
 
-bool tall_route(int rows, int columns, int min_columns, detail::ProjectionRoute route) {
+bool tall_route(int rows, int columns, int min_columns, int max_columns, detail::ProjectionRoute route) {
     if (route == detail::ProjectionRoute::Tall) { return true; }
     if (route == detail::ProjectionRoute::Narrow) { return false; }
-    return rows >= kTallMinRows && columns >= min_columns && columns <= kTallMaxColumns;
+    return rows >= kTallMinRows && columns >= min_columns && columns <= max_columns;
 }
 
 } // namespace
@@ -529,7 +561,7 @@ void detail::projection_fp32_route(const Tensor& x, const Weight& weight, Tensor
             "out must be FP32 [N, T]");
     const dim3 grid((rows + kRowsPerCta - 1) / kRowsPerCta, (columns + kColumns - 1) / kColumns);
     const std::size_t staged = static_cast<std::size_t>(std::min(kColumns, columns)) * k * sizeof(bf16);
-    if (!q4 && columns <= kTallMaxColumns && tall_route(rows, columns, kTallMinColumnsQ8, route)) {
+    if (!q4 && tall_route(rows, columns, kTallMinColumnsQ8, std::numeric_limits<int>::max(), route)) {
         launch_tall(x, k, columns, rows,
                     TallQ8{static_cast<const std::int8_t*>(weight.qdata), static_cast<const __half*>(weight.scales),
                            padded_k},
@@ -580,7 +612,8 @@ void detail::projection_fp32_route(const Tensor& x, std::span<const Tensor* cons
     if (segments.count == 1 &&
         mma_route(rows, columns, detail::projection_fp32_bf16_mma_supported(rows, k, columns), route)) {
         detail::projection_fp32_bf16_mma(x, segments.data[0], rows, out, stream);
-    } else if (columns <= kTallMaxColumns && tall_route(rows, columns, kTallMinColumnsBf16, route)) {
+    } else if (columns <= kTallMaxColumnsBf16 &&
+               tall_route(rows, columns, kTallMinColumnsBf16, kTallMaxColumnsBf16, route)) {
         launch_tall(x, k, columns, rows, TallBf16{segments, k}, out, stream);
     } else if (columns >= kWideMinColumns) {
         static const bool configured = [] {

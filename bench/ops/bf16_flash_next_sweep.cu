@@ -447,7 +447,9 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
         // head (recipe A) and the q8_g32_fp16 head (Dense8), each on the narrow and the tall mapping, whose
         // outputs must be equal bit for bit.
         using ops::detail::ProjectionRoute;
-        DeviceBuffer logits(static_cast<std::size_t>(shape.n) * 16 * 4), other(static_cast<std::size_t>(shape.n) * 16 * 4);
+        constexpr int kHeadMaxT = 32;
+        DeviceBuffer logits(static_cast<std::size_t>(shape.n) * kHeadMaxT * 4),
+            other(static_cast<std::size_t>(shape.n) * kHeadMaxT * 4);
         const Tensor rows(weight.storage.p, DType::BF16, {shape.k, shape.n});
         const Tensor* head[] = {&rows};
         auto q8 = bench::make_row_split_weight(QType::Q8_G32_FP16, shape.n, shape.k, shape.k);
@@ -471,7 +473,7 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
             std::printf("\n## head [%d,%d] %s on projection_fp32 (floor %.1f us)\n", shape.n, shape.k, form.name,
                         head_floor);
             std::printf("%8s %12s %12s %12s %s\n", "T", "narrow_us", "tall_us", "mma_us", "tall bits");
-            for (const int t : {1, 2, 3, 4, 5, 6, 8, 9, 12, 16}) {
+            for (const int t : {1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 18, 19, 24, 32}) {
                 Tensor xt(x.p, DType::BF16, {shape.k, t});
                 Tensor lt(logits.p, DType::FP32, {shape.n, t});
                 Tensor ot(other.p, DType::FP32, {shape.n, t});
@@ -490,8 +492,8 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
                              narrow.median_us, narrow.min_us, narrow.p95_us);
                 std::fprintf(csv, "head_%s,%d,%d,%d,tall,%.3f,%.3f,%.3f,0\n", form.name, shape.n, shape.k, t,
                              tall.median_us, tall.min_us, tall.p95_us);
-                double mma_us = NAN; // the tensor-core mapping serves BF16 heads only
-                if (std::strcmp(form.name, "bf16") == 0) {
+                double mma_us = NAN; // the tensor-core mapping serves BF16 heads at 1..16 columns only
+                if (std::strcmp(form.name, "bf16") == 0 && t <= 16) {
                     const auto mma = time_route([&](cudaStream_t s) { form.run(xt, lt, ProjectionRoute::Mma, s); },
                                                 flush, stream, options);
                     std::fprintf(csv, "head_%s,%d,%d,%d,mma,%.3f,%.3f,%.3f,0\n", form.name, shape.n, shape.k, t,

@@ -3592,6 +3592,21 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   oracle test covers 17 and 28 at the fused tolerance and 29 at the composed one; T1 records the new
   6 x 3 fast hash, every other shape and T1-exact unchanged. T1, same session, A/B twice: 6 x 3
   21.72 -> 21.17 ms, 8 x 3 25.73 -> 25.58, 6 x 4 25.42 -> 25.33, 6 x 2 15.81 -> 15.83 (same arithmetic).
+- **Q8 head above 16 columns (2026-10-24, RTX PRO 6000, this fork).** T1 kernel profiles of 6 x 3 and
+  6 x 4 put `projection_q8_kernel` (the q8_g32_fp16 head [248320, 2560], 636 MB) at 1.90 and 2.17 ms
+  per round (9 %): above 16 columns the head fell back to the narrow mapping, which reads the weights
+  once per eight columns. The tall mapping now serves every width from 9: up to 16 columns as before,
+  17..19 in one pass of a 19-column body (19 x 2560 BF16 columns fill a CTA's 99 KB; the wider body
+  costs ~5 % at 16 or fewer, so they keep the 16-column one), wider calls in balanced passes of up to
+  16, each reading the weights once. Bit-identical: the sweep's narrow/tall comparison is equal at
+  every width through 32, T1 and T1-exact unchanged. Per call: 18 / 24 / 32 columns 1871 / 2107 /
+  2801 -> 1186 / 1810 / 2142 us. T1, same session, A/B twice: 6 x 3 21.18 -> 20.30 ms, 6 x 4 25.35 ->
+  24.98, 1 x 1 / 6 x 1 / 6 x 2 unchanged. Rejected: a persistent tall kernel (one CTA per SM walking
+  row pairs, the next pair's chunks loading into a second register buffer) was slower at every width
+  (705-1516 us at 1-16 columns; 0.62 TB/s with ~7.5 MB in flight, and its fully unrolled 19-column
+  body stalled on instruction fetch). The head still costs 1.4-2.4 times its 377 us floor at 5-16
+  columns (tall 662-1073 us, narrow 479-1421 us): one CTA of 8 warps per SM never overlaps a CTA's
+  weight loads with another's FMAs.
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of
