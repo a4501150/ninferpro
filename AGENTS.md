@@ -25,6 +25,10 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
   - the prefix-cache tail snapshot for fresh one-call spans, in both resume modes (the finish
     endpoint covers continuations only; without the tap, repeats of a prompt that fits one call
     start from the root);
+  - the zero-token resume for exact repeats (DFlash2 and plain modes): the prefill-to-decode
+    transition captures a prompt-end snapshot carrying the pre-head residual, and a repeat of the
+    prompt regenerates its first token from it with no prefill at all (the MTP drafter's pending
+    cell blocks it there);
   - batched DFlash2 drafting at any round size with an online cost fit;
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
 
