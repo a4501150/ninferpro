@@ -265,7 +265,12 @@ constexpr std::array kQualified{
     // on the build with the head's gathered-column finish and the value-gated prompt-end
     // capture (S0/S1 shifted both routes together, so the excesses stand: TV 8.1e-4, top-1
     // +0.22 points bound 0.32, KL 6.0e-4, NLL 8.3e-4, p99.9 1.09; the 256-segment run
-    // near-passed top-1 the same way and the near-pass rule extended it again). The timing is
+    // near-passed top-1 the same way and the near-pass rule extended it again). Re-run on the
+    // MTP zero-token resume (S3), fast arm only (the exact route is unchanged: T1-exact and T2
+    // equal their records): its 256 and 768 extension segments are bit-identical to the S1 fast
+    // arm's, one resuming deeper (+496 reused tokens), so the verdict above stands unchanged —
+    // the gate's warm requests are one-call spans or continuations, which the value gate leaves
+    // to their taps and endpoints, so it barely reaches the zero-token path. The timing is
     // on the artifact itself: second-turn continuations 76 -> 28 ms TTFT (98.9 % resumed from the
     // endpoint), repeats of single-chunk prompts kept at 16-17 ms by planning the tail tap beside
     // the path (hybrid-prefix-cache-spec, Taps; without it they regressed to 178 ms and 0 %),
