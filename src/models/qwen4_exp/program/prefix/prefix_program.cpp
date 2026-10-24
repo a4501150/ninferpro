@@ -1006,7 +1006,14 @@ void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
     c.meta.head_residual = true;
     const std::uint64_t id = c.id;
     if (prefix_->capture_prompt_end(index, std::move(c), device_.stream)) {
+        // Not `deepest`: the finish endpoint above must still be captured (its guard reads
+        // deepest + kBlock). A continuation resumes there, past the blocks the last turn
+        // published with decode KV; a resume inside such a block deduplicates to the published
+        // copy — whose bits differ from the prefill's — and a capture over that path pairs the
+        // lane's prefill state with a path its own KV contradicts.
+        const std::uint32_t deepest = lane.prefix.deepest;
         prefix_captured(lane, id, n);
+        lane.prefix.deepest = deepest;
     } else {
         fresh.reset();       // the capture was refused: no staging slot or Host slabs (counted)
         reservation.reset();
