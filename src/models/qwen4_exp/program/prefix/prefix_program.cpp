@@ -973,13 +973,19 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
 // the tail is a private copy of the lane's page. Skips (and counts) when the MTP drafter is live
 // (its prompt-end cell encodes the cold run's first token, MR5/MR6), the frontier lies inside a
 // Vision item, the blocks are not published, or the staging slot, Host slabs or a free page are
-// out. A tap or endpoint below n does not suppress it: the spacing rule is a tap rule, and a
-// snapshot even one block below still costs a repeat its tail call.
+// out. A snapshot below n suppresses it only within one tap separation: what the image saves a
+// repeat is the re-fill from the path's deepest published frontier (the opener's realization, or
+// the tail tap of a one-call span) up to n, while the image is a fixed cost beside the decode
+// rounds that follow — measured on the artifact, capturing at every transition cost a concurrent
+// six-request decode ~4 % tok/s and filled the Host tier, for repeats a tail call of at most the
+// separation re-fills anyway. A span whose opener demoted to its last inner boundary (the
+// multi-call re-fill loss, up to chunk - 1 tokens) is past the separation and still captures.
 void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
     if (!options_.free_cache_resume || mtp_ || lane.mtp_live) { return; }
     const std::uint32_t n = lane.state_tokens, k = n / kBlock;
     if (n == 0 || lane.prefix.path.size() < k ||
-        prefix::inside_exclusion(n, lane.prefix.exclusions)) {
+        prefix::inside_exclusion(n, lane.prefix.exclusions) ||
+        n - lane.prefix.deepest < pc::kMinimumTapSeparation) {
         ++prefix_->counters().prompt_end_skipped;
         return;
     }
@@ -999,8 +1005,8 @@ void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
         pool_->copy_page(lane.pages.at(k - lane.prefix.page_base).handle(), fresh->handle(), device_.stream);
     }
     // The prompt's end is the divergence point of repeats and forks: a Boundary. The estimate
-    // values it against the lineage's deepest snapshot, whatever its distance (the tap spacing
-    // rule does not apply: a snapshot one block below still costs a repeat its tail call).
+    // values it against the lineage's deepest snapshot (the gate above already held the distance
+    // to it to at least the separation; the tap spacing rule does not apply beyond that).
     prefix::PrefixCache::Capture c =
         prefix_capture_at(lane, n, pc::SnapshotKind::Boundary, false, false, fresh ? &*fresh : nullptr);
     c.meta.head_residual = true;

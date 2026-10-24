@@ -265,8 +265,10 @@ constexpr std::array kQualified{
     // on the artifact itself: second-turn continuations 76 -> 28 ms TTFT (98.9 % resumed from the
     // endpoint), repeats of single-chunk prompts kept at 16-17 ms by planning the tail tap beside
     // the path (hybrid-prefix-cache-spec, Taps; without it they regressed to 178 ms and 0 %),
-    // preemption taking IQ3_S's and FP8's timings (rule 4d: requests admitted under a short pool,
-    // on the same GDN, attention and KV kernels).
+    // repeats of multi-call prompts 125 -> 6 ms at 80 -> 100 % reuse by the value-gated
+    // prompt-end capture (the same four-boot A/B: ungated it cost a concurrent six-request
+    // decode ~4 % tok/s, gated within 2 %), preemption taking IQ3_S's and FP8's timings (rule
+    // 4d: requests admitted under a short pool, on the same GDN, attention and KV kernels).
     Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},

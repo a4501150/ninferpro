@@ -15,10 +15,9 @@
 //                opener tap.
 //   X6           Sessions sharing only a system block resume at its structural tap (an exact split).
 //   X3           A repeat of a chat prompt resumes at its generation opener (an exact off-grid tap) and
-//                generates what the capturing run generated. Plain mode: the prompt's own end
-//                snapshot (the zero-token resume) is deeper, so the repeat reuses the whole prompt —
-//                unless this Engine's full page pool and small Host tier cannot admit or keep a
-//                snapshot worth only the few tokens over the opener, when the opener serves it.
+//                generates what the capturing run generated. In plain mode the prompt-end capture is
+//                value-gated there too (the opener realized within one tap separation of n), so the
+//                opener serves the repeat as under MTP.
 //   X12          (plain mode) Engine 1 serves two chat turns and stops, saving its Host tier to a file;
 //                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
 //                Between the turns, Engine 1's periodic save writes the file once and, with the Host
@@ -28,10 +27,13 @@
 //                completes, equals its cold run, and the Engine keeps serving.
 //   zero token   (plain mode, own Engine) The prompt-end snapshot with its saved head residual: an
 //                exact repeat reuses the whole prompt with no prefill (computed prefill 0) and
-//                reproduces the capturing run bit-for-bit — greedy and seeded, single-call and
-//                multi-call shapes, block-aligned and misaligned ends, a constrained repeat (the
-//                draws advance on the resumed sample), and the repeat-then-repeat-again case. A
-//                second Engine at concurrency 2 repeats two graph-warmed prompts in parallel.
+//                reproduces the capturing run bit-for-bit — greedy and seeded, multi-call shapes
+//                with block-aligned and misaligned ends (a span whose deepest published frontier
+//                sits within one tap separation of n — a one-call span's tail tap, an opener
+//                that realized just below n — skips the capture by value and its case asserts the
+//                fallback), a constrained repeat (the draws advance on the resumed sample), the
+//                repeat-then-repeat-again case, and the same reuse through the persistence file.
+//                A second Engine at concurrency 2 repeats two graph-warmed prompts in parallel.
 //
 //   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain] [--zero]   (default: both modes;
 //   --zero runs only the zero-token and persistence scenarios)
@@ -249,11 +251,10 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
                       "X6 sessions 2 and 3 resume at the shared structural frontier");
 
     // X3 split equivalence at an exact off-grid tap: session 2 again resumes at its own generation
-    // opener; the run that captured it split its prefill there, so the resume repeats its computation.
-    // Plain mode: the prompt's own end snapshot (the zero-token resume, taken at the prefill ->
-    // decode transition) is deeper than the opener, so the repeat reuses the whole prompt — unless
-    // the full page pool or small Host tier cannot admit or keep a snapshot worth only the few
-    // tokens over the opener (its GDSF claim), when the opener serves the repeat as before.
+    // opener; the run that captured it split its prefill there, so the resume repeats its
+    // computation. The prompt-end capture is value-gated in both modes (the opener realized
+    // within one tap separation of n, and the image would cost more than the short tail call it
+    // saves), so the opener serves the repeat; the capture's counters print as evidence.
     const infernix::GenerationResult again = chat({system, user("Summarise rule 12 in one sentence.")}, 32);
     const infernix::RuntimeStats after_again = engine.runtime_stats();
     std::printf("        X3: prompt-end captures %llu -> %llu -> %llu, skipped %llu -> %llu -> %llu\n",
@@ -263,19 +264,10 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
                 static_cast<unsigned long long>(before_s2.hybrid_prompt_end_skipped),
                 static_cast<unsigned long long>(after_s2.hybrid_prompt_end_skipped),
                 static_cast<unsigned long long>(after_again.hybrid_prompt_end_skipped));
-    if (mtp) {
-        failures += check(again.reused_prompt_tokens + 16U >= s2.prompt.prompt_tokens &&
-                              again.reused_prompt_tokens < s2.prompt.prompt_tokens,
-                          "X3 the repeat resumes at the opener (reused " +
-                              std::to_string(again.reused_prompt_tokens) + ")");
-    } else {
-        const bool ok_reuse = again.reused_prompt_tokens == s2.prompt.prompt_tokens ||
-                              again.reused_prompt_tokens + 16U >= s2.prompt.prompt_tokens;
-        failures += check(ok_reuse, "X3 the repeat reuses the prompt's own end snapshot, or the opener "
-                                    "when the Host tier cannot keep it (reused " +
-                              std::to_string(again.reused_prompt_tokens) + " of " +
-                              std::to_string(s2.prompt.prompt_tokens) + ")");
-    }
+    failures += check(again.reused_prompt_tokens + 16U >= s2.prompt.prompt_tokens &&
+                          again.reused_prompt_tokens < s2.prompt.prompt_tokens,
+                      "X3 the repeat resumes at the opener (reused " +
+                          std::to_string(again.reused_prompt_tokens) + ")");
     failures += check(again.generated_token_ids == s2.generated_token_ids,
                       "X3 the repeat equals the capturing run (" +
                           first_difference(again.generated_token_ids, s2.generated_token_ids) + ")");
@@ -283,9 +275,9 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     // Single-chunk tail snapshot: a prompt that fits one call has no inner boundary for its
     // opener to realize at, and the finish endpoint serves continuations only, so the tail tap
     // publishes the prompt's own tail (grid 16) and the repeat resumes there instead of from the
-    // root. Plain mode: the prompt-end snapshot (the zero-token resume) sits deeper still, so the
-    // repeat reuses the whole prompt — unless the Host tier is too full for a snapshot worth only
-    // the 16 tokens over the tail tap (its GDSF claim), when the tap serves it as before.
+    // root. Plain mode: the prompt-end capture is skipped by value (the tap sits within one
+    // separation of n, and the image would cost more than the short tail call it saves), so the
+    // tap serves the repeat; the deeper reuses below it in the file exercise the capture itself.
     {
         const std::vector<infernix::TokenId> p = synthetic_tokens(400, 26);
         const Run first  = generate(engine, p, 32, true);
@@ -297,9 +289,8 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
                     static_cast<unsigned long long>(stats.hybrid_host_capacity_bytes));
         const Run repeat = generate(engine, p, 32, true);
         const std::uint32_t tail = 399U / 16U * 16U;
-        const bool ok_reuse = mtp ? repeat.reused == tail : repeat.reused == 400U || repeat.reused == tail;
-        failures += check(ok_reuse, "a single-chunk repeat resumes at the prompt's end or its tail " +
-                                        std::to_string(tail) + " (got " + std::to_string(repeat.reused) + ")");
+        failures += check(repeat.reused == tail, "a single-chunk repeat resumes at its tail " +
+                                                      std::to_string(tail) + " (got " + std::to_string(repeat.reused) + ")");
         failures += check(repeat.tokens == first.tokens, "the single-chunk repeat equals the first run (" +
                                                             first_difference(repeat.tokens, first.tokens) + ")");
     }
@@ -309,11 +300,14 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
 // The zero-token resume: a prompt's own end snapshot, taken at its prefill -> decode transition,
 // carries the lane's whole state and the head's saved residual. An exact repeat reuses the whole
 // prompt (computed prefill 0) and regenerates its first token through the saved residual, so it
-// reproduces the capturing run bit-for-bit — greedy and seeded, single-call and multi-call shapes,
-// block-aligned and misaligned ends, a constrained repeat (the draws advance on the resumed
-// sample), and the repeat-then-repeat-again case (the snapshot serves its own repeat). Plain mode
-// only: the MTP drafter's prompt-end cell encodes the cold run's first token, so no such snapshot
-// is published there.
+// reproduces the capturing run bit-for-bit — greedy and seeded, multi-call shapes, block-aligned
+// and misaligned ends, a constrained repeat (the draws advance on the resumed sample), and the
+// repeat-then-repeat-again case (the snapshot serves its own repeat). A span whose deepest
+// published frontier sits within one tap separation of n (a one-call span's tail tap, an opener
+// that realized just below n) skips the capture by value — the image costs more than the short
+// tail call a repeat re-fills anyway — and its case below asserts the fallback. Plain mode only:
+// the MTP drafter's prompt-end cell encodes the cold run's first token, so no such snapshot is
+// published there.
 int run_zero_token(const char* artifact, const char* ngram) {
     std::printf("== the zero-token resume (plain, free cache resume)\n");
     infernix::EngineOptions zero = base_options(artifact, ngram);
@@ -339,7 +333,19 @@ int run_zero_token(const char* artifact, const char* ngram) {
     };
     repeat_case("multi-call, misaligned end", 1500, 31, 48);
     repeat_case("multi-call, block-aligned end", 1536, 32, 48);
-    repeat_case("single-call end", 400, 33, 32);
+
+    // A one-call span's tail tap sits within one separation of n, so the prompt-end capture is
+    // skipped by value and the repeat resumes at the tap, re-filling its short tail call.
+    {
+        const std::vector<infernix::TokenId> p = synthetic_tokens(400, 33);
+        const Run first  = generate(engine, p, 32, true);
+        const Run repeat = generate(engine, p, 32, true);
+        const std::uint32_t tail = 399U / 16U * 16U;
+        failures += check(repeat.reused == tail, "one-call end: the repeat resumes at the tail tap (got " +
+                                                      std::to_string(repeat.reused) + ")");
+        failures += check(repeat.tokens == first.tokens, "one-call end: the repeat equals the first run (" +
+                                                            first_difference(repeat.tokens, first.tokens) + ")");
+    }
 
     // Seeded sampling: the resumed draw keys by the same logical position, so it reproduces the
     // cold draw bit-for-bit.
@@ -365,6 +371,55 @@ int run_zero_token(const char* artifact, const char* ngram) {
                               first_difference(repeat.generated_token_ids, first.generated_token_ids) + ")");
     }
 
+    return failures;
+}
+
+// The same whole-prompt reuse through the persistence file (X12's chat prompts are value-gated:
+// their openers realize within one separation of n, so they exercise the opener fallback): a
+// tap-free multi-call prompt's snapshot — its image carrying the saved head residual — saves at
+// the Engine's stop, restores into a fresh Engine, and the repeat still regenerates its first
+// token with no prefill at all. Its own engines, one alive at a time (a second boot beside a
+// live Engine does not fit the model's experts in VRAM and falls back to the RAM tier).
+int run_zero_token_from_file(const char* artifact, const char* ngram) {
+    std::printf("== the zero-token resume from the persistence file (plain, free cache resume)\n");
+    const std::filesystem::path file = infernix::test::unique_temp_path("infernix_qwen4_exp_zero.cache");
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    infernix::EngineOptions zero = base_options(artifact, ngram);
+    zero.context_cache.host_capacity_bytes = 8ULL << 30;
+    zero.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(9216);
+    std::vector<infernix::TokenId> saved_tokens;
+    int failures = 0;
+    {
+        infernix::EngineOptions o                = zero;
+        o.context_cache.hybrid.persistent_file     = file;
+        o.context_cache.hybrid.persistent_identity = "zero";
+        infernix::Engine saving(o);
+        const std::vector<infernix::TokenId> p = synthetic_tokens(1500, 38);
+        const Run first                        = generate(saving, p, 48, true);
+        saved_tokens                           = first.tokens;
+        failures += check(first.reused == 0, "the file's capturing run is cold");
+    } // the stop saves the file with the prompt-end snapshot retained (its own endpoint does not supersede it)
+    {
+        infernix::EngineOptions o                = zero;
+        o.context_cache.hybrid.persistent_file     = file;
+        o.context_cache.hybrid.persistent_identity = "zero";
+        infernix::Engine engine(o);
+        const infernix::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
+        failures += check(restore.restored && restore.snapshots > 0, "the zero-token file restores its snapshots");
+        const std::vector<infernix::TokenId> p = synthetic_tokens(1500, 38);
+        const infernix::GenerationResult repeat = engine.generate(engine.prepare_tokens(p), greedy(48, true));
+        std::printf("        from file: reused %u, computed %u\n", repeat.reused_prompt_tokens,
+                    repeat.computed_prefill_tokens);
+        failures += check(repeat.reused_prompt_tokens == 1500 && repeat.computed_prefill_tokens == 0,
+                          "the restored prompt-end snapshot serves a zero-token resume (reused " +
+                              std::to_string(repeat.reused_prompt_tokens) + ", computed " +
+                              std::to_string(repeat.computed_prefill_tokens) + ")");
+        failures += check(repeat.generated_token_ids == saved_tokens,
+                          "the restored zero-token resume equals the capturing run (" +
+                              first_difference(repeat.generated_token_ids, saved_tokens) + ")");
+    }
+    std::filesystem::remove(file, ignored);
     return failures;
 }
 
@@ -536,18 +591,19 @@ int run_persistence(const char* artifact, const char* ngram) {
         turn2.push_back(message(infernix::ChatRole::Assistant, r1.content));
         turn2.push_back(message(infernix::ChatRole::User, context + "And colour 3?"));
         before = chat_on(engine, turn2, 32);
-        // The same turn 2 again, in-process: it takes the zero-token path over the snapshot
-        // `before` itself captured (a resumed lane's capture). If this equals `before`, the
-        // snapshot is good and any from-file divergence is the file's; if it differs, the capture
-        // of a resumed lane records state its own decode did not use.
+        // The same turn 2 again, in-process: its opener realized within one tap separation of n,
+        // so the prompt-end capture is value-gated and the repeat resumes at the opener,
+        // re-filling its 7-token tail call. It must still equal `before` (the exact route is
+        // request-invariant); the gated capture's own zero-token path runs in the suite's own
+        // from-file scenario below, on a prompt with no nearby tap.
         const infernix::GenerationResult before2 = chat_on(engine, turn2, 32);
         std::printf("        before2: reused %u, computed %u, %zu tokens (%s)\n",
                     before2.reused_prompt_tokens, before2.computed_prefill_tokens,
                     before2.generated_token_ids.size(),
                     before2.generated_token_ids == before.generated_token_ids ? "equals before" : "DIFFERS");
-        failures += check(before2.computed_prefill_tokens == 0 &&
+        failures += check(before2.computed_prefill_tokens <= 16U &&
                               before2.generated_token_ids == before.generated_token_ids,
-                          "the resumed capture serves an exact in-process zero-token resume (" +
+                          "the repeat of a value-gated turn resumes at its opener (" +
                               first_difference(before2.generated_token_ids, before.generated_token_ids) + ")");
     } // the stop saves the Host tier
     std::error_code size_error;
@@ -598,39 +654,38 @@ int run_persistence(const char* artifact, const char* ngram) {
         failures += check(after.generated_token_ids == before.generated_token_ids,
                           "the restored resume equals Engine 1's turn 2 (" +
                               first_difference(after.generated_token_ids, before.generated_token_ids) + ")");
-        // The same prompt-end snapshot serves the same repeat again: the from-file path is
+        // The same restored opener serves the same repeat again: the from-file path is
         // deterministic (a second divergence would be nondeterminism, not a state defect).
         const infernix::GenerationResult after2 = chat_on(engine, turn2, 32);
-        failures += check(after2.computed_prefill_tokens == 0 &&
+        failures += check(after2.computed_prefill_tokens <= 16U &&
                               after2.generated_token_ids == after.generated_token_ids,
-                          "the restored zero-token resume repeats itself (" +
+                          "the restored opener resume repeats itself (" +
                               first_difference(after2.generated_token_ids, after.generated_token_ids) + ")");
     }
     {
-        // Turn 1's own prompt-end snapshot was superseded (before's first capture superseded the
-        // snapshot it resumed from, and the stop saves only retained snapshots), so a from-file
-        // repeat of turn 1 alone resumes at its opener and re-fills the 7-token cut. To exercise
-        // the zero-token path on a cold capture through the file, Engine 3 re-runs turn 1 — its
-        // transition state is r1's bit for bit (the same reattached blocks, the same final
-        // 7-column call) — and captures a fresh prompt-end snapshot, and its stop saves it
-        // retained. Engine 4 must then regenerate r1's tokens from it with no prefill at all.
+        // Turn 1's opener realized within one separation of its end, so its prompt-end capture
+        // is value-gated: a from-file repeat of turn 1 alone resumes at the opener and re-fills
+        // the 7-token cut. Engine 3 re-runs turn 1 (its transition state is r1's bit for bit)
+        // and its stop saves the retained snapshots; Engine 4's repeat must still regenerate
+        // r1's tokens exactly — the zero-token path itself runs on a tap-free prompt in the
+        // zero-token suite's own from-file scenario.
         {
             infernix::Engine engine(options());
             const infernix::GenerationResult warm = chat_on(engine, turn1, 32);
             failures += check(warm.generated_token_ids == turn1_tokens,
                               "turn 1's re-run equals its cold run (" +
                                   first_difference(warm.generated_token_ids, turn1_tokens) + ")");
-        } // the stop saves the file with turn 1's own prompt-end snapshot retained
+        } // the stop saves the file with turn 1's retained snapshots
         infernix::Engine engine(options());
         const infernix::GenerationResult repeat = chat_on(engine, turn1, 32);
         std::printf("        turn 1 from file: reused %u of %u, computed %u, %zu tokens\n",
                     repeat.reused_prompt_tokens, repeat.prompt.prompt_tokens, repeat.computed_prefill_tokens,
                     repeat.generated_token_ids.size());
-        failures += check(repeat.computed_prefill_tokens == 0,
-                          "turn 1's cold prompt-end snapshot serves a zero-token resume (computed " +
+        failures += check(repeat.computed_prefill_tokens <= 16U,
+                          "turn 1's from-file repeat resumes at its opener (computed " +
                               std::to_string(repeat.computed_prefill_tokens) + ")");
         failures += check(repeat.generated_token_ids == turn1_tokens,
-                          "turn 1's zero-token resume equals its cold run (" +
+                          "turn 1's from-file repeat equals its cold run (" +
                               first_difference(repeat.generated_token_ids, turn1_tokens) + ")");
     }
     std::filesystem::remove(file, ignored);
@@ -658,6 +713,7 @@ int main(int argc, char** argv) {
         int failures = 0;
         if (zero_only) {
             failures += run_zero_token(artifact, ngram);
+            failures += run_zero_token_from_file(artifact, ngram);
             failures += run_zero_token_constrained(artifact, ngram);
             failures += run_zero_token_concurrency(artifact, ngram);
             failures += run_persistence(artifact, ngram);
@@ -669,6 +725,7 @@ int main(int argc, char** argv) {
         if (mtp) { failures += run_mode(artifact, ngram, true); }
         if (mtp) { failures += run_one_context(artifact, ngram); }
         if (plain) { failures += run_zero_token(artifact, ngram); }
+        if (plain) { failures += run_zero_token_from_file(artifact, ngram); }
         if (plain) { failures += run_zero_token_constrained(artifact, ngram); }
         if (plain) { failures += run_zero_token_concurrency(artifact, ngram); }
         if (plain) { failures += run_persistence(artifact, ngram); }

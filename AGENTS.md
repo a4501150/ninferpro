@@ -28,7 +28,9 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
   - the zero-token resume for exact repeats (DFlash2 and plain modes): the prefill-to-decode
     transition captures a prompt-end snapshot carrying the pre-head residual, and a repeat of the
     prompt regenerates its first token from it with no prefill at all (the MTP drafter's pending
-    cell blocks it there);
+    cell blocks it there; the capture is value-gated — within one tap separation of the path's
+    deepest published frontier it is skipped, so one-call spans keep their tail tap and only
+    spans whose opener demoted to the last inner boundary capture);
   - batched DFlash2 drafting at any round size with an online cost fit;
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
 
