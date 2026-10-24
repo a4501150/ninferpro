@@ -150,6 +150,9 @@ int run_flash_next_fp8_a16() {
         for (int t : {3, 9, 17, 33, 97})
             calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         calls.push_back({1, CallForm::A16Convenience});
+        // The column-invariant route (the tensor-core tiles at every T).
+        for (int t : {1, 2, 8, 9, 17, 32, 33, 97, 257, 1025, 4097})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16ColumnInvariant});
         failures += run_shape("FP8_A16 Flash-Next", ActivationCompute::A16, make_fp8_weight,
                               {n, k, seed++, Comparison::Sampled, true, calls});
     }
@@ -222,6 +225,29 @@ int fp8_a16_column_invariance() {
     return failures;
 }
 
+// The exact route's column-invariant projections (A16ColumnInvariant): every column of a call of any
+// width, starting at any column, has its bits computed alone, so a resumed or decoded column equals
+// the one a wide prefill call computes. Checkpoint-like operands (every finite E4M3 code).
+int fp8_a16_invariant_route() {
+    int failures = 0;
+    const std::array<std::int32_t, 16> widths{2, 7, 8, 9, 16, 17, 31, 32, 33, 64, 96, 97, 129, 257, 1000, 2049};
+    const std::array<std::int32_t, 3> offsets{0, 1, 37};
+    for (const auto& [n, k] : {std::pair{16384, 2560}, std::pair{13312, 2560}, std::pair{2560, 6144},
+                               std::pair{1280, 2560}, std::pair{2560, 640}}) {
+        auto host           = make_fp8_weight(n, k, 961U + static_cast<std::uint32_t>(n));
+        std::uint32_t state = static_cast<std::uint32_t>(k) * 31U ^ static_cast<std::uint32_t>(n);
+        for (std::uint64_t i = 0; i < host.code_plane_bytes; ++i) {
+            state     = state * 1664525U + 1013904223U;
+            auto code = static_cast<std::uint8_t>(state >> 24);
+            if ((code & 0x7FU) == 0x7FU) code ^= 1U; // not NaN
+            host.payload[i] = code;
+        }
+        failures += verify_column_invariance("FP8_A16 invariant", host, ops::LinearPolicy::A16ColumnInvariant, widths,
+                                             offsets, 977U + static_cast<std::uint32_t>(k));
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -230,7 +256,8 @@ int main() {
         return 77;
     }
     try {
-        const int failures = run_fp8_a16() + run_flash_next_fp8_a16() + fp8_a16_column_invariance();
+        const int failures = run_fp8_a16() + run_flash_next_fp8_a16() + fp8_a16_column_invariance() +
+                             fp8_a16_invariant_route();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

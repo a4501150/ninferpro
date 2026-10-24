@@ -50,10 +50,9 @@ struct RawGatePair {
     float beta;
 };
 
-__device__ __forceinline__ RawQkLane load_raw_qk_lane(const __nv_bfloat16* base,
-                                                      std::uint32_t dqk_base) {
+__device__ __forceinline__ RawQkLane raw_qk_lane(Bf16x4Pack bits) {
     RawQkLane out;
-    out.bits        = load_vec<Bf16x4Pack>(base + dqk_base);
+    out.bits        = bits;
     const float2 lo = bf16x2_to_float2(out.bits.pair[0]);
     const float2 hi = bf16x2_to_float2(out.bits.pair[1]);
     out.value[0]    = lo.x;
@@ -61,6 +60,11 @@ __device__ __forceinline__ RawQkLane load_raw_qk_lane(const __nv_bfloat16* base,
     out.value[2]    = hi.x;
     out.value[3]    = hi.y;
     return out;
+}
+
+__device__ __forceinline__ RawQkLane load_raw_qk_lane(const __nv_bfloat16* base,
+                                                      std::uint32_t dqk_base) {
+    return raw_qk_lane(load_vec<Bf16x4Pack>(base + dqk_base));
 }
 
 template <bool Normalize>
@@ -99,23 +103,104 @@ __device__ __forceinline__ RawGatePair load_record_gate(const uint2* gate, std::
     return {bits, __uint_as_float(bits.x), __uint_as_float(bits.y)};
 }
 
-__device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane],
-                                                     const float (&key)[kQkPerLane], float v_local,
-                                                     float g, float beta) {
+
+
+// Each row's lane partial of <state row, x>: the lane's kQkPerLane products added in order to 0.
+template <int Rows = kDvPerWarp>
+__device__ __forceinline__ void row_partials(float (&partial)[Rows], const float (&state)[Rows][kQkPerLane],
+                                             const float (&x)[kQkPerLane]) {
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) {
+        partial[r] = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { partial[r] += state[r][c] * x[c]; }
+    }
+}
+
+// The lane-index shift of warp_reduce_scatter_rows: lane l ends with row l >> shift.
+template <int Rows>
+inline constexpr int kRowLaneShift = Rows == 1 ? 5 : Rows == 2 ? 4 : Rows == 4 ? 3 : Rows == 8 ? 2 : -1;
+
+// warp_sum of every row as a reduce-scatter: at each xor level a lane keeps half of its rows and
+// sends the other half to its partner, so Rows rows take Rows - 1 + 5 - log2(Rows) shuffles instead
+// of 5 Rows. Every addition is warp_sum's (own partial + the partner's partial of the same row, in the
+// butterfly's pairing), so each row's sum carries warp_sum's bits. Returns row (lane >> shift)'s sum.
+template <int Rows>
+__device__ __forceinline__ float warp_reduce_scatter_rows(const float (&partial)[Rows], int lane) {
+    static_assert(kRowLaneShift<Rows> >= 0, "1, 2, 4 or 8 rows");
+    float buffer[Rows];
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) { buffer[r] = partial[r]; }
+    int offset = kWarpSize / 2;
+#pragma unroll
+    for (int count = Rows; count > 1; count /= 2, offset >>= 1) {
+        const int half   = count / 2;
+        const bool upper = (lane & offset) != 0;
+#pragma unroll
+        for (int j = 0; j < half; ++j) {
+            const float own  = upper ? buffer[half + j] : buffer[j];
+            const float send = upper ? buffer[j] : buffer[half + j];
+            buffer[j]        = own + __shfl_xor_sync(kFullWarpMask, send, offset, kWarpSize);
+        }
+    }
+#pragma unroll
+    for (; offset > 0; offset >>= 1) { buffer[0] += __shfl_xor_sync(kFullWarpMask, buffer[0], offset, kWarpSize); }
+    return buffer[0];
+}
+
+// warp_sum of every row, every lane receiving every row's sum.
+template <int Rows>
+__device__ __forceinline__ void warp_sum_rows(float (&partial)[Rows]) {
+    const int lane  = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const float sum = warp_reduce_scatter_rows(partial, lane);
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) { partial[r] = __shfl_sync(kFullWarpMask, sum, r << kRowLaneShift<Rows>, kWarpSize); }
+}
+
+// The state update from the rows' reduced predictions <state row, key> and their values.
+template <int Rows = kDvPerWarp>
+__device__ __forceinline__ void update_state_rows(float (&state)[Rows][kQkPerLane], const float (&prediction)[Rows],
+                                                  const float (&key)[kQkPerLane], const float (&value)[Rows],
+                                                  float g, float beta) {
     const float alpha = expf(g);
-
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        float partial = 0.0f;
-#pragma unroll
-        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * key[c]; }
-        partial = warp_sum<kWarpSize>(partial);
-
-        const float v_r   = __shfl_sync(0xffffffff, v_local, r, kWarpSize);
-        const float delta = beta * (v_r - alpha * partial);
+    for (int r = 0; r < Rows; ++r) {
+        const float delta = beta * (value[r] - alpha * prediction[r]);
 
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) { state[r][c] = alpha * state[r][c] + delta * key[c]; }
+    }
+}
+
+// As update_state_rows, v_r of row r being lane r's v_local.
+__device__ __forceinline__ void update_state(float (&state)[kDvPerWarp][kQkPerLane],
+                                             const float (&prediction)[kDvPerWarp],
+                                             const float (&key)[kQkPerLane], float v_local, float g, float beta) {
+    float value[kDvPerWarp];
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) { value[r] = __shfl_sync(0xffffffff, v_local, r, kWarpSize); }
+    update_state_rows(state, prediction, key, value, g, beta);
+}
+
+__device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane],
+                                                     const float (&key)[kQkPerLane], float v_local,
+                                                     float g, float beta) {
+    float prediction[kDvPerWarp];
+    row_partials(prediction, state, key);
+    warp_sum_rows(prediction);
+    update_state(state, prediction, key, v_local, g, beta);
+}
+
+// The readout of a prepared (normalized when the call normalizes) query lane.
+__device__ __forceinline__ void readout_values_and_store(const float (&state)[kDvPerWarp][kQkPerLane],
+                                                         const float (&query)[kQkPerLane], __nv_bfloat16* output,
+                                                         std::uint32_t dv_base, int lane, float scale) {
+    float partial[kDvPerWarp];
+    row_partials(partial, state, query);
+    const float sum = warp_reduce_scatter_rows(partial, lane);
+    // Row r's sum is in lane r << shift.
+    if ((lane & ((1 << kRowLaneShift<kDvPerWarp>) - 1)) == 0) {
+        output[dv_base + (lane >> kRowLaneShift<kDvPerWarp>)] = __float2bfloat16(sum * scale);
     }
 }
 
@@ -126,17 +211,7 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
                                                   int lane, float scale) {
     RawQkLane q = load_raw_qk_lane(query, dqk_base);
     normalize_qk_lane<Normalize>(q.value, lane);
-
-    float attn_val = 0.0f;
-#pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        float partial = 0.0f;
-#pragma unroll
-        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * q.value[c]; }
-        partial = warp_sum<kWarpSize>(partial);
-        if (lane == r) { attn_val = partial; }
-    }
-    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
+    readout_values_and_store(state, q.value, output, dv_base, lane, scale);
 }
 
 struct RecurrentCoordinates {
@@ -730,7 +805,7 @@ inline constexpr std::int8_t kTreeWalkNoSlot   = -1;
 // row with s side columns nests at most (s+1)/2 slots. A branch node beyond the Slots free slots
 // is rebuilt from the initial state when the walk returns to it. Returns the step count (nodes).
 template <int Slots>
-__device__ int build_tree_walk(const SpeculativeTreeRow& row, TreeWalkStep* steps) {
+__device__ inline int build_tree_walk(const SpeculativeTreeRow& row, TreeWalkStep* steps) {
     struct Pending {
         int node;
         int next;
@@ -815,7 +890,7 @@ restore_state_tile(float (&state)[kDvPerWarp][kQkPerLane],
 
 // Rebuilds the state after `node` from the initial state along its root path: the same
 // transitions the walk applied there, without effects.
-__device__ void replay_root_path(float (&state)[kDvPerWarp][kQkPerLane],
+__device__ inline void replay_root_path(float (&state)[kDvPerWarp][kQkPerLane],
                                  const RecordAccess<true>& access,
                                  const RecurrentCoordinates& coord, const SpeculativeTreeRow& row,
                                  int node) {

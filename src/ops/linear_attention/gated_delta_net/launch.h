@@ -31,6 +31,13 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                             cudaStream_t stream);
 
+// The recurrent arithmetic at any T (GdnChunkArithmetic::Recurrent): bit-identical, token by token, to
+// launch_recurrent_inout and the batch-update, record and fold kernels, staged for long calls.
+void launch_recurrent_prefill(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                              const Tensor& beta, float scale, bool normalize_qk,
+                              const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
+                              cudaStream_t stream);
+
 // The gating inputs of gated_delta_net_batch_update_gating (validated by the caller); a and b
 // columns may be strided.
 struct BatchUpdateGating {

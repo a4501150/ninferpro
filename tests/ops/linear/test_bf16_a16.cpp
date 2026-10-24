@@ -641,6 +641,27 @@ int run_new_bf16(int selected_n = 0, int selected_k = 0) {
     return failures;
 }
 
+// The exact route's column-invariant projections (A16ColumnInvariant, one sliced-K family at every
+// T): against the FP64 oracle, and every column of a call of any width, starting at any column, has
+// the bits it has computed alone.
+int run_bf16_invariant_route() {
+    using namespace infernix::test::linear;
+    int failures = 0;
+    const std::array<std::int32_t, 13> widths{2, 7, 8, 9, 16, 31, 32, 33, 64, 97, 257, 1025, 2049};
+    const std::array<std::int32_t, 3> offsets{0, 1, 37};
+    for (const auto& [n, k] : {std::pair{96, 2560}, std::pair{640, 2560}}) {
+        std::vector<Invocation> calls;
+        for (int t : {1, 2, 8, 9, 32, 33, 129, 1025})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16ColumnInvariant});
+        const std::uint32_t seed = static_cast<std::uint32_t>(n + k + 509);
+        failures += run_shape("BF16_A16 invariant", ActivationCompute::A16, make_bf16_weight,
+                              {n, k, seed, Comparison::Full, true, calls});
+        failures += verify_column_invariance("BF16_A16 invariant", make_bf16_weight(n, k, seed + 1),
+                                             ops::LinearPolicy::A16ColumnInvariant, widths, offsets, seed + 2);
+    }
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -658,7 +679,8 @@ int main(int argc, char** argv) {
         } else if (argc != 1) {
             throw std::invalid_argument("usage: infernix_linear_bf16_a16_test [--shape N K]");
         }
-        const int failures = (n == 0 ? run_bf16_linear() : 0) + run_new_bf16(n, k);
+        const int failures =
+            (n == 0 ? run_bf16_linear() + run_bf16_invariant_route() : 0) + run_new_bf16(n, k);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

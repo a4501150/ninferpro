@@ -20,6 +20,8 @@ namespace infernix::ops::detail {
                                                               std::int32_t min_tokens,
                                                               std::int32_t max_tokens);
 
+// Whether [n, k] registers an A16ColumnInvariant route.
+[[nodiscard]] bool fp8_column_invariant_supported(std::int32_t n, std::int32_t k) noexcept;
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   LinearRoutes routes, WorkspaceArena* workspace, cudaStream_t stream);
 

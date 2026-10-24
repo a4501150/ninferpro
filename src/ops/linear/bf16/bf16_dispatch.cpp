@@ -1,5 +1,6 @@
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_shapes.h"
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
@@ -8,13 +9,15 @@ namespace {
 struct ShapeEntry {
     std::int32_t n, k;
     Bf16Launch (*select)(std::int32_t);
+    Bf16Launch (*invariant)(std::int32_t) = nullptr; // A16ColumnInvariant, or null where none is registered
 };
 
 constexpr std::array kShapes{
     ShapeEntry{14336, 5120, select_bf16_n14336_k5120},
     ShapeEntry{5120, 6144, select_bf16_n5120_k6144},
     ShapeEntry{48, 2560, select_bf16_n48_k2560},
-    ShapeEntry{96, 2560, select_bf16_n96_k2560},
+    ShapeEntry{96, 2560, select_bf16_n96_k2560, select_bf16_n96_k2560_invariant},
+    ShapeEntry{640, 2560, select_bf16_n640_k2560, select_bf16_n640_k2560_invariant},
     ShapeEntry{1664, 2560, select_bf16_n1664_k2560},
     ShapeEntry{324, 10240, select_bf16_n324_k10240},
     ShapeEntry{320, 10240, select_bf16_n320_k10240},
@@ -50,9 +53,20 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
 }
 
 Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
-    if (!valid_linear_policy(policy) || column_invariant(policy))
-        throw std::invalid_argument("bf16 linear: unsupported policy");
+    if (!valid_linear_policy(policy)) throw std::invalid_argument("bf16 linear: unsupported policy");
+    if (column_invariant(policy)) {
+        if (t <= 0) throw std::invalid_argument("bf16 linear: T must be positive");
+        for (const auto& entry : kShapes) {
+            if (entry.n == n && entry.k == k && entry.invariant != nullptr) return entry.invariant(t);
+        }
+        throw std::invalid_argument("bf16 linear: no column-invariant route for this problem");
+    }
     return select_bf16_a16_launch(n, k, t);
+}
+
+bool bf16_column_invariant_supported(std::int32_t n, std::int32_t k) noexcept {
+    return std::any_of(kShapes.begin(), kShapes.end(),
+                       [&](const ShapeEntry& entry) { return entry.n == n && entry.k == k && entry.invariant != nullptr; });
 }
 
 void bf16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,

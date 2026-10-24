@@ -555,7 +555,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const models::qwen4_exp::FastPathSelection fast = models::qwen4_exp::select_fast_paths(instance->parameters, options);
     program_options.fast_paths        = fast.forward();
     program_options.pair_speculation  = fast.selected(FastPath::AdaptiveSpeculation);
-    program_options.free_cache_resume = fast.selected(FastPath::FreeCacheResume);
+    program_options.free_cache_resume = fast.selected(FastPath::FreeCacheResume) || fast.construction_exact();
     program_options.preemption        = fast.selected(FastPath::Preemption);
     program_options.sampled_mtp_drafts = fast.selected(FastPath::SampledMtpDrafts);
 

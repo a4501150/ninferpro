@@ -50,4 +50,11 @@ Bf16Launch select_bf16_n96_k2560(std::int32_t tokens) {
     if (tokens <= 4096) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>>; // tail_r64t64s3
     return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 128, 32, 32, 2, 1, Bf16MmaRaster::RowFast>>; // tail_r64t128s2_rows
 }
+// A16ColumnInvariant: one sliced-K family at every T (8 K-warps of 64 over the same K slices, reduced in
+// the same order; the token tile only sets how many columns a CTA holds, and the MMA's columns are
+// independent).
+Bf16Launch select_bf16_n96_k2560_invariant(std::int32_t tokens) {
+    if (tokens <= 8) return launch_bf16_sliced_k_mma<Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 8, 8, 64, 2>, 2560>>;
+    return launch_bf16_sliced_k_mma<Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 32, 8, 64, 2>, 2560>>;
+}
 } // namespace infernix::ops::detail

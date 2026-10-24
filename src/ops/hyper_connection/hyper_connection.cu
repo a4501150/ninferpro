@@ -238,7 +238,11 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     }
     require(eps > 0, "mix epsilon must be positive");
     auto scope = workspace.scope();
-    if (detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
+    // A16ColumnInvariant: the composed route at every T on the projections' invariant routes (the fused
+    // route's FP32 intermediates are its own arithmetic), the up projection and collapse fused at any
+    // width (bit-identical to the separate steps).
+    const bool invariant = column_invariant(policy);
+    if (!invariant && detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
         const DeviceSpan partials = workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
         detail::hc_mix_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject, partials.data, stream);
         return;
@@ -249,7 +253,8 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     linear(normalized, down, z, policy, workspace, stream);
     Tensor m = workspace.alloc(DType::BF16, {rank, T});
     hyper_connection_gates(z, rank, streams, m, inject, stream);
-    if (detail::hc_up_collapse_supported(up, hidden, streams, T)) {
+    if (invariant ? detail::hc_up_collapse_supported(up, hidden, streams)
+                  : detail::hc_up_collapse_preferred(up, hidden, streams, T)) {
         // Q8 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §19.3.23).
         detail::hc_up_collapse(m, up, normalized, streams, x, stream);
         return;

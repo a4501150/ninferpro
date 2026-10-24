@@ -270,7 +270,10 @@ constexpr std::array kQualified{
     // equal their records): its 256 and 768 extension segments are bit-identical to the S1 fast
     // arm's, one resuming deeper (+496 reused tokens), so the verdict above stands unchanged —
     // the gate's warm requests are one-call spans or continuations, which the value gate leaves
-    // to their taps and endpoints, so it barely reaches the zero-token path. The timing is
+    // to their taps and endpoints, so it barely reaches the zero-token path. The construction-exact
+    // exact route (2026-10-24) moved the reference: the fast route then failed the 1,024-segment
+    // tail (p99.9 KL ratio 1.34) and passes with the recurrent GDN prefill (TV 1.8e-3 bound
+    // 2.0e-3, top-1 1.9e-3 bound 2.9e-3, KL 1.0e-3, NLL 9.3e-5, p99.9 1.13; model-quality 6.8). The timing is
     // on the artifact itself: second-turn continuations 76 -> 28 ms TTFT (98.9 % resumed from the
     // endpoint), repeats of single-chunk prompts kept at 16-17 ms by planning the tail tap beside
     // the path (hybrid-prefix-cache-spec, Taps; without it they regressed to 178 ms and 0 %),
@@ -419,6 +422,21 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     return false;
 }
 
+// Every configuration whose exact route was measured construction-exact: the Forward's decompositions
+// of one prompt (off-grid and 16-aligned splits, 16- and 48-wide middle calls, the tail call, prefill
+// then decode) byte-equal at every layer, and the prefix-cache resumes at any position equal to the
+// cold run (tests/models/qwen4_exp/test_forward_real.cpp --split-equality,
+// test_prefix_cache_real.cpp; docs/maintainer/model-quality.md section 6.8).
+constexpr std::array kConstructionExact{
+    // orcarouter Uncensored NVFP4, recipe C (2026-10-23).
+    FastPathConfiguration{DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64},
+    FastPathConfiguration{DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256},
+};
+
+bool construction_exact(const FastPathConfiguration& configuration) {
+    return std::find(kConstructionExact.begin(), kConstructionExact.end(), configuration) != kConstructionExact.end();
+}
+
 bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration) {
     return std::any_of(kQualified.begin(), kQualified.end(), [&](const Qualification& entry) {
         return entry.path == path && entry.configuration == configuration;
@@ -453,7 +471,12 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
             .expert_a4_residual = selected(FastPath::ExpertA4Residual),
             .gdn_arithmetic     = selected(FastPath::GdnF16Accumulate) ? ops::GdnChunkArithmetic::Fp16Accumulate
-                                                                       : ops::GdnChunkArithmetic::Exact};
+                                                                       : ops::GdnChunkArithmetic::Recurrent,
+            .column_invariant   = request_invariant()};
+}
+
+bool FastPathSelection::construction_exact() const noexcept {
+    return paths.empty() && qwen4_exp::construction_exact(configuration);
 }
 
 FastPathSelection select_fast_paths(const execution::Parameters& parameters, const EngineOptions& options) {

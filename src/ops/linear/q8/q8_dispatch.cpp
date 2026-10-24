@@ -2,6 +2,7 @@
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/q8/q8_shapes.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
@@ -15,6 +16,8 @@ struct ShapeEntry {
     ShapeSelector select;
     // The shape's fast-path routes (LinearRoutes::Q8SlicedK), or null where it has none.
     ShapeSelector fast = nullptr;
+    // The shape's A16ColumnInvariant routes, or null where it registers none.
+    ShapeSelector invariant = nullptr;
 };
 
 template <class Geometry>
@@ -31,17 +34,18 @@ constexpr std::array kShapes{
     shape<Q8N5120K25600>(select_q8_n5120_k25600),   shape<Q8N6144K5120>(select_q8_n6144_k5120),
     shape<Q8N9216K2048>(select_q8_n9216_k2048),     shape<Q8N12288K2048>(select_q8_n12288_k2048),
     shape<Q8N14336K5120>(select_q8_n14336_k5120),   shape<Q8N17408K5120>(select_q8_n17408_k5120),
-    shape<Q8N34816K5120>(select_q8_n34816_k5120),   shape<Q8N248320K5120>(select_q8_n248320_k5120),
+    shape<Q8N34816K5120>(select_q8_n34816_k5120),
+    ShapeEntry{248320, 5120, select_q8_n248320_k5120, nullptr, select_q8_n248320_k5120_invariant},
     // Qwen3.8-Flash-Next (N 324 and 320 are not 16-row multiples, so they bypass the geometry type).
     ShapeEntry{16384, 2560, select_q8_n16384_k2560, select_q8_n16384_k2560_fast},
-    ShapeEntry{12800, 2560, select_q8_n12800_k2560},
+    ShapeEntry{12800, 2560, select_q8_n12800_k2560, nullptr, select_q8_n12800_k2560_invariant},
     ShapeEntry{13952, 2560, select_q8_n13952_k2560},
     ShapeEntry{2560, 2560, select_q8_n2560_k2560},
     ShapeEntry{1280, 2560, select_q8_n1280_k2560},
     ShapeEntry{2560, 6144, select_q8_n2560_k6144, select_q8_n2560_k6144_fast},
-    ShapeEntry{324, 10240, select_q8_n324_k10240},
-    ShapeEntry{320, 10240, select_q8_n320_k10240},
-    ShapeEntry{10240, 320, select_q8_n10240_k320},
+    ShapeEntry{324, 10240, select_q8_n324_k10240, nullptr, select_q8_n324_k10240_invariant},
+    ShapeEntry{320, 10240, select_q8_n320_k10240, nullptr, select_q8_n320_k10240_invariant},
+    ShapeEntry{10240, 320, select_q8_n10240_k320, nullptr, select_q8_n10240_k320_invariant},
     ShapeEntry{2560, 640, select_q8_n2560_k640},
     // NInfer's tunings for its own 2560-wide groupings.
     shape<Q8N6144K2560>(select_q8_n6144_k2560),   shape<Q8N10240K2560>(select_q8_n10240_k2560),
@@ -79,11 +83,17 @@ Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     if (!valid_linear_policy(policy)) throw std::invalid_argument("q8 linear: unsupported policy");
     if (column_invariant(policy)) {
         if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
-        if (n == Q8N248320K5120::kOutputRows && k == Q8N248320K5120::kInputRows)
-            return select_q8_n248320_k5120_invariant(t);
+        for (const auto& entry : kShapes) {
+            if (entry.n == n && entry.k == k && entry.invariant != nullptr) return entry.invariant(t);
+        }
         throw std::invalid_argument("q8 linear: no column-invariant route for this problem");
     }
     return select_q8_a16_launch(n, k, t, routes);
+}
+
+bool q8_column_invariant_supported(std::int32_t n, std::int32_t k) noexcept {
+    return std::any_of(kShapes.begin(), kShapes.end(),
+                       [&](const ShapeEntry& entry) { return entry.n == n && entry.k == k && entry.invariant != nullptr; });
 }
 
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,

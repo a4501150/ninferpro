@@ -498,4 +498,54 @@ int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k) {
     return failures;
 }
 
+int verify_column_invariance(std::string_view label, const quantized_weight::PackedWeight& host,
+                             ops::LinearPolicy policy, std::span<const std::int32_t> widths,
+                             std::span<const std::int32_t> offsets, std::uint32_t seed) {
+    const std::int32_t n = host.weight.n, k = host.weight.k;
+    const std::int32_t widest = *std::max_element(widths.begin(), widths.end());
+    const std::int32_t latest = *std::max_element(offsets.begin(), offsets.end());
+    const std::int32_t columns = widest + latest;
+    std::vector<std::uint16_t> activation(static_cast<std::size_t>(k) * columns);
+    std::uint32_t state = seed;
+    for (auto& bits : activation) {
+        state = state * 1664525U + 1013904223U;
+        bits  = static_cast<std::uint16_t>(((state >> 31) << 15) | ((107U + (state >> 8) % 25U) << 7) | (state & 0x7FU));
+    }
+    DeviceBuffer weight(host.payload.size()), x(activation.size() * 2),
+        y(static_cast<std::size_t>(n) * widest * 2);
+    weight.copy_from_host(host.payload.data(), host.payload.size());
+    x.copy_from_host(activation.data(), activation.size() * 2);
+    const Weight w = host.device_weight(weight.p);
+    const std::size_t capacity =
+        ops::linear_workspace_capacity_bytes(host.weight.qtype, n, k, policy, 1, widest);
+    DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+    std::vector<std::uint16_t> alone(static_cast<std::size_t>(n) * columns);
+    for (std::int32_t column = 0; column < columns; ++column) {
+        Tensor input(static_cast<std::uint16_t*>(x.p) + static_cast<std::size_t>(column) * k, DType::BF16, {k, 1});
+        Tensor output(y.p, DType::BF16, {n, 1});
+        ops::linear(input, w, output, policy, workspace, nullptr);
+        y.copy_to_host(alone.data() + static_cast<std::size_t>(column) * n, static_cast<std::size_t>(n) * 2);
+    }
+    int failures = 0;
+    std::vector<std::uint16_t> together(static_cast<std::size_t>(n) * widest);
+    for (const std::int32_t offset : offsets) {
+        for (const std::int32_t t : widths) {
+            Tensor input(static_cast<std::uint16_t*>(x.p) + static_cast<std::size_t>(offset) * k, DType::BF16, {k, t});
+            Tensor output(y.p, DType::BF16, {n, t});
+            ops::linear(input, w, output, policy, workspace, nullptr);
+            y.copy_to_host(together.data(), static_cast<std::size_t>(n) * t * 2);
+            std::size_t differing = 0;
+            for (std::size_t i = 0; i < static_cast<std::size_t>(n) * t; ++i) {
+                differing += together[i] != alone[static_cast<std::size_t>(offset) * n + i];
+            }
+            if (differing != 0) {
+                std::cerr << label << " [" << n << "," << k << "] T=" << t << " from column " << offset << ": "
+                          << differing << " outputs differ from the columns computed alone\n";
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace infernix::test::linear

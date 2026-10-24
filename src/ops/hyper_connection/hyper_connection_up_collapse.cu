@@ -94,19 +94,23 @@ void launch(const Tensor& m, const Weight& up, const Tensor& normalized, Tensor&
 
 } // namespace
 
-bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_t streams,
-                              std::int32_t columns) noexcept {
-    // Up to 96 columns the separate linear and collapse measured as fast or faster (+0.5-2 %).
-    return streams == kStreams && hidden > 0 && hidden % 16 == 0 && columns > 96 &&
+bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_t streams) noexcept {
+    return streams == kStreams && hidden > 0 && hidden % 16 == 0 &&
            up.qtype == QType::Q8_G32_FP16 && up.layout == QuantLayout::RowSplit && up.qdata != nullptr &&
            up.scales != nullptr && up.n == streams * hidden && up.padded_shape[1] % 128 == 0 &&
            up.padded_shape[1] >= up.k && up.k % 8 == 0;
 }
 
+bool hc_up_collapse_preferred(const Weight& up, std::int32_t hidden, std::int32_t streams,
+                              std::int32_t columns) noexcept {
+    // Up to 96 columns the separate linear and collapse measured as fast or faster (+0.5-2 %).
+    return columns > 96 && hc_up_collapse_supported(up, hidden, streams);
+}
+
 void hc_up_collapse(const Tensor& m, const Weight& up, const Tensor& normalized, std::int32_t streams, Tensor& x,
                     cudaStream_t stream) {
     const std::int32_t T = m.ne[1];
-    if (!hc_up_collapse_supported(up, x.ne[0], streams, T) || m.ne[0] != up.k || normalized.ne[1] != T ||
+    if (!hc_up_collapse_supported(up, x.ne[0], streams) || m.ne[0] != up.k || normalized.ne[1] != T ||
         normalized.ne[0] != up.n || x.ne[1] != T) {
         throw std::invalid_argument("hyper_connection: fused up + collapse shapes disagree");
     }

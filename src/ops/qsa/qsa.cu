@@ -1076,7 +1076,7 @@ std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int3
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append) {
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append, QsaAttentionRoute route) {
     require_geometry(geometry);
     const int columns = q.ne[2];
     require_batch(batch, columns);
@@ -1147,9 +1147,11 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, ws.select, ws.select_bytes,
                        {ws.selected, ws.counts}, stream, layer.spaces);
     // Calls this kernel would run unsplit take the Tensor Core prompt route (qsa_prompt.h): the same
-    // width-invariance class, so a column's bits still do not depend on its call's width there.
-    const int splits = attention_splits(columns, geometry);
-    if (splits == 1 && detail::qsa_prompt_supported(layer, geometry)) {
+    // width-invariance class, so a column's bits still do not depend on its call's width there. The
+    // column-invariant route takes it at every width.
+    const bool prompt = detail::qsa_prompt_supported(layer, geometry);
+    const int splits  = route == QsaAttentionRoute::ColumnInvariant && prompt ? 1 : attention_splits(columns, geometry);
+    if (splits == 1 && prompt) {
         detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts, out, stream,
                                      vq_args);
         commit();

@@ -41,6 +41,10 @@ using Fp8A8ResidualT64R128 =
 
 using Fp8A16TmaT32R64   = Fp8A16TmaMmaSchedule<32, 64, 1, 4, 6, 1>;
 using Fp8A16TmaT32R64S3 = Fp8A16TmaMmaSchedule<32, 64, 1, 4, 3, 2>;
+// The column-invariant route's narrow tile (T <= 16): eight warps of 8 rows, so a decode call spreads
+// its rows over twice the CTAs of the 32-column tile (2026-10-23 sweep, RTX PRO 6000: within 0-2 us of
+// the A16 route's GEMV at T = 1 on recipe C's shapes).
+using Fp8A16TmaT16R64 = Fp8A16TmaMmaSchedule<16, 64, 1, 8, 4, 1>;
 using Fp8A16TmaT32R128  = Fp8A16TmaMmaSchedule<32, 128, 1, 8, 4, 1>;
 using Fp8A16TmaT64R128  = Fp8A16TmaMmaSchedule<64, 128, 2, 4, 3, 1>;
 template <int Tokens, int Warps, int Stages>

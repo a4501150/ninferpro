@@ -110,6 +110,17 @@ int main() {
                           "adaptive-speculation is qualified on recipe C");
     }
 
+    // Construction-exact: the exact route of a registered configuration only.
+    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256}) {
+        const q::FastPathConfiguration recipe_c{DenseKernels::Fp8Row, false, kv};
+        failures += check(q::construction_exact(recipe_c), "recipe C's exact route is construction-exact");
+        q::FastPathSelection exact_c{.configuration = recipe_c, .paths = {}};
+        failures += check(exact_c.construction_exact(), "the exact route of recipe C resumes anywhere exactly");
+        exact_c.paths = {FastPath::GdnF16Accumulate};
+        failures += check(!exact_c.construction_exact(), "a selected path keeps the resume grid");
+    }
+    failures += check(!q::construction_exact(dense8), "Dense8 has no column-invariant route set");
+
     q::FastPathSelection selection{.configuration = dense8, .paths = {}};
     const auto exact = selection.forward();
     failures += check(exact.dense_routes == infernix::ops::LinearRoutes::Exact && !exact.gdn_conv_fused &&
@@ -205,8 +216,12 @@ int main() {
                               !q::fast_path_qualified(FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, kv}),
                           "gdn-f16-accumulate is registered where it was measured faster and passed");
     }
-    failures += check(exact.gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Exact,
-                      "the exact route keeps the GDN prefill exact");
+    failures += check(exact.gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Recurrent && exact.column_invariant,
+                      "the exact route runs the GDN prefill's recurrent arithmetic and the column-invariant kernels");
+    selection.paths = {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume};
+    failures += check(selection.forward().gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Recurrent &&
+                          !selection.forward().column_invariant,
+                      "a request-coupling fast route keeps the recurrent GDN prefill and its width routes");
     selection.paths = {FastPath::GdnF16Accumulate};
     failures += check(q::fast_path_applies(FastPath::GdnF16Accumulate, recipe_c, options) &&
                           selection.forward().gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Fp16Accumulate,

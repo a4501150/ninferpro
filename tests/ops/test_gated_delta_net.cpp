@@ -750,6 +750,123 @@ int batch_update_gating_case(int batch, std::uint32_t seed) {
     return same_out && same_states ? 0 : 1;
 }
 
+// GdnChunkArithmetic::Recurrent: the recurrent arithmetic at every T. Against the FP64 oracle with
+// the recurrent profile's limits, and bit for bit: (a) the same sequence split into calls at
+// `partitions`, (b) the last `decode` tokens as gated_delta_net_batch_update steps, (c) the last
+// `verify` tokens as one gated_delta_net_replay_record call from the state before them (Hq 16 and
+// Hv 32/48, normalized), and (d) at T < 16 the default route (the direct recurrent kernel). Outputs
+// and final state of every form must carry the one-call run's bits: a sequence's bits do not depend
+// on how it is split into prefill calls, decode steps and verifications.
+int recurrent_arithmetic_case(const Case& test_case, std::uint32_t seed, InputPattern pattern,
+                              const std::vector<int>& partitions, int decode, int verify) {
+    const gdn_ref::Inputs in = make_inputs(test_case, seed, pattern);
+    const int T = test_case.tokens, Hq = test_case.qk_heads, Hv = test_case.value_heads;
+    const std::string label = std::string("recurrent arithmetic ") + test_case.name + " H=" + std::to_string(Hq) +
+                              "/" + std::to_string(Hv) + " T=" + std::to_string(T) +
+                              (test_case.normalize_qk ? " normalized" : " raw");
+    std::cout << "GDN_CASE " << label << std::endl;
+    const float scale = 1.0F / std::sqrt(static_cast<float>(kStateDim));
+    DeviceInputs device(in);
+    const std::size_t state_count = in.state.size(), out_count = in.v.size();
+    DeviceBuffer state(state_count * sizeof(float)), out(out_count * sizeof(std::uint16_t));
+    DeviceBuffer scratch(256);
+    WorkspaceArena workspace(DeviceSpan{scratch.p, scratch.bytes});
+    Tensor q(device.q.p, DType::BF16, {kStateDim, Hq, T});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, Hq, T});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, Hv, T});
+    Tensor g(device.g.p, DType::FP32, {Hv, T});
+    Tensor beta(device.beta.p, DType::FP32, {Hv, T});
+    Tensor output(out.p, DType::BF16, {kStateDim, Hv, T});
+    Tensor running(state.p, DType::FP32, {kStateDim, kStateDim, Hv});
+    const auto exec = execution();
+    // Prefills [begin, end) with the given arithmetic into the running state.
+    const auto prefill = [&](int begin, int end, ops::GdnChunkArithmetic arithmetic) {
+        Tensor o = output.slice(2, begin, end - begin);
+        ops::gated_delta_net(q.slice(2, begin, end - begin), k.slice(2, begin, end - begin),
+                             v.slice(2, begin, end - begin), g.slice(1, begin, end - begin),
+                             beta.slice(1, begin, end - begin), scale, test_case.normalize_qk, workspace, running, o,
+                             exec, arithmetic);
+    };
+    const auto reset = [&] {
+        state.copy_from_host(in.state.data(), state_count * sizeof(float));
+        CUDA_CHECK(cudaMemset(out.p, 0xff, out_count * sizeof(std::uint16_t)));
+    };
+    const auto bits_out   = [&] { return from_device<std::uint16_t>(out, out_count); };
+    const auto bits_state = [&] { return from_device<std::uint32_t>(state, state_count); };
+
+    reset();
+    prefill(0, T, ops::GdnChunkArithmetic::Recurrent);
+    cuda_synchronize();
+    const auto one_out   = bits_out();
+    const auto one_state = bits_state();
+    int failures = 0;
+    {
+        const auto ref = gdn_ref::evaluate(in, scale, test_case.normalize_qk);
+        failures += verify_heads(label + " out", from_device_bf16(out, out_count), ref.out, Hv, T,
+                                 PrecisionProfile::Recurrent, false);
+        failures += verify_heads(label + " state", read_f32(state.p, state_count), ref.final_state, Hv, 1,
+                                 PrecisionProfile::Recurrent, true);
+    }
+    if (!partitions.empty()) {
+        reset();
+        int begin = 0;
+        for (const int length : partitions) {
+            prefill(begin, begin + length, ops::GdnChunkArithmetic::Recurrent);
+            begin += length;
+        }
+        cuda_synchronize();
+        failures += verify_exact(label + " split calls out", bits_out(), one_out);
+        failures += verify_exact(label + " split calls state", bits_state(), one_state);
+    }
+    DeviceBuffer slot(sizeof(std::int32_t));
+    CUDA_CHECK(cudaMemset(slot.p, 0, sizeof(std::int32_t)));
+    Tensor slots(slot.p, DType::I32, {1});
+    Tensor pool(state.p, DType::FP32, {kStateDim, kStateDim, Hv, 1});
+    if (decode > 0) {
+        reset();
+        prefill(0, T - decode, ops::GdnChunkArithmetic::Recurrent);
+        for (int t = T - decode; t < T; ++t) {
+            Tensor o = output.slice(2, t, 1).view({kStateDim, Hv, 1, 1});
+            ops::gated_delta_net_batch_update(q.slice(2, t, 1).view({kStateDim, Hq, 1, 1}),
+                                              k.slice(2, t, 1).view({kStateDim, Hq, 1, 1}),
+                                              v.slice(2, t, 1).view({kStateDim, Hv, 1, 1}),
+                                              g.slice(1, t, 1).view({Hv, 1, 1}), beta.slice(1, t, 1).view({Hv, 1, 1}),
+                                              scale, test_case.normalize_qk, pool, slots, slots, o, nullptr);
+        }
+        cuda_synchronize();
+        failures += verify_exact(label + " decode steps out", bits_out(), one_out);
+        failures += verify_exact(label + " decode steps state", bits_state(), one_state);
+    }
+    if (verify > 0) {
+        reset();
+        prefill(0, T - verify, ops::GdnChunkArithmetic::Recurrent);
+        const int W = verify;
+        DeviceBuffer key_record(static_cast<std::size_t>(kStateDim) * Hq * W * 2),
+            value_record(static_cast<std::size_t>(kStateDim) * Hv * W * 2),
+            gate_record(static_cast<std::size_t>(2) * Hv * W * 4);
+        Tensor kr(key_record.p, DType::BF16, {kStateDim, Hq, W, 1});
+        Tensor vr(value_record.p, DType::BF16, {kStateDim, Hv, W, 1});
+        Tensor gr(gate_record.p, DType::FP32, {2, Hv, W, 1});
+        Tensor o = output.slice(2, T - W, W).view({kStateDim, Hv, W, 1});
+        ops::gated_delta_net_replay_record(q.slice(2, T - W, W).view({kStateDim, Hq, W, 1}),
+                                           k.slice(2, T - W, W).view({kStateDim, Hq, W, 1}),
+                                           v.slice(2, T - W, W).view({kStateDim, Hv, W, 1}),
+                                           g.slice(1, T - W, W).view({Hv, W, 1}),
+                                           beta.slice(1, T - W, W).view({Hv, W, 1}), scale, pool, Tensor{}, slots, kr,
+                                           vr, gr, o, nullptr);
+        cuda_synchronize();
+        failures += verify_exact(label + " verification out", bits_out(), one_out);
+    }
+    if (T < 16) {
+        reset();
+        prefill(0, T, ops::GdnChunkArithmetic::Exact);
+        cuda_synchronize();
+        failures += verify_exact(label + " default route out", bits_out(), one_out);
+        failures += verify_exact(label + " default route state", bits_state(), one_state);
+    }
+    return failures;
+}
+
 int contract_rejection_cases() {
     DeviceBuffer q_buffer(kStateDim * 8 * sizeof(std::uint16_t));
     DeviceBuffer k_buffer(kStateDim * 8 * sizeof(std::uint16_t));
@@ -821,6 +938,19 @@ int main() {
     failures += contract_rejection_cases();
     for (const int batch : {1, 3, 8}) { failures += batch_update_gating_case(batch, 31000U + batch); }
 
+    failures += recurrent_arithmetic_case({"27b", 16, 48, 1025, true}, 17001U, InputPattern::Ordinary,
+                                          {7, 17, 1001}, 3, 8);
+    failures += recurrent_arithmetic_case({"35b", 16, 32, 2049, true}, 17002U, InputPattern::Ordinary,
+                                          {1003, 1, 15, 1030}, 2, 16);
+    failures += recurrent_arithmetic_case({"27b short", 16, 48, 15, true}, 17003U, InputPattern::Ordinary, {1, 14},
+                                          1, 4);
+    failures += recurrent_arithmetic_case({"raw grouped", 5, 15, 65, false}, 17004U, InputPattern::Ordinary,
+                                          {16, 33, 16}, 1, 0);
+    failures += recurrent_arithmetic_case({"raw short", 5, 15, 9, false}, 17005U, InputPattern::Ordinary, {}, 0, 0);
+    failures += recurrent_arithmetic_case({"weak decay", 1, 3, 16385, true}, 17006U, InputPattern::WeakDecay,
+                                          {5000, 11385}, 0, 0);
+    failures += recurrent_arithmetic_case({"strong decay", 16, 48, 4097, true}, 17007U, InputPattern::StrongDecay,
+                                          {}, 0, 0);
     failures += run_case({"27b recurrent", 16, 48, 1, true}, 12001U, InputPattern::Ordinary, true);
     failures += run_case({"27b recurrent", 16, 48, 7, false}, 12007U);
     failures += run_case({"35b recurrent", 16, 32, 15, true}, 12015U);

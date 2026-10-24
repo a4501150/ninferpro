@@ -152,6 +152,20 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     throw std::invalid_argument("linear workspace: unsupported weight qtype");
 }
 
+bool linear_column_invariant_supported(QType qtype, std::int32_t output_rows, std::int32_t input_rows) noexcept {
+    switch (qtype) {
+    case QType::Q8_G32_FP16: return detail::q8_column_invariant_supported(output_rows, input_rows);
+    case QType::BF16: return detail::bf16_column_invariant_supported(output_rows, input_rows);
+    case QType::FP8_E4M3FN_ROW_BF16: return detail::fp8_column_invariant_supported(output_rows, input_rows);
+    default: break;
+    }
+    // NVFP4 registers its text problems; the other formats register none.
+    try {
+        (void)linear_workspace_capacity_bytes(qtype, output_rows, input_rows, LinearPolicy::A16ColumnInvariant, 1, 1);
+        return true;
+    } catch (...) { return false; }
+}
+
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
     validate_linear_semantics(x, w, out, policy);

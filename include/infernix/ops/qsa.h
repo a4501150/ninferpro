@@ -243,9 +243,22 @@ struct QsaAppend {
 ///     a window slot for keys before the call, the call's own row for its columns (staged in the
 ///     workspace for calls wider than kKVWindowInlineWidth, which take one sequence, and committed
 ///     to the window afterwards); from its codes otherwise.
+///
+/// `route` picks the arithmetic of a call:
+///   - ByWidth: calls of at most 8 columns split each column's attended tokens into 64-token tiles
+///     (a column's bits do not depend on the other columns of such a call); wider calls split by
+///     the device's SM count, and calls that would run unsplit take the Tensor Core prompt route
+///     (bits independent of the width within that class). The three classes differ in rounding.
+///   - ColumnInvariant: the prompt route at every width where it serves the layer (every storage
+///     at head_dim 256 and at most 16 query heads per KV head), so a column's bits depend only on
+///     its query, its sequence's KV and its position, never on the call's width, batch or the
+///     other columns: decode, verification and prefill of a position agree bit for bit.
+enum class QsaAttentionRoute { ByWidth, ColumnInvariant };
+
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr);
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr,
+                   QsaAttentionRoute route = QsaAttentionRoute::ByWidth);
 
 } // namespace infernix::ops

@@ -296,3 +296,13 @@ infernix_add_op_test(infernix_offloaded_moe_wide_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_wide.cu"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_offloaded_moe_wide_test PROPERTIES TIMEOUT 900)
+
+# Width equality of the construction-exact route (model-quality.md section 6.8): every Op Flash-Next's
+# recipe C exact route runs, on its column-invariant routes, at width W against width 1, and the
+# stateful Ops' one-call against split-call and decode decompositions, byte for byte. Without
+# --invariant the binary prints the default routes' divergences as a table.
+infernix_add_op_test(infernix_width_equality_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_width_equality.cpp"
+  LIBRARIES infernix_ops infernix_linear_test_support
+  ARGS --invariant --strict)
+set_tests_properties(infernix_width_equality_test PROPERTIES TIMEOUT 1800)

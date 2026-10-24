@@ -74,4 +74,11 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
 // A declared token interval must reserve enough space for every public point it contains.
 int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k);
 
+// Column invariance under `policy`: every column of a call of each width in `widths`, starting at
+// each column of `offsets`, equals that column computed alone, bit for bit. The activations span 25
+// binades, so the FP32 sums round and any difference in reduction order changes output bits.
+int verify_column_invariance(std::string_view label, const quantized_weight::PackedWeight& host,
+                             ops::LinearPolicy policy, std::span<const std::int32_t> widths,
+                             std::span<const std::int32_t> offsets, std::uint32_t seed);
+
 } // namespace infernix::test::linear

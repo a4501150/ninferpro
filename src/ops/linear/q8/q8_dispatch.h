@@ -12,6 +12,8 @@ Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t, Li
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy,
                           LinearRoutes routes);
 
+// Whether [n, k] registers an A16ColumnInvariant route.
+[[nodiscard]] bool q8_column_invariant_supported(std::int32_t n, std::int32_t k) noexcept;
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  LinearRoutes routes, cudaStream_t stream);
 

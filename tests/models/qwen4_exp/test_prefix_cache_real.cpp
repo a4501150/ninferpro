@@ -8,16 +8,20 @@
 //                which has the same call boundaries.
 //   host blocks  (E3 through the Host tier) A pressure prompt evicts the cached blocks; the next
 //                resume restores them from the slab pool and still equals the cold run.
-//   endpoint     (E1) A second turn resumes from the first turn's endpoint left in its lane; after
-//                pressure evicts everything Device-side, the same second turn resumes through a
-//                Host image restore and must generate the same tokens.
+//   endpoint     (E1) A second turn resumes from the first turn's endpoint left in its lane (state
+//                that turn 1's decode computed) and generates what a cold run of turn 2 generates;
+//                after pressure evicts everything Device-side, the same second turn resumes through
+//                a Host image restore and must generate the same tokens.
 //   X5           Chat turn 2 without turn 1's reasoning block resumes at least at turn 1's generation
-//                opener tap.
+//                opener tap, off the 16-token grid, and generates what its cold run generates.
 //   X6           Sessions sharing only a system block resume at its structural tap (an exact split).
 //   X3           A repeat of a chat prompt resumes at its generation opener (an exact off-grid tap) and
-//                generates what the capturing run generated. The prompt-end capture is value-gated
-//                there (the opener realized within one tap separation of n), so the opener serves
-//                the repeat.
+//                generates what the capturing run and a cold run (calls at 0, 512, ...) generate.
+//                The prompt-end capture is value-gated there (the opener realized within one tap
+//                separation of n), so the opener serves the repeat.
+//   The comparisons with cold runs need the artifact's exact route to be construction-exact
+//   (recipe C, int8 or fp8 KV; model-quality.md §6.8). Under MTP their draft counts are printed,
+//   not asserted: the drafter's own kernels are not column-invariant.
 //   X12          (both modes) Engine 1 serves two chat turns and stops, saving its Host tier to a file;
 //                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
 //                Between the turns, Engine 1's periodic save writes the file once and, with the Host
@@ -110,6 +114,15 @@ std::string drafts_text(const infernix::SpeculativeStats& a, const infernix::Spe
 
 const char* mode_name(bool mtp) { return mtp ? "MTP" : "plain"; }
 
+// A resume against a cold run: the target model's bits are construction-exact, so the tokens must be
+// equal; the MTP drafter's own projections and experts keep their width-coupled routes, so its
+// drafts after a resume may differ from the cold run's (never the tokens: every draft is verified).
+// The counts are printed as an observation.
+void observe_drafts(const char* what, const infernix::SpeculativeStats& resumed, const infernix::SpeculativeStats& cold) {
+    std::printf("        %s: %s (%s)\n", what, drafts_text(resumed, cold).c_str(),
+                drafts_equal(resumed, cold) ? "equal" : "differ");
+}
+
 // The MTP drafter as the mode runs it (3 drafts).
 void use_mode(infernix::EngineOptions& options, bool mtp) {
     if (!mtp) { return; }
@@ -144,10 +157,10 @@ infernix::EngineOptions base_options(const char* artifact, const char* ngram) {
     options.max_pending_requests = 1;
     options.context_cache.host_capacity_bytes = 2ULL << 30;
     // Resumes equal cold runs on the exact route (model-quality.md §6.1); the default route's
-    // qualified paths make a column's bits depend on its call. Off-grid and endpoint resumes are the
-    // free-cache-resume path.
+    // qualified paths make a column's bits depend on its call. The artifact's exact route is
+    // construction-exact (recipe C, int8 or fp8 KV; model-quality.md §6.8), so it resumes, taps and
+    // publishes endpoints at any position itself, and every resume below equals a cold run.
     options.fast_paths           = false;
-    options.fast_path_candidates = {infernix::FastPath::FreeCacheResume};
     return options;
 }
 
@@ -210,6 +223,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     failures += check(warm_b.reused == 1024, "tap resume reuses 1024 tokens (got " + std::to_string(warm_b.reused) + ")");
     failures += check(warm_b.tokens == cold_b.tokens, "tap resume equals the cold run (" +
                                                           first_difference(warm_b.tokens, cold_b.tokens) + ")");
+    observe_drafts("tap resume against the cold run", warm_b.speculative, cold_b.speculative);
 
     // host blocks: pressure evicts the Device copies; B now resumes from its own prompt-tail tap
     // (1536) through Host block restores.
@@ -231,6 +245,12 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     const std::uint32_t endpoint = static_cast<std::uint32_t>(t1.size() + turn1.tokens.size() - 1U);
     failures += check(resident.reused == endpoint, "turn 2 resumes at the endpoint " + std::to_string(endpoint) +
                                                        " (got " + std::to_string(resident.reused) + ")");
+    // The endpoint holds decode-computed state (turn 1's output, decoded one round at a time);
+    // the cold run prefills those positions in its chunks.
+    const Run cold_t2 = generate(engine, t2, 48, false);
+    failures += check(resident.tokens == cold_t2.tokens, "the endpoint resume equals the cold run (" +
+                                                             first_difference(resident.tokens, cold_t2.tokens) + ")");
+    observe_drafts("the endpoint resume against the cold run", resident.speculative, cold_t2.speculative);
     // Re-create turn 1's endpoint, evict, then resume turn 2 through the Host image.
     (void)generate(engine, t1, 96, true);
     (void)generate(engine, pressure, 4, true);
@@ -264,6 +284,18 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     failures += check(x5.reused_prompt_tokens + 16U >= n1, "X5 turn 2 reuses at least turn 1's opener (reused " +
                                                                std::to_string(x5.reused_prompt_tokens) + ", turn 1 prompt " +
                                                                std::to_string(n1) + ")");
+    {
+        // The opener is off the 16-token grid; the cold run's calls start at 0, 512, 1024, ...
+        const infernix::GenerationResult cold =
+            chat_on(engine,
+                    {system, user("Which shelf takes colour 4?"), message(infernix::ChatRole::Assistant, s1.content),
+                     message(infernix::ChatRole::User, "And colour 5?")},
+                    32, false);
+        failures += check(x5.generated_token_ids == cold.generated_token_ids,
+                          "X5 the off-grid resume equals the cold run (" +
+                              first_difference(x5.generated_token_ids, cold.generated_token_ids) + ")");
+        observe_drafts("X5 against the cold run", x5.speculative, cold.speculative);
+    }
 
     const infernix::RuntimeStats before_s2 = engine.runtime_stats();
 
@@ -300,6 +332,13 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     failures += check(again.generated_token_ids == s2.generated_token_ids,
                       "X3 the repeat equals the capturing run (" +
                           first_difference(again.generated_token_ids, s2.generated_token_ids) + ")");
+    {
+        const infernix::GenerationResult cold = chat_on(engine, {system, user("Summarise rule 12 in one sentence.")}, 32, false);
+        failures += check(again.generated_token_ids == cold.generated_token_ids,
+                          "X3 the opener resume equals the cold run (" +
+                              first_difference(again.generated_token_ids, cold.generated_token_ids) + ")");
+        observe_drafts("X3 against the cold run", again.speculative, cold.speculative);
+    }
 
     // Single-chunk tail snapshot: a prompt that fits one call has no inner boundary for its
     // opener to realize at, and the finish endpoint serves continuations only, so the tail tap

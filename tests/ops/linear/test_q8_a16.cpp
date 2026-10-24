@@ -67,6 +67,13 @@ int q8_a16_conformance() {
         if (shape.n == 9216 && shape.k == 2048) {
             for (int t : {12, 13, 14}) calls.push_back({t});
         }
+        if ((shape.n == 324 || shape.n == 320) && shape.k == 10240 || (shape.n == 10240 && shape.k == 320) ||
+            (shape.n == 12800 && shape.k == 2560)) {
+            // The column-invariant route (the MMA tiles at every T).
+            for (int t : {1, 3, 8, 9, 64, 65, 97, 129, 1025}) {
+                calls.push_back({t, CallForm::Policy, infernix::ops::LinearPolicy::A16ColumnInvariant});
+            }
+        }
         if (shape.n == 248320) {
             calls.push_back({34});
             // The column-invariant route: one 8-K-warp family at every T, sliced beyond 32.
@@ -178,6 +185,22 @@ int q8_a16_column_invariance() {
     }
     return failures;
 }
+
+// The exact route's column-invariant projections (A16ColumnInvariant): every column of a call of any
+// width, starting at any column, has its bits computed alone (the MMA tiles at every T).
+int q8_a16_invariant_route() {
+    int failures = 0;
+    const std::array<std::int32_t, 15> widths{2, 3, 4, 8, 9, 16, 33, 63, 64, 65, 96, 97, 193, 1025, 2049};
+    const std::array<std::int32_t, 3> offsets{0, 1, 37};
+    for (const Geometry shape : {Geometry{324, 10240, 461U}, Geometry{320, 10240, 463U}, Geometry{10240, 320, 467U},
+                                 Geometry{12800, 2560, 479U}}) {
+        const auto host = make_q8_g32_fp16_weight(shape.n, shape.k, shape.seed);
+        failures += verify_column_invariance("Q8_A16 invariant", host,
+                                             infernix::ops::LinearPolicy::A16ColumnInvariant, widths, offsets,
+                                             shape.seed ^ 0x5A5AU);
+    }
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -186,7 +209,7 @@ int main() {
         return 77;
     }
     try {
-        const int failures = q8_a16_conformance() + q8_a16_column_invariance();
+        const int failures = q8_a16_conformance() + q8_a16_column_invariance() + q8_a16_invariant_route();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Q8_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
