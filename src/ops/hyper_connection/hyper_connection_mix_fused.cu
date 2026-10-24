@@ -45,6 +45,7 @@ constexpr int kStreams      = 4;
 constexpr int kHidden       = 2560;
 constexpr int kChunks       = kHidden / 256; // a lane's 8-weight chunks per stream slice
 constexpr int kMaxRank      = 512;
+constexpr int kK1MaxColumns = 16; // K1a/K1b (one column, or norm weights not 16-byte aligned)
 constexpr int kDownRows     = 8; // rows of W_down per CTA (a row per warp)
 constexpr int kDownThreads  = kDownRows * 32;
 constexpr int kPassColumns  = 8;
@@ -254,8 +255,8 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
     const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
     const bf16* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
     float* __restrict__ inject, bf16* __restrict__ x) {
-    __shared__ __align__(16) float m[kHcMixFusedMaxColumns * kMaxRank]; // [T][rank]
-    __shared__ float inv[kStreams * kHcMixFusedMaxColumns];             // [S][T]
+    __shared__ __align__(16) float m[kK1MaxColumns * kMaxRank]; // [T][rank]
+    __shared__ float inv[kStreams * kK1MaxColumns];             // [S][T]
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
     const int d    = static_cast<int>(blockIdx.x) * kUpFeatures + warp;
     const bool live = d < kHidden;
@@ -275,7 +276,7 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
     }
     // The norm weights (1 + w) of the warp's S rows, and the residual R[s*H + d, t] for every (t, s):
     // entry e = t*S + s is held by lane e % 32 in r_held[e / 32], for lane 0's collapse.
-    static_assert(kStreams * kHcMixFusedMaxColumns <= 64);
+    static_assert(kStreams * kK1MaxColumns <= 64);
     const int dl = live ? d : 0;
     float w_bias[kStreams];
 #pragma unroll
@@ -701,8 +702,7 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     const float* __restrict__ m_in, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
     const bf16* __restrict__ norm_weight, typename Codec::Params up, int rank, int columns, bf16* __restrict__ x) {
     static_assert(kUpFeatures == 2 * kUpV4Warps && kUpV4Rows == 2 * kStreams);
-    static_assert(kUpFeatures * kHcMixFusedMaxColumns <= kUpV4Threads);
-    __shared__ __align__(16) float m[kHcMixFusedMaxColumns * kMaxRank];    // [T][2][rank / 2]
+    extern __shared__ __align__(16) float m[];                           // [T][2][rank / 2]
     __shared__ float u[kHcMixFusedMaxColumns * kStreams * kUpFeatures];   // [T][S][feature]
     __shared__ float inv[kStreams * kHcMixFusedMaxColumns];               // [S][T]
     const int tid  = static_cast<int>(threadIdx.x);
@@ -732,8 +732,9 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
 #pragma unroll
         for (int h = 0; h < 2; ++h) { Codec::decode(chunk[q][h], wq[q][h]); }
     }
-    // The collapse thread of (token te, feature de) and its norm weights (1 + w).
-    const int fe = tid % kUpFeatures, te = tid / kUpFeatures;
+    // The collapse thread of (tokens te, te + 16, ..., feature de) and its norm weights (1 + w).
+    constexpr int kCollapseTokens = kUpV4Threads / kUpFeatures;
+    const int fe = tid % kUpFeatures, te0 = tid / kUpFeatures;
     const int de = d0 + fe;
     const int dl = de < kHidden ? de : 0;
     float w_bias[kStreams];
@@ -743,14 +744,6 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     }
     pdl::trigger_dependents();
     pdl::wait_for_dependencies();
-    const bool collapses = de < kHidden && te < columns;
-    float r[kStreams];
-#pragma unroll
-    for (int s = 0; s < kStreams; ++s) {
-        r[s] = collapses ? __bfloat162float(__ldg(residual + static_cast<std::int64_t>(te) * width +
-                                                  static_cast<std::int64_t>(s) * kHidden + de))
-                         : 0.0F;
-    }
 
     // 2. m, formed once by the down CTAs (K1b's z and SiLU, its plane layout).
     const float inv_streams = 1.0F / static_cast<float>(kStreams);
@@ -776,7 +769,14 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     __syncthreads();
 
     // 4. The collapse, K1b's expressions in its order.
-    if (collapses) {
+    if (de >= kHidden) { return; }
+    for (int te = te0; te < columns; te += kCollapseTokens) {
+        float r[kStreams];
+#pragma unroll
+        for (int s = 0; s < kStreams; ++s) {
+            r[s] = __bfloat162float(
+                __ldg(residual + static_cast<std::int64_t>(te) * width + static_cast<std::int64_t>(s) * kHidden + de));
+        }
         float sum = 0.0F;
 #pragma unroll
         for (int s = 0; s < kStreams; ++s) {
@@ -868,7 +868,19 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                      "down partials");
     }
     if (v4) {
-        check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpV4Threads), 0, stream},
+        static const bool up_configured = [] {
+            const cudaError_t error = cudaFuncSetAttribute(
+                hc_up_collapse_v4_kernel<Codec>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(static_cast<std::size_t>(kHcMixFusedMaxColumns) * kMaxRank * sizeof(float)));
+            if (error != cudaSuccess) {
+                throw std::runtime_error(std::string("hyper_connection_mix: shared memory: ") + cudaGetErrorString(error));
+            }
+            return true;
+        }();
+        (void)up_configured;
+        const std::size_t m_bytes = static_cast<std::size_t>(columns) * rank * sizeof(float);
+        check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpV4Threads), m_bytes,
+                                           stream},
                                           hc_up_collapse_v4_kernel<Codec>, static_cast<const float*>(partial),
                                           static_cast<const float*>(inv), static_cast<const bf16*>(residual.data),
                                           static_cast<const bf16*>(norm_weight.data), up, rank, columns,
@@ -887,10 +899,13 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
 
 } // namespace
 
-bool hc_mix_fused_supported(const Weight& down, const Weight& up, std::int32_t hidden, std::int32_t streams,
-                            std::int32_t rank, std::int32_t columns) noexcept {
+bool hc_mix_fused_supported(const Weight& down, const Weight& up, const void* norm_weight, std::int32_t hidden,
+                            std::int32_t streams, std::int32_t rank, std::int32_t columns) noexcept {
     const bool codec = (q8_rowsplit(down) && q8_rowsplit(up)) || (bf16_contiguous(down) && bf16_contiguous(up));
-    return codec && columns >= 1 && columns <= kHcMixFusedMaxColumns && hidden == kHidden && streams == kStreams &&
+    const bool width = columns >= 1 && (columns <= kK1MaxColumns ||
+                                        (columns <= kHcMixFusedMaxColumns &&
+                                         reinterpret_cast<std::uintptr_t>(norm_weight) % 16 == 0));
+    return codec && width && hidden == kHidden && streams == kStreams &&
            rank > 0 && rank % 8 == 0 && rank <= kMaxRank && down.k == kStreams * kHidden &&
            (down.n == rank || down.n == rank + kStreams) && up.n == kStreams * kHidden && up.k == rank;
 }
@@ -904,7 +919,7 @@ std::size_t hc_mix_fused_workspace_bytes(std::int32_t down_rows, std::int32_t st
 void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& down, const Weight& up,
                   std::int32_t streams, std::int32_t rank, float eps, Tensor& x, Tensor* inject, void* partials,
                   cudaStream_t stream) {
-    if (!hc_mix_fused_supported(down, up, x.ne[0], streams, rank, residual.ne[1])) {
+    if (!hc_mix_fused_supported(down, up, norm_weight.data, x.ne[0], streams, rank, residual.ne[1])) {
         throw std::invalid_argument("hyper_connection_mix: the fused route does not serve this problem");
     }
     if (inject != nullptr && down.n != rank + streams) {

@@ -7,11 +7,12 @@
 //   inject = 2 sigmoid(z[rank:] / S); u = W_up m; x = (1/S) sum_s sigmoid(u[sH + d]) Rn[sH + d].
 //
 // Cases: Flash-Next's geometry (S = 4, H = 2560, rank 320) with and without injects at T = 1, 4, 5,
-// 8, 9, 16 (the fused route) and 17, 64, 96, 97, 129, 193 (the composed route; with Q8 weights and
-// more than 96 columns its up projection and collapse run as one kernel, whose tile changes at 129
-// columns and leaves partial token tiles at 97, 129 and 193); column invariance of the fused route
-// (each column of a 16-column call bit-identical to that column alone, and a 5-column call equal to
-// the 16-column call's first five); one graph-captured call bit-identical to the eager call; the
+// 8, 9, 16, 17, 28 (the fused route; above 16 columns its collapse loops over token groups) and 29,
+// 64, 96, 97, 129, 193 (the composed route; with Q8 weights and more than 96 columns its up projection
+// and collapse run as one kernel, whose tile changes at 129 columns and leaves partial token tiles at
+// 97, 129 and 193); column invariance of the fused route (each column of a 28-column call
+// bit-identical to that column alone, and a 5-column call equal to the 28-column call's first five);
+// one graph-captured call bit-identical to the eager call; the
 // workspace capacity covers every T. Criteria: the fused route rounds only x to BF16 (FP32
 // intermediates), so |x - ref| <= 2^-8 |ref| + 2^-12 rms(ref), and injects to 1e-5 relative + 1e-6; the
 // composed route rounds Rn, z, m and u to BF16, so its bound is 2^-5 |ref| + 2^-6 rms(ref) and
@@ -340,18 +341,18 @@ int main() {
                 p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 193);
             infernix::WorkspaceArena ws(capacity);
             const std::string tag = std::string(codec == Codec::Q8 ? "q8 " : "bf16 ") + (inject ? "inject" : "no inject");
-            for (const int T : {1, 4, 5, 8, 9, 16, 17, 64, 96, 97, 129, 193}) {
+            for (const int T : {1, 4, 5, 8, 9, 16, 17, 28, 29, 64, 96, 97, 129, 193}) {
                 const auto r     = residual(T, 1000U + static_cast<std::uint32_t>(T));
                 const Result got = run(p, r, T, inject, ws, stream);
-                compare(got, oracle(r, p.norm, p.down_values, p.down_rows, p.up_values, T), T <= 16, inject,
+                compare(got, oracle(r, p.norm, p.down_values, p.down_rows, p.up_values, T), T <= 28, inject,
                         tag + " T=" + std::to_string(T));
                 check(ws.peak_used() <= capacity, tag + ": the workspace capacity covers T=" + std::to_string(T));
             }
             // Column invariance of the fused route.
-            const auto r16    = residual(16, 4242U);
-            const Result all  = run(p, r16, 16, inject, ws, stream);
+            const auto r16    = residual(28, 4242U);
+            const Result all  = run(p, r16, 28, inject, ws, stream);
             bool same         = true;
-            for (int c = 0; c < 16 && same; ++c) {
+            for (int c = 0; c < 28 && same; ++c) {
                 const std::vector<std::uint16_t> one(r16.begin() + static_cast<std::ptrdiff_t>(c) * kW,
                                                      r16.begin() + static_cast<std::ptrdiff_t>(c + 1) * kW);
                 const Result alone = run(p, one, 1, inject, ws, stream);
@@ -359,7 +360,7 @@ int main() {
                        (!inject || std::equal(alone.inject.begin(), alone.inject.end(),
                                               all.inject.begin() + static_cast<std::ptrdiff_t>(c) * kS));
             }
-            check(same, tag + ": each column of a 16-column call equals that column alone");
+            check(same, tag + ": each column of a 28-column call equals that column alone");
             const std::vector<std::uint16_t> r5(r16.begin(), r16.begin() + 5 * kW);
             const Result five = run(p, r5, 5, inject, ws, stream);
             check(std::equal(five.x.begin(), five.x.end(), all.x.begin()), tag + ": a 5-column call equals the first five");

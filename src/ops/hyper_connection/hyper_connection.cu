@@ -242,7 +242,7 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     // route's FP32 intermediates are its own arithmetic), the up projection and collapse fused at any
     // width (bit-identical to the separate steps).
     const bool invariant = column_invariant(policy);
-    if (!invariant && detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
+    if (!invariant && detail::hc_mix_fused_supported(down, up, norm_weight.data, hidden, streams, rank, T)) {
         const DeviceSpan partials = workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
         detail::hc_mix_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject, partials.data, stream);
         return;

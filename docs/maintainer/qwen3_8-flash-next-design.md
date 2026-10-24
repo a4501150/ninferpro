@@ -3580,6 +3580,18 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   columns split over the grid (more CTAs re-read weights and repeat the norm; T 12 20-34 us), two
   warps per row in 512-thread CTAs (T 12 26.7 us), and `__launch_bounds__(256, 2)` so K1a and K1b
   co-reside (at 128 registers the weights reload per pass; T 12 23-60 us).
+- **Hyper-connection mix: the fused route up to 28 columns (2026-10-24, RTX PRO 6000, this fork).**
+  Calls of 17 or more columns (6 x 3, 6 x 4 and 8 x 3 verification rounds) took the composed route,
+  ~30 us per call at 17-18 columns against ~21 us for the fused route at 16. The v4 pair now serves up
+  to 28 columns (K1b v4's m in dynamic shared memory, its collapse looping over 16-token groups; K1a
+  and K1b keep 16 for one column or unaligned norm weights); per call, Q8: 17 / 18 / 24 / 28 columns
+  29.5 / 30.2 / 31.9 / ~33 -> 22.8 / 23.8 / 28.0 / 32.1 us, while at 32 the composed route is faster
+  (34.4 against 35.3), hence 28. This changes the fast route's bits at 17-28 columns: they now take
+  the fused route's FP32 intermediates (column-invariant, so each column equals its width-1 bits)
+  instead of the composed route's BF16 ones; the exact route keeps the composed route. The FP64
+  oracle test covers 17 and 28 at the fused tolerance and 29 at the composed one; T1 records the new
+  6 x 3 fast hash, every other shape and T1-exact unchanged. T1, same session, A/B twice: 6 x 3
+  21.72 -> 21.17 ms, 8 x 3 25.73 -> 25.58, 6 x 4 25.42 -> 25.33, 6 x 2 15.81 -> 15.83 (same arithmetic).
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of
