@@ -17,4 +17,12 @@ Q8Launch select_q8_n13952_k2560(std::int32_t tokens) {
     return launch_q8_a16_mma_r32_t128;
 }
 
+// A16ColumnInvariant (the MTP attention group): the MMA tiles at every T, each accumulating an output
+// over K in the same order; at decode widths the 64 x 8 tile runs with its unused columns masked.
+Q8Launch select_q8_n13952_k2560_invariant(std::int32_t tokens) {
+    if (tokens <= 16) return launch_q8_a16_mma_r64_t8_k128;
+    if (tokens <= 64) return launch_q8_a16_mma_r32_t64;
+    return select_q8_n13952_k2560(tokens);
+}
+
 } // namespace infernix::ops::detail

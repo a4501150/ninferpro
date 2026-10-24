@@ -309,6 +309,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // Every Text GDN layer normalizes Q/K, and its chunked calls serve prefill.
     case FastPath::GdnF16Accumulate: return true;
     case FastPath::GgmlBf16Prefill: return false; // Qwen3.8-Flash-Next's GGUF imports only
+    case FastPath::GdnCompensated: return false;  // Qwen3.8-Flash-Next's construction-exact configurations only
     }
     return false;
 }

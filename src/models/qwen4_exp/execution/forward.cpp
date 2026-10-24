@@ -1101,13 +1101,14 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         Tensor e = work_.alloc(DType::BF16, {H, T});
         ops::rmsnorm(x0, p.embedding_norm, config_.rms_norm_eps, true, e, s);
         Tensor ep = work_.alloc(DType::BF16, {H, T});
-        project(e, p.embedding_projection, ep, work_, s, ops::LinearRoutes::Exact, false);
+        project(e, p.embedding_projection, ep, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
         Tensor hn = work_.alloc(DType::BF16, {W, T});
         ops::rmsnorm(rows, p.hidden_norm, config_.rms_norm_eps, true, hn, s);
         Tensor residual = work_.alloc(DType::BF16, {W, T});
         {
             Tensor per_stream = residual.view({H, S * T});
-            project(hn.view({H, S * T}), p.hidden_projection, per_stream, work_, s, ops::LinearRoutes::Exact, false);
+            project(hn.view({H, S * T}), p.hidden_projection, per_stream, work_, s, ops::LinearRoutes::Exact,
+                    fast_.column_invariant);
         }
         ops::hyper_connection_inject(ep, state_.mtp_ones.slice(1, 0, T), residual, s);
 
@@ -1145,9 +1146,9 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
                                   expert_ws.bytes, outputs, s);
         const std::int32_t SI = dim(m.shared_intermediate);
         Tensor product = work_.alloc(DType::BF16, {SI, T});
-        shared_swiglu(xm, p.shared_gate_up, product, work_, s, ops::LinearRoutes::Exact, false);
+        shared_swiglu(xm, p.shared_gate_up, product, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
         Tensor shared = work_.alloc(DType::BF16, {H, T});
-        project(product, p.shared_down, shared, work_, s, ops::LinearRoutes::Exact, false);
+        project(product, p.shared_down, shared, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
         ops::moe_combine_inject(outputs, routing, shared, inject, residual, s);
         CUDA_CHECK(cudaMemcpyAsync(call.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
 

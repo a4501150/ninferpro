@@ -3,6 +3,7 @@
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 #include "ops/linear/q8/q8_shapes.h"
+#include "ops/linear/q8/q8_sliced_k_invariant.cuh"
 
 namespace infernix::ops::detail {
 
@@ -55,6 +56,14 @@ Q8Launch select_q8_n2560_k6144_fast(std::int32_t tokens) {
     // Beyond 128 columns NInfer's table measured 1.0-1.45 times the exact routes (2026-10-15 sweep,
     // RTX 5090), so the exact routes serve them.
     return select_q8_n2560_k6144(tokens);
+}
+
+// A16ColumnInvariant (the MTP attention output): the 8-K-warp sliced-K contraction at every T
+// (2026-10-24, RTX PRO 6000: 12.5 against 47.1 us at T = 1 for the MMA tiles' single K chain over 40
+// CTAs (the width route 14.3); 520 against 274 us for the width route at T = 2048, where only the
+// MTP's prompt pass runs it).
+Q8Launch select_q8_n2560_k6144_invariant(std::int32_t tokens) {
+    return select_q8_sliced_k_invariant<6144, 8>(tokens);
 }
 
 } // namespace infernix::ops::detail

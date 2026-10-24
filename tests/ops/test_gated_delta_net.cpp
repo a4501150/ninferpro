@@ -35,7 +35,7 @@ DeviceExecutionView execution(cudaStream_t stream = nullptr) {
 
 constexpr int kStateDim = 128;
 
-enum class PrecisionProfile { Recurrent, ChunkedNormalized, ChunkedRaw, ChunkedFp16Accumulate };
+enum class PrecisionProfile { Recurrent, ChunkedNormalized, ChunkedRaw, ChunkedFp16Accumulate, ChunkedCompensated };
 
 struct Criteria {
     const char* name;
@@ -59,11 +59,18 @@ struct Criteria {
 // keep far below 65504. It keeps the chunked-normalized limits (measured 2026-10-16 at the 27B's
 // shapes: output relative RMS 2.08e-3 against the exact route's 3.60e-3, state 8.6e-4 against
 // 2.6e-3).
-constexpr std::array<Criteria, 4> kCriteria{{
+//
+// chunked-compensated is GdnChunkArithmetic::Compensated: every chunk product sums hi*hi + hi*lo +
+// lo*hi of BF16 or TF32 pairs, so its error is the recurrent profile's order rather than the chunked
+// one's (measured 2026-10-24: output relative L2 at most 1.71e-3, state 9.0e-5, against the recurrent
+// arithmetic's 2.10e-3 and 2.0e-5 and the chunked route's 4.44e-3 and 3.56e-3). Its limits keep
+// about twice and three times that margin, below the chunked limits.
+constexpr std::array<Criteria, 5> kCriteria{{
     {"recurrent", {4.1e-3, 5.0e-6, 5.5e-3}, {2.7e-3, 1.0e-5, 3.9e-3}},
     {"chunked-normalized", {6.0e-3, 5.0e-6, 8.0e-3}, {4.5e-3, 1.0e-5, 9.0e-3}},
     {"chunked-raw", {4.5e-3, 5.0e-6, 7.0e-3}, {3.0e-3, 1.0e-5, 4.0e-3}},
     {"chunked-fp16acc", {6.0e-3, 5.0e-6, 8.0e-3}, {4.5e-3, 1.0e-5, 9.0e-3}},
+    {"chunked-compensated", {3.0e-3, 5.0e-6, 5.5e-3}, {3.0e-4, 1.0e-5, 3.9e-3}},
 }};
 
 PrecisionProfile prefill_profile(int tokens, bool normalize_qk) {
@@ -514,12 +521,14 @@ int run_case(const Case& test_case, std::uint32_t seed,
     return failures;
 }
 
-// GdnChunkArithmetic::Fp16Accumulate through the public Op (distinct states), against the same
-// FP64 oracle as run_case, with the exact-zero and identity properties of the special inputs.
-int fp16_accumulate_case(const Case& test_case, std::uint32_t seed, InputPattern pattern = InputPattern::Ordinary) {
+// GdnChunkArithmetic::Fp16Accumulate or Compensated through the public Op (distinct states), against
+// the same FP64 oracle as run_case, with the exact-zero and identity properties of the special inputs.
+int chunk_arithmetic_case(const Case& test_case, std::uint32_t seed, InputPattern pattern = InputPattern::Ordinary,
+                          ops::GdnChunkArithmetic arithmetic = ops::GdnChunkArithmetic::Fp16Accumulate) {
+    const bool fp16          = arithmetic == ops::GdnChunkArithmetic::Fp16Accumulate;
     const gdn_ref::Inputs in = make_inputs(test_case, seed, pattern);
     const float scale        = 1.0F / std::sqrt(static_cast<float>(kStateDim));
-    const auto ref           = gdn_ref::evaluate(in, scale, true);
+    const auto ref           = gdn_ref::evaluate(in, scale, test_case.normalize_qk);
     DeviceInputs device(in);
     DeviceBuffer state_in = to_device_f32(in.state);
     GuardedDeviceBuffer state_out(in.state.size() * sizeof(float));
@@ -538,13 +547,16 @@ int fp16_accumulate_case(const Case& test_case, std::uint32_t seed, InputPattern
         test_case.qk_heads, test_case.value_heads, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
-    const std::string label = std::string(test_case.name) + " fp16acc H=" + std::to_string(test_case.qk_heads) + "/" +
+    const std::string label = std::string(test_case.name) + (fp16 ? " fp16acc" : " compensated") +
+                              (test_case.normalize_qk ? "" : " raw") + " H=" + std::to_string(test_case.qk_heads) + "/" +
                               std::to_string(test_case.value_heads) + " T=" + std::to_string(test_case.tokens);
     std::cout << "GDN_CASE " << label << std::endl;
-    ops::gated_delta_net(q, k, v, g, beta, scale, true, workspace, input_state, output_state, output, execution(),
-                         ops::GdnChunkArithmetic::Fp16Accumulate);
+    ops::gated_delta_net(q, k, v, g, beta, scale, test_case.normalize_qk, workspace, input_state, output_state, output,
+                         execution(), arithmetic);
     cuda_synchronize();
-    const auto profile    = test_case.tokens < 16 ? PrecisionProfile::Recurrent : PrecisionProfile::ChunkedFp16Accumulate;
+    const auto profile    = test_case.tokens < 16 ? PrecisionProfile::Recurrent
+                            : fp16                ? PrecisionProfile::ChunkedFp16Accumulate
+                                                  : PrecisionProfile::ChunkedCompensated;
     const auto got_output = from_device_bf16(out.data(), in.v.size());
     const auto got_state  = read_f32(state_out.data(), in.state.size());
     int failures          = 0;
@@ -1040,25 +1052,66 @@ int main() {
     for (const auto geometry :
          {Geometry{"qwen-27b", 16, 48, 1025}, Geometry{"qwen-35b-a3b", 16, 32, 1025},
           Geometry{"generic-grouped-map", 5, 15, 65}, Geometry{"shared-qk", 1, 3, 65}}) {
-        failures += fp16_accumulate_case({geometry.name, geometry.qk_heads, geometry.value_heads, geometry.tokens, true},
+        failures += chunk_arithmetic_case({geometry.name, geometry.qk_heads, geometry.value_heads, geometry.tokens, true},
                                          16180U + geometry.value_heads);
     }
     for (int tokens : {15, 16, 17, 33, 4096}) {
-        failures += fp16_accumulate_case({"fp16acc prefill boundary", 1, 3, tokens, true}, 90000U + tokens);
+        failures += chunk_arithmetic_case({"fp16acc prefill boundary", 1, 3, tokens, true}, 90000U + tokens);
     }
     for (const auto stress : {Stress{"weak decay", InputPattern::WeakDecay, 16385, 332211U},
                               Stress{"zero decay", InputPattern::ZeroDecay, 16385, 332212U},
                               Stress{"small beta", InputPattern::SmallBeta, 16385, 332213U},
                               Stress{"strong decay", InputPattern::StrongDecay, 16385, 332214U},
                               Stress{"near collinear", InputPattern::NearCollinear, 4097, 332215U}}) {
-        failures += fp16_accumulate_case({stress.name, 1, 3, stress.tokens, true}, stress.seed, stress.pattern);
+        failures += chunk_arithmetic_case({stress.name, 1, 3, stress.tokens, true}, stress.seed, stress.pattern);
     }
-    failures += fp16_accumulate_case({"27b weak decay", 16, 48, 2049, true}, 16048U, InputPattern::WeakDecay);
-    failures += fp16_accumulate_case({"near-zero normalization", 1, 3, 17, true, true}, 14017U);
-    failures += fp16_accumulate_case({"zero query", 1, 3, 17, true}, 14317U, InputPattern::ZeroQuery);
-    failures += fp16_accumulate_case({"zero signal", 1, 3, 17, true}, 14417U, InputPattern::ZeroSignal);
-    failures += fp16_accumulate_case({"zero beta", 1, 3, 17, true}, 14517U, InputPattern::ZeroBeta);
-    failures += fp16_accumulate_case({"unit beta", 1, 3, 257, true}, 14657U, InputPattern::UnitBeta);
+    failures += chunk_arithmetic_case({"27b weak decay", 16, 48, 2049, true}, 16048U, InputPattern::WeakDecay);
+    failures += chunk_arithmetic_case({"near-zero normalization", 1, 3, 17, true, true}, 14017U);
+    failures += chunk_arithmetic_case({"zero query", 1, 3, 17, true}, 14317U, InputPattern::ZeroQuery);
+    failures += chunk_arithmetic_case({"zero signal", 1, 3, 17, true}, 14417U, InputPattern::ZeroSignal);
+    failures += chunk_arithmetic_case({"zero beta", 1, 3, 17, true}, 14517U, InputPattern::ZeroBeta);
+    failures += chunk_arithmetic_case({"unit beta", 1, 3, 257, true}, 14657U, InputPattern::UnitBeta);
+
+    // Compensated chunk arithmetic: every value tile, both normalizations, the chunked boundaries, the
+    // stress inputs and a long continuation, against the recurrent arithmetic's limits.
+    constexpr auto kCompensated = ops::GdnChunkArithmetic::Compensated;
+    for (const auto geometry :
+         {Geometry{"qwen-27b", 16, 48, 1025}, Geometry{"qwen-35b-a3b", 16, 32, 1025},
+          Geometry{"generic-grouped-map", 5, 15, 65}, Geometry{"shared-qk", 1, 3, 65}}) {
+        for (bool normalize : {false, true}) {
+            failures += chunk_arithmetic_case({geometry.name, geometry.qk_heads, geometry.value_heads, geometry.tokens,
+                                               normalize},
+                                              16180U + geometry.value_heads, InputPattern::Ordinary, kCompensated);
+        }
+    }
+    for (int tokens : {15, 16, 17, 33, 4096}) {
+        failures += chunk_arithmetic_case({"compensated prefill boundary", 1, 3, tokens, true}, 90000U + tokens,
+                                          InputPattern::Ordinary, kCompensated);
+    }
+    for (const auto stress : {Stress{"weak decay", InputPattern::WeakDecay, 16385, 332211U},
+                              Stress{"zero decay", InputPattern::ZeroDecay, 16385, 332212U},
+                              Stress{"small beta", InputPattern::SmallBeta, 16385, 332213U},
+                              Stress{"strong decay", InputPattern::StrongDecay, 16385, 332214U},
+                              Stress{"near collinear", InputPattern::NearCollinear, 4097, 332215U}}) {
+        failures += chunk_arithmetic_case({stress.name, 1, 3, stress.tokens, true}, stress.seed, stress.pattern,
+                                          kCompensated);
+    }
+    failures += chunk_arithmetic_case({"27b weak decay", 16, 48, 2049, true}, 16048U, InputPattern::WeakDecay,
+                                      kCompensated);
+    failures += chunk_arithmetic_case({"27b zero decay", 16, 48, 4097, true}, 16032U, InputPattern::ZeroDecay,
+                                      kCompensated);
+    failures += chunk_arithmetic_case({"near-zero normalization", 1, 3, 17, true, true}, 14017U,
+                                      InputPattern::Ordinary, kCompensated);
+    for (bool normalize : {false, true}) {
+        failures += chunk_arithmetic_case({"zero query", 1, 3, 17, normalize}, 14317U, InputPattern::ZeroQuery,
+                                          kCompensated);
+        failures += chunk_arithmetic_case({"zero signal", 1, 3, 17, normalize}, 14417U, InputPattern::ZeroSignal,
+                                          kCompensated);
+        failures += chunk_arithmetic_case({"zero beta", 1, 3, 17, normalize}, 14517U, InputPattern::ZeroBeta,
+                                          kCompensated);
+        failures += chunk_arithmetic_case({"unit beta", 1, 3, 257, normalize}, 14657U, InputPattern::UnitBeta,
+                                          kCompensated);
+    }
 
     print_summaries();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";

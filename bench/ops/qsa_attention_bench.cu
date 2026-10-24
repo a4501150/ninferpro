@@ -47,6 +47,7 @@ struct Options {
     std::vector<int> widths{1, 5};
     int warmup = 5;
     int repeat = 50;
+    ops::QsaAttentionRoute route = ops::QsaAttentionRoute::ByWidth;
 };
 
 const char* storage_name(KvCacheStorage s) {
@@ -105,9 +106,14 @@ Options parse_options(int argc, char** argv) {
             o.warmup = std::atoi(argv[++i]);
         } else if (arg == "--repeat") {
             o.repeat = std::atoi(argv[++i]);
+        } else if (arg == "--route") {
+            const std::string_view route = value();
+            if (route != "width" && route != "invariant") { throw std::invalid_argument("--route width|invariant"); }
+            o.route = route == "invariant" ? ops::QsaAttentionRoute::ColumnInvariant : ops::QsaAttentionRoute::ByWidth;
         } else if (arg == "--help") {
             std::printf("infernix_qsa_attention_bench [--storage bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2] "
-                        "[--contexts 8192,131072] [--widths 1,5] [--warmup N] [--repeat N]\n");
+                        "[--contexts 8192,131072] [--widths 1,5] [--warmup N] [--repeat N]\n"
+                        "                             [--route width|invariant]\n");
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown option " + std::string(arg));
@@ -205,11 +211,12 @@ struct Case {
         out             = DeviceBuffer(static_cast<std::size_t>(kD) * kHeads * width * 2);
     }
 
-    void attention(cudaStream_t s) {
+    void attention(cudaStream_t s, ops::QsaAttentionRoute route) {
         Tensor o(out.p, DType::BF16, {kD, kHeads, width});
         ops::qsa_attention(Tensor(q.p, DType::BF16, {kD, kHeads, width}),
                            Tensor(iq.p, DType::BF16, {kDi, kIndexHeads, width}), layer, batch, kGeometry,
-                           1.0F / 16.0F, pages * kPage, workspace.p, workspace_bytes, o, s, vq ? &append : nullptr);
+                           1.0F / 16.0F, pages * kPage, workspace.p, workspace_bytes, o, s, vq ? &append : nullptr,
+                           route);
     }
 
     // The selection qsa_attention runs first, into the head of the same workspace layout.
@@ -256,7 +263,7 @@ int main(int argc, char** argv) {
                     Case data(storage, width, context);
                     try {
                         const auto total = time(flush, stream, options.warmup, options.repeat,
-                                                [&](cudaStream_t s) { data.attention(s); });
+                                                [&](cudaStream_t s) { data.attention(s, options.route); });
                         const auto select = time(flush, stream, options.warmup, options.repeat,
                                                  [&](cudaStream_t s) { data.selection(s); });
                         std::printf("%-7s %7d %5d %10.2f %10.2f %13.2f\n", storage_name(storage), context, width,

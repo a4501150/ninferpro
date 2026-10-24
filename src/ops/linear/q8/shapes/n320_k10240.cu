@@ -1,6 +1,6 @@
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_stream_launch.cuh"
-#include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/q8/q8_sliced_k_invariant.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -9,19 +9,6 @@ namespace {
 // row's K, x read through L1.
 template <int MaxCols, int ColsPerPass>
 using Stream = Q8A16StreamSchedule<10240, 2, 8, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
-
-// The column-invariant route: sixteen K warps of 64 at every width, as the hyper-connection down + inject
-// projection (n324_k10240.cu).
-template <int Tokens, int RowTiles = 1, int Stages = (Tokens <= 16 && RowTiles == 1 ? 2 : 1)>
-using Invariant = Q8A16SlicedKMmaSchedule<Tokens, 16, Stages, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
-                                          Q8ActivationStage::PaddedZero, 10240, Tokens, false, RowTiles>;
-
-template <class Schedule>
-void sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    launch_q8_a16_sliced_k_mma<Schedule>(q8_linear_operands(x, weight),
-                                         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
-                                         LinearIdentityEpilogue{}, stream);
-}
 } // namespace
 
 Q8Launch select_q8_n320_k10240(std::int32_t tokens) {
@@ -36,10 +23,7 @@ Q8Launch select_q8_n320_k10240(std::int32_t tokens) {
 // A16ColumnInvariant: the 16-K-warp sliced-K contraction at every T (the MMA tiles' single K chain took
 // 104 us at T = 1).
 Q8Launch select_q8_n320_k10240_invariant(std::int32_t tokens) {
-    if (tokens <= 8) return sliced<Invariant<8>>;
-    if (tokens <= 16) return sliced<Invariant<16>>;
-    if (tokens <= 64) return sliced<Invariant<32>>;
-    return sliced<Invariant<32, 2>>;
+    return select_q8_sliced_k_invariant<10240, 16>(tokens);
 }
 
 } // namespace infernix::ops::detail

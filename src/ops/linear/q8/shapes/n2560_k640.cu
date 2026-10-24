@@ -22,4 +22,13 @@ Q8Launch select_q8_n2560_k640(std::int32_t tokens) {
     return launch_q8_a16_mma_r64_t128;
 }
 
+// A16ColumnInvariant (the MTP shared expert down): the MMA tiles at every T, each accumulating an
+// output over K in the same order; at decode widths the 64 x 8 tile runs with its unused columns
+// masked.
+Q8Launch select_q8_n2560_k640_invariant(std::int32_t tokens) {
+    if (tokens <= 16) return launch_q8_a16_mma_r64_t8_k128;
+    if (tokens <= 64) return launch_q8_a16_mma_r32_t64;
+    return select_q8_n2560_k640(tokens);
+}
+
 } // namespace infernix::ops::detail

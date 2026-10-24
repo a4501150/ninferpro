@@ -145,12 +145,12 @@ struct Stage {
     static_assert(Values % 16 == 0 && KeyScales % 16 == 0 && ValueScales % 16 == 0 && ParityWord % 16 == 0);
 };
 
-// Shared memory: the query rows, then each warp's `Stages` stages (and NVFP4 value tile), later the merge:
-// one FP32 row buffer the warps accumulate into and every warp's (max, sum) per row; then the codebook.
-template <KvCacheStorage Storage, int Stages>
+// Shared memory: the query rows, then each of the CTA's `Warps` warps' `Stages` stages (and NVFP4 value
+// tile), later the merge: one FP32 row buffer the warps accumulate into and every warp's (max, sum) per
+// row; then the codebook.
+template <KvCacheStorage Storage, int Stages, int Warps = PromptShape<Storage>::Warps>
 __host__ __device__ constexpr int prompt_smem_bytes() {
     using S              = Stage<Storage>;
-    constexpr int Warps  = PromptShape<Storage>::Warps;
     constexpr int stages = Warps * (Stages * S::Bytes + S::Scratch);
     constexpr int merge  = (kRows * kD + Warps * kRows * 2) * 4;
     constexpr int book   = PromptShape<Storage>::Vq > 0 ? static_cast<int>(sizeof(kKVCacheVq2Codebook)) : 0;
@@ -261,20 +261,124 @@ __device__ __forceinline__ void decode_v_pair(unsigned codes, __half2 scales, un
     }
 }
 
-template <KvCacheStorage Storage, int Stages>
-__global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 ? 2 : 1)
+// One chain's state in a split call: the warp's 16 x 2 x 4 output registers per lane and its
+// (max, sum) of rows gid and gid + 8.
+constexpr int kChainFloats = (16 * 2 * 4 + 4) * 32;
+
+// Merges the chains' rows in chain order, warp w holding chain w (a chain is tiles w, w + Warps, ...,
+// one warp's sweep in an unsplit call): every warp publishes its (max, sum) per row, then the warps add
+// their scaled unnormalized rows into one FP32 buffer in turn (fma per element in warp order, skipping a
+// warp without keys for the row), and l the same way.
+template <KvCacheStorage Storage>
+__device__ __forceinline__ void merge_chains(unsigned char* smem, int warp, int lane, float m0, float m1, float l0,
+                                             float l1, const float (&o)[16][2][4], float scale_l2, int t, int heads,
+                                             int kv_head, int group, bf16* __restrict__ out) {
+    using S                = Stage<Storage>;
+    constexpr int Warps    = PromptShape<Storage>::Warps;
+    constexpr int Threads  = Warps * 32;
+    const int tid = static_cast<int>(threadIdx.x), gid = lane >> 2, lid = lane & 3;
+    __syncthreads();
+    float* rows  = reinterpret_cast<float*>(smem + kQRow * kRows); // [kRows][kD], swizzled
+    float* stats = rows + kRows * kD;                               // [Warps][kRows][2]
+    // Element (row, d) lives at row * kD + (d ^ swizzle(row)): the XOR moves the eight rows a warp's
+    // accumulation touches into the bank bits its lanes leave fixed (bits 0, 1 and 4 for 8-bit value
+    // tiles, whose lanes span bits 2-3; bits 0, 3 and 4 for FP16 tiles, bits 1-2), so they hit 32
+    // distinct banks. Only where an element is stored changes.
+    const auto at = [](int row, int d) {
+        const int swizzle = S::EvenOddValues ? (row & 3) | ((row & 4) << 2) : (row & 1) | ((row & 6) << 2);
+        return row * kD + (d ^ swizzle);
+    };
+    if (lid == 0) {
+        stats[(warp * kRows + gid) * 2]         = m0;
+        stats[(warp * kRows + gid) * 2 + 1]     = l0;
+        stats[(warp * kRows + gid + 8) * 2]     = m1;
+        stats[(warp * kRows + gid + 8) * 2 + 1] = l1;
+    }
+    __syncthreads();
+    const auto row_max = [&](int row) {
+        float m = -CUDART_INF_F;
+#pragma unroll
+        for (int w = 0; w < Warps; ++w) { m = fmaxf(m, stats[(w * kRows + row) * 2]); }
+        return m;
+    };
+    const float f0 = m0 == -CUDART_INF_F ? 0.0f : exp2_approx((m0 - row_max(gid)) * scale_l2);
+    const float f1 = m1 == -CUDART_INF_F ? 0.0f : exp2_approx((m1 - row_max(gid + 8)) * scale_l2);
+    for (int w = 0; w < Warps; ++w) {
+        if (warp == w) {
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int upper = j >> 1;
+                        const int row   = gid + 8 * upper;
+                        const int d = S::EvenOddValues ? 16 * b + 4 * lid + 2 * (j & 1) + h : 16 * b + 8 * h + 2 * lid + (j & 1);
+                        const bool live = (upper ? m1 : m0) != -CUDART_INF_F;
+                        float& a        = rows[at(row, d)];
+                        if (w == 0) {
+                            a = live ? __fmaf_rn(upper ? f1 : f0, o[b][h][j], 0.0f) : 0.0f;
+                        } else if (live) {
+                            a = __fmaf_rn(upper ? f1 : f0, o[b][h][j], a);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (int e = tid; e < group * kD; e += Threads) {
+        const int row = e / kD, d = e % kD;
+        const float m = row_max(row);
+        float l       = 0.0f;
+#pragma unroll
+        for (int w = 0; w < Warps; ++w) {
+            const float mw = stats[(w * kRows + row) * 2];
+            if (mw == -CUDART_INF_F) { continue; }
+            l = __fmaf_rn(exp2_approx((mw - m) * scale_l2), stats[(w * kRows + row) * 2 + 1], l);
+        }
+        const float value = l > 0.0f ? rows[at(row, d)] / l : 0.0f;
+        if constexpr (S::RotatedValues) {
+            rows[at(row, d)] = value;
+        } else {
+            out[(static_cast<std::size_t>(t) * heads + kv_head * group + row) * kD + d] = __float2bfloat16_rn(value);
+        }
+    }
+    if constexpr (S::RotatedValues) {
+        // Values are stored in the normalized Hadamard domain (its own inverse): rotate back.
+        __syncthreads();
+        for (int row = warp; row < group; row += Warps) {
+            float v[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) { v[k] = rows[at(row, lane + 32 * k)]; }
+            normalized_hadamard_d256_inplace(v, lane);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                out[(static_cast<std::size_t>(t) * heads + kv_head * group + row) * kD + lane + 32 * k] =
+                    __float2bfloat16_rn(v[k]);
+            }
+        }
+    }
+}
+
+// Split: one CTA of one warp per chain (blockIdx.z), its state written to `partials` for
+// qsa_prompt_merge_kernel; otherwise one CTA of Shape::Warps warps, warp w running chain w.
+template <KvCacheStorage Storage, int Stages, bool Split>
+__global__ void __launch_bounds__(Split ? 32 : PromptShape<Storage>::Warps * 32, Stages == 1 ? 2 : 1)
     qsa_prompt_kernel(const bf16* __restrict__ q, int heads, int kv_heads, const void* __restrict__ k_pages,
                       const void* __restrict__ v_pages, const void* __restrict__ k_scales,
                       const void* __restrict__ v_scales, const std::int32_t* __restrict__ tables,
                       int table_stride, const std::int32_t* __restrict__ table_rows,
                       const std::int32_t* __restrict__ positions, int width, int ratio,
                       const std::int32_t* __restrict__ selected, const std::int32_t* __restrict__ counts,
-                      int top_blocks, float scale, bf16* __restrict__ out, QsaPageSpaces spaces, QsaVqWindow vq) {
+                      int top_blocks, float scale, bf16* __restrict__ out, QsaPageSpaces spaces, QsaVqWindow vq,
+                      float* __restrict__ partials) {
     using Shape                 = PromptShape<Storage>;
     using S                     = Stage<Storage>;
     using K                     = Row<Shape::Key>;
     using V                     = Row<Shape::Value>;
-    constexpr int Warps         = Shape::Warps;
+    constexpr int Chains        = Shape::Warps;
+    constexpr int Warps         = Split ? 1 : Chains; // the CTA's
     constexpr int Threads       = Warps * 32;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
@@ -283,6 +387,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     const int t = static_cast<int>(blockIdx.x), kv_head = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
     const int gid = lane >> 2, lid = lane & 3;
+    const int chain = Split ? static_cast<int>(blockIdx.z) : warp;
     const int group = heads / kv_heads;
     const int p     = positions[t];
     const int count = counts[t];
@@ -317,7 +422,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     __syncthreads();
 
     // VQ2 codebook (vector-quantized storages): behind the stages and the merge rows.
-    constexpr int kCodebookAt = prompt_smem_bytes<Storage, Stages>() -
+    constexpr int kCodebookAt = prompt_smem_bytes<Storage, Stages, Warps>() -
                                 (Shape::Vq > 0 ? static_cast<int>(sizeof(kKVCacheVq2Codebook)) : 0);
     const auto* codebook = reinterpret_cast<const std::int8_t*>(smem + kCodebookAt);
     if constexpr (Shape::Vq > 0) {
@@ -767,7 +872,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     };
     if constexpr (Stages == 1) {
         // Two CTAs per SM: the other warps hide each tile's gather.
-        for (int i = warp; i < tiles; i += Warps) {
+        for (int i = chain; i < tiles; i += Chains) {
             issue(i, 0);
             cp_wait<0>();
             __syncwarp();
@@ -776,12 +881,16 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
             __syncwarp();
         }
     } else {
+        // A ring of Stages: the chain's next Stages - 1 tiles gather while one computes.
+#pragma unroll
+        for (int k = 0; k < Stages - 1; ++k) {
+            if (chain + k * Chains < tiles) { issue(chain + k * Chains, k); }
+        }
         int s = 0;
-        if (warp < tiles) { issue(warp, 0); }
-        for (int i = warp; i < tiles; i += Warps) {
-            if (i + Warps < tiles) {
-                issue(i + Warps, s ^ 1);
-                cp_wait<1>();
+        for (int i = chain; i < tiles; i += Chains) {
+            if (i + (Stages - 1) * Chains < tiles) {
+                issue(i + (Stages - 1) * Chains, (s + Stages - 1) % Stages);
+                cp_wait<Stages - 1>();
             } else {
                 cp_wait<0>();
             }
@@ -789,71 +898,89 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
             expand(s);
             compute(i, s);
             __syncwarp();
-            s ^= 1;
+            s = (s + 1) % Stages;
         }
     }
     cp_wait<0>();
 
-    // Merge the warps' rows in warp order: every warp publishes its (max, sum) per row, then the warps
-    // add their scaled unnormalized rows into one FP32 buffer in turn (fma per element in warp order,
-    // skipping a warp without keys for the row), and l the same way.
     l0 += __shfl_xor_sync(FullMask, l0, 1);
     l0 += __shfl_xor_sync(FullMask, l0, 2);
     l1 += __shfl_xor_sync(FullMask, l1, 1);
     l1 += __shfl_xor_sync(FullMask, l1, 2);
-    __syncthreads();
-    float* rows  = reinterpret_cast<float*>(smem + kQRow * kRows); // [kRows][kD]
-    float* stats = rows + kRows * kD;                               // [Warps][kRows][2]
-    if (lid == 0) {
-        stats[(warp * kRows + gid) * 2]         = m0;
-        stats[(warp * kRows + gid) * 2 + 1]     = l0;
-        stats[(warp * kRows + gid + 8) * 2]     = m1;
-        stats[(warp * kRows + gid + 8) * 2 + 1] = l1;
-    }
-    __syncthreads();
-    const auto row_max = [&](int row) {
-        float m = -CUDART_INF_F;
+    if constexpr (Split) {
+        // Chain `chain`'s state, for qsa_prompt_merge_kernel: o[b][h][j] of lane l at
+        // ((b * 2 + h) * 4 + j) * 32 + l, then m0, m1, l0, l1 per lane.
+        float* state = partials + ((static_cast<std::size_t>(t) * kv_heads + kv_head) * Chains + chain) * kChainFloats;
 #pragma unroll
-        for (int w = 0; w < Warps; ++w) { m = fmaxf(m, stats[(w * kRows + row) * 2]); }
-        return m;
-    };
-    const float f0 = m0 == -CUDART_INF_F ? 0.0f : exp2_approx((m0 - row_max(gid)) * scale_l2);
-    const float f1 = m1 == -CUDART_INF_F ? 0.0f : exp2_approx((m1 - row_max(gid + 8)) * scale_l2);
-    for (int w = 0; w < Warps; ++w) {
-        if (warp == w) {
+        for (int b = 0; b < 16; ++b) {
 #pragma unroll
-            for (int b = 0; b < 16; ++b) {
+            for (int h = 0; h < 2; ++h) {
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const int upper = j >> 1;
-                        const int row   = gid + 8 * upper;
-                        const int d = S::EvenOddValues ? 16 * b + 4 * lid + 2 * (j & 1) + h : 16 * b + 8 * h + 2 * lid + (j & 1);
-                        const bool live = (upper ? m1 : m0) != -CUDART_INF_F;
-                        float& a        = rows[row * kD + d];
-                        if (w == 0) {
-                            a = live ? __fmaf_rn(upper ? f1 : f0, o[b][h][j], 0.0f) : 0.0f;
-                        } else if (live) {
-                            a = __fmaf_rn(upper ? f1 : f0, o[b][h][j], a);
-                        }
-                    }
-                }
+                for (int j = 0; j < 4; ++j) { state[((b * 2 + h) * 4 + j) * 32 + lane] = o[b][h][j]; }
             }
         }
-        __syncthreads();
+        state[128 * 32 + lane]      = m0;
+        state[129 * 32 + lane]      = m1;
+        state[130 * 32 + lane]      = l0;
+        state[131 * 32 + lane]      = l1;
+    } else {
+        merge_chains<Storage>(smem, warp, lane, m0, m1, l0, l1, o, scale_l2, t, heads, kv_head, group, out);
     }
-    for (int e = tid; e < group * kD; e += Threads) {
+}
+
+// A split call's merge, element-parallel: each thread takes elements (row, d) and runs, over the chains
+// in chain order, the operations merge_chains runs for that element (the row's max, its scale per chain,
+// the fma accumulation of the scaled outputs and of the sums, the division), reading each chain's value
+// from the lane and register that held it. The order of every floating-point operation on an element is
+// the unsplit kernel's, so the bits are too; only the threads that run them change.
+template <KvCacheStorage Storage>
+__global__ void __launch_bounds__(256)
+    qsa_prompt_merge_kernel(const float* __restrict__ partials, int heads, int kv_heads, float scale,
+                            bf16* __restrict__ out) {
+    using S                 = Stage<Storage>;
+    constexpr int Chains    = PromptShape<Storage>::Warps;
+    constexpr int Threads   = 256;
+    constexpr float Log2E   = 1.4426950408889634074f;
+    __shared__ __align__(16) float rows[S::RotatedValues ? kRows * kD : 1];
+    const int t = static_cast<int>(blockIdx.x), kv_head = static_cast<int>(blockIdx.y);
+    const int group      = heads / kv_heads;
+    const float scale_l2 = scale * Log2E;
+    const float* state   = partials + (static_cast<std::size_t>(t) * kv_heads + kv_head) * Chains * kChainFloats;
+    for (int e = static_cast<int>(threadIdx.x); e < group * kD; e += Threads) {
         const int row = e / kD, d = e % kD;
-        const float m = row_max(row);
-        float l       = 0.0f;
+        // The lane and register of (row, d) in a chain's output tiles (merge_chains' d of b, h, j, lid).
+        const int upper = row >> 3, rem = d & 15, b = d >> 4;
+        const int lid   = S::EvenOddValues ? rem >> 2 : (rem >> 1) & 3;
+        const int h     = S::EvenOddValues ? rem & 1 : rem >> 3;
+        const int j     = 2 * upper + (S::EvenOddValues ? (rem >> 1) & 1 : rem & 1);
+        const int lane = (row & 7) * 4 + lid, lead = (row & 7) * 4;
+        float mw[Chains], lw[Chains];
+        float m = -CUDART_INF_F;
 #pragma unroll
-        for (int w = 0; w < Warps; ++w) {
-            const float mw = stats[(w * kRows + row) * 2];
-            if (mw == -CUDART_INF_F) { continue; }
-            l = __fmaf_rn(exp2_approx((mw - m) * scale_l2), stats[(w * kRows + row) * 2 + 1], l);
+        for (int w = 0; w < Chains; ++w) {
+            mw[w] = state[w * kChainFloats + (128 + upper) * 32 + lead];
+            lw[w] = state[w * kChainFloats + (130 + upper) * 32 + lead];
+            m     = fmaxf(m, mw[w]);
         }
-        const float value = l > 0.0f ? rows[row * kD + d] / l : 0.0f;
+        float a = 0.0f;
+#pragma unroll
+        for (int w = 0; w < Chains; ++w) {
+            const bool live = mw[w] != -CUDART_INF_F;
+            const float f   = live ? exp2_approx((mw[w] - m) * scale_l2) : 0.0f;
+            const float o   = state[w * kChainFloats + ((b * 2 + h) * 4 + j) * 32 + lane];
+            if (w == 0) {
+                a = live ? __fmaf_rn(f, o, 0.0f) : 0.0f;
+            } else if (live) {
+                a = __fmaf_rn(f, o, a);
+            }
+        }
+        float l = 0.0f;
+#pragma unroll
+        for (int w = 0; w < Chains; ++w) {
+            if (mw[w] == -CUDART_INF_F) { continue; }
+            l = __fmaf_rn(exp2_approx((mw[w] - m) * scale_l2), lw[w], l);
+        }
+        const float value = l > 0.0f ? a / l : 0.0f;
         if constexpr (S::RotatedValues) {
             rows[row * kD + d] = value;
         } else {
@@ -861,9 +988,10 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
         }
     }
     if constexpr (S::RotatedValues) {
-        // Values are stored in the normalized Hadamard domain (its own inverse): rotate back.
+        // As merge_chains: rotate each row back out of the normalized Hadamard domain.
         __syncthreads();
-        for (int row = warp; row < group; row += Warps) {
+        const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
+        for (int row = warp; row < group; row += Threads / 32) {
             float v[8];
 #pragma unroll
             for (int k = 0; k < 8; ++k) { v[k] = rows[row * kD + lane + 32 * k]; }
@@ -877,34 +1005,17 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     }
 }
 
-void require(bool condition, const char* message) {
-    if (!condition) { throw std::invalid_argument(std::string("qsa prompt: ") + message); }
+// The deepest ring of at most 8 stages (cp_wait's limit) whose one-warp CTA fits shared memory.
+template <KvCacheStorage Storage, int Stages = 8>
+constexpr int split_stages() {
+    if constexpr (Stages <= 2 || prompt_smem_bytes<Storage, Stages, 1>() <= 99 * 1024) {
+        return Stages;
+    } else {
+        return split_stages<Storage, Stages - 1>();
+    }
 }
 
-template <KvCacheStorage Storage>
-void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
-            const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
-            const QsaVqWindow& vq) {
-    const auto run = [&]<int Stages>() {
-        constexpr int bytes = prompt_smem_bytes<Storage, Stages>();
-        static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
-        static const cudaError_t configured = cudaFuncSetAttribute(
-            qsa_prompt_kernel<Storage, Stages>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-        require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
-        const int columns = q.ne[2];
-        const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads));
-        qsa_prompt_kernel<Storage, Stages><<<grid, PromptShape<Storage>::Warps * 32, bytes, stream>>>(
-            static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
-            layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
-            static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
-            static_cast<const std::int32_t*>(batch.table_rows.data),
-            static_cast<const std::int32_t*>(batch.positions.data), batch.width, g.ratio, selected, counts,
-            g.budget / g.ratio, scale, static_cast<bf16*>(out.data), layer.spaces, vq);
-    };
-    // One stage where two CTAs fit an SM and the call fills a wave: the second CTA's warps hide each
-    // tile's gather better than a second stage does (26-41 % faster at 86-512 columns, design
-    // §19.3.15). Narrower calls, and storages whose stages and value tile keep one CTA per SM, keep
-    // two stages.
+int multiprocessors() {
     static const int sms = [] {
         int device = 0, count = 0;
         if (cudaGetDevice(&device) != cudaSuccess ||
@@ -913,11 +1024,57 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
         }
         return count;
     }();
-    constexpr bool two_ctas = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
-    if (two_ctas && q.ne[2] * g.kv_heads >= sms) {
-        run.template operator()<1>();
+    return sms;
+}
+
+// Calls whose chains fit one wave of one-warp CTAs split them: a chain's tiles are serial, so an
+// unsplit narrow call leaves most SMs idle behind each tile's gather.
+bool split_call(int columns, const QsaGeometry& g, int chains) {
+    return columns * g.kv_heads * chains <= multiprocessors();
+}
+
+void require(bool condition, const char* message) {
+    if (!condition) { throw std::invalid_argument(std::string("qsa prompt: ") + message); }
+}
+
+template <KvCacheStorage Storage>
+void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
+            const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
+            const QsaVqWindow& vq, float* partials) {
+    constexpr int Chains = PromptShape<Storage>::Warps;
+    const int columns    = q.ne[2];
+    const auto run = [&]<int Stages, bool Split>() {
+        constexpr int warps = Split ? 1 : Chains;
+        constexpr int bytes = prompt_smem_bytes<Storage, Stages, warps>();
+        static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
+        static const cudaError_t configured = cudaFuncSetAttribute(
+            qsa_prompt_kernel<Storage, Stages, Split>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
+        const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads), Split ? Chains : 1);
+        qsa_prompt_kernel<Storage, Stages, Split><<<grid, warps * 32, bytes, stream>>>(
+            static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
+            layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
+            static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
+            static_cast<const std::int32_t*>(batch.table_rows.data),
+            static_cast<const std::int32_t*>(batch.positions.data), batch.width, g.ratio, selected, counts,
+            g.budget / g.ratio, scale, static_cast<bf16*>(out.data), layer.spaces, vq, partials);
+    };
+    if (partials != nullptr && split_call(columns, g, Chains)) {
+        run.template operator()<split_stages<Storage>(), true>();
+        qsa_prompt_merge_kernel<Storage><<<dim3(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads)),
+                                           256, 0, stream>>>(partials, g.heads, g.kv_heads, scale,
+                                                                     static_cast<bf16*>(out.data));
     } else {
-        run.template operator()<2>();
+        // One stage where two CTAs fit an SM and the call fills a wave: the second CTA's warps hide
+        // each tile's gather better than a second stage does (26-41 % faster at 86-512 columns, design
+        // §19.3.15). Narrower calls, and storages whose stages and value tile keep one CTA per SM, keep
+        // two stages.
+        constexpr bool two_ctas = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
+        if (two_ctas && columns * g.kv_heads >= multiprocessors()) {
+            run.template operator()<1, false>();
+        } else {
+            run.template operator()<2, false>();
+        }
     }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa prompt attention: ") + cudaGetErrorString(error)); }
@@ -940,31 +1097,40 @@ bool qsa_prompt_supported(const QsaKVLayer& layer, const QsaGeometry& geometry) 
     }
 }
 
+std::size_t qsa_prompt_partial_bytes(std::int32_t columns, const QsaGeometry& geometry) {
+    // A storage of c chains (2 to 4, PromptShape::Warps) splits while columns x KV heads x c fits a wave.
+    const int cells  = columns * geometry.kv_heads;
+    const int chains = std::min(4, multiprocessors() / std::max(cells, 1));
+    if (chains < 2) { return 0; }
+    return sizeof(float) * static_cast<std::size_t>(cells) * chains * kChainFloats;
+}
+
 void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch,
                           const QsaGeometry& geometry, float scale, const std::int32_t* selected,
-                          const std::int32_t* counts, Tensor& out, cudaStream_t stream, const QsaVqWindow& vq) {
+                          const std::int32_t* counts, Tensor& out, cudaStream_t stream, const QsaVqWindow& vq,
+                          float* partials) {
     require(qsa_prompt_supported(layer, geometry), "the prompt route does not serve this layer");
     switch (layer.kv.storage) {
     case KvCacheStorage::Int8Group64:
-        launch<KvCacheStorage::Int8Group64>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Int8Group64>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq, partials);
         break;
     case KvCacheStorage::Fp8E4M3Row256:
-        launch<KvCacheStorage::Fp8E4M3Row256>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Fp8E4M3Row256>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq, partials);
         break;
     case KvCacheStorage::Nvfp4Group16:
-        launch<KvCacheStorage::Nvfp4Group16>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Nvfp4Group16>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq, partials);
         break;
     case KvCacheStorage::Fp8KeyNvfp4Value:
-        launch<KvCacheStorage::Fp8KeyNvfp4Value>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Fp8KeyNvfp4Value>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq, partials);
         break;
     case KvCacheStorage::Vq2:
-        launch<KvCacheStorage::Vq2>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Vq2>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq, partials);
         break;
     case KvCacheStorage::Q4KeyVq2Value:
-        launch<KvCacheStorage::Q4KeyVq2Value>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Q4KeyVq2Value>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq, partials);
         break;
     default:
-        launch<KvCacheStorage::BFloat16>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::BFloat16>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq, partials);
         break;
     }
 }

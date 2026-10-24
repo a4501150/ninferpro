@@ -25,6 +25,10 @@ using MmaR128T80 = Q8A16MmaSchedule<128, 80, 64, 64, 16, 2, 2>;
 // K128 single-activation-stage schedules shared with fused consumers.
 using MmaR64x16T48K128A1 = Q8A16MmaSchedule<64, 48, 128, 16, 24, 1, 2>;
 using MmaR64x32T64K128A1 = Q8A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>;
+// The column-invariant routes' decode tile: four warps of 16 rows x 8 columns over 128-wide K steps,
+// the K chain of every other MMA tile (2026-10-23 sweep, RTX PRO 6000: 28.7 against 38.9 us for the
+// 32 x 64 tile on the [12800, 2560] PLE projection at T = 1-16).
+using MmaR64T8K128 = Q8A16MmaSchedule<64, 8, 128, 16, 8, 1, 2>;
 
 using SimtR8T4         = Q8A16SimtSchedule<8, 4, 1, 32, 2, Cache::cg, 1>;
 using SimtR8T8         = Q8A16SimtSchedule<8, 8, 1, 32, 2, Cache::cg, 1>;

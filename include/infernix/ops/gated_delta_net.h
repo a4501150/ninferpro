@@ -34,8 +34,15 @@ namespace infernix::ops {
 // Delta) take FP16 operands (S and the scaled Delta rounded to FP16) and accumulate each pair of
 // k16 products (32 terms) in FP16 before adding it to an FP32 accumulator; the update's product is
 // rounded once and added to the decayed FP32 state. The control products and the master state stay
-// FP32. It runs the state products at the FP16-accumulate tensor rate.
-enum class GdnChunkArithmetic : std::uint8_t { Exact, Fp16Accumulate, Recurrent };
+// FP32. It runs the state products at the FP16-accumulate tensor rate. Compensated runs the chunked
+// algorithm with every chunk product compensated: the normalized Q/K carry a second BF16 packet
+// (each element minus its packet value), and the control dot products, the prediction K S^T, the
+// readout Q S^T, both products with the control matrices and the update K^T diag(suffix) Delta
+// split their FP32 operands into high/low pairs (BF16 pairs for the BF16 products, TF32 pairs for
+// the TF32 ones) and sum hi*hi + hi*lo + lo*hi in FP32, about three times the exact route's tensor
+// work. Its error against the FP64 oracle is the recurrent arithmetic's order, not the chunked
+// route's, and its bits depend on the call's chunk grid like the exact route's.
+enum class GdnChunkArithmetic : std::uint8_t { Exact, Fp16Accumulate, Recurrent, Compensated };
 
 /**
  * Applies the Gated DeltaNet recurrence independently for each value head h. Let

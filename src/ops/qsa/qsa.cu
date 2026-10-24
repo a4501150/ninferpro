@@ -930,9 +930,11 @@ Workspace carve(void* base, const QsaGeometry& g, int columns, int max_context, 
     const std::size_t counts   = align(sizeof(std::int32_t) * static_cast<std::size_t>(columns));
     const std::size_t select   = align(detail::qsa_select_scratch_bytes(g, columns, max_context));
     const int splits           = attention_splits(columns, g);
-    const std::size_t partial  = splits > 1 ? align(sizeof(float) * static_cast<std::size_t>(columns) * splits *
-                                                    g.heads * (kHeadDim + 2))
-                                            : 0;
+    // The decode kernel's split partials, or the prompt kernel's chain states (the column-invariant
+    // route's narrow calls), whichever is larger.
+    const std::size_t partial  = align(std::max<std::size_t>(
+        splits > 1 ? sizeof(float) * static_cast<std::size_t>(columns) * splits * g.heads * (kHeadDim + 2) : 0,
+        detail::qsa_prompt_partial_bytes(columns, g)));
     // Staging rows [256, columns, Hkv] per role, [4, ...] FP16 scales per role, [2, ...] tags.
     const std::size_t rows   = static_cast<std::size_t>(columns) * g.kv_heads;
     const std::size_t codes  = staging ? align(kHeadDim * rows) : 0;
@@ -1063,14 +1065,18 @@ void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Ten
 std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int32_t columns,
                                           std::int32_t max_context, KvCacheStorage storage) {
     require_geometry(geometry);
-    // Bounded by the staging a windowed call of this width would need. Covers every narrower call
-    // too: a call of kSmallCallColumns columns keeps more split partials than wider calls up to ~21
-    // columns, and every other term grows with the width.
-    std::size_t bytes = 0, small = 0;
+    // Bounded by the staging a windowed call of this width would need, and by every narrower call:
+    // the decode kernel's split partials and the prompt kernel's chain states peak at narrow widths
+    // (both vanish once a call fills a wave unsplit, below 512 columns), and every other term grows
+    // with the width.
+    std::size_t bytes = 0;
     (void)carve(nullptr, geometry, columns, max_context, staged_call(storage, true, columns), bytes);
-    const int narrow = std::min<int>(columns, kSmallCallColumns);
-    (void)carve(nullptr, geometry, narrow, max_context, staged_call(storage, true, narrow), small);
-    return std::max(bytes, small);
+    for (int narrow = 1; narrow < std::min<int>(columns, 512); ++narrow) {
+        std::size_t need = 0;
+        (void)carve(nullptr, geometry, narrow, max_context, staged_call(storage, true, narrow), need);
+        bytes = std::max(bytes, need);
+    }
+    return bytes;
 }
 
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
@@ -1153,7 +1159,7 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     const int splits  = route == QsaAttentionRoute::ColumnInvariant && prompt ? 1 : attention_splits(columns, geometry);
     if (splits == 1 && prompt) {
         detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts, out, stream,
-                                     vq_args);
+                                     vq_args, ws.partial);
         commit();
         return;
     }

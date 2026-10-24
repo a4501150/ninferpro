@@ -173,8 +173,9 @@ enum class LinearRoutes : std::uint8_t {
  * every T, so each column's result is independent of the call's other columns. NVFP4 and FP8
  * register it for their text problems (FP8's Qwen3.8-Flash-Next problems through the tensor-core
  * tiles at every T), Q8 for the [248320, 5120] vocabulary head and Qwen3.8-Flash-Next's
- * hyper-connection and PLE problems (the MMA tiles at every T), and BF16 for Qwen3.8-Flash-Next's
- * GDN a/b and QSA index projections (one sliced-K family); the other formats and problems reject it.
+ * hyper-connection, PLE and MTP drafter problems (the MMA tiles, or one sliced-K family, at every T),
+ * and BF16 for Qwen3.8-Flash-Next's GDN a/b and QSA index projections (one sliced-K family); the
+ * other formats and problems reject it.
  *
  * @par Routes
  * Under LinearRoutes::Q8SlicedK, Q8 `[16384,2560]` and `[2560,6144]` (Qwen3.8-Flash-Next's GDN q/k/v/z

@@ -275,6 +275,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     const auto layout  = chunked::workspace_layout(q.ne[1], v.ne[1], q.ne[2]);
     const auto backing = ws.alloc_bytes(layout.total_bytes);
     auto* qk           = static_cast<chunked::QkChunk*>(layout.qk.bind(backing).data);
+    auto* qk_low       = static_cast<chunked::QkChunk*>(layout.qk_low.bind(backing).data);
     auto* control      = static_cast<chunked::ControlChunk*>(layout.control.bind(backing).data);
     const chunked::Arguments args{static_cast<const __nv_bfloat16*>(q.data),
                                   static_cast<const __nv_bfloat16*>(k.data),
@@ -288,8 +289,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                                   v.ne[1],
                                   q.ne[2],
                                   scale};
-    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream, fp16);
-    chunked::launch_recurrence(args, qk, control, execution, fp16);
+    chunked::launch_prepare(args, qk, qk_low, control, normalize_qk, execution.stream, arithmetic);
+    chunked::launch_recurrence(args, qk, qk_low, control, execution, arithmetic);
 }
 
 } // namespace infernix::ops

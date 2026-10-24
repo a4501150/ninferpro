@@ -893,6 +893,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
+| Qwen3.8-Flash-Next: `gdn-compensated` | GDN calls of 16+ tokens in the construction-exact configurations (recipe C with BF16, INT8 or FP8 KV) | recipe C with INT8 or FP8 KV (BF16 KV is the reference's own exact route, not gated; 6.8) |
 | `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B and FP8, every format; IQ3_S, every format but BF16 (fails there, under `ggml-bf16-prefill`); not the 35B-A3B or Dense8 (no gain beyond spread, below) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
@@ -1025,10 +1026,10 @@ mixes decode and prefill state beyond what resumes already did. The capture is v
 frontier it is skipped, so a one-call span's repeat keeps its tail tap and a repeat whose opener
 realized just below n re-fills that short tail; spans whose opener demoted to the last inner
 boundary (the multi-call re-fill loss) still capture. `preemption` as above. In a
-construction-exact configuration (recipe C with INT8 or FP8 KV since 2026-10-23, 6.8) the exact
-route itself runs every behaviour `free-cache-resume` names without selecting it: its kernels give a
-position the same bits whatever call, decode step or verification computed it, so off-grid resumes,
-coalescing and decode-state endpoints equal the cold run there.
+construction-exact configuration (recipe C with INT8 or FP8 KV since 2026-10-23, BF16 KV since
+2026-10-24; 6.8) the exact route itself runs every behaviour `free-cache-resume` names without
+selecting it: its kernels give a position the same bits whatever call, decode step or verification
+computed it, so off-grid resumes, coalescing and decode-state endpoints equal the cold run there.
 Its kernel path `q8-sliced-k` (below) couples requests too: its routes depend on the round's width;
 so does `ggml-bf16-prefill`, whose routes depend on a prompt's call boundaries and MoE grouping.
 
@@ -1188,8 +1189,9 @@ over), so the near-pass rule (6.1) extended the run to 1,024 — the extension c
 `concat-forced` joined the ranges; the 1,024 verdict replaces the 256 one. The construction-exact
 exact route (2026-10-24, 6.8) changed the reference; against the new one that fast route failed the
 1,024-segment tail (p99.9 KL ratio 1.34), and with the recurrent GDN prefill the fast route passes
-it again (TV excess 1.8e-3, top-1 1.9e-3 bound 2.9e-3, KL 1.0e-3, NLL 9.3e-5, p99.9 1.13), which
-is the gate these registrations now rest on. No fast run preempted,
+it again (TV excess 1.8e-3, top-1 1.9e-3 bound 2.9e-3, KL 1.0e-3, NLL 9.3e-5, p99.9 1.13; on FP8
+KV TV 1.1e-3, top-1 1.3e-3 bound 2.5e-3, p99.9 1.02), which is the gate these registrations now
+rest on. No fast run preempted,
 so `preemption` rests on the preemption real test's Replay equivalence and the kernel rule (item
 2: Replay runs the exact route's own prefill kernels), as on IQ3_S and FP8.
 `adaptive-speculation` was registered earlier from its own DFlash2 timing; `preemption`
@@ -1859,76 +1861,134 @@ A change to exact-route bits (6.1) is recorded here with its gate.
 call width, so a position's bits depended on how its prompt and output were split into prefill
 calls, decode steps and verifications, and the prefix cache resumed only on the grid that
 reproduced the cold split (off-grid resumes, coalescing and decode-state endpoints needed
-`free-cache-resume`). Every kernel on that route now runs one arithmetic at every width:
+`free-cache-resume`). In the configurations of the construction-exact registry (recipe C with BF16,
+INT8 or FP8 KV; `kConstructionExact`) every kernel on that route now runs one arithmetic at every
+width:
 - the GDN prefill runs the recurrent arithmetic of decode and verification at every T
   (`GdnChunkArithmetic::Recurrent`, a staged kernel bit-identical to the token-by-token one);
 - QSA attention runs the prompt kernel at every width (`QsaAttentionRoute::ColumnInvariant`);
 - the hyper-connection mix and the fused up-projection with collapse run at every width;
-- the Q8 hyper-connection and PLE projections, the FP8 text projections and the BF16 GDN a/b and
-  QSA index projections take one `A16ColumnInvariant` route at every T (the Q8 and FP8 tiles added
-  for narrow calls keep their K chains, so they give the wide tiles' bits).
+- the Q8 hyper-connection, PLE and MTP drafter projections, the FP8 text projections and the BF16
+  GDN a/b and QSA index projections take one `A16ColumnInvariant` route at every T (the Q8 and FP8
+  tiles added for narrow calls keep their K chains, so they give the wide tiles' bits; the deep-K Q8
+  problems take one sliced-K family at every T). The MTP drafter's resident experts and proposal head
+  were width-invariant already.
 
-Evidence: the width harness under `--invariant --strict`; the Forward's split equality
-(`infernix_qwen4_exp_forward_real_test --split-equality`, every decomposition of one prompt,
-decode included, byte-equal at every layer on INT8 and FP8 KV); the prefix-cache real test with
-off-grid resumes, taps and endpoints against cold runs. The FP64 Op oracle favours the recurrent
-GDN (output relative L2 at most 2.1e-3 against the chunked route's 4.4e-3; final state 2e-5
-against 3.6e-3). The 16-bit reference runs the GDN and hyper-connection kernels too, so under 6.1
-each build's reference favours its own route and the new build's reference decides. INT8 KV
-(FP8 KV, production's format, in the last two rows), `compare-decode` (MTP 4 at concurrency 2, every segment resuming from a warm 3,000-token entry)
-and `compare-prefill` (the quick corpus, 14,336-token windows at stride 7,168, chunks 896-7,168,
-1,044,668 positions):
+Every other configuration keeps its routes bit for bit (`FastPathSelection::forward` sets the
+construction-exact arithmetic only for registered configurations). The first version of this change
+(`33e1305`) set it on every Qwen3.8-Flash-Next configuration, ungated outside recipe C; scoping it
+restored the ModelOpt NVFP4 artifact's exact and fast routes exactly (`identical` on 36 quick-corpus
+prefill windows and 32 MTP decode segments, INT8 KV, against the base build).
 
-| Gate | Reference from | TV excess (bound) | Top-1 excess (bound) | KL excess | NLL excess (bound) | p99.9 KL ratio |
-|---|---|---:|---:|---:|---:|---:|
-| decode, 256 segments | base build | 4.7e-4 (9.0e-4) | 2.1e-3 (4.7e-3) | 9.6e-5 | 3.6e-4 (2.5e-3) | 0.82 |
-| decode, 256 segments | new build | -2.0e-3 (-1.6e-3) | -3.8e-3 (-1.6e-3) | -1.2e-3 | 3.6e-4 (2.5e-3) | 0.68 |
-| decode, 1,024 segments | new build | -1.7e-3 (-1.5e-3) | -2.8e-3 (-1.8e-3) | -9.6e-4 | 3.3e-4 (1.5e-3) | 0.88 |
-| prefill | new build | — | -1.4e-3 (-8.1e-4) | -6.1e-4 (bound -4.5e-4) | 1.0e-3 (2.3e-3) | 0.99 |
-| FP8 KV: decode, 256 segments | new build | -1.3e-3 (-8.2e-4) | -1.0e-3 (1.5e-3) | -5.4e-4 | 6.6e-4 (3.1e-3) | 1.07 |
-| FP8 KV: prefill | new build | — | -1.0e-3 (-4.7e-4) | -3.3e-4 (bound -2.2e-4) | 2.2e-5 (6.6e-4) | 0.98 |
+Evidence: the width harness under `--invariant --strict` (the MTP drafter's five Q8 problems at 22
+widths included); the Forward's split equality (`infernix_qwen4_exp_forward_real_test
+--split-equality`, every decomposition of one prompt, decode included, byte-equal at every layer on
+BF16, INT8 and FP8 KV); the prefix-cache real test with off-grid resumes, taps and endpoints against
+cold runs, the MTP drafter's rounds, drafts and acceptances equal to the cold run's; the Engine's
+causal scoring (`infernix_qwen4_exp_score_real_test`, 1,024-token chunks, INT8 KV) equal to the
+Forward's teacher-forced dump (256-token chunks) at all 2,999 positions of 3,000 bench-corpus
+tokens, log-probabilities and top-8 ids alike (the test scored on the fast route until 2026-10-24,
+where recipe C's lossy paths failed its criteria; it now scores on the exact route, the dump's).
+The FP64 Op oracle favours the recurrent GDN (output relative L2 at most 2.1e-3 against the chunked route's
+4.4e-3; final state 2e-5 against 3.6e-3). The 16-bit reference runs the GDN and hyper-connection
+kernels too, so under 6.1 each build's reference favours its own route and the new build's
+reference decides. `compare-decode` (MTP 4 at concurrency 2, every segment resuming from a warm
+3,000-token entry) and `compare-prefill` (14,336-token windows at stride 7,168; the quick corpus at
+chunks 896-7,168, and the full corpus at 2,048):
 
-Every criterion passes, and every TV, top-1 and KL estimate against the new reference is
-negative; the FP8 decode tail grew (p99.9 KL ratio 1.07, within its 1.25 cap). The NLL point
-estimates, which no reference enters, rose: on INT8 KV +3.3e-4 on decode and +1.0e-3 on the
-prefill corpus (perplexity ratio 1.0010), on FP8 KV +6.6e-4 and +2.2e-5, each inside its bound
-and below the 1.7e-3 a pure reordering showed in the A/A calibration (6.4, Qwen3.8-27B), so none
-is resolved from zero — but 6.1's "must not rise" is not met by the point estimates. The change
-stays on the exact route with that shortfall recorded here for the owner's review. The prefill
-NLL is the same at every chunk size on both builds (both prefills were already width-invariant
-at 896 and above), so the four chunk pairs are one comparison.
+| Gate | KV | Reference from | TV excess (bound) | Top-1 excess (bound) | KL excess | NLL excess (bound) | p99.9 KL ratio |
+|---|---|---|---:|---:|---:|---:|---:|
+| decode, 256 segments | INT8 | base build | 4.7e-4 (9.0e-4) | 2.1e-3 (4.7e-3) | 9.6e-5 | 3.6e-4 (2.5e-3) | 0.82 |
+| decode, 256 segments | INT8 | new build | -2.0e-3 (-1.6e-3) | -3.8e-3 (-1.6e-3) | -1.2e-3 | 3.6e-4 (2.5e-3) | 0.68 |
+| decode, 1,024 segments | INT8 | new build | -1.7e-3 (-1.5e-3) | -2.8e-3 (-1.8e-3) | -9.6e-4 | 3.3e-4 (1.5e-3) | 0.88 |
+| decode, 1,024 segments | FP8 | new build | -7.8e-4 (-5.4e-4) | -1.5e-3 (-3.7e-4) | -4.0e-4 | 3.1e-4 (1.6e-3) | 0.98 |
+| prefill, quick corpus | INT8 | new build | — | -1.4e-3 (-8.1e-4) | -6.1e-4 (bound -4.5e-4) | 1.0e-3 (2.3e-3) | 0.99 |
+| prefill, quick corpus | FP8 | new build | — | -1.0e-3 (-4.7e-4) | -3.3e-4 (bound -2.2e-4) | 2.2e-5 (6.6e-4) | 0.98 |
+| prefill, full corpus | INT8 | new build | — | -1.6e-3 (-1.3e-3) | -7.0e-4 (bound -6.0e-4) | -2.7e-4 (3.3e-4) | 0.91 |
+
+Every criterion passes, and every TV, top-1 and KL estimate against the new reference is negative.
+The corpus NLL, which no reference enters, fell on the full corpus (1,044,557 positions, perplexity
+ratio 0.99973), the protocol's larger sample: the quick corpus's +1.0e-3 (a quarter of it) was its
+sampling. The decode NLL point estimates rose by about 3e-4 on both formats (bounds 1.5e-3 and
+1.6e-3), unresolved from zero. The prefill NLL is the same at every chunk size on both builds (both
+prefills were already width-invariant at 896 and above), so the quick corpus's four chunk pairs are
+one comparison. The 256-segment FP8 run's tail ratio (1.07) fell to 0.98 at 1,024 segments.
 
 The fast route kept the width routes and, until this change, the chunked GDN prefill; against the
 new reference its joint decode gate near-passed at 256 segments (top-1 3.8e-3, bound 6.2e-3; p99.9
 ratio 1.27) and failed at 1,024 on the tail (p99.9 KL ratio 1.34 of 1.25; TV 2.0e-3, top-1 2.5e-3
 bound 3.6e-3, KL 1.2e-3, NLL 5.0e-4 passed). Under the failed-gate rule (6.1) the next more
 precise variant runs the recurrent GDN prefill on the fast route as well (the width routes stay):
-its 1,024-segment joint decode gate passes (TV 1.8e-3 bound 2.0e-3, top-1 1.9e-3 bound 2.9e-3,
-KL 1.0e-3, NLL 9.3e-5, p99.9 ratio 1.13, every prompt bucket; 256 segments near-passed at 1.26),
-its joint prefill gate passes (KL 9.0e-4 bound 1.1e-3, top-1 2.1e-3 bound 2.5e-3, NLL -4.8e-4,
-p99.9 1.09), and against the old fast route's prefill its excesses are negative except NLL
-(+1.5e-4, bound 4.7e-4). On FP8 KV the fast route's joint gates pass at 256 segments (decode TV
-1.1e-3 bound 1.6e-3, top-1 7.9e-4 bound 3.3e-3, p99.9 0.83; prefill KL 6.2e-4 bound 7.0e-4,
-top-1 1.3e-3 bound 1.8e-3, NLL -3.9e-4, p99.9 1.05). Every fast-route gate here uses the new
-build's references (the 1,024-segment extension's reference reproduced segments 254-255 bit for
-bit).
+its 1,024-segment joint decode gates pass on INT8 (TV 1.8e-3 bound 2.0e-3, top-1 1.9e-3 bound
+2.9e-3, KL 1.0e-3, NLL 9.3e-5, p99.9 ratio 1.13, every prompt bucket; 256 segments near-passed at
+1.26) and FP8 KV (TV 1.1e-3 bound 1.4e-3, top-1 1.3e-3 bound 2.5e-3, KL 6.1e-4, NLL 1.6e-4, p99.9
+1.02), its joint prefill gates pass (INT8: KL 9.0e-4 bound 1.1e-3, top-1 2.1e-3 bound 2.5e-3, NLL
+-4.8e-4, p99.9 1.09; FP8: KL 6.2e-4 bound 7.0e-4, top-1 1.3e-3 bound 1.8e-3, NLL -3.9e-4, p99.9
+1.05), and against the old fast route's prefill its excesses are negative except NLL (+1.5e-4,
+bound 4.7e-4). Every gate here uses the new build's references (the 1,024-segment extension's
+reference reproduced segments 254-255 bit for bit).
 
-Cost (RTX PRO 6000; T1 device time for decode, `infernix-perplexity` scoring time for prefill, INT8
-KV, the base build against the new one):
+Cost (RTX PRO 6000; T1 device time for decode, `infernix-perplexity` scoring time for prefill at
+`33e1305`, INT8 KV, the base build against the new one):
 
 | Route | 1x1 | 6x1 | 1x4 | 6x2 | Prefill, chunk 896 / 1,792 / 3,584 / 7,168 |
 |---|---:|---:|---:|---:|---|
-| exact | 5.66 -> 7.44 ms (+31 %) | 11.26 -> 12.07 ms (+7 %) | 9.05 -> 10.28 ms (+14 %) | 17.48 -> 18.11 ms (+4 %) | +1.2 / +3.7 / +4.6 / +5.0 % |
+| exact | 5.66 -> 7.32 ms (+29 %) | 11.26 -> 11.93 ms (+6 %) | 9.05 -> 10.01 ms (+11 %) | 17.48 -> 17.14 ms | +1.2 / +3.7 / +4.6 / +5.0 % |
 | fast | 5.68 ms | 11.27 ms | 8.96 ms | 16.43 ms | +4.9 / +5.8 / +6.2 / +6.9 % |
 
 The fast route's decode kernels did not change and its decode times were not re-measured on the
-base build. A later `t1-record` run measured the exact route at 12.09 ms (6x1) and 17.30 ms (6x2),
-so the 6x2 cost is within run-to-run variation. The exact route's decode cost comes from the
-narrow FP8 tiles (about 0.5 ms at 1x1), the Q8 mixer routes (about 0.7 ms) and QSA's prompt kernel at width 1 (0.63 ms). `t1-exact` and
-`t2-record` recorded new hashes and golden tokens for the exact route; the fast route's T1 hashes
-changed with its GDN prefill (the rounds start from a prefilled state). The MTP drafter's
-projections have no column-invariant routes, so drafts can differ after a resume; accepted tokens
-cannot.
+base build; the 6x2 exact round measured 17.1 to 18.1 ms across runs, so its cost is not resolved
+from the base's 17.5 ms. The exact route's decode cost comes from the narrow FP8 tiles (about
+0.5 ms at 1x1), the Q8 mixer routes (about 0.7 ms) and QSA's prompt kernel at narrow widths. That kernel's warps each run
+a serial chain of tiles with its own online softmax, merged in warp order, so its bits fix the chain
+count; at narrow widths each chain now runs in its own one-warp CTA with an eight-stage gather ring
+and an element-parallel merge of the same operations (bit-identical, `test_qsa`): 67.6 -> 55.3 us
+per INT8 call at width 1 (context 8,192), 0.12 ms per 1x1 round. More chains would change the bits,
+which 6.1 allows only for precision. A bank swizzle of the unsplit kernel's merge buffer took 3-4 %
+off its prefill calls (1,085 -> 1,038 us at 2,048 columns, INT8). The MTP drafter's invariant routes
+match its width routes at draft widths and cost about 0.67 ms per 2,048-token prompt chunk (its
+prompt pass, sliced-K at 8,192 and 2,048 columns). `t1-exact` and `t2-record` recorded new hashes
+and golden tokens for the exact route; the fast route's T1 hashes changed with its GDN prefill (the
+rounds start from a prefilled state).
+
+**`gdn-compensated`: the compensated chunked GDN prefill on recipe C's fast route (2026-10-24).**
+The recurrent prefill above cost the fast route about 9 % of its 30k-token prefill throughput
+(T3: 10,900 and 10,800 against 12,000 and 11,900 tok/s): at T = 2,048 (16/48 heads) it takes 666 us
+per layer against the chunked route's 172 us, a serial chain per token. `GdnChunkArithmetic::Compensated`
+keeps the chunked algorithm and compensates every product: prepare stores a second BF16 packet with
+each normalized Q/K element's remainder, and the control dot products, the prediction K S^T, the
+readout Q S^T, both control-matrix products and the update K^T diag(suffix) Delta carry their
+operands as BF16 pairs (TF32 pairs for the control matrices and Delta) summed as hi*hi + hi*lo +
+lo*hi in FP32. Against the FP64 Op oracle (`test_gated_delta_net`, every value tile, both
+normalizations, the boundary and stress inputs): output relative L2 at most 1.71e-3 and final state
+9.0e-5, against the recurrent arithmetic's 2.10e-3 and 2.0e-5 and the chunked route's 4.44e-3 and
+3.56e-3 (the state error that failed the tail falls 40-fold). It takes 258 us at T = 2,048 (prepare
+43, recurrence 223; the 64-column value tile stays the fastest of 64/32/16/8). A first version
+predicted with TF32 pairs (293 us); BF16 pairs of the same state give the same error.
+
+It runs only where `gdn-compensated` is selected, which applies only in the construction-exact
+configurations (elsewhere the exact route's chunked prefill is the baseline); the exact route keeps
+the recurrent prefill. Its bits depend on the call's chunk grid, so it is a request-coupling path
+(column-invariant routes off, like `ggml-bf16-prefill`). Joint gates with the qualified paths,
+against the construction-exact reference (the 1,024-segment extension's reference as above):
+
+| Gate | KV | TV excess (bound) | Top-1 excess (bound) | KL excess (bound) | NLL excess | p99.9 KL ratio |
+|---|---|---:|---:|---:|---:|---:|
+| decode, 256 segments | INT8 | 2.1e-3 (2.5e-3) | 2.6e-3 (5.2e-3, fails) | 1.1e-3 (1.4e-3) | -2.5e-3 | 1.27 (fails) |
+| decode, 1,024 segments | INT8 | 1.8e-3 (2.0e-3) | 2.5e-3 (3.6e-3) | 1.1e-3 (1.3e-3) | -9.2e-4 | 1.11 |
+| decode, 256 segments | FP8 | 1.2e-3 (1.6e-3) | 2.1e-3 (4.7e-3) | 4.0e-4 (7.7e-4) | 5.9e-4 | 0.83 |
+| decode, 1,024 segments | FP8 | 1.0e-3 (1.2e-3) | 2.0e-3 (3.1e-3) | 5.7e-4 (8.4e-4) | 1.2e-4 | 1.06 |
+| prefill, quick corpus | INT8 | — | 2.2e-3 (2.7e-3) | 9.3e-4 (1.1e-3) | -5.6e-4 | 1.11 |
+| prefill, quick corpus | FP8 | — | 1.1e-3 (1.6e-3) | 6.6e-4 (7.5e-4) | -2.8e-4 | 1.07 |
+
+The INT8 256-segment run near-passed (top-1's estimate within budget and its bound over, the tail
+1.27), as the recurrent prefill's did (1.26); the near-pass rule extended it to 1,024 segments,
+where every criterion passes (the recurrent prefill there: TV 1.8e-3, top-1 1.9e-3 bound 2.9e-3,
+p99.9 1.13). Against the recurrent fast route's own prefill (INT8) the compensated one moves KL by
+3.0e-5 (bound 1.2e-4) and the corpus NLL by -8.1e-5. Prefill scoring time (`infernix-perplexity`,
+INT8 / FP8, chunks 896 / 1,792 / 3,584 / 7,168) against the recurrent fast route: -4.2 / -4.3 /
+-5.1 / -5.6 % and -4.4 / -4.9 / -5.2 / -5.8 %. The exact route's bits are unchanged (`t1-exact`
+equals its record); the fast route's T1 hashes changed again, its decode times did not.
 
 **Prefill head gather-before-mix (2026-10-23).** `Forward::finish` mixed the residual over the
 call's full width before gathering the logit columns, so the LM head's arithmetic depended on the

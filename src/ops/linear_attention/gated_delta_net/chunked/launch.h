@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "infernix/ops/gated_delta_net.h"
 #include "ops/common/math.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
 
@@ -56,6 +57,7 @@ __host__ __device__ constexpr int square_index(int row, int col) {
 
 struct WorkspaceLayout {
     TensorRegion qk;
+    TensorRegion qk_low; // GdnChunkArithmetic::Compensated: the normalized Q/K minus the packet, in BF16
     TensorRegion control;
     std::size_t total_bytes;
 };
@@ -66,21 +68,29 @@ inline WorkspaceLayout workspace_layout(int qk_heads, int value_heads, int token
     WorkspaceLayout layout;
     layout.qk =
         builder.add_tensor(DType::U8, {int(sizeof(QkChunk)), chunks, qk_heads}, 256, "gdn.qk");
+    layout.qk_low =
+        builder.add_tensor(DType::U8, {int(sizeof(QkChunk)), chunks, qk_heads}, 256, "gdn.qk_low");
     layout.control = builder.add_tensor(DType::U8, {int(sizeof(ControlChunk)), chunks, value_heads},
                                         256, "gdn.control");
     layout.total_bytes = builder.finish(256, "GDN chunk workspace");
     return layout;
 }
 
-// `fp16` selects GdnChunkArithmetic::Fp16Accumulate: prepare stores the Q/K packet in FP16 instead
-// of BF16 (normalized rows keep every element inside FP16's range), and the recurrence's prediction
-// K S^T, readout Q S^T and state update K^T diag(suffix) Delta take FP16 operands (S and the scaled
-// Delta rounded to FP16) with FP16 accumulation over each pair of k16 products, carried into FP32.
-// The control products (solve, mqk) keep FP32 accumulators. Both launches take the same value.
-void launch_prepare(const Arguments& args, QkChunk* qk, ControlChunk* control, bool normalize_qk,
-                    cudaStream_t stream, bool fp16);
-void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
-                       DeviceExecutionView execution, bool fp16);
+// `arithmetic` is Exact, Fp16Accumulate or Compensated (Recurrent does not reach the chunked route).
+// Fp16Accumulate: prepare stores the Q/K packet in FP16 instead of BF16 (normalized rows keep every
+// element inside FP16's range), and the recurrence's prediction K S^T, readout Q S^T and state update
+// K^T diag(suffix) Delta take FP16 operands (S and the scaled Delta rounded to FP16) with FP16
+// accumulation over each pair of k16 products, carried into FP32. The control products (solve, mqk)
+// keep FP32 accumulators.
+// Compensated: prepare also stores `qk_low`, each normalized Q/K element minus its BF16 packet value
+// rounded to BF16, and every product of the chunk carries its operands as high/low pairs (BF16 pairs
+// for BF16 MMAs, TF32 pairs for TF32 MMAs) summed as hi*hi + hi*lo + lo*hi in FP32: the control dot
+// products, the prediction, the readout, both products with the control matrices and the update.
+// `qk_low` is read only by Compensated.
+void launch_prepare(const Arguments& args, QkChunk* qk, QkChunk* qk_low, ControlChunk* control, bool normalize_qk,
+                    cudaStream_t stream, GdnChunkArithmetic arithmetic);
+void launch_recurrence(const Arguments& args, const QkChunk* qk, const QkChunk* qk_low, const ControlChunk* control,
+                       DeviceExecutionView execution, GdnChunkArithmetic arithmetic);
 int value_tile(int value_heads, int multiprocessor_count);
 
 } // namespace infernix::ops::detail::gated_delta_net::chunked
