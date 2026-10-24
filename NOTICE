@@ -16,8 +16,9 @@ Modifications made in this product (summary; see README.md for details):
 - A prefix-cache tail snapshot for fresh one-call spans, in both resume modes
   (the finish endpoint covers continuations only; without the tap, repeats of
   a prompt that fits one call start from the root).
-- A zero-token prefix-cache resume for exact repeats (DFlash2 and plain
-  modes): the prompt-end snapshot carries the pre-head residual, and the
+- A zero-token prefix-cache resume for exact repeats (every drafter mode;
+  under MTP the drafter's pending cell is written by the resumed lane's
+  first round): the prompt-end snapshot carries the pre-head residual, and the
   repeat regenerates its first token from it with no prefill (value-gated:
   skipped within one tap separation of the deepest published frontier, so
   only spans whose opener demoted to the last inner boundary capture).

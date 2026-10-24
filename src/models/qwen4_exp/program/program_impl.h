@@ -137,6 +137,9 @@ struct LanePrefix {
     // The zero-token resume: the lane's state is the prompt's own end snapshot, whose head
     // residual is saved (resume_from_saved_head regenerates the first token from it).
     bool head_resume = false;
+    // The prompt-end capture waiting for its anchor block (MTP, a block-aligned prompt end): the
+    // lane resolves it when it publishes that block, or abandons it.
+    std::uint64_t pending_anchor = 0;
     std::optional<runtime::prefix_cache::SnapshotRef> resume;
     std::optional<prefix::RestoreTicket> restore;     // the first call waits on it per layer
     std::uint64_t capture          = 0;               // its copy-out gates the next call per layer
@@ -2057,7 +2060,9 @@ public:
                 "Qwen4Exp: a zero-token resume on a lane that is not at its prompt's end snapshot");
         }
         if (lane.prefix.restore) { prefix_->order_after_restore(*lane.prefix.restore, device_.stream); }
-        Tensor residual = head_saved_column(index);
+        // Under MTP the drafter's saved column is the same final residual (finish copies column
+        // T - 1 into both), so the image keeps it once.
+        Tensor residual = mtp_ ? saved_column(index) : head_saved_column(index);
         Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
         forward_->head_logits(residual, logits);
         const std::uint32_t rows[] = {index};

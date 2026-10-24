@@ -258,6 +258,9 @@ bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cuda
         capture.tail.size() >= pc::kBlockTokens) {
         throw std::invalid_argument("Qwen4Exp prefix cache: a prompt-end capture's tail does not match its page");
     }
+    if (capture.anchor_pending && (tail || capture.anchor.valid() || capture.frontier == 0)) {
+        throw std::invalid_argument("Qwen4Exp prefix cache: only a block-aligned prompt end awaits its anchor");
+    }
     // A free slot: one no pending capture reads. A landed-but-unpublished capture still holds it
     // until the next poll, which every admission runs.
     std::size_t slot = prompt_end_slots_.size();
@@ -456,12 +459,44 @@ void PrefixCache::write_blocks(std::span<const pc::NodeRef> nodes, cudaStream_t 
     writes_.push_back(PendingWrite{std::move(written), done});
 }
 
+void PrefixCache::resolve_capture_anchor(std::uint64_t id, pc::NodeRef anchor) {
+    for (PendingCapture& c : captures_) {
+        if (c.capture.id != id) { continue; }
+        if (!c.capture.anchor_pending || !anchor.valid()) {
+            throw std::logic_error("Qwen4Exp prefix cache: a capture's anchor is resolved twice or to no block");
+        }
+        index_->pin_node(anchor);
+        c.capture.anchor         = anchor;
+        c.capture.anchor_pending = false;
+        return;
+    }
+    throw std::logic_error("Qwen4Exp prefix cache: an anchor resolved for no pending capture");
+}
+
+void PrefixCache::abandon_capture(std::uint64_t id) noexcept {
+    const auto found = std::find_if(captures_.begin(), captures_.end(),
+                                    [&](const PendingCapture& c) { return c.capture.id == id; });
+    if (found == captures_.end()) { return; }
+    // The slabs and the staging slot are still read until the copy lands.
+    (void)cudaEventSynchronize(found->events.back());
+    for (cudaEvent_t event : found->events) { recycle(event); }
+    if (found->capture.anchor.valid()) { index_->unpin_node(found->capture.anchor); }
+    index_->release_host_image(std::move(found->image));
+    captures_.erase(found);
+}
+
 void PrefixCache::poll() {
-    while (!captures_.empty()) {
-        PendingCapture& c = captures_.front();
+    // Captures land in transfer-stream order; one still waiting for its anchor block keeps its
+    // place while the ones behind it publish.
+    for (auto it = captures_.begin(); it != captures_.end();) {
+        PendingCapture& c = *it;
         const cudaError_t status = cudaEventQuery(c.events.back());
         if (status == cudaErrorNotReady) { break; }
         CUDA_CHECK(status);
+        if (c.capture.anchor_pending) {
+            ++it;
+            continue;
+        }
         std::optional<std::uint32_t> tail_device;
         if (c.capture.tail_lease) { tail_device = adopt_tail(std::move(*c.capture.tail_lease)); }
         const pc::PublishResult result =
@@ -478,7 +513,7 @@ void PrefixCache::poll() {
         if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
         published_[c.capture.id] = result;
         for (cudaEvent_t event : c.events) { recycle(event); }
-        captures_.pop_front();
+        it = captures_.erase(it);
     }
     while (!writes_.empty()) {
         PendingWrite& w = writes_.front();
@@ -689,7 +724,8 @@ void PrefixCache::clear() noexcept {
     }
     landing_.clear();
     while (!staged_.empty()) { abandon_staged_capture(staged_.begin()->first); }
-    captures_.clear();
+    // Landed captures still waiting for their anchor (drain published every other one).
+    while (!captures_.empty()) { abandon_capture(captures_.front().capture.id); }
     writes_.clear();
     published_.clear();
     pc::PrefixIndexConfig config = index_->config();

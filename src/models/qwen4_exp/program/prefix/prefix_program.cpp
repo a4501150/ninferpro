@@ -71,7 +71,7 @@ void ProgramImpl::create_prefix_cache() {
     config.kv_pages   = kv_pages_;
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
                                                             options_.prefix_host_bytes);
-    if (options_.free_cache_resume && !mtp_) {
+    if (options_.free_cache_resume) {
         // The zero-token resume's prompt-end captures stage their image through fixed Device slots
         // (a lane's replayed decode graphs cannot wait on capture events): two cover a burst of
         // concurrent prompt ends, a third skips and counts. Their bytes come out of the expert
@@ -279,11 +279,13 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             s.shared              = k;
             if (c.frontier % kBlock != 0) {
                 s.cow = PrefixCow::Tail;
-            } else if (mtp_ && c.frontier < n && k > 0 &&
-                       prefix_->mtp_next(s.path[k - 1]) != prompt.token_ids[c.frontier]) {
-                // MR6: the anchor's last MTP cell encodes another continuation; the lane rewrites it
-                // in a private copy of the anchor page. (c.frontier < n: the prompt's own end has
-                // no continuation in the prompt to compare.)
+            } else if (mtp_ && k > 0 &&
+                       !(c.frontier < n && prefix_->mtp_next(s.path[k - 1]) == prompt.token_ids[c.frontier])) {
+                // MR6: the anchor's last MTP cell (F - 1) must encode history[F]; otherwise the lane
+                // rewrites it in a private copy of the anchor page. At the prompt's own end
+                // (F == n, the zero-token resume) history[F] is the token the resume regenerates,
+                // unknown here, so the anchor is always copied: its cell holds the capturing run's
+                // first token, and the lane's first decode round writes its own.
                 s.cow    = PrefixCow::Anchor;
                 s.shared = k - 1;
             }
@@ -293,9 +295,9 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
                 // The zero-token resume: the snapshot at the prompt's own end carries the whole
                 // state and its head's saved residual, so the prefill plan is empty (plan_calls
                 // refuses an empty one by design) and the first token regenerates from the residual
-                // at the prefill step (resume_from_saved_head). No MTP Program publishes one (the
-                // capture is gated), and match offers the frontier only with its residual.
-                if (c.head_residual && !mtp_ && fits(s)) {
+                // at the prefill step (resume_from_saved_head). Match offers the frontier only
+                // with its residual.
+                if (c.head_residual && fits(s)) {
                     s.cached_tokens = cached_tokens;
                     return s;
                 }
@@ -645,11 +647,15 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         } else {
             lane.mtp_cells = s.frontier;
         }
-        if (mtp_ && lane.mtp_cells != s.frontier) { ++prefix_->counters().mtp_continuation_mismatches; }
         lane.mtp_live = mtp_;
         // The zero-token resume's lane flag, read at the prefill step (the snapshot itself may be
         // evicted once its restore has landed; the lane keeps the state it restored).
         lane.prefix.head_resume = meta.head_residual && s.frontier == lane.prompt_tokens;
+        // A zero-token resume's pending cell is unwritten by construction (the capture precedes the
+        // first decode round), not a continuation that differs.
+        if (mtp_ && lane.mtp_cells != s.frontier && !lane.prefix.head_resume) {
+            ++prefix_->counters().mtp_continuation_mismatches;
+        }
         lane.dflash_frontier = std::min(meta.draft_frontier, s.frontier);
         // Penalty counts restart with the request; the lane's state came from the snapshot.
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(token_counts_.p) + index * static_cast<std::size_t>(token_domain_),
@@ -864,6 +870,12 @@ void ProgramImpl::prefix_publish(Lane& lane, std::uint32_t frontier) {
             prefix_->insert_block(parent, lane.prefix.hashes[b], tokens, extra, lease, attach, next);
         lane.prefix.path.push_back(result.node);
     }
+    // The prompt-end capture's anchor is the prompt's last block, published once the first decode
+    // round has written its pending cell.
+    if (lane.prefix.pending_anchor != 0 && lane.prefix.path.size() >= lane.prompt_tokens / kBlock) {
+        prefix_->resolve_capture_anchor(lane.prefix.pending_anchor, lane.prefix.path[lane.prompt_tokens / kBlock - 1]);
+        lane.prefix.pending_anchor = 0;
+    }
 }
 
 // A tap or endpoint snapshot of the lane's state at its frontier F = state_tokens (Host-born).
@@ -890,7 +902,8 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
     const std::uint32_t k = F / kBlock;
     prefix::PrefixCache::Capture c;
     c.id       = ++next_capture_;
-    c.anchor   = k == 0 ? pc::NodeRef{} : lane.prefix.path[k - 1];
+    // A block-aligned MTP prompt end's anchor block is not published yet (anchor_pending).
+    c.anchor   = k == 0 || lane.prefix.path.size() < k ? pc::NodeRef{} : lane.prefix.path[k - 1];
     c.frontier = F;
     c.tail.assign(lane.history.begin() + static_cast<std::ptrdiff_t>(k) * kBlock, lane.history.begin() + F);
     if (!c.tail.empty()) {
@@ -970,10 +983,15 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
 // head's saved residual in its image, that an exact repeat resumes from with no prefill at all.
 // The lane's next round is a graph-replayed decode, so the copy must not read the lane's state
 // after it: the image stages through a fixed slot on the compute stream (capture_prompt_end), and
-// the tail is a private copy of the lane's page. Skips (and counts) when the MTP drafter is live
-// (its prompt-end cell encodes the cold run's first token, MR5/MR6), the frontier lies inside a
-// Vision item, the blocks are not published, or the staging slot, Host slabs or a free page are
-// out. A snapshot below n suppresses it only within one tap separation: what the image saves a
+// the tail is a private copy of the lane's page. Under MTP the snapshot is the transition itself
+// (MR1): the drafter's pending cell n - 1 is unwritten (its token is the first one the resume
+// regenerates) and the resumed lane's first decode round writes it, into its private copy of the
+// tail page or, for a block-aligned n, of the anchor block (MR6 at F == n). That anchor block is
+// published only after the capturing lane's own first round has written the cell, so its capture
+// copies now and publishes once the lane names the block (anchor_pending). Skips (and counts) when
+// a drafter whose cells are not maintained, a frontier inside a Vision item, unpublished blocks,
+// or no staging slot, Host slabs or free page rule it out. A snapshot below n suppresses it only
+// within one tap separation: what the image saves a
 // repeat is the re-fill from the path's deepest published frontier (the opener's realization, or
 // the tail tap of a one-call span) up to n, while the image is a fixed cost beside the decode
 // rounds that follow — measured on the artifact, capturing at every transition cost a concurrent
@@ -981,9 +999,14 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
 // separation re-fills anyway. A span whose opener demoted to its last inner boundary (the
 // multi-call re-fill loss, up to chunk - 1 tokens) is past the separation and still captures.
 void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
-    if (!options_.free_cache_resume || mtp_ || lane.mtp_live) { return; }
+    if (!options_.free_cache_resume) { return; }
     const std::uint32_t n = lane.state_tokens, k = n / kBlock;
-    if (n == 0 || lane.prefix.path.size() < k ||
+    // MR1 at the transition: the cells end at n - 1, or at n after a replay whose ledger knows the
+    // token at n (either way the resume rewrites cell n - 1 privately).
+    const bool drafter = !mtp_ || (lane.mtp_live && lane.mtp_cells + 1U >= n);
+    // Under MTP the published blocks end at the cells: a block-aligned n's last block waits.
+    const bool anchor_pending = mtp_ && k > 0 && lane.prefix.path.size() + 1U == k && lane.mtp_cells < n;
+    if (n == 0 || !drafter || (lane.prefix.path.size() < k && !anchor_pending) ||
         prefix::inside_exclusion(n, lane.prefix.exclusions) ||
         n - lane.prefix.deepest < pc::kMinimumTapSeparation) {
         ++prefix_->counters().prompt_end_skipped;
@@ -1010,8 +1033,10 @@ void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
     prefix::PrefixCache::Capture c =
         prefix_capture_at(lane, n, pc::SnapshotKind::Boundary, false, false, fresh ? &*fresh : nullptr);
     c.meta.head_residual = true;
+    c.anchor_pending     = anchor_pending;
     const std::uint64_t id = c.id;
     if (prefix_->capture_prompt_end(index, std::move(c), device_.stream)) {
+        if (anchor_pending) { lane.prefix.pending_anchor = id; }
         // Not `deepest`: the finish endpoint above must still be captured (its guard reads
         // deepest + kBlock). A continuation resumes there, past the blocks the last turn
         // published with decode KV; a resume inside such a block deduplicates to the published
@@ -1034,6 +1059,12 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
         mtp_flush_cell(lane, index);
     }
     prefix_publish(lane, prefix_frontier(lane, true));
+    if (lane.prefix.pending_anchor != 0) {
+        // The lane ends before its first token was decided (no flush could write the pending cell):
+        // the prompt-end capture has no anchor block to publish under.
+        prefix_->abandon_capture(lane.prefix.pending_anchor);
+        lane.prefix.pending_anchor = 0;
+    }
     const std::uint32_t F = lane.state_tokens;
     const bool full_blocks = !lane.mtp_live || lane.mtp_cells >= F / kBlock * kBlock;
     // An endpoint holds decode-computed state: published only with free cache resume.
@@ -1080,6 +1111,7 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
         // have its restore landing in its private page and state slot: whatever reuses them next runs
         // on the compute stream, so that stream waits for the restore (free once it has landed).
         if (lane.prefix.restore) { prefix_->order_after_restore(*lane.prefix.restore, device_.stream); }
+        if (lane.prefix.pending_anchor != 0) { prefix_->abandon_capture(lane.prefix.pending_anchor); }
         if (!lane.prefix.path.empty()) { prefix_->index().release_path(lane.prefix.path); }
         prefix_->poll();
     } catch (...) {}
@@ -1089,6 +1121,7 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     lane.prefix.restore.reset();
     lane.prefix.resume.reset();
     lane.prefix.head_resume = false;
+    lane.prefix.pending_anchor = 0;
     lane.prefix.page_base = 0;
     lane.prefix.deepest   = 0;
     lane.prefix.reuse     = false;

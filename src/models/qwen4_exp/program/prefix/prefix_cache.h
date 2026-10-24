@@ -150,6 +150,10 @@ public:
     struct Capture {
         std::uint64_t id = 0; // the caller's name for capture_result
         runtime::prefix_cache::NodeRef anchor;
+        // A prompt-end capture on a block boundary under MTP: the anchor block holds the pending
+        // drafter cell, so the lane publishes it only after the first decode round has written that
+        // cell. The copy runs now; publication waits for resolve_capture_anchor.
+        bool anchor_pending    = false;
         std::uint32_t frontier = 0;
         std::vector<TokenId> tail;
         std::optional<DeviceKVPageHandle> tail_page;
@@ -172,6 +176,12 @@ public:
     // `capture.tail_page` must be the caller's private copy of the lane's tail page (its lease
     // moves to the snapshot). Returns false when no staging slot or Host slabs could be had.
     [[nodiscard]] bool capture_prompt_end(std::uint32_t lane, Capture&& capture, cudaStream_t producer);
+    // Names the anchor of a capture taken with `anchor_pending` (the block the capturing lane has
+    // now published); the capture publishes once it has landed.
+    void resolve_capture_anchor(std::uint64_t id, runtime::prefix_cache::NodeRef anchor);
+    // Drops a capture whose anchor will never be published (the lane ended before the block):
+    // waits for its copy and returns its slabs, its staging slot and its tail page.
+    void abandon_capture(std::uint64_t id) noexcept;
     // The fixed Device staging slots and their per-slot pinned headers (the Program's
     // preallocated packed images, one per concurrent prompt-end capture).
     void set_prompt_end_staging(std::vector<std::byte*> slots);
