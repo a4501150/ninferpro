@@ -261,7 +261,11 @@ constexpr std::array kQualified{
     // candidates, and the INT8 joint decode gate (MTP 4 at concurrency 2, warm 3,000-token
     // resumes, 1,024 segments) passes — TV excess 8.1e-4 (bound 1.0e-3), top-1 +0.22 points
     // (bound 0.32), p99.9 KL ratio 1.09 (256 segments near-passed it, the estimate within budget
-    // and only its bound over, so the near-pass rule extended the run). The timing is
+    // and only its bound over, so the near-pass rule extended the run). Re-measured 2026-10-23
+    // on the build with the head's gathered-column finish and the value-gated prompt-end
+    // capture (S0/S1 shifted both routes together, so the excesses stand: TV 8.1e-4, top-1
+    // +0.22 points bound 0.32, KL 6.0e-4, NLL 8.3e-4, p99.9 1.09; the 256-segment run
+    // near-passed top-1 the same way and the near-pass rule extended it again). The timing is
     // on the artifact itself: second-turn continuations 76 -> 28 ms TTFT (98.9 % resumed from the
     // endpoint), repeats of single-chunk prompts kept at 16-17 ms by planning the tail tap beside
     // the path (hybrid-prefix-cache-spec, Taps; without it they regressed to 178 ms and 0 %),
