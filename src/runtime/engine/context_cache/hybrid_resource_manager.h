@@ -74,6 +74,11 @@ public:
         out.hybrid_taps_created            = hybrid.taps_created;
         out.hybrid_taps_skipped            = hybrid.taps_skipped;
         out.hybrid_endpoints_created       = hybrid.endpoints_created;
+        // The zero-token resume's prompt-end captures (Qwen4Exp).
+        if constexpr (requires { hybrid.prompt_end_captures; }) {
+            out.hybrid_prompt_end_captures = hybrid.prompt_end_captures;
+            out.hybrid_prompt_end_skipped  = hybrid.prompt_end_skipped;
+        }
         // Publication refusals (Qwen3.5's Device snapshot slots; other caches have none).
         if constexpr (requires { hybrid.device_slot_refusals; }) {
             out.hybrid_taps_skipped_no_slot       = hybrid.taps_skipped_no_slot;

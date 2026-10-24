@@ -844,6 +844,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"taps_skipped_no_slot", delta(&RuntimeStats::hybrid_taps_skipped_no_slot)},
                  {"endpoints_created", delta(&RuntimeStats::hybrid_endpoints_created)},
                  {"endpoints_skipped", delta(&RuntimeStats::hybrid_endpoints_skipped)},
+                 {"prompt_end_captures", delta(&RuntimeStats::hybrid_prompt_end_captures)},
+                 {"prompt_end_skipped", delta(&RuntimeStats::hybrid_prompt_end_skipped)},
                  {"host_image_write_refusals",
                   delta(&RuntimeStats::hybrid_host_image_write_refusals)},
                  {"host_block_write_refusals",

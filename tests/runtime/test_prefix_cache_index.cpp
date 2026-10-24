@@ -110,7 +110,7 @@ SnapshotRef publish_tap(PrefixCacheIndex& index, NodeRef anchor) {
 // a block takes its tail from that block's tokens.
 SnapshotRef publish_at(PrefixCacheIndex& index, RecordingBackend& backend,
                        const std::vector<NodeRef>& path, const std::vector<TokenId>& tokens,
-                       std::uint32_t frontier, SnapshotKind kind) {
+                       std::uint32_t frontier, SnapshotKind kind, bool head_residual = false) {
     const std::uint32_t full = frontier / kBlockTokens;
     const std::uint32_t tail = frontier % kBlockTokens;
     const auto slot          = index.acquire_device_slot();
@@ -121,7 +121,7 @@ SnapshotRef publish_at(PrefixCacheIndex& index, RecordingBackend& backend,
         full == 0 ? NodeRef{} : path[full - 1], frontier,
         std::span<const TokenId>(tokens.data() + static_cast<std::size_t>(full) * kBlockTokens,
                                  tail),
-        tail_id, *slot, kind);
+        tail_id, *slot, kind, head_residual);
     require(result.created, "snapshot not created");
     index.check_invariants();
     return result.snapshot;
@@ -208,6 +208,58 @@ void test_match_and_choice() {
     require(index.match(tokens, media_hashes, extras, static_cast<std::uint32_t>(tokens.size()))
                 .path.empty(),
             "different media must not match");
+}
+
+// A snapshot at the prompt's own end serves only the zero-token resume: it must be offered with
+// its head residual, and stay unexposed without one — a block-aligned end's anchor is the last
+// walked block's node.
+void test_prompt_end_head_residual() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(), backend);
+    const auto tokens  = make_tokens(64 * 4 + 10, 5);
+    const auto blocks = std::vector<TokenId>(tokens.begin(), tokens.begin() + 64 * 4);
+    const auto path   = insert_sequence(index, backend, blocks);
+    const auto hashes = block_lookup_hashes(tokens, {});
+    const auto n       = static_cast<std::uint32_t>(tokens.size());
+    const SnapshotRef head =
+        publish_at(index, backend, path, tokens, n, SnapshotKind::Endpoint, true);
+    index.release_path(path);
+    index.check_invariants();
+
+    const MatchResult matched = index.match(tokens, hashes, {}, n);
+    require(matched.path.size() == 4, "match must walk the prompt's last full block");
+    require(matched.candidates.size() == 1 && matched.candidates[0].snapshot == head &&
+                matched.candidates[0].frontier == n && matched.candidates[0].head_residual &&
+                matched.candidates[0].tail,
+            "a prompt-end snapshot with its head residual must be offered");
+    require(index.choose(matched, n).candidate == 0U, "a zero-token resume beats every prefill");
+
+    // Without the residual the same end stays unexposed (the persisted-file check relies on it).
+    const std::vector<TokenId> plain_tokens = make_tokens(64 * 4, 6);
+    const auto plain_blocks = std::vector<TokenId>(plain_tokens.begin(), plain_tokens.end());
+    const auto plain_path   = insert_sequence(index, backend, plain_blocks);
+    (void)publish_at(index, backend, plain_path, plain_tokens, 256, SnapshotKind::Tap);
+    index.release_path(plain_path);
+    index.check_invariants();
+    const MatchResult plain_match =
+        index.match(plain_tokens, block_lookup_hashes(plain_tokens, {}), {}, 256);
+    require(plain_match.candidates.empty(), "a prompt-end snapshot without its head residual must stay unexposed");
+
+    // A block-aligned end with the residual: its anchor is the last block's node, which the
+    // raised block walk must reach.
+    const std::vector<TokenId> aligned_tokens = make_tokens(64 * 4, 7);
+    const auto aligned_blocks = std::vector<TokenId>(aligned_tokens.begin(), aligned_tokens.end());
+    const auto aligned_path   = insert_sequence(index, backend, aligned_blocks);
+    const SnapshotRef aligned =
+        publish_at(index, backend, aligned_path, aligned_tokens, 256, SnapshotKind::Endpoint, true);
+    index.release_path(aligned_path);
+    index.check_invariants();
+    const MatchResult aligned_match =
+        index.match(aligned_tokens, block_lookup_hashes(aligned_tokens, {}), {}, 256);
+    require(aligned_match.path.size() == 4 && aligned_match.candidates.size() == 1 &&
+                aligned_match.candidates[0].snapshot == aligned &&
+                aligned_match.candidates[0].head_residual && !aligned_match.candidates[0].tail,
+            "a block-aligned prompt end with its head residual must be offered");
 }
 
 void test_collisions_and_tails() {
@@ -1639,6 +1691,7 @@ int main() {
     try {
         test_hashes();
         test_match_and_choice();
+        test_prompt_end_head_residual();
         test_collisions_and_tails();
         test_device_lru_order();
         test_backed_before_unbacked();

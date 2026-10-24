@@ -430,6 +430,15 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
         CUDA_CHECK(cudaMemcpyAsync(chunk.saved.data, static_cast<const std::byte*>(residual.data) + column * (T - 1),
                                    column, cudaMemcpyDeviceToDevice, s));
     }
+    if (batch.head_residual_out.data != nullptr) {
+        // The pre-LM-head residual of the call's last column (the MTP saved column's counterpart):
+        // the zero-token resume's head_logits runs on exactly this state, so the resumed first
+        // token reproduces the cold draw bit-for-bit.
+        const std::size_t column = static_cast<std::size_t>(W) * 2;
+        CUDA_CHECK(cudaMemcpyAsync(batch.head_residual_out.data,
+                                   static_cast<const std::byte*>(residual.data) + column * (T - 1), column,
+                                   cudaMemcpyDeviceToDevice, s));
+    }
     if (logits == nullptr) { return; }
     auto scope = work_.scope();
     Tensor head;

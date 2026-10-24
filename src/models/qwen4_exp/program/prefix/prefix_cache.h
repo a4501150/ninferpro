@@ -46,6 +46,8 @@ struct PrefixCacheCounters {
     std::uint64_t blocks_duplicate            = 0;
     std::uint64_t taps_created                = 0;
     std::uint64_t taps_skipped                = 0;
+    std::uint64_t prompt_end_captures         = 0; // the zero-token resume's prompt-end snapshots
+    std::uint64_t prompt_end_skipped          = 0; // no staging slot, Host slabs or free page
     std::uint64_t endpoints_created           = 0;
     std::uint64_t endpoint_skipped_mtp        = 0;
     std::uint64_t endpoint_mismatch_fallbacks = 0;
@@ -162,6 +164,17 @@ public:
     };
     // Returns false when no slabs could be reserved for its claim (the capture is skipped).
     [[nodiscard]] bool capture(std::uint32_t lane, Capture&& capture, cudaStream_t producer);
+    // The zero-token resume's prompt-end capture: a snapshot at the prompt's own frontier whose
+    // image carries the head's saved residual, so an exact repeat regenerates its first token
+    // without prefill. The lane's next round is a graph-replayed decode that cannot wait on
+    // capture events, so the image stages through a fixed Device slot on `producer` (stream-
+    // ordered before that round) and the Host copy reads the slot, never the live state.
+    // `capture.tail_page` must be the caller's private copy of the lane's tail page (its lease
+    // moves to the snapshot). Returns false when no staging slot or Host slabs could be had.
+    [[nodiscard]] bool capture_prompt_end(std::uint32_t lane, Capture&& capture, cudaStream_t producer);
+    // The fixed Device staging slots and their per-slot pinned headers (the Program's
+    // preallocated packed images, one per concurrent prompt-end capture).
+    void set_prompt_end_staging(std::vector<std::byte*> slots);
     // A capture taken group by group, for a layer walk that passes the frontier inside a span
     // (prefill_walk.cpp): the walk reaches the frontier in each layer at another point of its queue,
     // so each group (with that layer's planes of the tail page) is copied once the walk has enqueued
@@ -245,6 +258,9 @@ private:
         Capture capture;
         runtime::prefix_cache::HostImageReservation image;
         std::vector<cudaEvent_t> events; // decoder layers, then MTP
+        // The prompt-end staging slot this capture reads; a slot is free once no pending capture
+        // names it. Null for the group-by-group captures.
+        std::byte* staging = nullptr;
     };
     struct StagedCapture {
         runtime::prefix_cache::HostImageReservation image;
@@ -255,6 +271,9 @@ private:
     // The image's segments, as HostImage takes them.
     [[nodiscard]] std::vector<std::byte*> image_segments(const runtime::prefix_cache::HostImageReservation& image) const;
     // Group g's copy-out (its layer's planes of a tail page first) on the transfer stream.
+    // A prompt-end capture's private tail page, every KV layer's planes to its Host record.
+    void copy_tail_page_to_record(DeviceKVPageHandle page, std::byte* record, std::uint32_t group,
+                                  cudaStream_t stream) const;
     void copy_capture_group(std::uint32_t group, std::uint32_t lane, const HostImage& destination,
                             std::byte* tail_record, std::uint32_t tail_group, std::optional<DeviceKVPageHandle> tail_page);
     struct PendingWrite {
@@ -308,6 +327,8 @@ private:
     std::deque<RestoreBatch> landing_;
     std::uint64_t next_ticket_ = 1;
     std::vector<cudaEvent_t> spare_events_;
+    std::vector<std::byte*> prompt_end_slots_;      // the fixed staging images (set_prompt_end_staging)
+    std::vector<PinnedHostBuffer> prompt_end_headers_; // one pinned header per slot, its capture's own
     PrefixCacheCounters counters_;
     std::optional<runtime::prefix_cache::PrefixCacheIndex> index_;
 };

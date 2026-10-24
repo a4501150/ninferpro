@@ -243,6 +243,86 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     return true;
 }
 
+void PrefixCache::set_prompt_end_staging(std::vector<std::byte*> slots) {
+    prompt_end_headers_.clear();
+    prompt_end_headers_.reserve(slots.size());
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        prompt_end_headers_.emplace_back(kStateImageHeaderBytes);
+    }
+    prompt_end_slots_ = std::move(slots);
+}
+
+bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cudaStream_t producer) {
+    const bool tail = !capture.tail.empty();
+    if (tail != capture.tail_page.has_value() || tail != capture.tail_lease.has_value() ||
+        capture.tail.size() >= pc::kBlockTokens) {
+        throw std::invalid_argument("Qwen4Exp prefix cache: a prompt-end capture's tail does not match its page");
+    }
+    // A free slot: one no pending capture reads. A landed-but-unpublished capture still holds it
+    // until the next poll, which every admission runs.
+    std::size_t slot = prompt_end_slots_.size();
+    for (std::size_t i = 0; i < prompt_end_slots_.size() && slot == prompt_end_slots_.size(); ++i) {
+        if (std::none_of(captures_.begin(), captures_.end(),
+                         [&](const PendingCapture& c) { return c.staging == prompt_end_slots_[i]; })) {
+            slot = i;
+        }
+    }
+    if (slot == prompt_end_slots_.size()) {
+        ++counters_.prompt_end_skipped;
+        return false;
+    }
+    std::byte* const staging = prompt_end_slots_[slot];
+    auto image                = index_->reserve_host_image(tail, capture.claim);
+    if (!image) {
+        ++counters_.prompt_end_skipped;
+        return false;
+    }
+    // The anchor must outlive the copy: the capturing lane may release its path before it lands.
+    if (capture.anchor.valid()) { index_->pin_node(capture.anchor); }
+    // The header and every part into the slot, on the producer: the compute stream runs the lane's
+    // next (graph-replayed) round only after the copy, so the slot never sees the state move.
+    write_state_image_header(lanes_->layout(), capture.meta,
+                             static_cast<std::byte*>(prompt_end_headers_[slot].data()));
+    CUDA_CHECK(cudaMemcpyAsync(staging, prompt_end_headers_[slot].data(), kStateImageHeaderBytes,
+                               cudaMemcpyHostToDevice, producer));
+    lanes_->copy_lane_to_packed(lane, staging, producer);
+    cudaEvent_t start = take_event();
+    CUDA_CHECK(cudaEventRecord(start, producer));
+    CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
+    recycle(start);
+    const std::vector<std::byte*> segments = image_segments(*image);
+    lanes_->copy_packed_to_host(staging, HostImage{segments, host_.slab_bytes}, transfer_);
+    if (tail) {
+        copy_tail_page_to_record(*capture.tail_page, slab(image->slabs.back()), slab_group(image->slabs.back()),
+                                 transfer_);
+    }
+    // One event per layer group, as the group-by-group captures take: the whole image is copied at
+    // once, so every layer's wait is the copy's end (a lane's next call waits the full set).
+    std::vector<cudaEvent_t> events;
+    for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) {
+        cudaEvent_t event = take_event();
+        CUDA_CHECK(cudaEventRecord(event, transfer_));
+        events.push_back(event);
+    }
+    counters_.host_write_bytes += host_.image_bytes + (tail ? host_.page.page_stride : 0U);
+    ++counters_.host_image_writes;
+    ++counters_.prompt_end_captures;
+    captures_.push_back(PendingCapture{std::move(capture), std::move(*image), std::move(events), staging});
+    return true;
+}
+
+void PrefixCache::copy_tail_page_to_record(DeviceKVPageHandle page, std::byte* record, std::uint32_t group,
+                                           cudaStream_t stream) const {
+    for (std::uint32_t k = 0; k < geometry_.kv_layers; ++k) {
+        const PlaneRange planes = kv_layer_planes(geometry_, k);
+        const DeviceKVPageHandle pages[1] = {page};
+        std::byte* const records[1]       = {record};
+        const std::uint32_t groups[1]      = {group};
+        pool_->copy_to_host_records(std::span(pages, 1), std::span(records, 1), std::span(groups, 1), host_.page,
+                                    planes.begin, planes.end, stream);
+    }
+}
+
 std::vector<std::byte*> PrefixCache::image_segments(const pc::HostImageReservation& image) const {
     std::vector<std::byte*> segments;
     segments.reserve(host_.image_slabs);
@@ -386,7 +466,7 @@ void PrefixCache::poll() {
         if (c.capture.tail_lease) { tail_device = adopt_tail(std::move(*c.capture.tail_lease)); }
         const pc::PublishResult result =
             index_->publish_host_snapshot(c.capture.anchor, c.capture.frontier, c.capture.tail, tail_device,
-                                          std::move(c.image), c.capture.kind);
+                                          std::move(c.image), c.capture.kind, c.capture.meta.head_residual);
         if (result.created) {
             snapshot_meta_[result.snapshot.index] = c.capture.meta;
             ++(c.capture.kind == pc::SnapshotKind::Endpoint ? counters_.endpoints_created : counters_.taps_created);

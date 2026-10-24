@@ -1725,6 +1725,11 @@ struct RuntimeStats {
     std::uint64_t hybrid_taps_created            = 0;
     std::uint64_t hybrid_taps_skipped            = 0;
     std::uint64_t hybrid_endpoints_created       = 0;
+    // The zero-token resume (Qwen4Exp): prompt-end snapshots taken at the prompt's own frontier,
+    // and skips (no staging slot, Host slabs or free page, an excluded frontier, unpublished
+    // blocks). Zero for other caches.
+    std::uint64_t hybrid_prompt_end_captures     = 0;
+    std::uint64_t hybrid_prompt_end_skipped      = 0;
     // Publication refusals: taps skipped for want of a Device snapshot slot (of taps_skipped),
     // endpoints that passed their gates but were not published, snapshot images and blocks
     // refused Host slabs (they stay Device-only), Device snapshot slots taken from an owner, slot

@@ -157,9 +157,12 @@ void test_layout(const TextConfig& c) {
                 layout.parts[m + 1].kind == StateImagePart::Kind::MtpTail,
             "the MTP group is the saved residual then the MTP tail");
     const StateImageLayout plain = plan_state_image(state_image_spec(c, false, KvCacheStorage::Int8Group64));
-    require(plain.group_begin[plain.drafter_group()] == plain.group_begin[plain.drafter_group() + 1] &&
+    const std::uint32_t h        = plain.group_begin[plain.drafter_group()];
+    require(plain.group_begin[plain.drafter_group() + 1] - h == 1 &&
+                plain.parts[h].kind == StateImagePart::Kind::HeadSaved &&
+                plain.parts[h].bytes == plain.spec.head_saved_bytes &&
                 plain.fingerprint != layout.fingerprint && plain.image_bytes < layout.image_bytes,
-            "without MTP the MTP group is empty and the layout differs");
+            "without MTP the drafter group holds the saved head residual and the layout differs");
 }
 
 void test_round_trips(const TextConfig& c) {
@@ -278,8 +281,8 @@ void test_draft_ring_layout(const TextConfig& c) {
     const StateImageLayout layout = plan_state_image(state_image_spec(c, false, KvCacheStorage::Int8Group64, ring));
     const StateImageLayout plain  = plan_state_image(state_image_spec(c, false, KvCacheStorage::Int8Group64));
     const std::uint32_t d         = layout.group_begin[layout.drafter_group()];
-    require(layout.groups() == c.num_hidden_layers + 1U && layout.group_begin[layout.drafter_group() + 1] - d == 10,
-            "the drafter group holds the ring's ten planes");
+    require(layout.groups() == c.num_hidden_layers + 1U && layout.group_begin[layout.drafter_group() + 1] - d == 11,
+            "the drafter group holds the ring's ten planes and the saved head residual");
     for (std::uint32_t l = 0; l < 5; ++l) {
         const StateImagePart& k = layout.parts[d + 2 * l];
         const StateImagePart& v = layout.parts[d + 2 * l + 1];
@@ -287,6 +290,9 @@ void test_draft_ring_layout(const TextConfig& c) {
                     v.index == l && k.bytes == ring.k_bytes && v.bytes == ring.v_bytes,
                 "each drafter layer contributes its K then its V");
     }
+    require(layout.parts[d + 10].kind == StateImagePart::Kind::HeadSaved &&
+                layout.parts[d + 10].bytes == layout.spec.head_saved_bytes,
+            "the saved head residual closes the drafter group");
     require(layout.image_bytes >= plain.image_bytes + 10 * ring.k_bytes && layout.fingerprint != plain.fingerprint,
             "the ring grows the image by its 40 MiB and changes the layout");
     require_throws([&] { (void)state_image_spec(c, true, KvCacheStorage::Int8Group64, ring); }, "MTP and DFlash2 together");
@@ -315,10 +321,12 @@ void test_draft_ring_round_trip(const TextConfig& c) {
     LinearAttentionStatePool gdn(DeviceSpan{state.p, state.bytes}, gdn_layout);
     DeviceBuffer ple(spec.ple_bytes * kLanes);
     DeviceBuffer tails(spec.qsa_tail_bytes * kLanes * c.attention_layers);
+    DeviceBuffer head(spec.head_saved_bytes * kLanes);
     fill_random(state.p, state.bytes, 200);
     fill_random(ple.p, ple.bytes, 201);
     fill_random(tails.p, tails.bytes, 202);
     fill_random(ring_backing.p, ring_backing.bytes, 203);
+    fill_random(head.p, head.bytes, 204);
     std::vector<std::byte*> ring_k, ring_v;
     for (std::uint32_t l = 0; l < ring.layer_count(); ++l) {
         ring_k.push_back(static_cast<std::byte*>(ring.layer_view(l).k.data));
@@ -326,18 +334,30 @@ void test_draft_ring_round_trip(const TextConfig& c) {
     }
     require_throws(
         [&] {
+            (void)LaneStateImage(layout, LaneStateBuffers{.gdn       = &gdn,
+                                                          .lanes     = kLanes,
+                                                          .ple       = static_cast<std::byte*>(ple.p),
+                                                          .tails     = static_cast<std::byte*>(tails.p),
+                                                          .head_saved = static_cast<std::byte*>(head.p)});
+        },
+        "a ring layout without the ring's buffers");
+    require_throws(
+        [&] {
             (void)LaneStateImage(layout, LaneStateBuffers{.gdn   = &gdn,
                                                           .lanes = kLanes,
                                                           .ple   = static_cast<std::byte*>(ple.p),
-                                                          .tails = static_cast<std::byte*>(tails.p)});
+                                                          .tails = static_cast<std::byte*>(tails.p),
+                                                          .ring_k = ring_k,
+                                                          .ring_v = ring_v});
         },
-        "a ring layout without the ring's buffers");
-    const LaneStateImage image(layout, LaneStateBuffers{.gdn    = &gdn,
-                                                        .lanes  = kLanes,
-                                                        .ple    = static_cast<std::byte*>(ple.p),
-                                                        .tails  = static_cast<std::byte*>(tails.p),
-                                                        .ring_k = ring_k,
-                                                        .ring_v = ring_v});
+        "a layout without the saved head residual's buffer");
+    const LaneStateImage image(layout, LaneStateBuffers{.gdn       = &gdn,
+                                                        .lanes     = kLanes,
+                                                        .ple       = static_cast<std::byte*>(ple.p),
+                                                        .tails     = static_cast<std::byte*>(tails.p),
+                                                        .head_saved = static_cast<std::byte*>(head.p),
+                                                        .ring_k    = ring_k,
+                                                        .ring_v    = ring_v});
     // Each ring part is that lane's own slice of its layer's plane.
     const std::uint32_t d = layout.group_begin[layout.drafter_group()];
     require(image.device_part(layout.parts[d + 2], 2) ==
@@ -354,13 +374,15 @@ void test_draft_ring_round_trip(const TextConfig& c) {
     StateImageHeader header;
     header.frontier       = 9000;
     header.draft_frontier = 8192;
+    header.head_residual = true;
     write_state_image_header(layout, header, host.segments[0]);
     for (std::uint32_t g = 0; g < layout.groups(); ++g) { image.copy_group_from_host(g, host.const_image(), 1, stream); }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     require(lane_bytes(image, 1) == want, "the ring and the lane state restore byte for byte");
     require(lane_bytes(image, 2) == lane2, "a ring restore touches no other lane");
     const auto read = read_state_image_header(layout, host.segments[0]);
-    require(read && read->frontier == 9000 && read->draft_frontier == 8192, "the DFlash2 frontier round-trips");
+    require(read && read->frontier == 9000 && read->draft_frontier == 8192 && read->head_residual,
+            "the DFlash2 frontier and the head-residual flag round-trip");
     CUDA_CHECK(cudaStreamDestroy(stream));
     std::printf("DFlash2 ring: %zu-byte image, %zu ring bytes per lane, Host round trip byte-exact\n",
                 layout.image_bytes, 5 * (spec.draft_ring.k_bytes + spec.draft_ring.v_bytes));

@@ -134,6 +134,9 @@ struct LanePrefix {
     std::uint32_t page_base = 0;                       // logical block of lane.pages[0]
     std::uint32_t deepest   = 0;                       // frontier of the lineage's deepest snapshot
     std::uint32_t reused    = 0;
+    // The zero-token resume: the lane's state is the prompt's own end snapshot, whose head
+    // residual is saved (resume_from_saved_head regenerates the first token from it).
+    bool head_resume = false;
     std::optional<runtime::prefix_cache::SnapshotRef> resume;
     std::optional<prefix::RestoreTicket> restore;     // the first call waits on it per layer
     std::uint64_t capture          = 0;               // its copy-out gates the next call per layer
@@ -722,8 +725,9 @@ public:
         b.workspace = d.work;
         b.staging   = d.staging;
         b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
-                  (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0) + d.dflash_features +
-                  d.dflash_ring;
+                  (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes
+                         : 2ULL * width * lanes) + // the saved head residual (the zero-token resume)
+                  d.dflash_features + d.dflash_ring;
         b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
                4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words + kGateStatsBytes * lanes +
@@ -874,6 +878,9 @@ public:
         ple_backing_.fill(0);
         allocate(tails_backing_, plan_.tails, allocated);
         tails_backing_.fill(0);
+        // The zero-token resume's saved head residual: one residual column per lane (the MTP saved
+        // column's counterpart for a non-MTP Program); the prompt-end snapshot carries it.
+        if (!mtp_) { allocate(head_saved_, 2ULL * static_cast<std::size_t>(width_) * lanes, allocated); }
         window_geometry_ = prefix::kv_window_geometry(c_, options_.kv_cache, mtp_,
                                                       static_cast<std::uint32_t>(options_.max_concurrency));
         if (window_geometry_.present()) {
@@ -1928,6 +1935,10 @@ public:
             if (walk_.lane != index) { throw std::logic_error("Qwen4Exp: another lane's prefill holds the layer walk"); }
             return walk_step(lane, index, start);
         }
+        // The zero-token resume: the plan is empty because the prompt's own end snapshot holds the
+        // lane's whole state; the first token regenerates from its saved head residual, with no
+        // prefill call at all.
+        if (lane.calls.empty()) { return resume_from_saved_head(lane, index, start); }
         const std::int32_t begin = static_cast<std::int32_t>(lane.state_tokens);
         if (lane.next_call >= lane.calls.size() || lane.calls[lane.next_call] <= lane.state_tokens) {
             throw std::logic_error(
@@ -2029,6 +2040,48 @@ public:
     // The progress of a prefill unit whose calls were enqueued (the last ends at `begin + width`,
     // `tokens` prompt tokens in all): for the prompt's last call the first token is sampled and the
     // pending batch returned. Non-last units have already synchronized and applied their routes.
+    // The zero-token resume's prefill step (an exact repeat of a prompt whose own end snapshot is
+    // cached): no prefill call runs — the snapshot holds the lane's whole state — and the first
+    // token regenerates from the snapshot's saved head residual through head_logits, the same head
+    // function at the same logit width the cold run's finish used, so its logits are byte-equal and
+    // the draw (keyed by the same logical position, n - 1) reproduces the cold first token
+    // bit-for-bit, greedy and seeded. The head runs after the restore's event: its column is the
+    // snapshot's. Nothing else of a prefill call runs — no stream lease, no wide work, no route log
+    // (seed_prompt_experts and note_prompt_routes are performance only; the cold run's published
+    // blocks already serve the cache).
+    PrefillProgress resume_from_saved_head(Lane& lane, std::uint32_t index, Clock::time_point start) {
+        if (lane.phase != Phase::Prefill || !lane.calls.empty() ||
+            lane.state_tokens != lane.prefill_end || lane.state_tokens != lane.prompt_tokens ||
+            lane.state_tokens == 0 || !lane.prefix.head_resume) {
+            throw std::logic_error(
+                "Qwen4Exp: a zero-token resume on a lane that is not at its prompt's end snapshot");
+        }
+        if (lane.prefix.restore) { prefix_->order_after_restore(*lane.prefix.restore, device_.stream); }
+        Tensor residual = head_saved_column(index);
+        Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
+        forward_->head_logits(residual, logits);
+        const std::uint32_t rows[] = {index};
+        const std::int32_t positions[] = {static_cast<std::int32_t>(lane.prompt_tokens) - 1};
+        sample(rows, positions);
+        // No call reads the encode window (the snapshot's KV holds the image columns); the bind
+        // completed only once the encode did, so the handoff returns here, as after a last call.
+        if (lane.vision) { vision_release(lane); }
+        PrefillProgress out;
+        out.summary                 = prefill_summary(lane);
+        out.processed_prompt_tokens = 0;
+        out.complete                = true;
+        if (!lane.readout.empty()) { out.readout = read_prompt_frontier(lane); }
+        const SequenceHandle handles[] = {handle(index)};
+        out.timing.submit_host_ns = elapsed_ns(start);
+        lane.prefill_ns += out.timing.submit_host_ns;
+        out.pending.emplace(ContractAccess::make_pending(this, ++next_transaction_, handles,
+                                                         {pending_tokens_.data(), 1}, out.timing));
+        mark_grammar_failures(*out.pending, {});
+        plain_round_ = false;
+        pending_transaction_ = next_transaction_;
+        return out;
+    }
+
     PrefillProgress prefill_progress(Lane& lane, std::uint32_t index, std::int32_t begin, std::int32_t width,
                                      std::uint32_t tokens, bool last, std::size_t promotions,
                                      Clock::time_point start) {
@@ -4808,6 +4861,12 @@ private:
         }
         // A scored prompt's calls keep their final residuals for the LM head (causal_score).
         if (scoring_) { fb.residual_out = score_residuals(score_column_, cols); }
+        // The zero-token resume's saved head residual: a non-MTP prompt call's last column. The
+        // prompt-end snapshot carries it; decode, verification and MTP calls leave it alone (an MTP
+        // Program has no buffer — its own saved column cannot serve the resume, S3 of the design).
+        if (head_saved_.p != nullptr && chunk == nullptr && verify == nullptr && !decode_round && !scoring_) {
+            fb.head_residual_out = head_saved_column(static_cast<std::uint32_t>(host_lanes_[0]));
+        }
         Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
         forward_->run(fb, logits);
     }
@@ -5227,6 +5286,11 @@ private:
     std::int32_t* mtp_device(std::size_t offset) const { return static_cast<std::int32_t*>(mtp_device_.p) + offset; }
     Tensor saved_column(std::uint32_t lane) const {
         return Tensor(static_cast<std::byte*>(mtp_saved_.p) + 2ULL * width_ * lane, DType::BF16, {width_});
+    }
+
+    // The zero-token resume's saved head residual (a non-MTP Program's lanes; see finish).
+    Tensor head_saved_column(std::uint32_t lane) const {
+        return Tensor(static_cast<std::byte*>(head_saved_.p) + 2ULL * width_ * lane, DType::BF16, {width_});
     }
 
     // MR1's settled invariant (see Lane): the pending cell is the last processed position's.
@@ -5875,10 +5939,16 @@ private:
     void prefix_publish(Lane& lane, std::uint32_t frontier);
     void prefix_capture(Lane& lane, std::uint32_t index, runtime::prefix_cache::SnapshotKind kind, bool hand_over_tail);
     // The capture of the lane's state at frontier F (the lane's published path reaches F's anchor);
-    // `mtp_written`: the MTP cell F - 1 is final.
+    // `mtp_written`: the MTP cell F - 1 is final. `fresh_tail`: the prompt-end capture's private
+    // copy of the lane's tail page, which the snapshot takes instead of the lane's.
     [[nodiscard]] prefix::PrefixCache::Capture prefix_capture_at(Lane& lane, std::uint32_t F,
                                                                  runtime::prefix_cache::SnapshotKind kind,
-                                                                 bool hand_over_tail, bool mtp_written);
+                                                                 bool hand_over_tail, bool mtp_written,
+                                                                 DeviceKVPageLease* fresh_tail = nullptr);
+    // The zero-token resume's prompt-end capture: a snapshot at the prompt's own frontier whose
+    // image carries the head's saved residual. Free cache resume and no MTP drafter only (the
+    // MTP prompt-end cell encodes the cold run's first token, MR5/MR6).
+    void prefix_prompt_end_capture(Lane& lane, std::uint32_t index);
     // Records a capture the cache accepted as the lane's latest.
     void prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F);
     // Removes the lane's taps realized at the call boundary B before calls[next_call]; returns whether
@@ -5924,6 +5994,9 @@ private:
     // its resume frontier: what a later prompt diverging further along re-prefills without it.
     static constexpr std::uint32_t kBranchTapMinTokens = 1024;
     DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
+    DeviceBuffer head_saved_; // the zero-token resume's saved head residual, per lane (!mtp_)
+    // The prompt-end capture's fixed staging images (one packed state image each).
+    std::vector<DeviceBuffer> prompt_end_staging_;
     // The vq2/k4v2 exact window (design §19.3.15), every KV layer and lane.
     DeviceBuffer window_backing_;
     prefix::KvWindowGeometry window_geometry_;

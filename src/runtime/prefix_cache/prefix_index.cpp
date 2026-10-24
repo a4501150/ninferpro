@@ -147,7 +147,9 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
     MatchResult result;
     if (prompt_tokens < 2) { return result; }
     const std::uint32_t max_frontier = prompt_tokens - 1U;
-    const std::uint32_t max_blocks   = max_frontier / kBlockTokens;
+    // A block-aligned prompt's own end anchors on its last full block's node: walking only
+    // max_frontier's blocks never reaches it, and its prompt-end snapshot is never considered.
+    const std::uint32_t max_blocks   = prompt_tokens / kBlockTokens;
 
     std::vector<std::uint32_t> host_only;
     std::vector<std::uint32_t> filling;
@@ -169,8 +171,12 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
 
     auto consider = [&](std::uint32_t snapshot_index, std::uint32_t path_blocks) {
         const Snapshot& snapshot = snapshots_[snapshot_index];
-        if (snapshot.frontier > max_frontier || !snapshot_valid(snapshot) ||
-            !tail_matches(snapshot, tokens)) {
+        // A snapshot at the prompt's own length serves only the zero-token resume; one without
+        // its head residual (a tap never sits at a prompt end, but a restored file is checked)
+        // stays unexposed.
+        if (snapshot.frontier > prompt_tokens ||
+            (snapshot.frontier == prompt_tokens && !snapshot.head_residual) ||
+            !snapshot_valid(snapshot) || !tail_matches(snapshot, tokens)) {
             return;
         }
         MatchCandidate candidate;
@@ -182,6 +188,7 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
         candidate.tail             = snapshot.tail_len != 0;
         candidate.tail_on_device   = snapshot.tail_device_copy == CopyState::Resident;
         candidate.image_on_device  = snapshot.device_slot != kNoId;
+        candidate.head_residual    = snapshot.head_residual;
         candidate.restore_bytes =
             static_cast<std::uint64_t>(candidate.host_only_blocks) * config_.block_bytes +
             (candidate.image_on_device ? 0ULL : config_.image_bytes) +
@@ -1035,7 +1042,8 @@ void PrefixCacheIndex::release_device_slot(std::uint32_t slot) {
 PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                  std::span<const TokenId> tail,
                                                  std::optional<std::uint32_t> tail_device_id,
-                                                 std::uint32_t device_slot, SnapshotKind kind) {
+                                                 std::uint32_t device_slot, SnapshotKind kind,
+                                                 bool head_residual) {
     if (device_slot >= slot_state_.size() || slot_state_[device_slot] != SlotState::Staging) {
         invariant("prefix cache snapshot image is not in a staging slot");
     }
@@ -1043,7 +1051,7 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
     if (!tail.empty() && !tail_device_id) {
         throw std::invalid_argument("prefix cache snapshot tail is inconsistent");
     }
-    return publish_image(anchor, frontier, tail, tail_device_id, device_slot, {}, kind);
+    return publish_image(anchor, frontier, tail, tail_device_id, device_slot, {}, kind, head_residual);
 }
 
 std::optional<HostImageReservation> PrefixCacheIndex::reserve_host_image(bool tail, double claim) {
@@ -1077,7 +1085,7 @@ PublishResult PrefixCacheIndex::publish_host_snapshot(NodeRef anchor, std::uint3
                                                       std::span<const TokenId> tail,
                                                       std::optional<std::uint32_t> tail_device_id,
                                                       HostImageReservation&& image,
-                                                      SnapshotKind kind) {
+                                                      SnapshotKind kind, bool head_residual) {
     if (image.tail != !tail.empty()) {
         throw std::invalid_argument(
             "prefix cache Host-born snapshot tail does not match its reservation");
@@ -1089,7 +1097,8 @@ PublishResult PrefixCacheIndex::publish_host_snapshot(NodeRef anchor, std::uint3
         invariant("prefix cache Host-born snapshot image is not a reservation");
     }
     const PublishResult result =
-        publish_image(anchor, frontier, tail, tail_device_id, kNoId, std::move(image.slabs), kind);
+        publish_image(anchor, frontier, tail, tail_device_id, kNoId, std::move(image.slabs), kind,
+                      head_residual);
     image.slabs.clear();
     image.tail = false;
     return result;
@@ -1100,7 +1109,7 @@ PublishResult PrefixCacheIndex::publish_image(NodeRef anchor, std::uint32_t fron
                                               std::optional<std::uint32_t> tail_device_id,
                                               std::uint32_t device_slot,
                                               std::vector<std::uint32_t>&& host_slabs,
-                                              SnapshotKind kind) {
+                                              SnapshotKind kind, bool head_residual) {
     if (tail.size() >= kBlockTokens || (tail.empty() && tail_device_id) ||
         (tail_device_id && *tail_device_id == kNoId)) {
         throw std::invalid_argument("prefix cache snapshot tail is inconsistent");
@@ -1158,6 +1167,7 @@ PublishResult PrefixCacheIndex::publish_image(NodeRef anchor, std::uint32_t fron
     snapshot.host_slabs      = std::move(host_slabs);
     snapshot.pins            = 0;
     snapshot.kind            = kind;
+    snapshot.head_residual   = head_residual;
     snapshot.hits            = 0;
     snapshot.last_hit_tick   = ++tick_;
     snapshot.priority_base   = inflation_;
@@ -1394,6 +1404,7 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     for (const std::uint32_t slab : snapshot.host_slabs) { free_slab(slab); }
     snapshot.host_slabs.clear();
     snapshot.host                   = CopyState::Absent;
+    snapshot.head_residual          = false;
     const std::uint32_t tail_device = snapshot.tail_device;
     const bool release_tail         = snapshot.tail_device_copy == CopyState::Resident;
     snapshot.tail_device            = kNoId;
@@ -1498,6 +1509,7 @@ SnapshotView PrefixCacheIndex::snapshot(SnapshotRef ref) const {
     view.kind             = snapshot.kind;
     view.hits             = snapshot.hits;
     view.superseded       = snapshot.superseded;
+    view.head_residual    = snapshot.head_residual;
     view.tail             = std::span<const TokenId>(snapshot.tail.data(), snapshot.tail_len);
     return view;
 }
@@ -1603,7 +1615,8 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
                                                                    std::uint32_t frontier,
                                                                    std::span<const TokenId> tail,
                                                                    SnapshotKind kind,
-                                                                   std::uint32_t hits) {
+                                                                   std::uint32_t hits,
+                                                                   bool head_residual) {
     if (!config_.host_blocks || tail.size() >= kBlockTokens) {
         throw std::invalid_argument("prefix cache restored snapshot is inconsistent");
     }
@@ -1643,6 +1656,7 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
     snapshot.host             = CopyState::Resident;
     snapshot.pins             = 0;
     snapshot.kind             = kind;
+    snapshot.head_residual    = head_residual;
     snapshot.hits             = hits;
     snapshot.last_hit_tick    = ++tick_;
     snapshot.priority_base    = inflation_;

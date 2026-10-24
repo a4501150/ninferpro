@@ -60,6 +60,7 @@ void ProgramImpl::create_prefix_cache() {
                                  .ple       = static_cast<std::byte*>(ple_backing_.p),
                                  .tails     = static_cast<std::byte*>(tails_backing_.p),
                                  .mtp_saved = mtp_ ? static_cast<std::byte*>(mtp_saved_.p) : nullptr,
+                                 .head_saved = mtp_ ? nullptr : static_cast<std::byte*>(head_saved_.p),
                                  .window    = static_cast<std::byte*>(window_backing_.p),
                                  .window_geometry = window_geometry_,
                                  .ring_k    = std::move(ring_k),
@@ -70,6 +71,21 @@ void ProgramImpl::create_prefix_cache() {
     config.kv_pages   = kv_pages_;
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
                                                             options_.prefix_host_bytes);
+    if (options_.free_cache_resume && !mtp_) {
+        // The zero-token resume's prompt-end captures stage their image through fixed Device slots
+        // (a lane's replayed decode graphs cannot wait on capture events): two cover a burst of
+        // concurrent prompt ends, a third skips and counts. Their bytes come out of the expert
+        // frames, which are sized after this from the memory the fixed allocations leave.
+        const std::uint32_t slots = std::min(lanes, 2U);
+        std::vector<std::byte*> bytes;
+        prompt_end_staging_.reserve(slots);
+        bytes.reserve(slots);
+        for (std::uint32_t s = 0; s < slots; ++s) {
+            prompt_end_staging_.emplace_back(image_layout_.image_bytes);
+            bytes.push_back(static_cast<std::byte*>(prompt_end_staging_.back().p));
+        }
+        prefix_->set_prompt_end_staging(std::move(bytes));
+    }
     if (mtp_) {
         // The MR3 flush cell's inputs: token, cell, slot and table row.
         // id, cell, slot, row, then the cell's RoPE position and its pooled-block start (3 each).
@@ -263,14 +279,28 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             s.shared              = k;
             if (c.frontier % kBlock != 0) {
                 s.cow = PrefixCow::Tail;
-            } else if (mtp_ && k > 0 && prefix_->mtp_next(s.path[k - 1]) != prompt.token_ids[c.frontier]) {
+            } else if (mtp_ && c.frontier < n && k > 0 &&
+                       prefix_->mtp_next(s.path[k - 1]) != prompt.token_ids[c.frontier]) {
                 // MR6: the anchor's last MTP cell encodes another continuation; the lane rewrites it
-                // in a private copy of the anchor page.
+                // in a private copy of the anchor page. (c.frontier < n: the prompt's own end has
+                // no continuation in the prompt to compare.)
                 s.cow    = PrefixCow::Anchor;
                 s.shared = k - 1;
             }
             s.image_restore = !(resident && *resident == c.snapshot);
             s.existing      = frontiers;
+            if (c.frontier == n) {
+                // The zero-token resume: the snapshot at the prompt's own end carries the whole
+                // state and its head's saved residual, so the prefill plan is empty (plan_calls
+                // refuses an empty one by design) and the first token regenerates from the residual
+                // at the prefill step (resume_from_saved_head). No MTP Program publishes one (the
+                // capture is gated), and match offers the frontier only with its residual.
+                if (c.head_residual && !mtp_ && fits(s)) {
+                    s.cached_tokens = cached_tokens;
+                    return s;
+                }
+                continue;
+            }
             if (fits(s)) { return planned(std::move(s)); }
         }
         return std::nullopt;
@@ -617,6 +647,9 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         }
         if (mtp_ && lane.mtp_cells != s.frontier) { ++prefix_->counters().mtp_continuation_mismatches; }
         lane.mtp_live = mtp_;
+        // The zero-token resume's lane flag, read at the prefill step (the snapshot itself may be
+        // evicted once its restore has landed; the lane keeps the state it restored).
+        lane.prefix.head_resume = meta.head_residual && s.frontier == lane.prompt_tokens;
         lane.dflash_frontier = std::min(meta.draft_frontier, s.frontier);
         // Penalty counts restart with the request; the lane's state came from the snapshot.
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(token_counts_.p) + index * static_cast<std::size_t>(token_domain_),
@@ -723,6 +756,8 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     out.blocks_duplicate        = count.blocks_duplicate;
     out.taps_created            = count.taps_created;
     out.taps_skipped            = count.taps_skipped;
+    out.prompt_end_captures     = count.prompt_end_captures;
+    out.prompt_end_skipped      = count.prompt_end_skipped;
     out.endpoints_created       = count.endpoints_created;
     out.host_image_writes       = count.host_image_writes;
     out.host_block_writes       = count.host_block_writes;
@@ -850,7 +885,8 @@ void ProgramImpl::prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F)
 }
 
 prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uint32_t F, pc::SnapshotKind kind,
-                                                            bool hand_over_tail, bool mtp_written) {
+                                                            bool hand_over_tail, bool mtp_written,
+                                                            DeviceKVPageLease* fresh_tail) {
     const std::uint32_t k = F / kBlock;
     prefix::PrefixCache::Capture c;
     c.id       = ++next_capture_;
@@ -858,9 +894,16 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
     c.frontier = F;
     c.tail.assign(lane.history.begin() + static_cast<std::ptrdiff_t>(k) * kBlock, lane.history.begin() + F);
     if (!c.tail.empty()) {
-        DeviceKVPageLease& page = lane.pages.at(k - lane.prefix.page_base);
-        c.tail_page             = page.handle();
-        if (hand_over_tail) { c.tail_lease.emplace(std::move(page)); }
+        if (fresh_tail != nullptr) {
+            // The prompt-end capture: the snapshot takes a private copy of the lane's page, which
+            // decode keeps writing (the lane's own stays with it, its table entry unchanged).
+            c.tail_page = fresh_tail->handle();
+            c.tail_lease.emplace(std::move(*fresh_tail));
+        } else {
+            DeviceKVPageLease& page = lane.pages.at(k - lane.prefix.page_base);
+            c.tail_page             = page.handle();
+            if (hand_over_tail) { c.tail_lease.emplace(std::move(page)); }
+        }
     }
     c.kind             = kind;
     c.claim            = prefix_->index().estimate_priority(lane.prefix.deepest, F, !c.tail.empty());
@@ -912,11 +955,61 @@ bool ProgramImpl::prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next
 void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, bool last) {
     if (!prefix_ || !lane.prefix.reuse) { return; }
     prefix_publish(lane, prefix_frontier(lane, false));
-    if (last) { return; }
+    if (last) {
+        prefix_prompt_end_capture(lane, index);
+        return;
+    }
     const std::uint32_t B = lane.state_tokens;
     bool boundary         = false;
     if (prefix_take_taps(lane, B, lane.next_call, boundary) && B >= lane.prefix.deepest + kBlock) {
         prefix_capture(lane, index, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false);
+    }
+}
+
+// The zero-token resume's prompt-end capture: a snapshot at the prompt's own frontier n, with the
+// head's saved residual in its image, that an exact repeat resumes from with no prefill at all.
+// The lane's next round is a graph-replayed decode, so the copy must not read the lane's state
+// after it: the image stages through a fixed slot on the compute stream (capture_prompt_end), and
+// the tail is a private copy of the lane's page. Skips (and counts) when the MTP drafter is live
+// (its prompt-end cell encodes the cold run's first token, MR5/MR6), the frontier lies inside a
+// Vision item, the blocks are not published, or the staging slot, Host slabs or a free page are
+// out. A tap or endpoint below n does not suppress it: the spacing rule is a tap rule, and a
+// snapshot even one block below still costs a repeat its tail call.
+void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
+    if (!options_.free_cache_resume || mtp_ || lane.mtp_live) { return; }
+    const std::uint32_t n = lane.state_tokens, k = n / kBlock;
+    if (n == 0 || lane.prefix.path.size() < k ||
+        prefix::inside_exclusion(n, lane.prefix.exclusions)) {
+        ++prefix_->counters().prompt_end_skipped;
+        return;
+    }
+    // The fresh tail page: the snapshot's own copy of the lane's last partial block, taken before
+    // the capture (decode writes the lane's page without waiting). Every later device writer of a
+    // pool page runs on the compute stream or after it (the restore stream waits on its event), so
+    // returning the page on a refusal cannot race the copy still ordered there.
+    std::optional<DeviceKVPageReservation> reservation;
+    std::optional<DeviceKVPageLease> fresh;
+    if (n % kBlock != 0) {
+        reservation = pool_->reserve(1);
+        if (!reservation) {
+            ++prefix_->counters().prompt_end_skipped;
+            return;
+        }
+        fresh = pool_->materialize_one(*reservation);
+        pool_->copy_page(lane.pages.at(k - lane.prefix.page_base).handle(), fresh->handle(), device_.stream);
+    }
+    // The prompt's end is the divergence point of repeats and forks: a Boundary. The estimate
+    // values it against the lineage's deepest snapshot, whatever its distance (the tap spacing
+    // rule does not apply: a snapshot one block below still costs a repeat its tail call).
+    prefix::PrefixCache::Capture c =
+        prefix_capture_at(lane, n, pc::SnapshotKind::Boundary, false, false, fresh ? &*fresh : nullptr);
+    c.meta.head_residual = true;
+    const std::uint64_t id = c.id;
+    if (prefix_->capture_prompt_end(index, std::move(c), device_.stream)) {
+        prefix_captured(lane, id, n);
+    } else {
+        fresh.reset();       // the capture was refused: no staging slot or Host slabs (counted)
+        reservation.reset();
     }
 }
 
@@ -982,6 +1075,7 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     lane.prefix.exclusions.clear();
     lane.prefix.restore.reset();
     lane.prefix.resume.reset();
+    lane.prefix.head_resume = false;
     lane.prefix.page_base = 0;
     lane.prefix.deepest   = 0;
     lane.prefix.reuse     = false;

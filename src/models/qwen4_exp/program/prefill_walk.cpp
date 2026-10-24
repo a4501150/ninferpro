@@ -286,6 +286,7 @@ execution::ForwardBatch ProgramImpl::walk_batch(std::size_t c) {
     fb.stream         = true;
     fb.release_stream = c + 1 == walk_.widths.size();
     if (scoring_) { fb.residual_out = score_residuals(walk_.begins[c], w); } // a scored prompt's (causal_score)
+    if (head_saved_.p != nullptr) { fb.head_residual_out = head_saved_column(walk_.lane); }
     return fb;
 }
 
