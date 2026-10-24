@@ -6,9 +6,11 @@
 // and the Host geometry (slab, page record and state-image layout) match; a damaged or foreign file
 // loads nothing.
 //
-// Layout (version 1): the header, the block table (parents first), the snapshot table, then the
+// Layout (version 2): the header, the block table (parents first), the snapshot table, then the
 // slab bytes of every block and of every snapshot in table order, then the footer. The tables come
 // first so a Host tier smaller than the file can choose what to restore before reading any slab.
+// Version 2 adds each snapshot record's head-residual byte (the zero-token resume); version 1
+// files fail the state-image fingerprint before it is read.
 
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
 
@@ -32,7 +34,7 @@ namespace {
 
 constexpr std::array<char, 8> kMagic  = {'N', 'I', 'N', 'F', 'Q', '4', 'P', 'C'};
 constexpr std::array<char, 8> kFooter = {'N', 'I', 'N', 'F', 'Q', '4', 'E', 'D'};
-constexpr std::uint32_t kVersion      = 1;
+constexpr std::uint32_t kVersion      = 2;
 constexpr std::int32_t kRootIndex     = -1;
 constexpr std::uint64_t kFooterBytes  = kFooter.size() + 2U * sizeof(std::uint32_t);
 constexpr const char* kSaveAbandoned  = "abandoned; the previous file is kept";
@@ -71,6 +73,7 @@ struct SavedSnapshot {
     std::array<TokenId, pc::kBlockTokens> tail{};
     pc::SnapshotKind kind = pc::SnapshotKind::Tap;
     std::uint32_t hits    = 0;
+    bool head_residual    = false;
     std::uint32_t slabs   = 0;
     // First slab of this snapshot, counted from the start of the slab bytes.
     std::uint64_t first_slab = 0;
@@ -205,6 +208,7 @@ PersistResult PrefixCache::save(const std::filesystem::path& path, std::string_v
             writer.bytes(view.tail.data(), view.tail.size_bytes());
             writer.value(static_cast<std::uint8_t>(view.kind));
             writer.value(view.hits);
+            writer.value(static_cast<std::uint8_t>(view.head_residual));
         }
         for (const pc::NodeRef node : nodes) {
             check_abandoned();
@@ -321,6 +325,9 @@ PersistResult PrefixCache::load(const std::filesystem::path& path, std::string_v
             }
             snapshot.kind       = static_cast<pc::SnapshotKind>(kind_byte);
             snapshot.hits       = reader.value<std::uint32_t>();
+            const auto head_byte = reader.value<std::uint8_t>();
+            if (head_byte > 1U) { throw std::runtime_error("prefix cache file snapshot flag is damaged"); }
+            snapshot.head_residual = head_byte != 0;
             snapshot.slabs      = host_.image_slabs + (snapshot.tail_len != 0 ? 1U : 0U);
             snapshot.first_slab = slabs;
             slabs += snapshot.slabs;
@@ -376,14 +383,15 @@ PersistResult PrefixCache::load(const std::filesystem::path& path, std::string_v
             const std::optional<pc::SnapshotRef> snapshot = index_->restore_host_snapshot(
                 anchor, saved_snapshot.frontier,
                 std::span<const TokenId>(saved_snapshot.tail.data(), saved_snapshot.tail_len), saved_snapshot.kind,
-                saved_snapshot.hits);
+                saved_snapshot.hits, saved_snapshot.head_residual);
             if (!snapshot) { continue; }
             reader.seek(payload + saved_snapshot.first_slab * slab_bytes);
             const std::span<const std::uint32_t> slab_ids = index_->snapshot(*snapshot).host_slabs;
             for (const std::uint32_t slab_id : slab_ids) { reader.bytes(slab(slab_id), slab_bytes); }
             // The image's header slab carries the snapshot's meta (MTP cell state, lineage).
             const std::optional<StateImageHeader> header = read_state_image_header(lanes_->layout(), slab(slab_ids[0]));
-            if (!header || header->frontier != saved_snapshot.frontier) {
+            if (!header || header->frontier != saved_snapshot.frontier ||
+                header->head_residual != saved_snapshot.head_residual) {
                 throw std::runtime_error("prefix cache file snapshot meta is damaged");
             }
             snapshot_meta_[snapshot->index] = *header;

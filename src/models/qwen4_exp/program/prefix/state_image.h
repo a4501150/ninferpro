@@ -76,6 +76,10 @@ struct StateImageSpec {
     bool mtp                         = false;
     std::size_t mtp_saved_bytes      = 0;
     std::size_t mtp_tail_bytes       = 0;
+    // The target head's saved residual (the zero-token resume) — every non-MTP image: MTP's own
+    // saved column cannot serve the resume (a prompt-end cell encodes the cold run's first token).
+    bool head_saved                  = false;
+    std::size_t head_saved_bytes     = 0;
     DraftRingGeometry draft_ring; // DFlash2 (layers 0: none)
     // One lane's bytes of each exact-window plane per KV layer (zero without a window).
     std::array<std::size_t, KvWindowGeometry::kPlanes> window_bytes{};
@@ -86,7 +90,8 @@ struct StateImageSpec {
 
 struct StateImagePart {
     enum class Kind : std::uint8_t {
-        Header, Ple, GdnRecurrent, GdnConv, QsaTail, MtpSaved, MtpTail, QsaWindow, DraftRingK, DraftRingV
+        Header, Ple, GdnRecurrent, GdnConv, QsaTail, MtpSaved, MtpTail, QsaWindow, DraftRingK, DraftRingV,
+        HeadSaved
     };
 
     Kind kind           = Kind::Header;
@@ -124,6 +129,9 @@ struct StateImageHeader {
     bool lineage_echo = false;
     // The snapshot is the generation-opener tap (an exact split before the assistant turn).
     bool opener = false;
+    // The HeadSaved part holds the target head's residual of this frontier's last token — valid
+    // only on a prompt-end capture; taps and endpoints carry a stale column and leave this clear.
+    bool head_residual = false;
     std::array<double, 8> mtp_accept{};
     // DFlash2: the ring holds the context of every position below this one (the frontier, except a
     // tap inside a prefill layer walk, which captures the ring as it was before the walk's span).
@@ -145,6 +153,7 @@ struct LaneStateBuffers {
     // tails + (k * lanes + l) * spec.qsa_tail_bytes.
     std::byte* tails     = nullptr;
     std::byte* mtp_saved = nullptr; // lane l at mtp_saved + l * spec.mtp_saved_bytes
+    std::byte* head_saved = nullptr; // lane l at head_saved + l * spec.head_saved_bytes
     // The exact window (vector-quantized storages): KvWindowGeometry's planes at `window`.
     std::byte* window = nullptr;
     KvWindowGeometry window_geometry;

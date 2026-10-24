@@ -243,6 +243,89 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     return true;
 }
 
+void PrefixCache::set_prompt_end_staging(std::vector<std::byte*> slots) {
+    prompt_end_headers_.clear();
+    prompt_end_headers_.reserve(slots.size());
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        prompt_end_headers_.emplace_back(kStateImageHeaderBytes);
+    }
+    prompt_end_slots_ = std::move(slots);
+}
+
+bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cudaStream_t producer) {
+    const bool tail = !capture.tail.empty();
+    if (tail != capture.tail_page.has_value() || tail != capture.tail_lease.has_value() ||
+        capture.tail.size() >= pc::kBlockTokens) {
+        throw std::invalid_argument("Qwen4Exp prefix cache: a prompt-end capture's tail does not match its page");
+    }
+    if (capture.anchor_pending && (tail || capture.anchor.valid() || capture.frontier == 0)) {
+        throw std::invalid_argument("Qwen4Exp prefix cache: only a block-aligned prompt end awaits its anchor");
+    }
+    // A free slot: one no pending capture reads. A landed-but-unpublished capture still holds it
+    // until the next poll, which every admission runs.
+    std::size_t slot = prompt_end_slots_.size();
+    for (std::size_t i = 0; i < prompt_end_slots_.size() && slot == prompt_end_slots_.size(); ++i) {
+        if (std::none_of(captures_.begin(), captures_.end(),
+                         [&](const PendingCapture& c) { return c.staging == prompt_end_slots_[i]; })) {
+            slot = i;
+        }
+    }
+    if (slot == prompt_end_slots_.size()) {
+        ++counters_.prompt_end_skipped;
+        return false;
+    }
+    std::byte* const staging = prompt_end_slots_[slot];
+    auto image                = index_->reserve_host_image(tail, capture.claim);
+    if (!image) {
+        ++counters_.prompt_end_skipped;
+        return false;
+    }
+    // The anchor must outlive the copy: the capturing lane may release its path before it lands.
+    if (capture.anchor.valid()) { index_->pin_node(capture.anchor); }
+    // The header and every part into the slot, on the producer: the compute stream runs the lane's
+    // next (graph-replayed) round only after the copy, so the slot never sees the state move.
+    write_state_image_header(lanes_->layout(), capture.meta,
+                             static_cast<std::byte*>(prompt_end_headers_[slot].data()));
+    CUDA_CHECK(cudaMemcpyAsync(staging, prompt_end_headers_[slot].data(), kStateImageHeaderBytes,
+                               cudaMemcpyHostToDevice, producer));
+    lanes_->copy_lane_to_packed(lane, staging, producer);
+    cudaEvent_t start = take_event();
+    CUDA_CHECK(cudaEventRecord(start, producer));
+    CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
+    recycle(start);
+    const std::vector<std::byte*> segments = image_segments(*image);
+    lanes_->copy_packed_to_host(staging, HostImage{segments, host_.slab_bytes}, transfer_);
+    if (tail) {
+        copy_tail_page_to_record(*capture.tail_page, slab(image->slabs.back()), slab_group(image->slabs.back()),
+                                 transfer_);
+    }
+    // One event per layer group, as the group-by-group captures take: the whole image is copied at
+    // once, so every layer's wait is the copy's end (a lane's next call waits the full set).
+    std::vector<cudaEvent_t> events;
+    for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) {
+        cudaEvent_t event = take_event();
+        CUDA_CHECK(cudaEventRecord(event, transfer_));
+        events.push_back(event);
+    }
+    counters_.host_write_bytes += host_.image_bytes + (tail ? host_.page.page_stride : 0U);
+    ++counters_.host_image_writes;
+    ++counters_.prompt_end_captures;
+    captures_.push_back(PendingCapture{std::move(capture), std::move(*image), std::move(events), staging});
+    return true;
+}
+
+void PrefixCache::copy_tail_page_to_record(DeviceKVPageHandle page, std::byte* record, std::uint32_t group,
+                                           cudaStream_t stream) const {
+    for (std::uint32_t k = 0; k < geometry_.kv_layers; ++k) {
+        const PlaneRange planes = kv_layer_planes(geometry_, k);
+        const DeviceKVPageHandle pages[1] = {page};
+        std::byte* const records[1]       = {record};
+        const std::uint32_t groups[1]      = {group};
+        pool_->copy_to_host_records(std::span(pages, 1), std::span(records, 1), std::span(groups, 1), host_.page,
+                                    planes.begin, planes.end, stream);
+    }
+}
+
 std::vector<std::byte*> PrefixCache::image_segments(const pc::HostImageReservation& image) const {
     std::vector<std::byte*> segments;
     segments.reserve(host_.image_slabs);
@@ -376,17 +459,49 @@ void PrefixCache::write_blocks(std::span<const pc::NodeRef> nodes, cudaStream_t 
     writes_.push_back(PendingWrite{std::move(written), done});
 }
 
+void PrefixCache::resolve_capture_anchor(std::uint64_t id, pc::NodeRef anchor) {
+    for (PendingCapture& c : captures_) {
+        if (c.capture.id != id) { continue; }
+        if (!c.capture.anchor_pending || !anchor.valid()) {
+            throw std::logic_error("Qwen4Exp prefix cache: a capture's anchor is resolved twice or to no block");
+        }
+        index_->pin_node(anchor);
+        c.capture.anchor         = anchor;
+        c.capture.anchor_pending = false;
+        return;
+    }
+    throw std::logic_error("Qwen4Exp prefix cache: an anchor resolved for no pending capture");
+}
+
+void PrefixCache::abandon_capture(std::uint64_t id) noexcept {
+    const auto found = std::find_if(captures_.begin(), captures_.end(),
+                                    [&](const PendingCapture& c) { return c.capture.id == id; });
+    if (found == captures_.end()) { return; }
+    // The slabs and the staging slot are still read until the copy lands.
+    (void)cudaEventSynchronize(found->events.back());
+    for (cudaEvent_t event : found->events) { recycle(event); }
+    if (found->capture.anchor.valid()) { index_->unpin_node(found->capture.anchor); }
+    index_->release_host_image(std::move(found->image));
+    captures_.erase(found);
+}
+
 void PrefixCache::poll() {
-    while (!captures_.empty()) {
-        PendingCapture& c = captures_.front();
+    // Captures land in transfer-stream order; one still waiting for its anchor block keeps its
+    // place while the ones behind it publish.
+    for (auto it = captures_.begin(); it != captures_.end();) {
+        PendingCapture& c = *it;
         const cudaError_t status = cudaEventQuery(c.events.back());
         if (status == cudaErrorNotReady) { break; }
         CUDA_CHECK(status);
+        if (c.capture.anchor_pending) {
+            ++it;
+            continue;
+        }
         std::optional<std::uint32_t> tail_device;
         if (c.capture.tail_lease) { tail_device = adopt_tail(std::move(*c.capture.tail_lease)); }
         const pc::PublishResult result =
             index_->publish_host_snapshot(c.capture.anchor, c.capture.frontier, c.capture.tail, tail_device,
-                                          std::move(c.image), c.capture.kind);
+                                          std::move(c.image), c.capture.kind, c.capture.meta.head_residual);
         if (result.created) {
             snapshot_meta_[result.snapshot.index] = c.capture.meta;
             ++(c.capture.kind == pc::SnapshotKind::Endpoint ? counters_.endpoints_created : counters_.taps_created);
@@ -398,7 +513,7 @@ void PrefixCache::poll() {
         if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
         published_[c.capture.id] = result;
         for (cudaEvent_t event : c.events) { recycle(event); }
-        captures_.pop_front();
+        it = captures_.erase(it);
     }
     while (!writes_.empty()) {
         PendingWrite& w = writes_.front();
@@ -609,7 +724,8 @@ void PrefixCache::clear() noexcept {
     }
     landing_.clear();
     while (!staged_.empty()) { abandon_staged_capture(staged_.begin()->first); }
-    captures_.clear();
+    // Landed captures still waiting for their anchor (drain published every other one).
+    while (!captures_.empty()) { abandon_capture(captures_.front().capture.id); }
     writes_.clear();
     published_.clear();
     pc::PrefixIndexConfig config = index_->config();

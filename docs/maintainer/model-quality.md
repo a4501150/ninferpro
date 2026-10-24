@@ -1010,7 +1010,16 @@ output was identical across concurrency 1-8 and to plain decode, 2026-10-14), so
 (`ProgramOptions` holds them): `adaptive-speculation` is its two-row MTP rounds, which share one
 draft length chosen from both rows (without it two rows decode plain, as three or more do);
 `free-cache-resume` is prefill calls, taps and resumes off its 16-token GDN sub-chunk grid,
-sibling coalescing, and endpoints and blocks holding decode-computed state; `preemption` as above.
+sibling coalescing, and endpoints and blocks holding decode-computed state; and (2026-10-23) its
+prompt-end captures: a repeat of a prompt whose own end snapshot is cached regenerates the first
+token from the stored pre-head residual with no prefill call, through the head's gathered-column
+route (width-exact since the finish gather of the same date), so the resumed token is the cold
+one bit-for-bit and the empty call plan keeps the request's decomposition — nothing of the path
+mixes decode and prefill state beyond what resumes already did. The capture is value-gated
+(hybrid-prefix-cache-spec, Taps): within one tap separation of the path's deepest published
+frontier it is skipped, so a one-call span's repeat keeps its tail tap and a repeat whose opener
+realized just below n re-fills that short tail; spans whose opener demoted to the last inner
+boundary (the multi-call re-fill loss) still capture. `preemption` as above.
 Its kernel path `q8-sliced-k` (below) couples requests too: its routes depend on the round's width;
 so does `ggml-bf16-prefill`, whose routes depend on a prompt's call boundaries and MoE grouping.
 

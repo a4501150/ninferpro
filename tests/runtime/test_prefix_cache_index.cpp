@@ -110,7 +110,7 @@ SnapshotRef publish_tap(PrefixCacheIndex& index, NodeRef anchor) {
 // a block takes its tail from that block's tokens.
 SnapshotRef publish_at(PrefixCacheIndex& index, RecordingBackend& backend,
                        const std::vector<NodeRef>& path, const std::vector<TokenId>& tokens,
-                       std::uint32_t frontier, SnapshotKind kind) {
+                       std::uint32_t frontier, SnapshotKind kind, bool head_residual = false) {
     const std::uint32_t full = frontier / kBlockTokens;
     const std::uint32_t tail = frontier % kBlockTokens;
     const auto slot          = index.acquire_device_slot();
@@ -121,7 +121,7 @@ SnapshotRef publish_at(PrefixCacheIndex& index, RecordingBackend& backend,
         full == 0 ? NodeRef{} : path[full - 1], frontier,
         std::span<const TokenId>(tokens.data() + static_cast<std::size_t>(full) * kBlockTokens,
                                  tail),
-        tail_id, *slot, kind);
+        tail_id, *slot, kind, head_residual);
     require(result.created, "snapshot not created");
     index.check_invariants();
     return result.snapshot;
@@ -208,6 +208,58 @@ void test_match_and_choice() {
     require(index.match(tokens, media_hashes, extras, static_cast<std::uint32_t>(tokens.size()))
                 .path.empty(),
             "different media must not match");
+}
+
+// A snapshot at the prompt's own end serves only the zero-token resume: it must be offered with
+// its head residual, and stay unexposed without one — a block-aligned end's anchor is the last
+// walked block's node.
+void test_prompt_end_head_residual() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(), backend);
+    const auto tokens  = make_tokens(64 * 4 + 10, 5);
+    const auto blocks = std::vector<TokenId>(tokens.begin(), tokens.begin() + 64 * 4);
+    const auto path   = insert_sequence(index, backend, blocks);
+    const auto hashes = block_lookup_hashes(tokens, {});
+    const auto n       = static_cast<std::uint32_t>(tokens.size());
+    const SnapshotRef head =
+        publish_at(index, backend, path, tokens, n, SnapshotKind::Endpoint, true);
+    index.release_path(path);
+    index.check_invariants();
+
+    const MatchResult matched = index.match(tokens, hashes, {}, n);
+    require(matched.path.size() == 4, "match must walk the prompt's last full block");
+    require(matched.candidates.size() == 1 && matched.candidates[0].snapshot == head &&
+                matched.candidates[0].frontier == n && matched.candidates[0].head_residual &&
+                matched.candidates[0].tail,
+            "a prompt-end snapshot with its head residual must be offered");
+    require(index.choose(matched, n).candidate == 0U, "a zero-token resume beats every prefill");
+
+    // Without the residual the same end stays unexposed (the persisted-file check relies on it).
+    const std::vector<TokenId> plain_tokens = make_tokens(64 * 4, 6);
+    const auto plain_blocks = std::vector<TokenId>(plain_tokens.begin(), plain_tokens.end());
+    const auto plain_path   = insert_sequence(index, backend, plain_blocks);
+    (void)publish_at(index, backend, plain_path, plain_tokens, 256, SnapshotKind::Tap);
+    index.release_path(plain_path);
+    index.check_invariants();
+    const MatchResult plain_match =
+        index.match(plain_tokens, block_lookup_hashes(plain_tokens, {}), {}, 256);
+    require(plain_match.candidates.empty(), "a prompt-end snapshot without its head residual must stay unexposed");
+
+    // A block-aligned end with the residual: its anchor is the last block's node, which the
+    // raised block walk must reach.
+    const std::vector<TokenId> aligned_tokens = make_tokens(64 * 4, 7);
+    const auto aligned_blocks = std::vector<TokenId>(aligned_tokens.begin(), aligned_tokens.end());
+    const auto aligned_path   = insert_sequence(index, backend, aligned_blocks);
+    const SnapshotRef aligned =
+        publish_at(index, backend, aligned_path, aligned_tokens, 256, SnapshotKind::Endpoint, true);
+    index.release_path(aligned_path);
+    index.check_invariants();
+    const MatchResult aligned_match =
+        index.match(aligned_tokens, block_lookup_hashes(aligned_tokens, {}), {}, 256);
+    require(aligned_match.path.size() == 4 && aligned_match.candidates.size() == 1 &&
+                aligned_match.candidates[0].snapshot == aligned &&
+                aligned_match.candidates[0].head_residual && !aligned_match.candidates[0].tail,
+            "a block-aligned prompt end with its head residual must be offered");
 }
 
 void test_collisions_and_tails() {
@@ -429,20 +481,23 @@ void test_host_only_reattach() {
     }
     const std::size_t live_before = backend.live.size();
 
-    // A sequence recomputing the same blocks re-establishes their Device copies.
+    // A sequence recomputing the same blocks re-establishes their Device copies; the records no
+    // longer describe the pages (a resume inside a block recomputes on another call grid), so
+    // they are dropped until the sequence's release writes the pages through.
     const auto again = insert_sequence(index, backend, tokens);
     require(again == path, "recomputed blocks must resolve to the existing nodes");
     require(backend.live.size() == live_before + 3, "the index must keep the recomputed pages");
     for (const NodeRef node : path) {
         const NodeView view = index.node(node);
-        require(view.device == CopyState::Resident && view.host == CopyState::Resident,
-                "a reattached block is resident on both tiers");
+        require(view.device == CopyState::Resident && view.host == CopyState::Absent,
+                "a reattached block drops its stale Host record");
     }
     // Duplicates of Device copies another sequence pins stay private to the inserting sequence.
     const auto twice = insert_sequence(index, backend, tokens);
     require(backend.live.size() == live_before + 3, "a pinned resident duplicate must not be retained");
     index.release_path(twice);
     index.release_path(again);
+    for (const NodeRef node : path) { backup_node(index, node); } // the release's write-through
     index.check_invariants();
     require(index.evict_device_blocks(3) == 3, "reattached backed blocks are evictable again");
     index.check_invariants();
@@ -480,8 +535,9 @@ void test_resident_duplicate_replacement() {
                 "an unpinned Device copy is replaced by the sequence's page");
         require(!backend.live.contains(old_ids[b]), "the replaced copy returns to the pool");
     }
-    require(index.node(path[1]).host == CopyState::Resident,
-            "a replaced block keeps its Host copy");
+    require(index.node(path[1]).host == CopyState::Absent,
+            "a replaced block drops its Host record: a page recomputed on another call grid no "
+            "longer matches it, and the sequence's release writes the page through");
     require(backend.live.size() == 3, "one page per block while the sequence holds the path");
     require(index.device_evictable_blocks() == 0, "the sequence pins its path");
     index.check_invariants();
@@ -492,6 +548,27 @@ void test_resident_duplicate_replacement() {
     require(index.evict_device_blocks(3) == 3 && backend.live.empty(),
             "evicting the blocks releases the adopted pages");
     index.check_invariants();
+}
+
+// A recomputation that re-attaches a host-only block drops the record the same way: the page it
+// computed (a resume inside the block runs another call grid) no longer matches the record.
+void test_host_only_record_drop() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 1), backend);
+    const auto tokens = make_tokens(64 * 2, 63);
+    const auto path   = insert_sequence(index, backend, tokens);
+    for (const NodeRef node : path) { backup_node(index, node); }
+    index.release_path(path);
+    require(index.evict_device_blocks(2) == 2, "the backed blocks become host-only");
+    const auto again = insert_sequence(index, backend, tokens);
+    require(again == path, "recomputed blocks resolve to the existing nodes");
+    for (const NodeRef node : path) {
+        const NodeView view = index.node(node);
+        require(view.device == CopyState::Resident, "the host-only blocks regain a Device copy");
+        require(view.host == CopyState::Absent, "the regained block drops its stale Host record");
+    }
+    index.check_invariants();
+    index.release_path(again);
 }
 
 // A saved Host tier keeps exactly the Host-backed snapshots whose paths are Host-resident, and a
@@ -1639,6 +1716,7 @@ int main() {
     try {
         test_hashes();
         test_match_and_choice();
+        test_prompt_end_head_residual();
         test_collisions_and_tails();
         test_device_lru_order();
         test_backed_before_unbacked();
@@ -1654,6 +1732,7 @@ int main() {
         test_passed_endpoints();
         test_host_only_reattach();
         test_resident_duplicate_replacement();
+        test_host_only_record_drop();
         test_tail_device_fill();
         test_persistence_roundtrip();
         test_restore_plan();

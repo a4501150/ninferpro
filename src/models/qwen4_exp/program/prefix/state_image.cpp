@@ -116,6 +116,9 @@ StateImageSpec state_image_spec(const TextConfig& c, bool mtp, KvCacheStorage st
     if (mtp) {
         spec.mtp_saved_bytes = static_cast<std::size_t>(c.residual_width()) * 2U;
         spec.mtp_tail_bytes  = spec.qsa_tail_bytes;
+    } else {
+        spec.head_saved       = true;
+        spec.head_saved_bytes = static_cast<std::size_t>(c.residual_width()) * 2U;
     }
     const KvWindowGeometry window = kv_window_geometry(c, storage, mtp, 1);
     if (window.present()) {
@@ -168,6 +171,9 @@ StateImageLayout plan_state_image(const StateImageSpec& spec) {
         add_part(StateImagePart::Kind::DraftRingK, layer, spec.draft_ring.k_bytes);
         add_part(StateImagePart::Kind::DraftRingV, layer, spec.draft_ring.v_bytes);
     }
+    // The zero-token resume's saved head residual joins the last group: it is read only by the
+    // resume hook, after the restore completes, so no forward pass waits on it.
+    if (spec.head_saved) { add_part(StateImagePart::Kind::HeadSaved, 0, spec.head_saved_bytes); }
     layout.group_begin.push_back(static_cast<std::uint32_t>(layout.parts.size()));
     layout.image_bytes = offset;
     std::uint64_t hash = 0xCBF29CE484222325ULL;
@@ -186,7 +192,8 @@ void write_state_image_header(const StateImageLayout& layout, const StateImageHe
     PackedHeader packed;
     packed.magic       = kHeaderMagic;
     packed.version     = kHeaderVersion;
-    packed.flags       = (header.mtp_written ? 1U : 0U) | (header.lineage_echo ? 2U : 0U) | (header.opener ? 4U : 0U);
+    packed.flags       = (header.mtp_written ? 1U : 0U) | (header.lineage_echo ? 2U : 0U) |
+                         (header.opener ? 4U : 0U) | (header.head_residual ? 8U : 0U);
     packed.fingerprint = layout.fingerprint;
     packed.image_bytes = layout.image_bytes;
     packed.frontier    = header.frontier;
@@ -203,7 +210,7 @@ std::optional<StateImageHeader> read_state_image_header(const StateImageLayout& 
     std::memcpy(&packed, image_begin, sizeof(packed));
     if (packed.magic != kHeaderMagic || packed.version != kHeaderVersion ||
         packed.fingerprint != layout.fingerprint || packed.image_bytes != layout.image_bytes ||
-        (packed.flags & ~7U) != 0) {
+        (packed.flags & ~15U) != 0) {
         return std::nullopt;
     }
     StateImageHeader header;
@@ -211,6 +218,7 @@ std::optional<StateImageHeader> read_state_image_header(const StateImageLayout& 
     header.mtp_written  = (packed.flags & 1U) != 0;
     header.lineage_echo = (packed.flags & 2U) != 0;
     header.opener       = (packed.flags & 4U) != 0;
+    header.head_residual = (packed.flags & 8U) != 0;
     header.mtp_next     = packed.mtp_next;
     header.mtp_accept   = packed.mtp_accept;
     header.draft_frontier = packed.draft_frontier;
@@ -223,7 +231,7 @@ LaneStateImage::LaneStateImage(const StateImageLayout& layout, const LaneStateBu
     std::uint32_t gdn_layers = 0, attention_layers = 0;
     for (const MixerKind kind : spec.layer_types) { ++(kind == MixerKind::Gdn ? gdn_layers : attention_layers); }
     if (buffers.lanes == 0 || buffers.ple == nullptr || (attention_layers + (spec.mtp ? 1U : 0U) > 0 && buffers.tails == nullptr) ||
-        (spec.mtp && buffers.mtp_saved == nullptr)) {
+        (spec.mtp && buffers.mtp_saved == nullptr) || (spec.head_saved && buffers.head_saved == nullptr)) {
         throw std::invalid_argument("Qwen4Exp state image: lane buffers are missing");
     }
     if (spec.window_bytes[0] != 0) {
@@ -264,6 +272,8 @@ std::byte* LaneStateImage::device_part(const StateImagePart& part, std::uint32_t
         return buffers_.tails + (static_cast<std::size_t>(part.index) * buffers_.lanes + lane) * spec.qsa_tail_bytes;
     case StateImagePart::Kind::MtpSaved:
         return buffers_.mtp_saved + static_cast<std::size_t>(lane) * spec.mtp_saved_bytes;
+    case StateImagePart::Kind::HeadSaved:
+        return buffers_.head_saved + static_cast<std::size_t>(lane) * spec.head_saved_bytes;
     case StateImagePart::Kind::MtpTail:
         return buffers_.tails + (static_cast<std::size_t>(attention_layers) * buffers_.lanes + lane) * spec.qsa_tail_bytes;
     case StateImagePart::Kind::QsaWindow: {

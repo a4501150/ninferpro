@@ -180,6 +180,10 @@ struct ForwardBatch {
     std::int32_t batch = 0;
     std::int32_t width = 0;
     const ForwardVerify* verify = nullptr; // set for a speculative verification call
+    // When set (a prefill call of a Program with the zero-token resume): BF16 [W, 1] receives the
+    // final residual's last column — the pre-LM-head state head_logits regenerates the prompt's
+    // first token from, so an exact repeat needs no prefill.
+    Tensor head_residual_out;
     // A generation round (decode or verification), not a prefill chunk, forced token or scored
     // position: the only calls ForwardExperts::tail_skip_rank applies to.
     bool decode_round = false;

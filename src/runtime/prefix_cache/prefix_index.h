@@ -106,6 +106,9 @@ struct MatchCandidate {
     bool tail                      = false;
     bool tail_on_device            = false;
     bool image_on_device           = false;
+    // The snapshot carries its frontier's pre-LM-head residual: at frontier == prompt_tokens it
+    // resumes the exact repeat with no prefill at all (the zero-token resume).
+    bool head_residual             = false;
     std::uint64_t restore_bytes    = 0;
 };
 
@@ -168,6 +171,9 @@ struct SnapshotView {
     SnapshotKind kind  = SnapshotKind::Tap;
     std::uint32_t hits = 0;
     bool superseded    = false;
+    // The image's HeadSaved part holds the head residual of this frontier's last token — the
+    // zero-token resume's state; only a prompt-end capture sets it.
+    bool head_residual = false;
     std::span<const TokenId> tail;
 };
 
@@ -223,7 +229,9 @@ public:
 
     // ---- lookup and choice (§6.1, §6.2) -------------------------------------------------------
     // `block_hashes[b]` is block_lookup_hashes(tokens)[b]; `block_extras` is empty or one extra key
-    // per full block. Only snapshots with frontier <= prompt_tokens - 1 are returned.
+    // per full block. Snapshots with frontier <= prompt_tokens - 1 are returned, and a snapshot
+    // with its head residual at frontier == prompt_tokens (the zero-token resume of an exact
+    // repeat); a snapshot at the prompt's own length without one stays unexposed.
     [[nodiscard]] MatchResult match(std::span<const TokenId> tokens,
                                     std::span<const std::uint64_t> block_hashes,
                                     std::span<const std::uint64_t> block_extras,
@@ -347,10 +355,12 @@ public:
     // 64 * (anchor depth + 1) + tail.size() (tail.size() for the root anchor). A tail requires
     // `tail_device_id`. For a duplicate (same anchor and tail) the staging slot is freed, the tail
     // device id is released and the existing snapshot is returned with created=false.
+    // `head_residual`: the image carries its frontier's head residual (a prompt-end capture).
     [[nodiscard]] PublishResult publish_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                  std::span<const TokenId> tail,
                                                  std::optional<std::uint32_t> tail_device_id,
-                                                 std::uint32_t device_slot, SnapshotKind kind);
+                                                 std::uint32_t device_slot, SnapshotKind kind,
+                                                 bool head_residual = false);
     // Host-born snapshots: the image (and tail) is copied straight to Host slabs, with no Device
     // slot. Reserves the image's slabs, plus one tail slab when `tail` (which needs host_blocks),
     // evicting like begin_snapshot_host_fill but no retained snapshot valued above `claim` (the
@@ -367,7 +377,7 @@ public:
                                                       std::span<const TokenId> tail,
                                                       std::optional<std::uint32_t> tail_device_id,
                                                       HostImageReservation&& image,
-                                                      SnapshotKind kind);
+                                                      SnapshotKind kind, bool head_residual = false);
 
     // ---- persistence ---------------------------------------------------------------------------
     // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is Host-resident
@@ -385,7 +395,7 @@ public:
                                                                   std::uint64_t extra);
     [[nodiscard]] std::optional<SnapshotRef>
     restore_host_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
-                          SnapshotKind kind, std::uint32_t hits);
+                          SnapshotKind kind, std::uint32_t hits, bool head_residual = false);
 
     // ---- views
     // ------------------------------------------------------------------------------------
@@ -439,6 +449,9 @@ private:
         std::uint32_t pins            = 0;
         SnapshotKind kind             = SnapshotKind::Tap;
         std::uint32_t hits            = 0;
+        // The image's HeadSaved part holds the head residual of this frontier's last token — the
+        // zero-token resume's state; only a prompt-end capture sets it.
+        bool head_residual            = false;
         double priority               = 0.0; // GDSF H = priority_base + F * C / Z
         double priority_base          = 0.0; // GDSF inflation at the last publication or hit
         std::uint64_t last_hit_tick   = 0;
@@ -520,7 +533,7 @@ private:
                                               std::optional<std::uint32_t> tail_device_id,
                                               std::uint32_t device_slot,
                                               std::vector<std::uint32_t>&& host_slabs,
-                                              SnapshotKind kind);
+                                              SnapshotKind kind, bool head_residual);
     void remove_snapshot(std::uint32_t snapshot);
     // Snapshot ancestry: `above` lies on `below`'s path at a smaller frontier.
     [[nodiscard]] bool on_path(const Snapshot& above, const Snapshot& below) const noexcept;

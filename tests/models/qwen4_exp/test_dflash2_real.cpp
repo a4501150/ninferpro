@@ -14,6 +14,10 @@
 //   tap resume    With the prefix cache (512-token calls), a request resuming from another's tap at
 //                 1024 restores the drafter's context ring with the rest of the state: its tokens and
 //                 its drafted and accepted counts equal a cold run's (same call boundaries).
+//   zero token    With the prefix cache, an exact repeat of a prompt whose own end snapshot is
+//                 cached reuses the whole prompt with no prefill; its tokens and its rounds,
+//                 drafted and accepted counts equal the first run's (a gap in the restored ring at
+//                 the resumed position would show only in the counts).
 //   distribution  N seeded requests (T 1.0, top-k 20, top-p 0.95, G tokens each) from plain decoding
 //                 and from DFlash2: each output position's token distribution, and the first two
 //                 tokens' jointly, must match (two-sample chi-square, family alpha 0.001,
@@ -244,6 +248,39 @@ Tokens synthetic_tokens(std::size_t count, std::uint32_t seed) {
     return tokens;
 }
 
+// The zero-token resume with the drafter's ring: an exact repeat of a prompt whose own end
+// snapshot is cached reuses the whole prompt with no prefill. A gap in the restored ring at the
+// resumed position would show only in the drafted and accepted counts, never in output equality,
+// so the counts must equal the first run's too.
+int zero_token_resume(const Setup& setup) {
+    std::printf("== the zero-token resume with the prefix cache (512-token calls)\n");
+    infernix::EngineOptions options = engine_options(setup, Drafter::TextHead, 1);
+    options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(4608);
+    options.prefill_chunk                     = 512;
+    options.context_cache.host_capacity_bytes = 2ULL << 30;
+    options.fast_path_candidates              = {infernix::FastPath::FreeCacheResume};
+    infernix::Engine engine(std::move(options));
+    const Tokens p = synthetic_tokens(1500, 41);
+    const auto first  = engine.generate(engine.prepare_tokens(p), request(0.0F, 0, 96, true));
+    const auto repeat = engine.generate(engine.prepare_tokens(p), request(0.0F, 0, 96, true));
+    std::printf("  first: ");
+    print_acceptance(first.speculative);
+    std::printf("  repeat: ");
+    print_acceptance(repeat.speculative);
+    int failures = 0;
+    failures += check(repeat.reused_prompt_tokens == 1500,
+                      "the repeat reuses the whole prompt (reused " +
+                          std::to_string(repeat.reused_prompt_tokens) + ")");
+    failures += check(repeat.generated_token_ids == first.generated_token_ids,
+                      "the repeat equals the first run (" +
+                          first_difference(repeat.generated_token_ids, first.generated_token_ids) + ")");
+    failures += check(repeat.speculative.rounds == first.speculative.rounds &&
+                          repeat.speculative.drafted_tokens == first.speculative.drafted_tokens &&
+                          repeat.speculative.accepted_tokens == first.speculative.accepted_tokens,
+                      "the restored ring drafts as the first run's (rounds, drafted and accepted counts)");
+    return failures;
+}
+
 // The prefix cache's tap resume (test_prefix_cache_real's scenario) with the drafter's ring.
 int tap_resume(const Setup& setup) {
     std::printf("== tap resume with the prefix cache (512-token calls)\n");
@@ -410,6 +447,7 @@ int main(int argc, char** argv) {
             proposal.reset();
         }
         failures += tap_resume(setup);
+        failures += zero_token_resume(setup);
         std::printf(failures == 0 ? "all DFlash2 checks passed\n" : "%d DFlash2 check(s) failed\n", failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& e) {
