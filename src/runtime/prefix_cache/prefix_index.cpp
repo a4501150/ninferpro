@@ -615,6 +615,15 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
             node.device_id            = device_id;
             result.device_attached    = true;
         }
+        // The recomputation's page differs from the record whenever it ran on another call grid
+        // (a resume inside the block), so a Host record the page displaced no longer describes
+        // the block: it would serve a later Host restore, and a snapshot over the path, bits the
+        // recomputing sequence's own state contradicts. The record is dropped and the sequence's
+        // release writes the page back through. A Host fill in flight pins the node, so the
+        // record here is only ever resident or absent.
+        if (result.device_attached && node.host == CopyState::Resident) {
+            drop_node_host_copy(existing->index);
+        }
         ++node.pins;
         refresh_node(existing->index);
         return result;

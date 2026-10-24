@@ -481,20 +481,23 @@ void test_host_only_reattach() {
     }
     const std::size_t live_before = backend.live.size();
 
-    // A sequence recomputing the same blocks re-establishes their Device copies.
+    // A sequence recomputing the same blocks re-establishes their Device copies; the records no
+    // longer describe the pages (a resume inside a block recomputes on another call grid), so
+    // they are dropped until the sequence's release writes the pages through.
     const auto again = insert_sequence(index, backend, tokens);
     require(again == path, "recomputed blocks must resolve to the existing nodes");
     require(backend.live.size() == live_before + 3, "the index must keep the recomputed pages");
     for (const NodeRef node : path) {
         const NodeView view = index.node(node);
-        require(view.device == CopyState::Resident && view.host == CopyState::Resident,
-                "a reattached block is resident on both tiers");
+        require(view.device == CopyState::Resident && view.host == CopyState::Absent,
+                "a reattached block drops its stale Host record");
     }
     // Duplicates of Device copies another sequence pins stay private to the inserting sequence.
     const auto twice = insert_sequence(index, backend, tokens);
     require(backend.live.size() == live_before + 3, "a pinned resident duplicate must not be retained");
     index.release_path(twice);
     index.release_path(again);
+    for (const NodeRef node : path) { backup_node(index, node); } // the release's write-through
     index.check_invariants();
     require(index.evict_device_blocks(3) == 3, "reattached backed blocks are evictable again");
     index.check_invariants();
@@ -532,8 +535,9 @@ void test_resident_duplicate_replacement() {
                 "an unpinned Device copy is replaced by the sequence's page");
         require(!backend.live.contains(old_ids[b]), "the replaced copy returns to the pool");
     }
-    require(index.node(path[1]).host == CopyState::Resident,
-            "a replaced block keeps its Host copy");
+    require(index.node(path[1]).host == CopyState::Absent,
+            "a replaced block drops its Host record: a page recomputed on another call grid no "
+            "longer matches it, and the sequence's release writes the page through");
     require(backend.live.size() == 3, "one page per block while the sequence holds the path");
     require(index.device_evictable_blocks() == 0, "the sequence pins its path");
     index.check_invariants();
@@ -544,6 +548,27 @@ void test_resident_duplicate_replacement() {
     require(index.evict_device_blocks(3) == 3 && backend.live.empty(),
             "evicting the blocks releases the adopted pages");
     index.check_invariants();
+}
+
+// A recomputation that re-attaches a host-only block drops the record the same way: the page it
+// computed (a resume inside the block runs another call grid) no longer matches the record.
+void test_host_only_record_drop() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 1), backend);
+    const auto tokens = make_tokens(64 * 2, 63);
+    const auto path   = insert_sequence(index, backend, tokens);
+    for (const NodeRef node : path) { backup_node(index, node); }
+    index.release_path(path);
+    require(index.evict_device_blocks(2) == 2, "the backed blocks become host-only");
+    const auto again = insert_sequence(index, backend, tokens);
+    require(again == path, "recomputed blocks resolve to the existing nodes");
+    for (const NodeRef node : path) {
+        const NodeView view = index.node(node);
+        require(view.device == CopyState::Resident, "the host-only blocks regain a Device copy");
+        require(view.host == CopyState::Absent, "the regained block drops its stale Host record");
+    }
+    index.check_invariants();
+    index.release_path(again);
 }
 
 // A saved Host tier keeps exactly the Host-backed snapshots whose paths are Host-resident, and a
@@ -1707,6 +1732,7 @@ int main() {
         test_passed_endpoints();
         test_host_only_reattach();
         test_resident_duplicate_replacement();
+        test_host_only_record_drop();
         test_tail_device_fill();
         test_persistence_roundtrip();
         test_restore_plan();
