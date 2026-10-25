@@ -59,6 +59,23 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
     ops::linear(x, p.weight, out, column ? ops::LinearPolicy::A16ColumnInvariant : p.policy, work, s, routes);
 }
 
+// project() with the output's consecutive row ranges written to `parts` (split_rows's bits). A route
+// that stores the ranges itself skips the complete output and its copy.
+void project_rows(const Tensor& x, const LinearParameters& p, std::span<Tensor* const> parts, WorkspaceArena& work,
+                  cudaStream_t s, ops::LinearRoutes routes, bool invariant) {
+    if (p.is_ggml()) {
+        std::int32_t rows = 0;
+        for (const Tensor* part : parts) { rows += part->ne[0]; }
+        auto scope       = work.scope();
+        Tensor projected = work.alloc(DType::BF16, {rows, x.ne[1]});
+        project(x, p, projected, work, s, routes, invariant);
+        ops::split_rows(projected, parts, s);
+        return;
+    }
+    const bool column = invariant && ops::linear_column_invariant_supported(p.weight.qtype, p.weight.n, p.weight.k);
+    ops::linear_rows(x, p.weight, parts, column ? ops::LinearPolicy::A16ColumnInvariant : p.policy, work, s, routes);
+}
+
 // Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly.
 void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s) {
     if (table.layout == QuantLayout::GgmlRows) {
@@ -103,13 +120,11 @@ void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out
         ops::silu_mul(gate, up, out, s);
         return;
     }
-    Tensor projected = work.alloc(DType::BF16, {2 * I, T});
-    project(x, gate_up, projected, work, s, routes, invariant);
     Tensor gate = work.alloc(DType::BF16, {I, T});
     Tensor up   = work.alloc(DType::BF16, {I, T});
     {
         Tensor* parts[] = {&gate, &up};
-        ops::split_rows(projected, parts, s);
+        project_rows(x, gate_up, parts, work, s, routes, invariant);
     }
     ops::silu_mul(gate, up, out, s);
 }
@@ -593,10 +608,8 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
             // Q8 (Dense8): the projection writes q/k/v and z to their destinations itself.
             ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, dense_routes());
         } else {
-            Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
-            project(x, p.projection, projected, work_, s, dense_routes(), fast_.column_invariant);
             Tensor* parts[] = {&qkv, &z};
-            ops::split_rows(projected, parts, s);
+            project_rows(x, p.projection, parts, work_, s, dense_routes(), fast_.column_invariant);
         }
         project(x, p.control, ab, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
     }
@@ -707,19 +720,16 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         ops::ggml_linear(x, ops::ggml_split_segments(segments, x.ne[0], bounds), parts, nullptr, 0, work_, s,
                          dense_routes());
     } else {
-        Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + (p.index_projection ? 0 : index_rows), T});
-        project(x, p.projection, projected, work_, s, dense_routes(), fast_.column_invariant);
         Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
         if (p.index_projection) {
-            Tensor indexed = work_.alloc(DType::BF16, {index_rows, T});
-            project(x, *p.index_projection, indexed, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
             Tensor* parts[]       = {&qf, &gate, &kf, &vf};
             Tensor* index_parts[] = {&iqf, &ik};
-            ops::split_rows(projected, parts, s);
-            ops::split_rows(indexed, index_parts, s);
+            project_rows(x, p.projection, parts, work_, s, dense_routes(), fast_.column_invariant);
+            project_rows(x, *p.index_projection, index_parts, work_, s, ops::LinearRoutes::Exact,
+                         fast_.column_invariant);
         } else {
             Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
-            ops::split_rows(projected, parts, s);
+            project_rows(x, p.projection, parts, work_, s, dense_routes(), fast_.column_invariant);
         }
     }
     // The vector-quantized storages' exact window is addressed by the sequences' state slots.

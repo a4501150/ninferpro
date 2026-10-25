@@ -52,5 +52,6 @@ void launch_invariant(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
 } // namespace
 
 const Fp8LinearShape kFp8N13312K2560{13312,   2560, launch_a16, nullptr, uses_a8, nullptr,
-                                     launch_invariant, launch_fp8_a8_pair<Geometry>, kPairMinTokens};
+                                     launch_invariant, launch_fp8_a8_pair<Geometry>, kPairMinTokens,
+                                     launch_fp8_a8_pair_rows<Geometry>};
 } // namespace infernix::ops::detail

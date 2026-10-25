@@ -582,6 +582,73 @@ int pair_admission_seams() {
 
 } // namespace
 
+// linear_rows on the pair route writes each row range straight to its tensor: every part must equal
+// the same rows of linear()'s complete output bit for bit, at each problem's admission and in the
+// 128-column tiles (Qwen3.8-Flash-Next's splits: GDN q/k/v and z, attention q/gate/k/v, the shared
+// expert's gate and up), and on the exact route, which projects and splits.
+int linear_rows_equal_split() {
+    struct Case {
+        std::int32_t n, k;
+        std::vector<std::int32_t> parts;
+        std::vector<std::int32_t> widths;
+    };
+    const Case cases[] = {
+        {16384, 2560, {10240, 6144}, {33, 300, 4101}},
+        {13312, 2560, {4096, 4096, 2560, 2560}, {97, 4101}},
+        {1280, 2560, {640, 640}, {1025, 4101}},
+    };
+    int failures       = 0;
+    std::uint32_t seed = 1201U;
+    for (const Case& c : cases) {
+        DeviceProblem problem(c.n, c.k, seed++);
+        for (const std::int32_t t : c.widths) {
+            for (const ops::LinearRoutes routes : {kPair, ops::LinearRoutes::Exact}) {
+                const std::vector<std::uint16_t> bits = outlier_activations(c.k, t, seed);
+                DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
+                x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
+                const auto full = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, routes);
+                const std::size_t capacity =
+                    ops::linear_workspace_capacity_bytes(problem.view.qtype, c.n, c.k, ops::LinearPolicy::A16Only, t, t) +
+                    static_cast<std::size_t>(c.n) * t * sizeof(std::uint16_t) + 512;
+                DeviceArena workspace(capacity);
+                std::vector<DeviceBuffer> buffers;
+                std::vector<Tensor> tensors;
+                for (const std::int32_t rows : c.parts) {
+                    buffers.emplace_back(static_cast<std::size_t>(rows) * t * sizeof(std::uint16_t));
+                    tensors.emplace_back(buffers.back().p, DType::BF16, std::initializer_list<std::int32_t>{rows, t});
+                }
+                std::vector<Tensor*> parts;
+                for (Tensor& tensor : tensors) parts.push_back(&tensor);
+                const Tensor input(x.p, DType::BF16, {c.k, t});
+                ops::linear_rows(input, problem.view, parts, ops::LinearPolicy::A16Only, workspace, nullptr, routes);
+                test::cuda_check(cudaDeviceSynchronize(), "linear_rows");
+                std::int64_t differing = 0;
+                std::int32_t begin     = 0;
+                for (std::size_t i = 0; i < c.parts.size(); ++i) {
+                    const std::int32_t rows = c.parts[i];
+                    std::vector<std::uint16_t> part(static_cast<std::size_t>(rows) * t);
+                    buffers[i].copy_to_host(part.data(), part.size() * sizeof(std::uint16_t));
+                    for (std::int32_t token = 0; token < t; ++token)
+                        for (std::int32_t r = 0; r < rows; ++r)
+                            differing += part[static_cast<std::size_t>(token) * rows + r] !=
+                                         full[static_cast<std::size_t>(token) * c.n + begin + r];
+                    begin += rows;
+                }
+                const std::string label = "linear_rows [" + std::to_string(c.n) + "," + std::to_string(c.k) +
+                                          "] T=" + std::to_string(t) +
+                                          (routes == kPair ? " pair" : " exact");
+                if (differing != 0) {
+                    std::cerr << "FAIL " << label << ": " << differing << " values differ from linear + split\n";
+                    ++failures;
+                } else {
+                    std::cout << "ok   " << label << " equals linear + split\n";
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 int main() {
     if (!infernix::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -590,7 +657,7 @@ int main() {
     try {
         const int failures = run_fp8_a8() + run_flash_next_fp8_a8_pair() + pair_quantizer_exact() +
                              pair_deterministic() + run_flash_next_pair_outliers() +
-                             pair_admission_seams();
+                             pair_admission_seams() + linear_rows_equal_split();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A8 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

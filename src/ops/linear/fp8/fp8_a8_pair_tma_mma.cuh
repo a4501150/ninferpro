@@ -12,6 +12,7 @@
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/output.cuh"
+#include "ops/linear/common/row_parts.h"
 #include "ops/linear/fp8/fp8_a8_mma_common.cuh"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_a8_tma_mma.cuh"
@@ -119,7 +120,7 @@ fp8_mma_pair_compute_stage(const std::uint8_t* activation_hi, const std::uint8_t
 
 // `operands` carries the high term (x, x_scales); the low term's codes reach the kernel only
 // through its tensor map, and its column scales through `scales_lo`.
-template <class Schedule, bool FullTokens>
+template <class Schedule, bool FullTokens, class Output>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 fp8_a8_pair_tma_mma_kernel(
 #ifdef _WIN32
@@ -128,7 +129,7 @@ fp8_a8_pair_tma_mma_kernel(
 #else
     const __grid_constant__ Fp8TmaPairDescriptors descriptors,
 #endif
-    Fp8A8Operands operands, const float* __restrict__ scales_lo, LinearBf16Output output,
+    Fp8A8Operands operands, const float* __restrict__ scales_lo, Output output,
     int token_offset, int count) {
 #ifdef _WIN32
     const Fp8TmaPairDescriptors& descriptors = *descriptors_pointer;
@@ -230,9 +231,9 @@ fp8_a8_pair_tma_mma_kernel(
                                               lane);
 }
 
-template <class Schedule>
+template <class Schedule, class Output>
 void launch_fp8_a8_pair_tma_mma(const Fp8A8Operands& p, const std::uint8_t* x_lo,
-                                const float* scales_lo, LinearBf16Output output,
+                                const float* scales_lo, Output output,
                                 cudaStream_t stream) {
     validate_fp8_operands<Schedule>(p);
     if (x_lo == nullptr || reinterpret_cast<std::uintptr_t>(x_lo) % 16 != 0 ||
@@ -253,7 +254,7 @@ void launch_fp8_a8_pair_tma_mma(const Fp8A8Operands& p, const std::uint8_t* x_lo
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
         const auto launch = [&]<bool Full>() {
-            constexpr auto kernel = fp8_a8_pair_tma_mma_kernel<Schedule, Full>;
+            constexpr auto kernel = fp8_a8_pair_tma_mma_kernel<Schedule, Full, Output>;
             constexpr int bytes =
                 fp8_tma_scratch_bytes<Schedule, LinearIdentityEpilogue> + Schedule::kBarrierBytes;
             const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
@@ -274,13 +275,12 @@ void launch_fp8_a8_pair_tma_mma(const Fp8A8Operands& p, const std::uint8_t* x_lo
 }
 
 // The complete pair route of one registered problem: both terms, then the fused GEMM.
-template <class Geometry>
-void launch_fp8_a8_pair(const Tensor& x, const Weight& w, Tensor& out, Fp8A8PairWorkspace scratch,
-                        cudaStream_t stream) {
+template <class Geometry, class Output>
+void launch_fp8_a8_pair_into(const Tensor& x, const Weight& w, Output output, Fp8A8PairWorkspace scratch,
+                             cudaStream_t stream) {
     launch_fp8_a8_pair_quantize(x, w, scratch, stream);
     const Fp8A8Operands operands =
         fp8_a8_operands(w, Fp8A8Workspace{scratch.codes_hi, scratch.scales_hi, nullptr}, x.ne[1]);
-    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), w.n};
     if (x.ne[1] <= kFp8A8PairNarrowTokens) {
         launch_fp8_a8_pair_tma_mma<Fp8ScheduleInstance<Fp8A8PairT64, Geometry::kInputRows>>(
             operands, scratch.codes_lo, scratch.scales_lo, output, stream);
@@ -288,6 +288,20 @@ void launch_fp8_a8_pair(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Pair
     }
     launch_fp8_a8_pair_tma_mma<Fp8ScheduleInstance<Fp8A8PairT128, Geometry::kInputRows>>(
         operands, scratch.codes_lo, scratch.scales_lo, output, stream);
+}
+
+template <class Geometry>
+void launch_fp8_a8_pair(const Tensor& x, const Weight& w, Tensor& out, Fp8A8PairWorkspace scratch,
+                        cudaStream_t stream) {
+    launch_fp8_a8_pair_into<Geometry>(x, w, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, scratch,
+                                      stream);
+}
+
+// The same route writing consecutive row ranges to separate tensors (no split copy afterwards).
+template <class Geometry>
+void launch_fp8_a8_pair_rows(const Tensor& x, const Weight& w, const LinearBf16RowParts& parts,
+                             Fp8A8PairWorkspace scratch, cudaStream_t stream) {
+    launch_fp8_a8_pair_into<Geometry>(x, w, parts, scratch, stream);
 }
 
 } // namespace infernix::ops::detail

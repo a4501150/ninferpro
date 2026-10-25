@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace infernix::ops {
 
@@ -205,6 +206,18 @@ enum class LinearRoutes : std::uint8_t {
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             WorkspaceArena& workspace, cudaStream_t stream,
             LinearRoutes routes = LinearRoutes::Exact);
+
+/**
+ * @brief linear() with its output rows written to consecutive parts.
+ *
+ * @details Rows [b_i, b_i + r_i) of the `[N,T]` result go to `parts[i]`, a contiguous, 16-byte-aligned
+ * BF16 `[r_i,T]` tensor, with the bits linear() followed by split_rows() produces. Where the selected
+ * route can store the ranges itself (Qwen3.8-Flash-Next's row-FP8 projections on the fp8-a8-pair route,
+ * at most four parts, each a multiple of eight rows), no complete output is materialized; otherwise
+ * the call projects into `workspace` and splits.
+ */
+void linear_rows(const Tensor& x, const Weight& w, std::span<Tensor* const> parts, LinearPolicy policy,
+                 WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact);
 
 /**
  * Whether the registered problem `[output_rows, input_rows]` of `qtype` has an A16ColumnInvariant

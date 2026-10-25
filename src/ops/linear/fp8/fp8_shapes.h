@@ -1,6 +1,7 @@
 #pragma once
 #include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
+#include "ops/linear/common/row_parts.h"
 
 namespace infernix::ops::detail {
 struct Fp8LinearShape {
@@ -16,6 +17,10 @@ struct Fp8LinearShape {
     // where the problem registers none.
     void (*pair)(const Tensor&, const Weight&, Tensor&, Fp8A8PairWorkspace, cudaStream_t) = nullptr;
     std::int32_t pair_min_tokens = 0;
+    // The pair route writing row ranges to separate tensors (linear_rows); null where callers split
+    // the problem's output with a copy.
+    void (*pair_rows)(const Tensor&, const Weight&, const LinearBf16RowParts&, Fp8A8PairWorkspace,
+                      cudaStream_t) = nullptr;
 };
 
 extern const Fp8LinearShape kFp8N14336K5120;

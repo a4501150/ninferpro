@@ -3645,6 +3645,19 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   half of FHFMA's ~110 TFLOP/s (ncu: barrier, shared-load throttle and short-scoreboard stalls with
   16 warps per SM); 8 x 8 and 8 x 16 warp tiles, 1,024-thread CTAs and two CTAs per SM of the large
   tile measured slower.
+- **Projections written to their split tensors (2026-10-24, RTX PRO 6000, this fork).** Recipe C's
+  fused FP8 projections were projected into one [N, T] tensor and copied into their parts by
+  `split_rows`: per 16K prefill chunk 36 GDN q/k/v + z splits at 909 us, 13 attention splits at 779 us
+  and 60 small ones (the shared expert's gate/up, the indexer's two parts) at 111 us, about 49 ms
+  (3.8 %). `ops::linear_rows` now takes the parts; on the fp8-a8-pair route of [16384, 2560],
+  [13312, 2560] and [1280, 2560] the GEMM epilogue stores each 8-row vector straight into its part
+  (`LinearBf16RowParts`, up to four parts), and every other route projects into the workspace and
+  splits as before. Bit-identical: the parts equal linear()'s output rows at each problem's admission
+  and in the 128-column tiles, on the pair and exact routes (`infernix_linear_fp8_a8_test`); T1,
+  T1-exact and T2 unchanged. Prefill (`infernix_bench`, FP8 KV, base/new/new/base twice): pp4096
+  +3.2 / +3.2 %, pp16384 +3.1 / +3.3 %, pp32768 +3.1 / +3.3 %, pp512 +2.4 / +2.0 %. T1 6 x 8 (48
+  columns, past the GDN pair admission) 37.01 / 37.03 -> 36.85 / 36.85 ms; narrower rounds unchanged.
+  The exact route keeps its split copies.
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of
