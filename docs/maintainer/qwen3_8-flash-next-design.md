@@ -3676,6 +3676,9 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   T1-exact and T2 unchanged). T1 (FP8 KV, base/new/new/base, ms): 1 x 1 5.514 / 5.505 -> 5.395 /
   5.396 (-2.1 %), 2 x 1 -2.1 %, 4 x 1 -1.6 %, 6 x 1 -1.0 %, 1 x 4 -1.7 %; 8 x 1 and 1 x 8 (8
   columns) unchanged (+0.1 / 0.0 %).
+  Two later compositions from these blocks kept the bits but measured slower at T1 1 x 1 (a
+  per-head GDN decode chain +0.4 %, a persistent projection-plus-chain kernel with a grid barrier
+  +2.8 %) and stay on branch `exp/gdn-chain`; a one-column expert gate/up kernel (+0.6 %) was dropped.
 - **QSA index projection on tensor cores (`bf16-index-mma`, 2026-10-25, RTX PRO 6000, this fork).**
   Recipe C's BF16 QSA indexer projection [640, 2560] has no tuned exact route: the exact route of
   the construction-exact configurations takes its column-invariant sliced-K route, and every other
