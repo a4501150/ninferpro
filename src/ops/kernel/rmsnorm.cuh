@@ -32,26 +32,14 @@ __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weig
     return value;
 }
 
-// Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
-// registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
-// than part of the row geometry.
-template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0>
-__launch_bounds__(Block) __global__
-    void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                    const __nv_bfloat162* z, __nv_bfloat162* out,
-                                    std::int32_t input_d, std::int64_t rows, float eps) {
-    pdl::enter();
-    const int d = FixedD ? FixedD : input_d;
-    static_assert(Block % kWarpSize == 0);
-    constexpr int kWarpsPerBlock   = Block / kWarpSize;
+// One row of rmsnorm_warp_bf16x2_kernel, by one warp: lane l holds pairs l + 32 k. Also the
+// Gated DeltaNet decode chain's gated norm (same bits).
+template <RmsEpilogue Epilogue, bool Prefetch>
+__device__ __forceinline__ void rmsnorm_warp_row_bf16x2(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                                        const __nv_bfloat162* z, __nv_bfloat162* out, int d,
+                                                        float eps, int lane) {
     constexpr int kMaxPairsPerLane = 4;
-    const int lane                 = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    const int warp                 = static_cast<int>(threadIdx.x) / kWarpSize;
-    const std::int64_t row         = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
-    if (row >= rows) { return; }
-
-    const int pairs             = d / 2;
-    const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
+    const int pairs = d / 2;
     __nv_bfloat162 values[kMaxPairsPerLane];
     __nv_bfloat162 weights[kMaxPairsPerLane];
     __nv_bfloat162 gates[kMaxPairsPerLane];
@@ -61,10 +49,10 @@ __launch_bounds__(Block) __global__
     for (int k = 0; k < kMaxPairsPerLane; ++k) {
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
-            values[k] = x[row_base + pair];
+            values[k] = x[pair];
             if constexpr (Prefetch) {
                 weights[k] = weight[pair];
-                if constexpr (rms_gated(Epilogue)) { gates[k] = z[row_base + pair]; }
+                if constexpr (rms_gated(Epilogue)) { gates[k] = z[pair]; }
             }
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
@@ -87,16 +75,36 @@ __launch_bounds__(Block) __global__
                 if constexpr (rms_gated(Epilogue)) { z_pair = gates[k]; }
             } else {
                 w_pair = weight[pair];
-                if constexpr (rms_gated(Epilogue)) { z_pair = z[row_base + pair]; }
+                if constexpr (rms_gated(Epilogue)) { z_pair = z[pair]; }
             }
             const float2 wf = __bfloat1622float2(w_pair);
             float2 zf{0.0f, 0.0f};
             if constexpr (rms_gated(Epilogue)) { zf = __bfloat1622float2(z_pair); }
-            out[row_base + pair] =
-                __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
-                                      rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
+            out[pair] = __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
+                                              rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
         }
     }
+}
+
+// Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
+// registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
+// than part of the row geometry.
+template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0>
+__launch_bounds__(Block) __global__
+    void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                    const __nv_bfloat162* z, __nv_bfloat162* out,
+                                    std::int32_t input_d, std::int64_t rows, float eps) {
+    pdl::enter();
+    const int d = FixedD ? FixedD : input_d;
+    static_assert(Block % kWarpSize == 0);
+    constexpr int kWarpsPerBlock = Block / kWarpSize;
+    const int lane               = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp               = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t row       = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    if (row >= rows) { return; }
+    const std::int64_t row_base = row * static_cast<std::int64_t>(d / 2);
+    rmsnorm_warp_row_bf16x2<Epilogue, Prefetch>(x + row_base, weight, rms_gated(Epilogue) ? z + row_base : z,
+                                                out + row_base, d, eps, lane);
 }
 
 // Implements: include/infernix/ops/rmsnorm.h

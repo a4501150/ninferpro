@@ -658,7 +658,11 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         }
     }
 
-    if (!fused_conv) {
+    const auto gate_kind = g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu;
+    // Decode of the gates' own layout (a, b in the control projection): the GDN middle as one chain.
+    const bool chain = decode && !fused_conv && !g.a_direct &&
+                       ops::gated_delta_net_decode_chain_supports(NK, NV, p.convolution.ne[1], DK) && DK == DV;
+    if (!fused_conv && !chain) {
         q = work_.alloc(DType::BF16, {KW, T});
         k = work_.alloc(DType::BF16, {KW, T});
         v = work_.alloc(DType::BF16, {VW, T});
@@ -688,6 +692,16 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         ops::gated_delta_net(q.view({DK, NK, T}), k.view({DK, NK, T}), v.view({DV, NV, T}), gate, beta, scale,
                              /*normalize_qk=*/true, work_, state, state, o, device_.execution_view(),
                              fast_.gdn_arithmetic);
+    } else if (chain) {
+        // One position per sequence (decode), as the composed calls below in one launch.
+        auto layer          = state_.gdn->layer_view(index);
+        Tensor chain_normed = work_.alloc(DType::BF16, {DV, NV * T});
+        ops::gated_delta_net_decode_chain(qkv, p.convolution, layer.conv, ab.slice(0, 0, NV), ab.slice(0, NV, NV),
+                                          p.a_log, p.dt_bias, scale, layer.recurrent, batch.slots, p.norm,
+                                          z.view({DV, NV * T}), gate_kind, config_.rms_norm_eps, NK, chain_normed, s);
+        Tensor y = work_.alloc(DType::BF16, {H, T});
+        project(chain_normed.view({VW, T}), p.output, y, work_, s, dense_routes(), fast_.column_invariant);
+        return y;
     } else {
         // One position per sequence (decode): the recurrent update with device-chosen slots.
         auto layer = state_.gdn->layer_view(index);
@@ -711,9 +725,8 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     Tensor normed      = work_.alloc(DType::BF16, {DV, NV * T});
     const Tensor rows  = o.view({DV, NV * T});
     const Tensor gates = z.view({DV, NV * T});
-    ops::gated_rmsnorm(rows, p.norm, gates,
-                       g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,
-                       config_.rms_norm_eps, normed, device_.execution_view().on_stream(s));
+    ops::gated_rmsnorm(rows, p.norm, gates, gate_kind, config_.rms_norm_eps, normed,
+                       device_.execution_view().on_stream(s));
     Tensor y = work_.alloc(DType::BF16, {H, T});
     project(normed.view({VW, T}), p.output, y, work_, s, dense_routes(), fast_.column_invariant);
     return y;

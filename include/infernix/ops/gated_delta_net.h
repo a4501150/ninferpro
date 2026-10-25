@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "infernix/ops/gated_rmsnorm.h"
 #include "infernix/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
@@ -113,6 +114,24 @@ void gated_delta_net_batch_update_gating(const Tensor& q, const Tensor& k, const
                                          const Tensor& b, const Tensor& A_log, const Tensor& dt_bias, float scale,
                                          bool normalize_qk, Tensor& ssm_states, const Tensor& source_state_slots,
                                          const Tensor& destination_state_slots, Tensor& out, cudaStream_t stream);
+
+/// Whether gated_delta_net_decode_chain serves this geometry: 128-wide heads, a 4-tap convolution
+/// and at most eight value heads per key head.
+[[nodiscard]] bool gated_delta_net_decode_chain_supports(std::int32_t qk_heads, std::int32_t value_heads,
+                                                         std::int32_t conv_taps, std::int32_t head_dim);
+
+/**
+ * A GDN layer's decode middle in one launch, with the bits of the three calls it replaces:
+ * causal_conv1d_silu_snapshot_split(qkv, conv_weight, conv_states, {}, slots, slots, q, k, v),
+ * gated_delta_net_batch_update_gating(q, k, v, a, b, A_log, dt_bias, scale, true, ssm_states, slots,
+ * slots, o) and gated_rmsnorm(o, norm_weight, z, gate, eps, out). qkv: BF16 [C, B] (q | k | v
+ * channels); a, b: BF16 [Hv, B]; z, out: BF16 [128, Hv * B]. Both states update in place at
+ * `slots`. q, k, v and o are not materialized.
+ */
+void gated_delta_net_decode_chain(const Tensor& qkv, const Tensor& conv_weight, Tensor& conv_states, const Tensor& a,
+                                  const Tensor& b, const Tensor& A_log, const Tensor& dt_bias, float scale,
+                                  Tensor& ssm_states, const Tensor& slots, const Tensor& norm_weight, const Tensor& z,
+                                  RmsGate gate, float eps, std::int32_t qk_heads, Tensor& out, cudaStream_t stream);
 
 /**
  * Op: gated_delta_net_replay_record
