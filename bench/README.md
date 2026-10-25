@@ -81,6 +81,18 @@ commit device times, the logits and lane-state hashes, and with `--sections` eac
 own graph. `make t1`, `make t1-exact`, `make t1-kernels` and `make t1-record` drive it (AGENTS.md
 "Iteration tiers"); the source header lists every option.
 
+`--profile` brackets the timed replays with `cudaProfilerStart`/`Stop`, so Nsight Compute can profile
+the decode kernels inside the round's graph:
+`ncu --profile-from-start off --replay-mode application --clock-control none --cache-control none
+-k 'regex:^name$' --launch-skip N ... infernix_qwen4_exp_round_bench ... --shape 1x1 --replays 1
+--determinism 1 --profile`. Keep the clock and cache options: with Nsight Compute's defaults (base
+clocks, L2 flushed before every kernel) the A16 gate/up rows kernel showed 53 % of DRAM bandwidth,
+against about 75 % in the round. Nsight Compute also runs kernels one at a time, so a programmatic
+dependent's time there leaves out its overlap with the kernel before it; `make t1-kernels` gives the
+in-graph view. Round times of one build differ by up to about 0.5 % between runs (1 x 1: 5,117 and
+5,140 us on 2026-10-25), so compare builds in alternating runs of one session before reading a
+difference below 1 %.
+
 `infernix_qwen4_exp_engine_bench` (`make t2-bench`) runs the public Engine in process with
 production's options and `bench_infernix.py`'s concurrent phase: C requests at once (default 6) of N
 output tokens (default 256), one warm-up set and `--repeat` sets, each reported as aggregate tok/s
