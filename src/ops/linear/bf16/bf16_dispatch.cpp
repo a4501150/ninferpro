@@ -10,6 +10,7 @@ struct ShapeEntry {
     std::int32_t n, k;
     Bf16Launch (*select)(std::int32_t);
     Bf16Launch (*invariant)(std::int32_t) = nullptr; // A16ColumnInvariant, or null where none is registered
+    Bf16Launch (*index_mma)(std::int32_t) = nullptr; // LinearRoutes::Bf16IndexMma, or null
 };
 
 constexpr std::array kShapes{
@@ -17,7 +18,7 @@ constexpr std::array kShapes{
     ShapeEntry{5120, 6144, select_bf16_n5120_k6144},
     ShapeEntry{48, 2560, select_bf16_n48_k2560},
     ShapeEntry{96, 2560, select_bf16_n96_k2560, select_bf16_n96_k2560_invariant},
-    ShapeEntry{640, 2560, select_bf16_n640_k2560, select_bf16_n640_k2560_invariant},
+    ShapeEntry{640, 2560, select_bf16_n640_k2560, select_bf16_n640_k2560_invariant, select_bf16_n640_k2560_index_mma},
     ShapeEntry{1664, 2560, select_bf16_n1664_k2560},
     ShapeEntry{324, 10240, select_bf16_n324_k10240},
     ShapeEntry{320, 10240, select_bf16_n320_k10240},
@@ -42,17 +43,20 @@ constexpr std::array kShapes{
 };
 } // namespace
 
-Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearRoutes routes) {
     if (t <= 0) throw std::invalid_argument("bf16 linear: T must be positive");
     for (const auto& entry : kShapes) {
-        if (entry.n == n && entry.k == k) return entry.select(t);
+        if (entry.n != n || entry.k != k) continue;
+        if (has_route(routes, LinearRoutes::Bf16IndexMma) && entry.index_mma != nullptr) return entry.index_mma(t);
+        return entry.select(t);
     }
     // Shapes without a specialised kernel (for example a full-precision vocab head) fall back to the
     // general runtime-shape GEMM.
     return select_bf16_general_launch(t);
 }
 
-Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
+Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy,
+                              LinearRoutes routes) {
     if (!valid_linear_policy(policy)) throw std::invalid_argument("bf16 linear: unsupported policy");
     if (column_invariant(policy)) {
         if (t <= 0) throw std::invalid_argument("bf16 linear: T must be positive");
@@ -61,7 +65,7 @@ Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, Li
         }
         throw std::invalid_argument("bf16 linear: no column-invariant route for this problem");
     }
-    return select_bf16_a16_launch(n, k, t);
+    return select_bf16_a16_launch(n, k, t, routes);
 }
 
 bool bf16_column_invariant_supported(std::int32_t n, std::int32_t k) noexcept {
@@ -70,7 +74,7 @@ bool bf16_column_invariant_supported(std::int32_t n, std::int32_t k) noexcept {
 }
 
 void bf16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
-                   cudaStream_t stream) {
-    select_bf16_launch(weight.n, weight.k, x.ne[1], policy)(x, weight, out, stream);
+                   LinearRoutes routes, cudaStream_t stream) {
+    select_bf16_launch(weight.n, weight.k, x.ne[1], policy, routes)(x, weight, out, stream);
 }
 } // namespace infernix::ops::detail

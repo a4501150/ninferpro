@@ -725,7 +725,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
             Tensor* parts[]       = {&qf, &gate, &kf, &vf};
             Tensor* index_parts[] = {&iqf, &ik};
             project_rows(x, p.projection, parts, work_, s, dense_routes(), fast_.column_invariant);
-            project_rows(x, *p.index_projection, index_parts, work_, s, ops::LinearRoutes::Exact,
+            project_rows(x, *p.index_projection, index_parts, work_, s, dense_routes(),
                          fast_.column_invariant);
         } else {
             Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};

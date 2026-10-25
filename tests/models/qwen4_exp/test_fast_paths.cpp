@@ -162,6 +162,19 @@ int main() {
     }
     failures += check(!q::fast_path_applies(FastPath::HcSlicedK, dense8, options),
                       "hc-sliced-k does not apply to Dense8 (q8-sliced-k's configuration)");
+    // bf16-index-mma tiles recipe C's BF16 QSA index projection by its call's width.
+    {
+        const q::FastPathConfiguration recipe_c{DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256};
+        failures += check(q::fast_path_applies(FastPath::Bf16IndexMma, recipe_c, options) &&
+                              !q::fast_path_applies(FastPath::Bf16IndexMma, dense8, options),
+                          "bf16-index-mma applies to recipe C only");
+        const q::FastPathSelection mma{.configuration = recipe_c, .paths = {FastPath::Bf16IndexMma}};
+        failures += check(mma.forward().dense_routes == infernix::ops::LinearRoutes::Bf16IndexMma &&
+                              !mma.request_invariant(),
+                          "bf16-index-mma sets its route and couples a column to its call's width");
+        failures += check(q::fast_path_qualified(FastPath::Bf16IndexMma, recipe_c),
+                          "bf16-index-mma is qualified on recipe C with FP8 KV");
+    }
 
     q::FastPathSelection selection{.configuration = dense8, .paths = {}};
     const auto exact = selection.forward();

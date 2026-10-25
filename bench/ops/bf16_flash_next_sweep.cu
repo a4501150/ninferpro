@@ -154,6 +154,7 @@ struct Shape {
 constexpr Shape kShapes[] = {
     {"qkvg", 13952, 2560, 8192},    // QSA query, gate, key, value and index projections (both recipes)
     {"gdnab", 96, 2560, 8192},      // GDN a/b projections (both recipes)
+    {"qsaidx", 640, 2560, 16384},   // QSA index projection (both recipes)
     {"gdnqkvz", 16384, 2560, 8192}, // GDN query, key, value and z
     {"out6144", 2560, 6144, 8192},  // GDN output and QSA output projections
     {"plekv", 12800, 2560, 8192},   // PLE key and value projections

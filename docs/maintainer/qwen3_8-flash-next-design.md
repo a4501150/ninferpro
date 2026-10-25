@@ -3658,19 +3658,21 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   +3.2 / +3.2 %, pp16384 +3.1 / +3.3 %, pp32768 +3.1 / +3.3 %, pp512 +2.4 / +2.0 %. T1 6 x 8 (48
   columns, past the GDN pair admission) 37.01 / 37.03 -> 36.85 / 36.85 ms; narrower rounds unchanged.
   The exact route keeps its split copies.
-- **The general BF16 GEMM in 64 x 64 tiles (2026-10-24, RTX PRO 6000, this fork).** Recipe C's BF16
-  QSA indexer projection [640, 2560] has no tuned BF16 route: from 65 columns it ran
-  `bf16_general_gemm_kernel` (32 x 32 tiles, 2 x 2 outputs per thread, operands widened per FMA), 3.9 ms
-  per 16K-token call, 13.6 TFLOP/s, 3.3 % of prefill. The general GEMM now runs 64 x 64 tiles with 4 x 4
-  outputs per thread, BF16 operands multiplied by `fma.rn.f32.bf16` and K slices staged as k-pair
-  words; every output is still one fmaf chain over k = 0..K-1 from zero with K padded to 32, so the
-  bits are unchanged (output hashes equal the previous build's at nine shapes, K 40 and 72 among them,
-  and the QAT BF16 vocabulary head [248320, 5120]); calls with K % 8 != 0 keep the old kernel. Per call:
-  [640, 2560] 227-384 -> 74-84 us from 65 to 1,024 columns, 1,065 -> 266 us at 4,096, 3,858 -> 905 at
-  16,384; [248320, 5120] at 65 columns 17.7 -> 7.3 ms. 128 x 128 tiles of 8 x 8 were as fast or slower
-  everywhere. T1, T1-exact and T2 unchanged (decode rounds up to 64 columns run the skinny kernel).
-  Prefill (`infernix_bench`, FP8 KV, base/new/new/base twice): pp4096 +2.7 / +2.9 %, pp16384 +2.6 /
-  +2.8 %, pp32768 +2.4 / +2.7 %, pp512 +2.7 / +2.1 %.
+- **QSA index projection on tensor cores (`bf16-index-mma`, 2026-10-25, RTX PRO 6000, this fork).**
+  Recipe C's BF16 QSA indexer projection [640, 2560] has no tuned exact route: the exact route of
+  the construction-exact configurations takes its column-invariant sliced-K route, and every other
+  route ran the runtime-shape GEMM (`bf16_general_gemm_kernel`, an FP32 FMA chain per output on the
+  CUDA cores), which the fast route reached because it turns column invariance off. Under the
+  `bf16-index-mma` fast path (`LinearRoutes::Bf16IndexMma`, `select_bf16_n640_k2560_index_mma`)
+  calls of 9 or more columns run the BF16 tensor-core tiles the other BF16 shapes use (sweep
+  `infernix_bf16_flash_next_sweep --shape qsaidx`): 8 against 33-74 us at 32-65 columns, 18 against
+  84 us at 1,024, 178 against 926 us at 16,384 (the 926 us is a 64 x 64-tile version of the
+  runtime-shape GEMM, since removed; the 32 x 32 kernel took 3,858 us). It is qualified on recipe C
+  with FP8 KV (model-quality.md 6.7). T1 (FP8 KV): 6 x 6 -1.1 %, 8 x 8 -1.5 %, 6 x 2 -0.5 %;
+  prefill pp512 +1.0 %, pp2048 +0.6 %, pp16384 +0.6 %. The exact route's bits are unchanged
+  (`t1-exact`, T2); the fast T1 hashes are re-recorded. A 64 x 64-tile CUDA-core version of the runtime-shape GEMM (2026-10-24)
+  was removed with it: once the served route left the runtime-shape GEMM, it only sped up exact
+  routes this fork does not serve, beside the 32 x 32 kernel that K % 8 != 0 still needed.
 - **Two-term x formed once per token (2026-10-24, RTX PRO 6000, this fork).** The wide route's
   `quantize_x_terms_kernel` formed each wide entry's two-term A4 x from its token's row, so a token's
   terms were computed once per routed expert (ten times at top-10): 654 us per layer at 16K tokens.

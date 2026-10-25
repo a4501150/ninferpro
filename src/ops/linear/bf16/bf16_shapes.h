@@ -35,6 +35,7 @@ namespace infernix::ops::detail {
 // A16ColumnInvariant routes (one reduction for every T).
 [[nodiscard]] Bf16Launch select_bf16_n96_k2560_invariant(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n640_k2560_invariant(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n640_k2560_index_mma(std::int32_t tokens);
 
 
 // Runtime-shape GEMM fallback for any (n, k) the table above does not specialise.

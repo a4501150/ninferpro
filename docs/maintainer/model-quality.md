@@ -765,7 +765,7 @@ experts' 4-bit activations cost; pass `--ngram-volume` to the gate when the volu
 every position, and the RAM and SSD expert tiers give the same output. Its qualified paths are
 the three request-coupling paths (every configuration), sampled MTP drafts, the three
 Q8 dense-kernel paths (Dense8), FP16 GDN (IQ3_S and FP8) and recipe C's expert, FP8 pair,
-compensated GDN and hyper-connection sliced-K paths (6.7).
+compensated GDN, hyper-connection sliced-K and index-projection paths (6.7).
 
 ### 6.6 Calibration and comparison with other engines
 
@@ -895,6 +895,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | Qwen3.8-Flash-Next: `gdn-compensated` | GDN calls of 16+ tokens in the construction-exact configurations (recipe C with BF16, INT8 or FP8 KV) | recipe C with INT8 or FP8 KV (BF16 KV is the reference's own exact route, not gated; 6.8) |
 | Qwen3.8-Flash-Next: `hc-sliced-k` | the Q8 hyper-connection mix ([324, 10240], [320, 10240]) of recipe C at 29-2,048 columns | recipe C with FP8 KV (INT8 fails its decode tail, below; other formats not gated) |
+| Qwen3.8-Flash-Next: `bf16-index-mma` | the BF16 QSA index projection ([640, 2560]) of recipe C at 9 or more columns | recipe C with FP8 KV (other formats not gated) |
 | `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B and FP8, every format; IQ3_S, every format but BF16 (fails there, under `ggml-bf16-prefill`); not the 35B-A3B or Dense8 (no gain beyond spread, below) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
@@ -2022,6 +2023,26 @@ base/new/new/base): 6 x 6 30.89 / 30.97 -> 30.14 / 30.15 ms, 6 x 8 35.92 / 36.01
 unchanged (1 x 4 to 6 x 3 within 0.3 %). Prefill (`infernix_bench`, FP8 KV): pp256 4,632 / 4,634 ->
 5,468 / 5,344 tok/s, pp512 7,142 / 7,144 -> 7,703 / 7,832, pp1024 9,563 / 9,438 -> 9,754 / 9,756,
 pp2048 12,296 / 12,203 -> 12,242 / 12,270 (no gain at 2,048).
+
+**`bf16-index-mma`: the QSA index projection on BF16 tensor cores (2026-10-25).** Recipe C's BF16
+[640, 2560] index projection ran the runtime-shape GEMM (an FP32 FMA chain per output on the CUDA
+cores) on every route but the construction-exact exact route's column-invariant one. Under
+`LinearRoutes::Bf16IndexMma` calls of 9 or more columns run the BF16 tensor-core tiles (sliced-K up
+to 128 columns, TMA tiles beyond), whose tile and K order depend on the call's width (a
+request-coupling path). The Op meets the A16 criterion at each seam (`infernix_linear_bf16_a16_test`).
+Joint gates with recipe C's qualified paths, `hc-sliced-k` among them, by that path's protocol and
+against the same exact runs:
+
+| Gate | KV | TV excess (bound) | Top-1 excess (bound) | KL excess (bound) | NLL excess | p99.9 KL ratio |
+|---|---|---:|---:|---:|---:|---:|
+| decode, 256 segments | FP8 | 1.4e-3 (1.8e-3) | 1.6e-3 (4.2e-3) | 5.7e-4 (9.1e-4) | -2.2e-3 | 0.98 |
+| prefill, quick corpus | FP8 | — | 1.1e-3 (1.6e-3) | 5.8e-4 (6.8e-4) | -2.5e-4 | 1.03 |
+
+Against the fast route without it (prefill), KL moves by -1.8e-5 (bound 2.7e-5). Timing: the
+projection 8 against 33-74 us at 32-65 columns and 178 against 926 us at 16,384; T1 (FP8 KV,
+base/new/new/base) 6 x 6 30.18 / 30.14 -> 29.89 / 29.80 ms, 8 x 8 39.22 / 39.15 -> 38.58 / 38.59;
+prefill (`infernix_bench`) pp512 +1.0 %, pp2048 +0.6 %, pp16384 +0.6 % (the two pairs -0.0 and
++1.5 %). INT8 and the other formats were not gated.
 
 **Prefill head gather-before-mix (2026-10-23).** `Forward::finish` mixed the residual over the
 call's full width before gathering the logit columns, so the LM head's arithmetic depended on the

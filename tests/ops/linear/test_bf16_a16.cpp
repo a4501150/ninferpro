@@ -662,6 +662,21 @@ int run_bf16_invariant_route() {
     return failures;
 }
 
+// bf16-index-mma (LinearRoutes::Bf16IndexMma): the index projection's tensor-core tiles meet the A16
+// criterion at each seam of their table; the flag leaves the invariant route and other shapes alone.
+int run_bf16_index_mma_route() {
+    using namespace infernix::test::linear;
+    std::vector<Invocation> calls;
+    for (int t : {1, 8, 9, 64, 128, 129, 256, 257, 1024, 1025, 2048, 2049, 4096})
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Bf16IndexMma});
+    for (int t : {9, 129})
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true, ops::LinearRoutes::Bf16IndexMma});
+    for (int t : {9, 1025})
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16ColumnInvariant, false, ops::LinearRoutes::Bf16IndexMma});
+    return run_shape("BF16_A16 index-mma", ActivationCompute::A16, make_bf16_weight,
+                     {640, 2560, 640 + 2560 + 911, Comparison::Full, true, calls});
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -680,7 +695,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("usage: infernix_linear_bf16_a16_test [--shape N K]");
         }
         const int failures =
-            (n == 0 ? run_bf16_linear() + run_bf16_invariant_route() : 0) + run_new_bf16(n, k);
+            (n == 0 ? run_bf16_linear() + run_bf16_invariant_route() + run_bf16_index_mma_route() : 0) + run_new_bf16(n, k);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

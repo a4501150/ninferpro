@@ -94,7 +94,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q8_dispatch(x, w, out, policy, routes, stream);
         return;
     case QType::BF16:
-        detail::bf16_dispatch(x, w, out, policy, stream);
+        detail::bf16_dispatch(x, w, out, policy, routes, stream);
         return;
     case QType::NVFP4:
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);

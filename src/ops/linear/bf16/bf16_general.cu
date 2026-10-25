@@ -44,16 +44,6 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     const std::int32_t N = weight.n;
     const std::int32_t K = weight.k;
     const std::int32_t T = x.ne[1];
-    if (K % 8 == 0 && reinterpret_cast<std::uintptr_t>(weight.qdata) % 16 == 0 &&
-        reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0) {
-        constexpr int kTile = 64, kThread = 4;
-        const dim3 tiles(static_cast<unsigned>((N + kTile - 1) / kTile), static_cast<unsigned>((T + kTile - 1) / kTile));
-        bf16_general_tiled_kernel<kTile, kTile, kThread, kThread><<<tiles, kTiledThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
-            static_cast<__nv_bfloat16*>(out.data), N, K, T);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
     const dim3 grid(static_cast<unsigned>((N + kTileN - 1) / kTileN),
                     static_cast<unsigned>((T + kTileT - 1) / kTileT));
     bf16_general_gemm_kernel<<<grid, kThreads, 0, stream>>>(

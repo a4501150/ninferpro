@@ -62,6 +62,9 @@ enum class LinearRoutes : std::uint8_t {
     /// hc-sliced-k: Q8 [324,10240] and [320,10240] (Qwen3.8-Flash-Next's hyper-connection mix) on
     /// sliced-K routes at 6-2048 columns instead of the exact MMA tiles.
     Q8HcSlicedK = 32,
+    /// bf16-index-mma: BF16 [640,2560] (Qwen3.8-Flash-Next's QSA index projection) on the BF16
+    /// tensor-core tiles from 9 columns instead of the runtime-shape GEMM.
+    Bf16IndexMma = 64,
 };
 
 [[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
@@ -73,7 +76,7 @@ enum class LinearRoutes : std::uint8_t {
 }
 
 [[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
-    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{63}) == 0;
+    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{127}) == 0;
 }
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
@@ -189,7 +192,8 @@ enum class LinearRoutes : std::uint8_t {
  * and [2560,640] at T >= 17, unless a single-term A8 route is selected, carry each activation column
  * as two E4M3 terms with their own scales on the 8-bit Tensor Core path. Under
  * LinearRoutes::Q8HcSlicedK, Q8 [324,10240] and [320,10240] at 6 <= T <= 2048 run sliced-K routes
- * whose K split depends on T. Every other problem runs its
+ * whose K split depends on T. Under LinearRoutes::Bf16IndexMma, BF16 [640,2560] at T >= 9 runs the
+ * BF16 tensor-core tiles, whose tile and K order depend on T. Every other problem runs its
  * exact route under a flag it does not register. Under A16ColumnInvariant every flag is ignored:
  * the column-invariant route is the exact route's. Every route meets the A16 criterion; the
  * workspace query covers the two-term route's scratch.

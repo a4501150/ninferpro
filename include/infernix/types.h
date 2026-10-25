@@ -168,9 +168,14 @@ enum class FastPath : std::uint8_t {
     // whose K split depends on the call's width, instead of the exact MMA tiles. A column's bits then
     // depend on its call's width. Without it the mix stays on the exact tiles.
     HcSlicedK,
+    // Qwen3.8-Flash-Next with FP8 dense kernels: the BF16 QSA index projection ([640,2560]) of calls
+    // of 9 or more columns runs the BF16 tensor-core tiles (ops::LinearRoutes::Bf16IndexMma) instead
+    // of the runtime-shape GEMM's FP32 chain. A column's bits then depend on its call's width.
+    // Without it the projection keeps the runtime-shape GEMM.
+    Bf16IndexMma,
 };
 
-inline constexpr std::array<FastPath, 24> kFastPaths{
+inline constexpr std::array<FastPath, 25> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -183,7 +188,7 @@ inline constexpr std::array<FastPath, 24> kFastPaths{
     FastPath::AdaptiveMtp,         FastPath::FreeCacheResume,
     FastPath::Preemption,          FastPath::IdleWidePrefill,
     FastPath::GgmlBf16Prefill,     FastPath::GdnCompensated,
-    FastPath::HcSlicedK};
+    FastPath::HcSlicedK,           FastPath::Bf16IndexMma};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -211,6 +216,7 @@ inline constexpr std::array<FastPath, 24> kFastPaths{
     case FastPath::GgmlBf16Prefill: return "ggml-bf16-prefill";
     case FastPath::GdnCompensated: return "gdn-compensated";
     case FastPath::HcSlicedK: return "hc-sliced-k";
+    case FastPath::Bf16IndexMma: return "bf16-index-mma";
     }
     return "unknown";
 }
