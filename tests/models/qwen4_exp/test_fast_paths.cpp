@@ -175,6 +175,12 @@ int main() {
         failures += check(q::fast_path_qualified(FastPath::Bf16IndexMma, recipe_c),
                           "bf16-index-mma is qualified on recipe C with FP8 KV");
     }
+    // qsa-prepare-fused is qualified on recipe C with FP8 KV, the one format its gate ran there.
+    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256}) {
+        const q::FastPathConfiguration recipe_c{DenseKernels::Fp8Row, false, kv};
+        failures += check(q::fast_path_qualified(FastPath::QsaPrepareFused, recipe_c) == (kv == KvCacheStorage::Fp8E4M3Row256),
+                          "qsa-prepare-fused is qualified on recipe C with FP8 KV only");
+    }
 
     q::FastPathSelection selection{.configuration = dense8, .paths = {}};
     const auto exact = selection.forward();

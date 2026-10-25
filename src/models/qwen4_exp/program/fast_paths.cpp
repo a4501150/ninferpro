@@ -329,6 +329,11 @@ constexpr std::array kQualified{
     // 1.8e-3), top-1 1.6e-3 (bound 4.2e-3), p99.9 0.98. Prefill: FP8 KL 5.8e-4 (bound 6.8e-4),
     // top-1 1.1e-3, corpus NLL -2.5e-4. Timed: T1 8 x 8 -1.5 %, the projection 4-7x faster.
     Qualification{FastPath::Bf16IndexMma, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    // Recipe C: the fused QSA prepare, jointly with the qualified paths against the construction-exact
+    // reference (2026-10-25), the hc-sliced-k gate's protocol. Decode, 256 segments: FP8 TV 1.1e-3
+    // (bound 1.5e-3), top-1 -3.1e-4 (bound 2.4e-3), p99.9 0.93. Prefill: FP8 KL 5.8e-4 (bound
+    // 6.6e-4), top-1 9.8e-4 (bound 1.5e-3), corpus NLL -6.2e-5. Timed: T1 1 x 1 -1.3 %, 6 x 2 -1.0 %.
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
 };
 
 const char* dense_name(DenseKernels dense) {

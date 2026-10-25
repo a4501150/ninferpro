@@ -885,7 +885,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A and recipe C, every format (recipe C since 2026-10-23, the TMA proxy fence closing its exact-route defect; below) |
-| Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
+| Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: every dense format, with BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves; also recipe C with FP8 KV, below) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail, BF16 its prefill; below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B and 35B-A3B, every format |
@@ -2043,6 +2043,19 @@ projection 8 against 33-74 us at 32-65 columns and 178 against 926 us at 16,384;
 base/new/new/base) 6 x 6 30.18 / 30.14 -> 29.89 / 29.80 ms, 8 x 8 39.22 / 39.15 -> 38.58 / 38.59;
 prefill (`infernix_bench`) pp512 +1.0 %, pp2048 +0.6 %, pp16384 +0.6 % (the two pairs -0.0 and
 +1.5 %). INT8 and the other formats were not gated.
+
+**`qsa-prepare-fused` on recipe C (2026-10-25).** The fused QSA prepare (norms, rotations, K/V
+and index-key appends in one kernel) was qualified on Dense8 only; recipe C ran the composed
+prepare. Joint gates with recipe C's qualified paths (`hc-sliced-k` and `bf16-index-mma` among
+them), by the `hc-sliced-k` protocol and against the same exact runs:
+
+| Gate | KV | TV excess (bound) | Top-1 excess (bound) | KL excess (bound) | NLL excess | p99.9 KL ratio |
+|---|---|---:|---:|---:|---:|---:|
+| decode, 256 segments | FP8 | 1.1e-3 (1.5e-3) | -3.1e-4 (2.4e-3) | 3.0e-4 (6.4e-4) | 9.0e-4 | 0.93 |
+| prefill, quick corpus | FP8 | — | 9.8e-4 (1.5e-3) | 5.8e-4 (6.6e-4) | -6.2e-5 | 1.04 |
+
+Timing (T1, FP8 KV, against the fast route without it): 1 x 1 -1.3 %, 6 x 1 -0.8 %, 6 x 2 -1.0 %,
+1 x 8 -0.2 %. INT8 and the other formats were not gated on recipe C.
 
 **Prefill head gather-before-mix (2026-10-23).** `Forward::finish` mixed the residual over the
 call's full width before gathering the logit columns, so the LM head's arithmetic depended on the
