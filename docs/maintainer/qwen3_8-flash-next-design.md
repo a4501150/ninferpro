@@ -3684,8 +3684,8 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   layers): gate/up's first wave keeps DRAM busy to about 7.5 us, the second wave and the down CTAs
   start only as first-wave CTAs finish their math, and the down CTAs, which issue their weight loads
   only once resident, finish 3 to 5 us after gate/up's last CTA. Two bit-identical fixes did not pay:
-  down CTAs waiting on their own job's gate/up row groups (branch `exp/moe-job-ready`; 1 x 1
-  unchanged, 6 x 2 +0.9 %, 6 x 3 +1.7 %) and an L2 prefetch of the down weights from gate/up (+1.5 to
+  down CTAs waiting on their own job's gate/up row groups (branch `exp/moe-job-ready`; 1 x 1 0 to
+  +0.4 % across baseline runs, 6 x 1 +0.7 %, 6 x 2 +0.9 %, 6 x 3 +1.7 %) and an L2 prefetch of the down weights from gate/up (+1.5 to
   +2.5 %, it delays gate/up's first wave by the bytes it moves earlier).
 - **QSA index projection on tensor cores (`bf16-index-mma`, 2026-10-25, RTX PRO 6000, this fork).**
   Recipe C's BF16 QSA indexer projection [640, 2560] has no tuned exact route: the exact route of
