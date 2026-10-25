@@ -556,7 +556,7 @@ constexpr int kDispatchThreads = 1024;
 // scan order gives the same values.
 __device__ __forceinline__ int dispatch_scan(int c, int experts, std::int32_t* __restrict__ offsets,
                                               std::int32_t* cursor, std::int32_t* __restrict__ jobs,
-                                              std::int32_t* __restrict__ job_count,
+                                              std::int32_t* __restrict__ job_count, std::int32_t* __restrict__ ready,
                                               std::int32_t (&warp_totals)[2][kDispatchThreads / 32]) {
     const int e = threadIdx.x, lane = e % 32, warp = e / 32;
     int sum = c, used = c > 0 ? 1 : 0;
@@ -596,7 +596,10 @@ __device__ __forceinline__ int dispatch_scan(int c, int experts, std::int32_t* _
     if (e < experts) {
         offsets[e] = sum - c;
         cursor[e]  = sum - c;
-        if (c > 0) { jobs[used - 1] = e; }
+        if (c > 0) {
+            jobs[used - 1]  = e;
+            ready[used - 1] = 0;
+        }
     }
     if (e == experts - 1) {
         offsets[experts] = sum;
@@ -624,7 +627,8 @@ __device__ __forceinline__ int dispatch_small(int id, int entries, int experts, 
     __syncthreads();
     const int c = count[i];
     if (i < experts) { dispatch.counts[i] = c; }
-    const int job = dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
+    const int job = dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, dispatch.ready,
+                                  warp_totals);
     __syncthreads();
     if (i < entries) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
     return job;
@@ -683,10 +687,10 @@ __global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries,
 __global__ void __launch_bounds__(kDispatchThreads)
     scan_kernel(const std::int32_t* __restrict__ counts, int experts, std::int32_t* __restrict__ offsets,
                 std::int32_t* __restrict__ cursor, std::int32_t* __restrict__ jobs,
-                std::int32_t* __restrict__ job_count) {
+                std::int32_t* __restrict__ job_count, std::int32_t* __restrict__ ready) {
     __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
     const int e = threadIdx.x;
-    (void)dispatch_scan(e < experts ? counts[e] : 0, experts, offsets, cursor, jobs, job_count, warp_totals);
+    (void)dispatch_scan(e < experts ? counts[e] : 0, experts, offsets, cursor, jobs, job_count, ready, warp_totals);
 }
 
 __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries,
@@ -1278,6 +1282,12 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
                 canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
         }
     }
+    // Publish the row group's h: the job's down CTAs start once all kGateUpRowGroups have.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicAdd(&dispatch.ready[job], 1);
+    }
 }
 
 // The down pass's column encode: encode_a16_columns' exponent and blocks for one h row of
@@ -1290,7 +1300,7 @@ __device__ __forceinline__ void encode_a16_h(const std::uint16_t* column, A16Act
     const int t = static_cast<int>(threadIdx.x), lane = t % 32, warp = t / 32;
     unsigned words[4] = {};
     if (t < kVectors) {
-        const uint4 v = reinterpret_cast<const uint4*>(column)[t];
+        const uint4 v = __ldcg(reinterpret_cast<const uint4*>(column) + t);
         words[0] = v.x;
         words[1] = v.y;
         words[2] = v.z;
@@ -1339,9 +1349,19 @@ struct DownRowShared16 {
     unsigned key[kWarps][1];
 };
 
+__device__ __forceinline__ int ld_acquire(const std::int32_t* address) {
+    int value;
+    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(value) : "l"(address) : "memory");
+    return value;
+}
+
 // One CTA per (4 down row groups, job): warps 2r and 2r + 1 take row group 4 * tile + r, blocks
-// 0..19 and 20..39. A programmatic dependent of the gate/up pass under down_kernel's contract: the
-// weights are read before the wait, h_plane only after it, and every CTA waits.
+// 0..19 and 20..39. A programmatic dependent of the gate/up pass that reads its weights at once and
+// its job's h once that job's gate/up row groups have published it (dispatch.ready), not when the
+// whole gate/up grid has completed: a job whose row groups ran in gate/up's first wave is done
+// before the second wave ends. The job's last CTA clears its count for the next pass on the same
+// dispatch. Every CTA still waits for the grid before it exits, so completion of this grid implies
+// completion of the gate/up pass.
 __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
     down_rows_kernel_a16(MoeDispatch dispatch, MoeExpertSource source, int hidden,
                          const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
@@ -1371,8 +1391,15 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
         load_warp_units(record + moe::kGateUpBytes + static_cast<std::size_t>(group) * moe::kDownBlocks * moe::kUnitBytes,
                         base, 1, w);
     }
-    pdl::wait_for_dependencies();
-    if (record == nullptr) { return; }
+    if (record == nullptr) {
+        pdl::wait_for_dependencies();
+        return;
+    }
+    // The low 16 bits count the job's gate/up row groups; each down CTA adds 1 << 16 once past this wait.
+    constexpr int kDone = 1 << 16;
+    if (threadIdx.x == 0) {
+        while ((ld_acquire(&dispatch.ready[job]) & (kDone - 1)) < static_cast<int>(moe::kGateUpRowGroups)) { __nanosleep(64); }
+    }
     for (int c = 0; c < count; ++c) {
         __syncthreads();
         encode_a16_h(h_plane + static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements, sm.acts, sm.emax,
@@ -1392,6 +1419,11 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
                 canon::a16_row_output(total, sm.emax[0], scales.alpha_down);
         }
     }
+    if (threadIdx.x == 0 &&
+        atomicAdd(&dispatch.ready[job], kDone) == static_cast<int>(moe::kGateUpRowGroups) + (kDownCtas - 1) * kDone) {
+        dispatch.ready[job] = 0;
+    }
+    pdl::wait_for_dependencies();
 }
 
 void launch_expert_pass_a16_rows(const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
@@ -1958,7 +1990,7 @@ void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cu
 }
 
 std::size_t moe_dispatch_bytes(std::int32_t experts, std::int32_t entries) {
-    const std::size_t words = static_cast<std::size_t>(experts) * 4 + 1 + 1 + static_cast<std::size_t>(entries);
+    const std::size_t words = static_cast<std::size_t>(experts) * 5 + 1 + 1 + static_cast<std::size_t>(entries);
     return (words * sizeof(std::int32_t) + 255) / 256 * 256;
 }
 
@@ -1971,7 +2003,7 @@ MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t en
     out.jobs      = out.cursor + experts;
     out.job_count = out.jobs + experts;
     out.entries   = out.job_count + 1;
-    (void)entries;
+    out.ready     = out.entries + entries;
     return out;
 }
 
@@ -1992,7 +2024,7 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
                                                                                 route_log);
     check_launch("count");
     scan_kernel<<<1, kDispatchThreads, 0, stream>>>(dispatch.counts, experts, dispatch.offsets, dispatch.cursor,
-                                                    dispatch.jobs, dispatch.job_count);
+                                                    dispatch.jobs, dispatch.job_count, dispatch.ready);
     check_launch("scan");
     scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         ids, entries, dispatch.cursor, dispatch.entries);

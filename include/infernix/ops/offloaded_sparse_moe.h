@@ -59,6 +59,7 @@ struct MoeDispatch {
     std::int32_t* entries = nullptr; // [k*T]: t * k + slot, grouped by expert
     std::int32_t* jobs    = nullptr; // [E]: experts with entries, ascending id
     std::int32_t* job_count = nullptr; // [1]
+    std::int32_t* ready   = nullptr; // [E]: per job, the A16 narrow gate/up row groups done; zeroed by the dispatch
 };
 
 [[nodiscard]] std::size_t moe_dispatch_bytes(std::int32_t experts, std::int32_t entries);
