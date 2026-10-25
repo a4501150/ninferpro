@@ -275,6 +275,37 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, co
     return bytes;
 }
 
+void hyper_connection_inject_mix(const Tensor& y, const Tensor& inject_in, Tensor& residual,
+                                 const Tensor& norm_weight, const Weight& down, const Weight& up,
+                                 LinearPolicy policy, std::int32_t streams, std::int32_t rank, float eps,
+                                 Tensor& x, Tensor* inject_out, WorkspaceArena& workspace, cudaStream_t stream,
+                                 LinearRoutes routes) {
+    const std::int32_t T = residual.ne[1], hidden = x.ne[0];
+    const bool fused = !column_invariant(policy) &&
+                       detail::hc_mix_fused_supported(down, up, norm_weight.data, hidden, streams, rank, T) &&
+                       detail::hc_mix_fused_injects(residual, norm_weight) && contiguous_2d(y, DType::BF16) &&
+                       y.ne[0] == hidden && y.ne[1] == T && reinterpret_cast<std::uintptr_t>(y.data) % 16 == 0 &&
+                       contiguous_2d(inject_in, DType::FP32) && inject_in.ne[0] == streams && inject_in.ne[1] == T;
+    if (!fused) {
+        hyper_connection_inject(y, inject_in, residual, stream);
+        hyper_connection_mix(residual, norm_weight, down, up, policy, streams, rank, eps, x, inject_out, workspace,
+                             stream, routes);
+        return;
+    }
+    require(contiguous_2d(residual, DType::BF16) && contiguous_2d(x, DType::BF16) && residual.ne[0] == streams * hidden &&
+                norm_weight.ne[0] == residual.ne[0] && down.n == rank + (inject_out != nullptr ? streams : 0),
+            "mix shapes disagree");
+    if (inject_out != nullptr) {
+        require(contiguous_2d(*inject_out, DType::FP32) && inject_out->ne[0] == streams && inject_out->ne[1] == T,
+                "mix inject output must be FP32 [S, T]");
+    }
+    require(eps > 0, "mix epsilon must be positive");
+    auto scope = workspace.scope();
+    const DeviceSpan partials = workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
+    detail::hc_mix_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject_out, partials.data, stream, &y,
+                         &inject_in);
+}
+
 void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& residual,
                              cudaStream_t stream) {
     require(contiguous_2d(y, DType::BF16) && contiguous_2d(inject, DType::FP32) &&

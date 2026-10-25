@@ -27,9 +27,15 @@ inline constexpr std::int32_t kHcMixFusedMaxColumns = 28;
 [[nodiscard]] std::size_t hc_mix_fused_workspace_bytes(std::int32_t down_rows, std::int32_t streams,
                                                        std::int32_t columns) noexcept;
 
-// K1a then K1b. `partials` holds hc_mix_fused_workspace_bytes; inject (FP32 [S, T]) may be null.
+// Whether the fused route can apply a pending inject (its K1a/K1b kernels: one column, or norm weights
+// not 16-byte aligned).
+[[nodiscard]] bool hc_mix_fused_injects(const Tensor& residual, const Tensor& norm_weight) noexcept;
+
+// K1a then K1b. `partials` holds hc_mix_fused_workspace_bytes; inject (FP32 [S, T]) may be null. With
+// pending_y, R first gains pending_inject[s] * pending_y (hyper_connection_inject's bits, R updated in
+// place); hc_mix_fused_injects must hold.
 void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& down, const Weight& up,
                   std::int32_t streams, std::int32_t rank, float eps, Tensor& x, Tensor* inject, void* partials,
-                  cudaStream_t stream);
+                  cudaStream_t stream, const Tensor* pending_y = nullptr, const Tensor* pending_inject = nullptr);
 
 } // namespace infernix::ops::detail

@@ -56,6 +56,16 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,
     std::int32_t rank, std::int32_t max_tokens);
 
+/// hyper_connection_inject(y, inject_in, residual) followed by hyper_connection_mix(residual, ...,
+/// x, inject_out), with the same bits. inject_out may be inject_in (the mix then overwrites the injects
+/// it applied) or null. The fused route's one-column kernels apply the injection inside the mix (no
+/// separate inject kernel); every other call runs the two steps.
+void hyper_connection_inject_mix(const Tensor& y, const Tensor& inject_in, Tensor& residual,
+                                 const Tensor& norm_weight, const Weight& down, const Weight& up,
+                                 LinearPolicy policy, std::int32_t streams, std::int32_t rank, float eps,
+                                 Tensor& x, Tensor* inject_out, WorkspaceArena& workspace, cudaStream_t stream,
+                                 LinearRoutes routes = LinearRoutes::Exact);
+
 /// residual[s*H+d,t] = bf16(residual[s*H+d,t] + inject[s,t] * y[d,t]). y: BF16 [H, T];
 /// inject: FP32 [S, T]; residual: BF16 [S*H, T], updated in place.
 void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& residual,

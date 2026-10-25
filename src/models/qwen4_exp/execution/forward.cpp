@@ -296,8 +296,7 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         Tensor inject = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
         Tensor xa     = mix(block.attn_hc, residual, &inject);
         Tensor y      = mixer(layer, batch, xa);
-        ops::hyper_connection_inject(y, inject, residual, s);
-        Tensor xm = mix(block.mlp_hc, residual, &inject);
+        Tensor xm     = mix(block.mlp_hc, residual, &inject, nullptr, &y);
         // The combine injects its output directly unless a tap records it.
         const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
         Tensor ym = moe(block.moe, xm, layer,
@@ -378,8 +377,7 @@ void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor
         if (block.ple) { ple(*block.ple, residual, batch); }
         Tensor xa = mix(block.attn_hc, residual, &inject);
         Tensor y  = mixer(layer, batch, xa);
-        ops::hyper_connection_inject(y, inject, residual, s);
-        (void)mix(block.mlp_hc, residual, &inject, &xm);
+        (void)mix(block.mlp_hc, residual, &inject, &xm, &y);
     } catch (const std::exception& error) {
         throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
     }
@@ -512,7 +510,8 @@ void Forward::head_logits(const Tensor& residuals, Tensor& logits) {
     text_head_logits(parameters_, final_x, logits, work_, device_.stream);
 }
 
-Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into) {
+Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into,
+                    const Tensor* pending) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
@@ -522,9 +521,17 @@ Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, 
     const bool column = fast_.column_invariant &&
                         ops::linear_column_invariant_supported(p.down.weight.qtype, p.down.weight.n, p.down.weight.k) &&
                         ops::linear_column_invariant_supported(p.up.weight.qtype, p.up.weight.n, p.up.weight.k);
-    ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight,
-                              column ? ops::LinearPolicy::A16ColumnInvariant : p.down.policy, S, rank,
-                              config_.rms_norm_eps, x, p.combine ? inject : nullptr, work_, s, dense_routes());
+    const auto policy = column ? ops::LinearPolicy::A16ColumnInvariant : p.down.policy;
+    if (pending != nullptr) {
+        // `pending` (a mixer's output) joins the residual with the injects in `inject` first.
+        Tensor updated = residual; // updated in place
+        ops::hyper_connection_inject_mix(*pending, *inject, updated, p.norm, p.down.weight, p.up.weight, policy, S,
+                                         rank, config_.rms_norm_eps, x, p.combine ? inject : nullptr, work_, s,
+                                         dense_routes());
+        return x;
+    }
+    ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, policy, S, rank, config_.rms_norm_eps, x,
+                              p.combine ? inject : nullptr, work_, s, dense_routes());
     return x;
 }
 
@@ -1161,10 +1168,9 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
                                            .width        = call.width};
         Tensor y = attention(p.attention, xa, attention_call);
         if (call.kv_only) { return; }
-        ops::hyper_connection_inject(y, inject, residual, s);
 
         // MoE over the device-resident experts, with the shared expert.
-        Tensor xm = mix(p.mlp_hc, residual, &inject);
+        Tensor xm = mix(p.mlp_hc, residual, &inject, nullptr, &y);
         const auto& m        = config_.moe;
         const std::int32_t E = dim(m.experts), K = dim(m.top_k), I = dim(m.intermediate);
         Tensor logits = work_.alloc(DType::FP32, {E + 1, T});

@@ -113,10 +113,32 @@ struct Bf16Codec {
     }
 };
 
+// R + inject[s] * y for 8 consecutive features (hyper_connection_inject's expression and rounding).
+__device__ __forceinline__ uint4 inject8(uint4 r, uint4 y, float a) {
+    unsigned words[4] = {r.x, r.y, r.z, r.w};
+    const unsigned ys[4] = {y.x, y.y, y.z, y.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 rv = bf16x2_bits_to_float2(words[i]), yv = bf16x2_bits_to_float2(ys[i]);
+        const bf16 lo = __float2bfloat16_rn(rv.x + a * yv.x), hi = __float2bfloat16_rn(rv.y + a * yv.y);
+        words[i] = static_cast<unsigned>(__bfloat16_as_ushort(lo)) | (static_cast<unsigned>(__bfloat16_as_ushort(hi)) << 16);
+    }
+    return {words[0], words[1], words[2], words[3]};
+}
+
+// A pending inject (hyper_connection_inject_mix): R gains inject[s] * y before the mix. K1a applies it to
+// the slice it reads (every CTA from the unchanged R) and saves the injects; K1b applies it to the
+// features it owns and writes R back.
+struct PendingInject {
+    const bf16* y;        // [H, T], null when none
+    const float* inject;  // [S, T] as hyper_connection_inject reads it
+    float* saved;         // [S][T]: K1a's copy for K1b (K1b's CTA 0 overwrites `inject`)
+};
+
 template <class Codec>
 __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
     const bf16* __restrict__ residual, const bf16* __restrict__ norm_weight, typename Codec::Params down, int rows,
-    int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out) {
+    int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out, PendingInject pending) {
     extern __shared__ __align__(16) float rn[]; // [kPassColumns][kHidden]
     __shared__ float scratch[kDownThreads / 32][kPassColumns];
     __shared__ float inv[kPassColumns];
@@ -162,6 +184,23 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
             for (int h = 0; h < kSlices; ++h) {
                 const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
                 if (c < pass && i < kHidden) { values[c][h] = load_ldg<uint4>(r + i); }
+            }
+        }
+        if (pending.y != nullptr) {
+#pragma unroll
+            for (int c = 0; c < kPassColumns; ++c) {
+                if (c >= pass) { continue; }
+                const float a = pending.inject[static_cast<std::int64_t>(c0 + c) * kStreams + s];
+                const bf16* y = pending.y + static_cast<std::int64_t>(c0 + c) * kHidden;
+#pragma unroll
+                for (int h = 0; h < kSlices; ++h) {
+                    const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
+                    if (i < kHidden) { values[c][h] = inject8(values[c][h], load_ldg<uint4>(y + i), a); }
+                }
+            }
+            if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < pass) {
+                pending.saved[static_cast<std::int64_t>(s) * columns + c0 + static_cast<int>(threadIdx.x)] =
+                    pending.inject[static_cast<std::int64_t>(c0 + static_cast<int>(threadIdx.x)) * kStreams + s];
             }
         }
         float sums[kPassColumns];
@@ -252,9 +291,9 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
 
 template <class Codec>
 __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
+    const float* __restrict__ partial, const float* __restrict__ inv_in, bf16* __restrict__ residual,
     const bf16* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
-    float* __restrict__ inject, bf16* __restrict__ x) {
+    float* __restrict__ inject, bf16* __restrict__ x, PendingInject pending) {
     __shared__ __align__(16) float m[kK1MaxColumns * kMaxRank]; // [T][rank]
     __shared__ float inv[kStreams * kK1MaxColumns];             // [S][T]
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
@@ -291,9 +330,16 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
         const int e = lane + 32 * h, t = e / kStreams, s = e - t * kStreams;
-        r_held[h]   = t < columns ? __bfloat162float(residual[static_cast<std::int64_t>(t) * width +
-                                                              static_cast<std::int64_t>(s) * kHidden + dl])
-                                  : 0.0F;
+        if (t >= columns) {
+            r_held[h] = 0.0F;
+            continue;
+        }
+        bf16& r = residual[static_cast<std::int64_t>(t) * width + static_cast<std::int64_t>(s) * kHidden + dl];
+        if (pending.y != nullptr && live) {
+            const float a = pending.saved[static_cast<std::int64_t>(s) * columns + t];
+            r = __float2bfloat16_rn(__bfloat162float(r) + a * __bfloat162float(pending.y[static_cast<std::int64_t>(t) * kHidden + d]));
+        }
+        r_held[h] = __bfloat162float(r);
     }
     // Lanes 4-7 of each quarter warp read a chunk's two float4 halves of m in the other order, so a
     // quarter warp's eight 16-byte reads cover all 32 banks.
@@ -831,7 +877,7 @@ void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename 
 template <class Codec>
 void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::Params down,
             typename Codec::Params up, int down_rows, int rank, int streams, float eps, Tensor& x, Tensor* inject,
-            void* partials, cudaStream_t stream) {
+            void* partials, PendingInject pending, cudaStream_t stream) {
     static const bool configured = [] {
         const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_kernel<Codec>,
                                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -847,6 +893,8 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     const std::size_t partial_bytes =
         (static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float) + 255) / 256 * 256;
     auto* inv = reinterpret_cast<float*>(static_cast<std::byte*>(partials) + partial_bytes);
+    const std::size_t inv_bytes = (static_cast<std::size_t>(streams) * columns * sizeof(float) + 255) / 256 * 256;
+    if (pending.y != nullptr) { pending.saved = reinterpret_cast<float*>(reinterpret_cast<std::byte*>(inv) + inv_bytes); }
     // Both kernels read their weights before pdl::enter(), so as programmatic dependents in a captured
     // graph they fetch them while the kernel before them finishes.
     // Rn for the columns of one pass only, so the up collapse fits beside a down CTA on its SM.
@@ -855,6 +903,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     // Two or more columns take v4's read scheduling (above); the v4 K1a reads the norm weights as
     // 16-byte vectors.
     const bool v4 = columns >= 2 && reinterpret_cast<std::uintptr_t>(norm_weight.data) % 16 == 0;
+    if (v4 && pending.y != nullptr) { throw std::logic_error("hyper_connection_mix: a pending inject needs K1a/K1b"); }
     if (v4) {
         // The partial workspace holds m (T x rank floats, fewer than S x down_rows x T).
         launch_down_v4<Codec>(residual, norm_weight, down, down_rows, rank, streams, eps, partial,
@@ -864,7 +913,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                                            rn_bytes, stream},
                                           hc_down_partials_kernel<Codec>, static_cast<const bf16*>(residual.data),
                                           static_cast<const bf16*>(norm_weight.data), down, down_rows, columns, eps,
-                                          partial, inv),
+                                          partial, inv, pending),
                      "down partials");
     }
     if (v4) {
@@ -890,10 +939,10 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     }
     check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpThreads), 0, stream},
                                       hc_up_collapse_kernel<Codec>, static_cast<const float*>(partial),
-                                      static_cast<const float*>(inv), static_cast<const bf16*>(residual.data),
+                                      static_cast<const float*>(inv), static_cast<bf16*>(residual.data),
                                       static_cast<const bf16*>(norm_weight.data), up, rank, down_rows, columns,
                                       inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
-                                      static_cast<bf16*>(x.data)),
+                                      static_cast<bf16*>(x.data), pending),
                  "up collapse");
 }
 
@@ -912,25 +961,33 @@ bool hc_mix_fused_supported(const Weight& down, const Weight& up, const void* no
 
 std::size_t hc_mix_fused_workspace_bytes(std::int32_t down_rows, std::int32_t streams, std::int32_t columns) noexcept {
     const auto align = [](std::size_t bytes) { return (bytes + 255) / 256 * 256; };
+    // Partials, inv and a pending inject's saved injects.
     return align(static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float)) +
-           align(static_cast<std::size_t>(streams) * columns * sizeof(float));
+           2 * align(static_cast<std::size_t>(streams) * columns * sizeof(float));
+}
+
+bool hc_mix_fused_injects(const Tensor& residual, const Tensor& norm_weight) noexcept {
+    return residual.ne[1] == 1 || reinterpret_cast<std::uintptr_t>(norm_weight.data) % 16 != 0;
 }
 
 void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& down, const Weight& up,
                   std::int32_t streams, std::int32_t rank, float eps, Tensor& x, Tensor* inject, void* partials,
-                  cudaStream_t stream) {
+                  cudaStream_t stream, const Tensor* pending_y, const Tensor* pending_inject) {
     if (!hc_mix_fused_supported(down, up, norm_weight.data, x.ne[0], streams, rank, residual.ne[1])) {
         throw std::invalid_argument("hyper_connection_mix: the fused route does not serve this problem");
     }
     if (inject != nullptr && down.n != rank + streams) {
         throw std::invalid_argument("hyper_connection_mix: injects need the down projection's injection rows");
     }
+    const PendingInject pending{pending_y != nullptr ? static_cast<const bf16*>(pending_y->data) : nullptr,
+                                pending_inject != nullptr ? static_cast<const float*>(pending_inject->data) : nullptr,
+                                nullptr};
     if (down.qtype == QType::Q8_G32_FP16) {
         launch<Q8Codec>(residual, norm_weight, q8_params(down), q8_params(up), down.n, rank, streams, eps, x, inject,
-                        partials, stream);
+                        partials, pending, stream);
     } else {
         launch<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank, streams, eps, x,
-                          inject, partials, stream);
+                          inject, partials, pending, stream);
     }
 }
 

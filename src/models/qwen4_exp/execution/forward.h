@@ -321,7 +321,10 @@ public:
 private:
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     // The block's mixed input (into `into` when given, else the workspace).
-    Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
+    // `pending` (a mixer output) is first injected into `residual` with `inject`'s injects
+    // (hyper_connection_inject_mix).
+    Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr,
+               const Tensor* pending = nullptr);
     // The layer's token mixer (GDN or QSA attention) over its mixed input.
     Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa);
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
