@@ -160,7 +160,7 @@ struct Offsets {
     std::size_t h_blocks, x_plane;                      // W4A4
     std::size_t x_limbs, h_rows, x_emax, h_emax;        // W4A16
     std::size_t x_acts, x_acts_emax;                    // W4A16 narrow route
-    std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
+    std::size_t x_terms_plane, x_token_terms, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
     std::size_t ggml_planes;                            // GGUF banks' kGgmlBf16
     bool has_ggml_planes;
     std::size_t end;
@@ -194,6 +194,7 @@ Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t column
         o.h_rows      = take(e * kA16HRowBytes);
         o.h_emax      = take(e * sizeof(std::int32_t));
         o.x_terms_plane = take(e * kXTermsRowBytes);
+        o.x_token_terms = take(t * kXTermsRowBytes);
         o.x_row_scale = take(t * sizeof(float));
         o.h_terms_plane = take(e * kHTermsRowBytes);
         o.h_row_scale = take(e * sizeof(float));
@@ -374,12 +375,16 @@ __device__ __forceinline__ void store_terms(std::uint8_t* row, int b, int code_b
     }
 }
 
-// Every token's x row scale: one CTA per token.
+// Every token's x row scale and terms: one CTA per token, a 16-element block per thread. A token feeds
+// up to top_k wide entries with the same terms, so they are formed once here and copied to the entries.
 __global__ void __launch_bounds__(kEncodeXThreads)
-    x_row_scale_kernel(const std::uint16_t* __restrict__ x, float* __restrict__ row_scale) {
+    x_token_terms_kernel(const std::uint16_t* __restrict__ x, float* __restrict__ row_scale,
+                         std::uint8_t* __restrict__ token_terms) {
     __shared__ float maxima[kEncodeXThreads / 32];
+    __shared__ float scale;
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
-    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * kHidden + 16 * b);
+    const std::uint16_t* block = x + static_cast<std::size_t>(t) * kHidden + 16 * b;
+    const auto* source = reinterpret_cast<const uint4*>(block);
     std::uint16_t v[16];
     unpack16(source[0], source[1], v);
     float amax = 0.0F;
@@ -399,28 +404,34 @@ __global__ void __launch_bounds__(kEncodeXThreads)
         float all = 0.0F;
 #pragma unroll
         for (int w = 0; w < kEncodeXThreads / 32; ++w) { all = maxima[w] > all || maxima[w] != maxima[w] ? maxima[w] : all; }
-        row_scale[t] = residual_row_scale(all);
+        scale        = residual_row_scale(all);
+        row_scale[t] = scale;
     }
+    __syncthreads();
+    TermBlock q;
+    term_block(block, scale, q);
+    store_terms(token_terms + static_cast<std::size_t>(t) * kXTermsRowBytes, b, kXCodeBytes, kXRowBytes, q);
 }
 
-// The terms of every wide entry's x (its token's row), as quantize_kernel does for A4.
+// Every wide entry's x terms: its token's row of x_token_terms_kernel, as quantize_kernel lays out A4.
 __global__ void __launch_bounds__(kQuantizeThreads)
-    quantize_x_terms_kernel(const std::uint16_t* __restrict__ x, int top_k, MoeDispatch dispatch,
-                       const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ pass_tiles, int passes,
-                       const float* __restrict__ row_scale, std::uint8_t* __restrict__ plane) {
+    copy_x_terms_kernel(int top_k, MoeDispatch dispatch, const std::int32_t* __restrict__ tiles,
+                        const std::int32_t* __restrict__ pass_tiles, int passes,
+                        const std::uint8_t* __restrict__ token_terms, std::uint8_t* __restrict__ plane) {
+    constexpr int kWords = kXTermsRowBytes / 16;
+    static_assert(kXTermsRowBytes % 16 == 0);
     const int total = pass_tiles[passes];
     for (int tile = static_cast<int>(blockIdx.x); tile < total; tile += static_cast<int>(gridDim.x)) {
         const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
         const int expert = dispatch.jobs[job];
         const int first  = dispatch.offsets[expert] + column;
         const int count  = min(kTileColumns, dispatch.offsets[expert + 1] - first);
-        for (int task = static_cast<int>(threadIdx.x); task < count * kGateUpBlocks; task += kQuantizeThreads) {
-            const int i = task / kGateUpBlocks, b = task % kGateUpBlocks;
+        for (int task = static_cast<int>(threadIdx.x); task < count * kWords; task += kQuantizeThreads) {
+            const int i = task / kWords, word = task % kWords;
             const int p = first + i;
             const int t = dispatch.entries[p] / top_k;
-            TermBlock q;
-            term_block(x + static_cast<std::size_t>(t) * kHidden + 16 * b, row_scale[t], q);
-            store_terms(plane + static_cast<std::size_t>(p) * kXTermsRowBytes, b, kXCodeBytes, kXRowBytes, q);
+            reinterpret_cast<uint4*>(plane + static_cast<std::size_t>(p) * kXTermsRowBytes)[word] =
+                reinterpret_cast<const uint4*>(token_terms + static_cast<std::size_t>(t) * kXTermsRowBytes)[word];
         }
     }
 }
@@ -527,6 +538,7 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
         w.h_rows      = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
         w.h_emax      = reinterpret_cast<std::int32_t*>(p + o.h_emax);
         w.x_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.x_terms_plane);
+        w.x_token_terms = reinterpret_cast<std::uint8_t*>(p + o.x_token_terms);
         w.x_row_scale = reinterpret_cast<float*>(p + o.x_row_scale);
         w.h_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.h_terms_plane);
         w.h_row_scale = reinterpret_cast<float*>(p + o.h_row_scale);
@@ -579,13 +591,13 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.x_row_scale   = workspace.x_row_scale;
         call.h_terms_plane = workspace.h_terms_plane;
         call.h_row_scale   = workspace.h_row_scale;
-        x_row_scale_kernel<<<x.ne[1], kEncodeXThreads, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
-                                                                    workspace.x_row_scale);
-        check_launch("x row scale");
-        quantize_x_terms_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
-            static_cast<const std::uint16_t*>(x.data), top_k, dispatch, workspace.tiles, workspace.pass_tiles,
-            call.passes, workspace.x_row_scale, workspace.x_terms_plane);
-        check_launch("quantize two-term x");
+        x_token_terms_kernel<<<x.ne[1], kEncodeXThreads, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
+                                                                      workspace.x_row_scale, workspace.x_token_terms);
+        check_launch("two-term x");
+        copy_x_terms_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
+            top_k, dispatch, workspace.tiles, workspace.pass_tiles, call.passes, workspace.x_token_terms,
+            workspace.x_terms_plane);
+        check_launch("copy two-term x");
         const Descriptors descriptors = make_descriptors_terms(workspace.x_terms_plane, workspace.h_terms_plane, entries);
 #ifdef _WIN32
         call.descriptors = descriptor_staging().stage(descriptors, stream);

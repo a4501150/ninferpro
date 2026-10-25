@@ -82,4 +82,17 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
         shape.partial_capacity_bytes ? shape.partial_capacity_bytes(x.ne[1]) : 0);
     shape.a8(x, weight, out, scratch, stream);
 }
+bool fp8_dispatch_rows(const Tensor& x, const Weight& weight, const LinearBf16RowParts& parts, LinearPolicy policy,
+                       LinearRoutes routes, WorkspaceArena* workspace, cudaStream_t stream) {
+    validate_fp8_weight(weight, "fp8 linear");
+    if (x.ne[1] <= 0) throw std::invalid_argument("fp8 linear: T must be positive");
+    const auto& shape = resolve_shape(weight.n, weight.k, policy);
+    if (column_invariant(policy) || shape.pair_rows == nullptr || !uses_pair(shape, policy, routes, x.ne[1]))
+        return false;
+    if (workspace == nullptr) throw std::invalid_argument("fp8 A8 pair linear requires caller workspace");
+    auto scope         = workspace->scope();
+    const auto scratch = allocate_fp8_a8_pair_workspace(*workspace, x.ne[1], weight.k);
+    shape.pair_rows(x, weight, parts, scratch, stream);
+    return true;
+}
 } // namespace infernix::ops::detail

@@ -148,6 +148,40 @@ int main() {
                           "gdn-compensated does not apply where the exact route runs the chunked GDN prefill");
     }
 
+    // hc-sliced-k routes recipe C's Q8 hyper-connection mix by its call's width; FP8 KV only.
+    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256}) {
+        const q::FastPathConfiguration recipe_c{DenseKernels::Fp8Row, false, kv};
+        failures += check(q::fast_path_applies(FastPath::HcSlicedK, recipe_c, options),
+                          "hc-sliced-k applies to recipe C");
+        const q::FastPathSelection hc{.configuration = recipe_c, .paths = {FastPath::HcSlicedK}};
+        failures += check(hc.forward().dense_routes == infernix::ops::LinearRoutes::Q8HcSlicedK &&
+                              !hc.forward().column_invariant && !hc.request_invariant(),
+                          "hc-sliced-k sets its route and couples a column to its call's width");
+        failures += check(q::fast_path_qualified(FastPath::HcSlicedK, recipe_c) == (kv == KvCacheStorage::Fp8E4M3Row256),
+                          "hc-sliced-k is qualified on recipe C with FP8 KV");
+    }
+    failures += check(!q::fast_path_applies(FastPath::HcSlicedK, dense8, options),
+                      "hc-sliced-k does not apply to Dense8 (q8-sliced-k's configuration)");
+    // bf16-index-mma tiles recipe C's BF16 QSA index projection by its call's width.
+    {
+        const q::FastPathConfiguration recipe_c{DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256};
+        failures += check(q::fast_path_applies(FastPath::Bf16IndexMma, recipe_c, options) &&
+                              !q::fast_path_applies(FastPath::Bf16IndexMma, dense8, options),
+                          "bf16-index-mma applies to recipe C only");
+        const q::FastPathSelection mma{.configuration = recipe_c, .paths = {FastPath::Bf16IndexMma}};
+        failures += check(mma.forward().dense_routes == infernix::ops::LinearRoutes::Bf16IndexMma &&
+                              !mma.request_invariant(),
+                          "bf16-index-mma sets its route and couples a column to its call's width");
+        failures += check(q::fast_path_qualified(FastPath::Bf16IndexMma, recipe_c),
+                          "bf16-index-mma is qualified on recipe C with FP8 KV");
+    }
+    // qsa-prepare-fused is qualified on recipe C with FP8 KV, the one format its gate ran there.
+    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256}) {
+        const q::FastPathConfiguration recipe_c{DenseKernels::Fp8Row, false, kv};
+        failures += check(q::fast_path_qualified(FastPath::QsaPrepareFused, recipe_c) == (kv == KvCacheStorage::Fp8E4M3Row256),
+                          "qsa-prepare-fused is qualified on recipe C with FP8 KV only");
+    }
+
     q::FastPathSelection selection{.configuration = dense8, .paths = {}};
     const auto exact = selection.forward();
     failures += check(exact.dense_routes == infernix::ops::LinearRoutes::Exact && !exact.gdn_conv_fused &&

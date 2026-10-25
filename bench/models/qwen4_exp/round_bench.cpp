@@ -10,6 +10,7 @@
 //       [--context N] [--replays N] [--kv bf16|int8|fp8|nvfp4|k8v4] [--experts N|all]
 //       [--accept K] [--sections] [--layers] [--exact] [--profile] [--check FILE | --record FILE]
 //       [--determinism N] [--no-fork] [--no-shared-stream] [--miss-route] [--staging-slots N]
+//       [--fast-path NAME]...
 //
 // A shape R x W is R rows of W columns: W = 1 a plain decode round, W >= 2 a verification round of
 // W - 1 drafts per row followed by the commit of K columns per row (--accept, default W). Each row
@@ -29,6 +30,7 @@
 // `--experts vram=100%`; --miss-route runs them as a partial placement's calls run with no miss to
 // serve: the miss staging of --staging-slots N (default 80, production's top_k x (1 + 7 DFlash2
 // drafts) without the SSD tier), the fork route of calls of at most N jobs, and the landing tables.
+// --fast-path NAME adds the path to the fast route before its registry entry (it must apply).
 //
 // Not included: the DFlash2 drafter's calls and catch-up, the acceptance kernels, sampling and the
 // host's round work (the server's GPU is busy about 98% of a round, the drafter included).
@@ -128,6 +130,7 @@ struct Options {
     bool no_fork = false, no_shared_stream = false; // run the MoE fork / the shared expert in order
     std::int32_t staging_slots = 80;
     bool miss_route = false;
+    std::vector<FastPath> fast_path_candidates; // --fast-path: run before its registry entry
 };
 
 std::vector<Shape> parse_shapes(const std::string& text) {
@@ -198,6 +201,11 @@ Options parse(int argc, char** argv) {
             o.staging_slots = std::max(0, std::stoi(value()));
         } else if (arg == "--miss-route") {
             o.miss_route = true;
+        } else if (arg == "--fast-path") {
+            const std::string name = value();
+            const auto path        = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("--fast-path " + name + ": no such fast path"); }
+            o.fast_path_candidates.push_back(*path);
         } else if (arg == "--check") {
             o.check = value();
         } else if (arg == "--record") {
@@ -830,6 +838,7 @@ std::string hash_key(const Options& o, const Shape& shape) {
     key << o.artifact.filename().string() << ' ' << shape.rows << 'x' << shape.width << " context=" << o.context
         << " kv=" << o.kv_name << " experts=" << (o.sample_experts == 0 ? std::string("all") : std::to_string(o.sample_experts))
         << ' ' << (o.exact ? "exact" : "fast") << " accept=" << (o.accept < 0 ? shape.width : std::clamp(o.accept, 0, shape.width));
+    for (const FastPath path : o.fast_path_candidates) { key << " +" << fast_path_name(path); }
     return key.str();
 }
 
@@ -884,6 +893,7 @@ int main(int argc, char** argv) {
         EngineOptions engine;
         engine.fast_paths = !o.exact;
         engine.kv_cache   = storage;
+        engine.fast_path_candidates = o.fast_path_candidates;
         const q4::FastPathSelection selection = q4::select_fast_paths(parameters, engine);
         std::printf("fast paths:");
         for (const FastPath path : selection.paths) { std::printf(" %s", fast_path_name(path)); }

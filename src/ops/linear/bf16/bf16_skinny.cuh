@@ -5,9 +5,11 @@
 // only in speed: a shape selector may choose a different instance per width without changing bits.
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ops/linear/bf16/bf16_launch.h"
+#include "ops/linear/common/output.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -50,14 +52,16 @@ __device__ __forceinline__ void skinny_accumulate(const __nv_bfloat16* __restric
 // instance (2 warps, 1 row per warp, Preload = chunks per lane) serves weights of at most
 // kSkinnySmallNRows rows, such as the Qwen4Exp GDN control [96, 2560]: its grid spreads over N / 2
 // CTAs instead of N / 16, and each lane issues all of its chunk loads before the first FMA.
-template <int Tokens, int Warps, int RowsPerWarp, int Preload>
-__global__ void __launch_bounds__(Warps * 32)
-    bf16_skinny_gemv_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
-                            __nv_bfloat16* __restrict__ out, std::int32_t N, std::int32_t K) {
+// The skinny GEMV's work for CTA `cta` (blockIdx.x in its own kernel; a block's index when composed,
+// ops/common/blocks.cuh).
+template <int Tokens, int Warps, int RowsPerWarp, int Preload, class Output>
+__device__ __forceinline__ void bf16_skinny_gemv_cta(const __nv_bfloat16* __restrict__ x,
+                                                     const __nv_bfloat16* __restrict__ weight, Output output,
+                                                     std::int32_t N, std::int32_t K, int cta) {
     const std::int32_t lane   = static_cast<std::int32_t>(threadIdx.x % 32);
     const std::int32_t warp   = static_cast<std::int32_t>(threadIdx.x / 32);
     const std::int32_t chunks = K / 8;
-    const std::int32_t first  = (static_cast<std::int32_t>(blockIdx.x) * Warps + warp) * RowsPerWarp;
+    const std::int32_t first  = (cta * Warps + warp) * RowsPerWarp;
     float sums[RowsPerWarp][Tokens] = {};
     const uint4* rows[RowsPerWarp];
 #pragma unroll
@@ -94,12 +98,35 @@ __global__ void __launch_bounds__(Warps * 32)
         for (int t = 0; t < Tokens; ++t) {
             float v = sums[r][t];
             for (int offset = 16; offset > 0; offset >>= 1) { v += __shfl_xor_sync(0xFFFFFFFFU, v, offset); }
-            if (lane == 0 && first + r < N) {
-                out[static_cast<std::int64_t>(t) * N + first + r] = __float2bfloat16_rn(v);
-            }
+            if (lane == 0 && first + r < N) { output.store(first + r, t, v); }
         }
     }
 }
+
+template <int Tokens, int Warps, int RowsPerWarp, int Preload>
+__global__ void __launch_bounds__(Warps * 32)
+    bf16_skinny_gemv_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+                            __nv_bfloat16* __restrict__ out, std::int32_t N, std::int32_t K) {
+    bf16_skinny_gemv_cta<Tokens, Warps, RowsPerWarp, Preload>(x, weight, LinearBf16Output{out, N}, N, K,
+                                                              static_cast<int>(blockIdx.x));
+}
+
+// The skinny GEMV as a block (ops/common/blocks.cuh). Its own kernel is an ordinary launch, so the
+// block waits for the launch's dependencies.
+template <int Tokens, int Warps, int RowsPerWarp, int Preload, class Output>
+struct Bf16SkinnyGemvBlock {
+    static constexpr int kThreads = Warps * 32;
+    const __nv_bfloat16* x;
+    const __nv_bfloat16* weight;
+    Output output;
+    std::int32_t n, k;
+
+    [[nodiscard]] int ctas() const { return (n + Warps * RowsPerWarp - 1) / (Warps * RowsPerWarp); }
+    __device__ __forceinline__ void run(int cta) const {
+        pdl::wait_for_dependencies();
+        bf16_skinny_gemv_cta<Tokens, Warps, RowsPerWarp, Preload>(x, weight, output, n, k, cta);
+    }
+};
 
 template <int Tokens, int Warps, int RowsPerWarp, int Preload>
 void launch_bf16_skinny_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {

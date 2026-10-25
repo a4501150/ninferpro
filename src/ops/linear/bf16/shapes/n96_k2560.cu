@@ -1,20 +1,17 @@
 #include "ops/linear/bf16/bf16_instances.cuh"
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_launch.cuh"
+#include "ops/linear/bf16/bf16_decode_routes.cuh"
 
 namespace infernix::ops::detail {
 // NInfer's tuned routes for this shape (NInfer 81c8ce09), used where they measured fastest.
 namespace {
-using S0 = Bf16ScheduleInstance<
-    Bf16A16GemvSchedule<4, 2, 1, 8, 4, Bf16ActivationAccess::Direct, Bf16WeightCache::Default,
-                        Bf16PhaseOrder::Sequential, 1, 1, 4, 2>,
-    2560>;
+using S0 = Bf16N96K2560Gemv;
 using S1 = Bf16ScheduleInstance<
     Bf16A16SimtSchedule<4, 2, 1, 8, 4, 2, Bf16SimtActivationAccess::WarpPacked,
                         Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 4, 1, 2, 2>,
     2560>;
-using S2 = Bf16A16SimtSchedule<8, 2, 1, 8, 4, 2, Bf16SimtActivationAccess::WarpPacked,
-                               Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 4, 1, 2, 2>;
+using S2 = Bf16N96K2560Simt;
 using S3 = Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 8, 8, 64, 2>, 2560>;
 using S4 = Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 32, 8, 64, 2>, 2560>;
 using S5 = Bf16ScheduleInstance<

@@ -129,6 +129,7 @@ struct ExpertsWorkspace {
     std::int32_t* x_acts_emax;    // [columns]
     // W4A16, two-term A4 (h_rows holds the BF16 h)
     std::uint8_t* x_terms_plane;  // [entries][kXTermsRowBytes]
+    std::uint8_t* x_token_terms;  // [columns][kXTermsRowBytes]: each token's terms, copied to its entries
     float* x_row_scale;           // [columns]
     std::uint8_t* h_terms_plane;  // [entries][kHTermsRowBytes]
     float* h_row_scale;           // [entries]

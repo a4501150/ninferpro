@@ -316,6 +316,24 @@ constexpr std::array kQualified{
     // reference's own exact route (floor 0) and is not registered.
     Qualification{FastPath::GdnCompensated, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GdnCompensated, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    // Recipe C: the hyper-connection mix's sliced-K routes at 29-2048 columns, jointly with the
+    // qualified paths against the construction-exact reference (2026-10-24). Decode (MTP 4 at
+    // concurrency 8, 40-column verifications, warm 3,000-token resumes), 256 segments: FP8 TV 1.3e-3
+    // (bound 1.7e-3), top-1 1.2e-3 (bound 3.6e-3), p99.9 0.91. Prefill (quick corpus, four chunks):
+    // FP8 KL 6.0e-4 (bound 6.8e-4), top-1 1.0e-3, corpus NLL -1.3e-4. Timed: T1 6 x 8 -5.4 %, 8 x 8
+    // -5.5 %, pp256 +17 %, pp512 +9 %. INT8 KV fails its decode tail (p99.9 1.64 at 256 segments).
+    Qualification{FastPath::HcSlicedK, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    // Recipe C: the BF16 QSA index projection on the BF16 tensor-core tiles from 9 columns, jointly
+    // with the qualified paths (hc-sliced-k among them) against the construction-exact reference
+    // (2026-10-25), the hc-sliced-k gate's protocol. Decode, 256 segments: FP8 TV 1.4e-3 (bound
+    // 1.8e-3), top-1 1.6e-3 (bound 4.2e-3), p99.9 0.98. Prefill: FP8 KL 5.8e-4 (bound 6.8e-4),
+    // top-1 1.1e-3, corpus NLL -2.5e-4. Timed: T1 8 x 8 -1.5 %, the projection 4-7x faster.
+    Qualification{FastPath::Bf16IndexMma, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    // Recipe C: the fused QSA prepare, jointly with the qualified paths against the construction-exact
+    // reference (2026-10-25), the hc-sliced-k gate's protocol. Decode, 256 segments: FP8 TV 1.1e-3
+    // (bound 1.5e-3), top-1 -3.1e-4 (bound 2.4e-3), p99.9 0.93. Prefill: FP8 KL 5.8e-4 (bound
+    // 6.6e-4), top-1 9.8e-4 (bound 1.5e-3), corpus NLL -6.2e-5. Timed: T1 1 x 1 -1.3 %, 6 x 2 -1.0 %.
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -426,6 +444,10 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::GgmlBf16Prefill: return configuration.dense == DenseKernels::Ggml;
     // It replaces the recurrent GDN prefill, which only the construction-exact configurations run.
     case FastPath::GdnCompensated: return qwen4_exp::construction_exact(configuration);
+    // The Q8 hyper-connection mix of the FP8-row dense recipe (recipe C).
+    case FastPath::HcSlicedK: return configuration.dense == DenseKernels::Fp8Row;
+    // The BF16 QSA index projection of the FP8-row dense recipe (recipe C).
+    case FastPath::Bf16IndexMma: return configuration.dense == DenseKernels::Fp8Row;
     case FastPath::QsaPrepareFused:
         // ops::qsa_prepare_supports's KV formats (bf16, int8, fp8, nvfp4, k8v4); VQ2 and K4V2 append
         // inside qsa_attention and keep the composed prepare.
@@ -470,11 +492,14 @@ bool FastPathSelection::request_invariant() const noexcept {
         // expert-a4-residual routes an expert, and fp8-a8-pair a dense problem, by its column count in
         // the call, which batched rounds share between requests. ggml-bf16-prefill routes a prompt's
         // GGUF projections by its calls' widths, and gdn-compensated runs a prompt's GDN on its calls'
-        // chunk grids, whose boundaries prefix-cache resumes move.
+        // chunk grids, whose boundaries prefix-cache resumes move. hc-sliced-k splits the
+        // hyper-connection mix's K, and bf16-index-mma tiles the index projection, by the call's
+        // width, which batched rounds share.
         return path == FastPath::AdaptiveSpeculation || path == FastPath::FreeCacheResume ||
                path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
                path == FastPath::ExpertA4Residual || path == FastPath::Fp8A8Pair ||
-               path == FastPath::GgmlBf16Prefill || path == FastPath::GdnCompensated;
+               path == FastPath::GgmlBf16Prefill || path == FastPath::GdnCompensated ||
+               path == FastPath::HcSlicedK || path == FastPath::Bf16IndexMma;
     });
 }
 
@@ -483,6 +508,8 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     if (selected(FastPath::Q8SlicedK)) { routes = routes | ops::LinearRoutes::Q8SlicedK; }
     if (selected(FastPath::Fp8A8Pair)) { routes = routes | ops::LinearRoutes::Fp8A8Pair; }
     if (selected(FastPath::GgmlBf16Prefill)) { routes = routes | ops::LinearRoutes::GgmlBf16Wide; }
+    if (selected(FastPath::HcSlicedK)) { routes = routes | ops::LinearRoutes::Q8HcSlicedK; }
+    if (selected(FastPath::Bf16IndexMma)) { routes = routes | ops::LinearRoutes::Bf16IndexMma; }
     // The construction-exact arithmetic runs only in the configurations it was qualified on: there the
     // exact route takes the column-invariant kernels and the recurrent GDN prefill, which the fast route
     // keeps unless gdn-compensated is selected. Elsewhere both routes keep the arithmetic their own

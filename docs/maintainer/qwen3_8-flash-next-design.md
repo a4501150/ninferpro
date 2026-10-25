@@ -3537,6 +3537,189 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   13.3 ms). A lane then keeps all 20 of its units' words in registers for every column of its job
   (a job of n columns reads its weights once; capped at two CTAs per SM): two columns per expert at
   T = 12 214 -> 173 us; C = 6 with DFlash2 one draft per row 463 -> 488 tok/s, two 438 -> 484.
+- **A row pair's four quads per lane (2026-10-24, RTX PRO 6000, this fork).** Under Nsight Compute
+  both W4A16 passes ran at 128 registers, two CTAs per SM, 31 % occupancy, DRAM 54-63 % busy and
+  one instruction per 7-9 cycles per scheduler: the integer arithmetic, not the weight stream, set
+  their time. Lane 8 s + i now takes rows i and i + 8 of unit s, all four quads (a warp covers four
+  units per step): a row's block product P_b is below 2^29 (§16.2.1), so its dp4a partial sums chain
+  across the quads in 32 bits, and the scale decode and the int64 product run once per row and
+  unit instead of once per quad, with the same integer sums. The weights take 25 registers instead
+  of 40, so the passes run three CTAs per SM (80 registers, no spills), and the down pass encodes
+  its h column with each of 80 threads holding eight elements in registers (one global read, two
+  quads per thread) instead of 40 threads encoding whole blocks after a second read. The W4A4
+  one-column kernels (`unit_sums`) take the same lane layout (|P_q| <= 576, so a row's block sum
+  times Sw fits int32). `infernix_offloaded_moe_wide_bench --cold --route fork`, frames, before ->
+  after: W4A16 T = 1 / 4 / 6 / 12 / 16 36.9 / 90.2 / 120.9 / 210 / 270 -> 32.8 / 77.9 / 104.5 /
+  188 / 241 us, eight columns per expert at T = 64 594 -> 397, the prefill mix at T = 256 2183 ->
+  1733; W4A4 T = 6 / 12 / 64 (four per expert) / 256 119 / 216 / 775 / 2155 -> 113 / 203 / 703 /
+  1908 (T = 1 within the timer's 2 us step, 37-39); gate/up 63 -> 81 % and down 54 -> 68 % of DRAM
+  at T = 12. Every output hash equal (decode widths 1-48, 2-8 columns per expert, staged placement,
+  the wide mixes), T1 and T1-exact equal their records: fast 1x1 / 6x1 / 1x4 / 6x2 / 6x3 5.68 /
+  11.27 / 8.89 / 16.44 / 22.87 -> 5.51 / 10.65 / 8.49 / 15.11 / 20.65 ms, exact 6x1 / 6x2 11.93 /
+  17.13 -> 11.23 / 15.69 ms. T3 (`bench_infernix.py`, every expert in VRAM, two alternating runs
+  against `cbcead6`): short C1 338-339 -> 359-360 tok/s, C6 aggregate 448-450 -> 480-494, prefill
+  30k 11,700 -> 11,800-12,000; 30k-context C1 272-290 both ways. Rejected on the way: 16-byte code loads with `L1::no_allocate` and a
+  quad per lane (equal times: the loads were not the limit); a persistent pass double-buffering each
+  item's 23 KB through shared memory (two CTAs per SM; 234 against 210 us at T = 12); three and four
+  CTAs per SM with a quad per lane (spills: 49 and 60 us at T = 1). `L1::no_allocate` code loads in
+  `fp8_a16_gemv_kernel` changed no T1 time (5.49 ms at 1x1 both ways) and were not kept.
+- **Hyper-connection mix: m formed once (2026-10-24, RTX PRO 6000, this fork).** A T1 kernel
+  profile with GPU metrics put the two fused HC kernels at 1.99 ms of the 6 x 2 round (15-29 % of
+  DRAM bandwidth) and 0.83 ms of 1 x 1. Each runs one 226-255-register CTA per SM, so per column
+  the down chain costs ~0.6 us and the up chain ~0.4 us of latency-bound issue (nsys chains at T 12:
+  down 10.2 us, up 8.6 us). A timing-only probe without K1b v4's z phase saved 3.3 us per call at T 12:
+  every one of its 160 CTAs read all S x down_rows x T partials and evaluated down_rows x T sigmoids.
+  K1a v4's four stream CTAs of a row block now form a cluster (`__cluster_dims__(1, 4, 1)`), and
+  stream 0's CTA sums their row sums from distributed shared memory in K1b's order and writes m and
+  the injects once; K1b v4 copies m and decodes its weights once instead of once per token group
+  (both exact). Bit-identical (bench hashes T 1-16, Q8 and BF16; hyper-connection and width-equality
+  tests; T1 and T1-exact). Per call, Q8: T 2-3 unchanged, T 4 / 8 / 12 / 16 10.6 / 14.3 / 19.0 / 23.2
+  -> 10.1 / 13.1 / 17.1 / 20.2 us; BF16 T 2-3 +0.6-0.8 us, T >= 4 faster. T1, same session, A/B
+  twice: 1 x 1 5.52 -> 5.50 ms, 6 x 1 10.63 -> 10.48, 1 x 4 8.61 -> 8.52, 6 x 2 15.93 -> 15.79, 6 x 3
+  21.71 -> 21.66 (18 columns take the composed route). Rejected, all bit-identical and slower:
+  columns split over the grid (more CTAs re-read weights and repeat the norm; T 12 20-34 us), two
+  warps per row in 512-thread CTAs (T 12 26.7 us), and `__launch_bounds__(256, 2)` so K1a and K1b
+  co-reside (at 128 registers the weights reload per pass; T 12 23-60 us).
+- **Hyper-connection mix: the fused route up to 28 columns (2026-10-24, RTX PRO 6000, this fork).**
+  Calls of 17 or more columns (6 x 3, 6 x 4 and 8 x 3 verification rounds) took the composed route,
+  ~30 us per call at 17-18 columns against ~21 us for the fused route at 16. The v4 pair now serves up
+  to 28 columns (K1b v4's m in dynamic shared memory, its collapse looping over 16-token groups; K1a
+  and K1b keep 16 for one column or unaligned norm weights); per call, Q8: 17 / 18 / 24 / 28 columns
+  29.5 / 30.2 / 31.9 / ~33 -> 22.8 / 23.8 / 28.0 / 32.1 us, while at 32 the composed route is faster
+  (34.4 against 35.3), hence 28. This changes the fast route's bits at 17-28 columns: they now take
+  the fused route's FP32 intermediates (column-invariant, so each column equals its width-1 bits)
+  instead of the composed route's BF16 ones; the exact route keeps the composed route. The FP64
+  oracle test covers 17 and 28 at the fused tolerance and 29 at the composed one; T1 records the new
+  6 x 3 fast hash, every other shape and T1-exact unchanged. T1, same session, A/B twice: 6 x 3
+  21.72 -> 21.17 ms, 8 x 3 25.73 -> 25.58, 6 x 4 25.42 -> 25.33, 6 x 2 15.81 -> 15.83 (same arithmetic).
+- **Q8 head above 16 columns (2026-10-24, RTX PRO 6000, this fork).** T1 kernel profiles of 6 x 3 and
+  6 x 4 put `projection_q8_kernel` (the q8_g32_fp16 head [248320, 2560], 636 MB) at 1.90 and 2.17 ms
+  per round (9 %): above 16 columns the head fell back to the narrow mapping, which reads the weights
+  once per eight columns. The tall mapping now serves every width from 9: up to 16 columns as before,
+  17..19 in one pass of a 19-column body (19 x 2560 BF16 columns fill a CTA's 99 KB; the wider body
+  costs ~5 % at 16 or fewer, so they keep the 16-column one), wider calls in balanced passes of up to
+  16, each reading the weights once. Bit-identical: the sweep's narrow/tall comparison is equal at
+  every width through 32, T1 and T1-exact unchanged. Per call: 18 / 24 / 32 columns 1871 / 2107 /
+  2801 -> 1186 / 1810 / 2142 us. T1, same session, A/B twice: 6 x 3 21.18 -> 20.30 ms, 6 x 4 25.35 ->
+  24.98, 1 x 1 / 6 x 1 / 6 x 2 unchanged. Rejected: a persistent tall kernel (one CTA per SM walking
+  row pairs, the next pair's chunks loading into a second register buffer) was slower at every width
+  (705-1516 us at 1-16 columns; 0.62 TB/s with ~7.5 MB in flight, and its fully unrolled 19-column
+  body stalled on instruction fetch). The head still costs 1.4-2.4 times its 377 us floor at 5-16
+  columns (tall 662-1073 us, narrow 479-1421 us): one CTA of 8 warps per SM never overlaps a CTA's
+  weight loads with another's FMAs.
+- **Hyper-connection down tiles beyond 2048 columns (2026-10-24, RTX PRO 6000, this fork).** In a
+  16K prefill chunk the composed mix's [324, 10240] Q8 down projection ran the 48 x 64 MMA tile, 664 us
+  per call (96 calls). Each MMA tile runs one CTA per SM, and its time steps up by 50-100 us where its
+  CTA count passes a multiple of the 188 SMs, so the best of the r48_t64, r64_t128, r96_t96 and
+  r128_t80 tiles changes with the width. The exact A16 selector now takes, per width range, a tile not
+  just past a step: 1.01 times the fastest of the four at worst over every 128-column step from 2048
+  to 16384, where r48_t64 alone took 1.19 times as long in total and 1.35 at worst (590 against 664 us
+  at T = 16384). Bit-identical: every tile accumulates an output over K in one order, and the output
+  hashes of all five tiles and the exact route agree at T 2049, 4096, 4513, 9000, 13616 and 16384; T1
+  and T2 unchanged. Prefill (`infernix_bench`, FP8 KV, every expert in VRAM, base/new/new/base twice;
+  the machine drifted 2-3 % across the session): pp16384 +0.4 % / +0.7 %, pp4096 +0.04 % / +0.2 %.
+  Not adopted: from 6 to 2048 columns the sliced-K tiles (16 down to 4 K warps, two row tiles) take
+  20-104 us against the exact route's 96-125 (at 512 columns 37 against 96 us; prefill +7.7 % at 512
+  tokens, +2.8 % at 1024). They change the reduction order, so they need a fast path with its own
+  model-level gates; recipe C does not run `q8-sliced-k`, and adding them to it would change that
+  path's qualified arithmetic on Dense8.
+- **Router without widening (2026-10-24, RTX PRO 6000, this fork).** The FP32 router [513, 2560]
+  (`projection_fp32`, router and shared-expert score as two segments) took 5.2 % of a 16K prefill:
+  the wide mapping ran at ~30 TFLOP/s, 57 % of issue slots busy, a third of its instructions BF16
+  widenings and butterfly shuffles. The wide kernel now multiplies through `fma.rn.f32.bf16`
+  (`FHFMA.BF16` on sm_120a), which takes each BF16 operand as its exact FP32 widening and reads
+  either half of a register, so it rounds as fmaf on widened values and needs no conversions; the
+  butterfly runs as a reduce-scatter (each output keeps the xor 16..1 tree, 31 shuffles per lane
+  instead of 160); one barrier per slice over three cp.async stages, weight slices staged before the
+  PDL wait. Two tile shapes: 16 x 16 CTAs (two per SM) from 21 to 512 columns, 32 x 32 beyond.
+  Bit-identical: output hashes equal the previous build's at 19 widths from 1 to 16,384, the
+  projection test now forces the narrow mapping as its reference (the Narrow route had taken the wide
+  kernel from 64 columns, so those comparisons had been wide against wide) and finds no column
+  differing at 21, 48, 64, 512, 513 and 4,096 columns and its other shapes; T1, T1-exact and T2
+  unchanged. Per call: 4,096 / 16,384 columns 358 / 1,358 -> 195-209 / 743-778 us; 21-64 columns
+  10-18 -> 8 us. T1, previous build first, A/B twice: 6 x 4 24.97 / 25.04 -> 24.83 / 24.86 ms, 8 x 3
+  25.24 / 25.30 -> 25.10 / 25.16, 6 x 8 37.43 / 37.52 -> 36.97 / 37.02; rounds up to 20 columns keep
+  the narrow mappings (18 columns had taken 0.6 % longer on the wide kernel in a round's graph, 20
+  and 21 tied). Prefill (`infernix_bench`, FP8 KV, base/new/new/base twice): pp4096 +2.1 / +2.2 %,
+  pp16384 +2.1 / +2.3 %, pp32768 +2.1 / +2.2 %, pp512 +0.2 / +0.8 %. The large shape reaches about
+  half of FHFMA's ~110 TFLOP/s (ncu: barrier, shared-load throttle and short-scoreboard stalls with
+  16 warps per SM); 8 x 8 and 8 x 16 warp tiles, 1,024-thread CTAs and two CTAs per SM of the large
+  tile measured slower.
+- **Projections written to their split tensors (2026-10-24, RTX PRO 6000, this fork).** Recipe C's
+  fused FP8 projections were projected into one [N, T] tensor and copied into their parts by
+  `split_rows`: per 16K prefill chunk 36 GDN q/k/v + z splits at 909 us, 13 attention splits at 779 us
+  and 60 small ones (the shared expert's gate/up, the indexer's two parts) at 111 us, about 49 ms
+  (3.8 %). `ops::linear_rows` now takes the parts; on the fp8-a8-pair route of [16384, 2560],
+  [13312, 2560] and [1280, 2560] the GEMM epilogue stores each 8-row vector straight into its part
+  (`LinearBf16RowParts`, up to four parts), and every other route projects into the workspace and
+  splits as before. Bit-identical: the parts equal linear()'s output rows at each problem's admission
+  and in the 128-column tiles, on the pair and exact routes (`infernix_linear_fp8_a8_test`); T1,
+  T1-exact and T2 unchanged. Prefill (`infernix_bench`, FP8 KV, base/new/new/base twice): pp4096
+  +3.2 / +3.2 %, pp16384 +3.1 / +3.3 %, pp32768 +3.1 / +3.3 %, pp512 +2.4 / +2.0 %. T1 6 x 8 (48
+  columns, past the GDN pair admission) 37.01 / 37.03 -> 36.85 / 36.85 ms; narrower rounds unchanged.
+  The exact route keeps its split copies.
+- **Decode building blocks: independent projections in one launch (2026-10-25, RTX PRO 6000, this
+  fork).** A one-column round spent 5.49 ms, about 3.4 ms of it reading weights; 2.1 ms left DRAM
+  bandwidth unused, much of it in kernel boundaries between small dependent kernels. Kernels now
+  expose their CTA body as a device function on a virtual CTA index, and `ops/common/blocks.cuh`
+  composes such blocks at compile time (`Chain`, `launch_composed`: each block takes a CTA range of one
+  launch, synchronizes with a named barrier of its own threads, and waits for the launch's
+  dependencies itself), so a fused kernel is a composition of the same bodies the standalone kernels
+  run, and a later persistent decode kernel can chain them. First use: `ops::linear_group`, two
+  independent projections of one input, which at decode widths (T <= 8) under A16Only launches the
+  GDN q/k/v/z GEMV or SIMT tile (row-FP8, straight into its q/k/v and z tensors) beside the a/b
+  GEMV or SIMT tile (BF16), and the attention q/gate/k/v GEMV or SIMT tile beside the QSA index
+  projection's skinny GEMV; the a/b and index projections no longer wait for the q/k/v/z projection
+  and its split. The schedules both routes use live in `fp8_decode_routes.cuh` /
+  `bf16_decode_routes.cuh`, so the composition has the standalone routes' bits
+  (`infernix_linear_fp8_a8_test`: both pairs equal the separate calls at T = 1, 2, 3, 5 and 8; T1,
+  T1-exact and T2 unchanged). T1 (FP8 KV, base/new/new/base, ms): 1 x 1 5.514 / 5.505 -> 5.395 /
+  5.396 (-2.1 %), 2 x 1 -2.1 %, 4 x 1 -1.6 %, 6 x 1 -1.0 %, 1 x 4 -1.7 %; 8 x 1 and 1 x 8 (8
+  columns) unchanged (+0.1 / 0.0 %).
+  Two later compositions from these blocks kept the bits but measured slower at T1 1 x 1 (a
+  per-head GDN decode chain +0.4 %, a persistent projection-plus-chain kernel with a grid barrier
+  +2.8 %) and stay on branch `exp/gdn-chain`; a one-column expert gate/up kernel (+0.6 %) was dropped.
+  The A16 expert pair (gate/up rows, then down rows; 27.6 MB at 1 x 1, a floor of about 16.6 us
+  against a plain streaming kernel's 1.77 TB/s) takes 21.7 us per layer (per-CTA timestamps, 54
+  layers): gate/up's first wave keeps DRAM busy to about 7.5 us, the second wave and the down CTAs
+  start only as first-wave CTAs finish their math, and the down CTAs, which issue their weight loads
+  only once resident, finish 3 to 5 us after gate/up's last CTA. Two bit-identical fixes did not pay:
+  down CTAs waiting on their own job's gate/up row groups (branch `exp/moe-job-ready`; 1 x 1 0 to
+  +0.4 % across baseline runs, 6 x 1 +0.7 %, 6 x 2 +0.9 %, 6 x 3 +1.7 %) and an L2 prefetch of the down weights from gate/up (+1.5 to
+  +2.5 %, it delays gate/up's first wave by the bytes it moves earlier).
+- **QSA index projection on tensor cores (`bf16-index-mma`, 2026-10-25, RTX PRO 6000, this fork).**
+  Recipe C's BF16 QSA indexer projection [640, 2560] has no tuned exact route: the exact route of
+  the construction-exact configurations takes its column-invariant sliced-K route, and every other
+  route ran the runtime-shape GEMM (`bf16_general_gemm_kernel`, an FP32 FMA chain per output on the
+  CUDA cores), which the fast route reached because it turns column invariance off. Under the
+  `bf16-index-mma` fast path (`LinearRoutes::Bf16IndexMma`, `select_bf16_n640_k2560_index_mma`)
+  calls of 9 or more columns run the BF16 tensor-core tiles the other BF16 shapes use (sweep
+  `infernix_bf16_flash_next_sweep --shape qsaidx`): 8 against 33-74 us at 32-65 columns, 18 against
+  84 us at 1,024, 178 against 926 us at 16,384 (the 926 us is a 64 x 64-tile version of the
+  runtime-shape GEMM, since removed; the 32 x 32 kernel took 3,858 us). It is qualified on recipe C
+  with FP8 KV (model-quality.md 6.7). T1 (FP8 KV): 6 x 6 -1.1 %, 8 x 8 -1.5 %, 6 x 2 -0.5 %;
+  prefill pp512 +1.0 %, pp2048 +0.6 %, pp16384 +0.6 %. The exact route's bits are unchanged
+  (`t1-exact`, T2); the fast T1 hashes are re-recorded. A 64 x 64-tile CUDA-core version of the runtime-shape GEMM (2026-10-24)
+  was removed with it: once the served route left the runtime-shape GEMM, it only sped up exact
+  routes this fork does not serve, beside the 32 x 32 kernel that K % 8 != 0 still needed.
+- **Two-term x formed once per token (2026-10-24, RTX PRO 6000, this fork).** The wide route's
+  `quantize_x_terms_kernel` formed each wide entry's two-term A4 x from its token's row, so a token's
+  terms were computed once per routed expert (ten times at top-10): 654 us per layer at 16K tokens.
+  `x_token_terms_kernel` now forms every token's row scale and terms once (replacing
+  `x_row_scale_kernel`) into a per-token plane (`x_token_terms`, 2,880 bytes per column of workspace),
+  and `copy_x_terms_kernel` copies each entry's token row into the entry plane the GEMM's TMA maps
+  read. The rows are fully written, so the planes hold the same bytes: T1, T1-exact and T2 unchanged,
+  `infernix_offloaded_moe_wide_test` passes. Prefill (`infernix_bench`, FP8 KV, base/new/new/base
+  twice): pp4096 +0.9 / +1.0 %, pp16384 +0.8 / +0.9 %, pp32768 +0.7 / +0.9 %, pp512 +1.3 / +2.9 %.
+- **Hyper-connection mix on sliced-K routes (`hc-sliced-k`, 2026-10-24, RTX PRO 6000, this fork).**
+  Above the fused route (29 or more columns) the mix's Q8 [324, 10240] and [320, 10240] projections
+  ran one MMA chain over K = 10,240 in a few dozen CTAs, 24-125 us per call from 9 to 2,048 columns.
+  The `hc-sliced-k` fast path (`LinearRoutes::Q8HcSlicedK`, `select_q8_n324_k10240_fast`) runs them
+  on sliced-K routes from 6 to 2,048 columns; beyond, the exact tiles stay. It is qualified on recipe
+  C with FP8 KV only (INT8 fails its decode tail; model-quality.md 6.7). T1 (FP8 KV, base/new twice):
+  6 x 6 -2.5 %, 6 x 8 -5.4 %, 8 x 8 -5.5 %; 28 columns or fewer unchanged. Prefill: pp256 +17 %,
+  pp512 +9 %, pp1024 +2 %, pp2048 unchanged. The exact route's bits are unchanged (`t1-exact`); the
+  fast route's T1 hashes are re-recorded (each lane's 1,024-token context prefill takes the path).
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of

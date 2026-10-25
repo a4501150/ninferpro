@@ -368,8 +368,9 @@ MixRun mix_run(MixProblem& p, const std::uint16_t* residual, std::int32_t width,
 }
 
 void section_hyper_connection_mix() {
-    const std::int32_t widths[] = {1, 2, 8, 9, 15, 16, 17, 32, 64, 96, 97, 128, 129, 255, 256, 257, 512};
-    constexpr std::int32_t kWidest = 512;
+    const std::int32_t widths[] = {1, 2, 8, 9, 15, 16, 17, 28, 29, 32, 64, 96, 97, 128, 129, 255, 256, 257, 512};
+    constexpr std::int32_t kWidest       = 512;
+    constexpr std::int32_t kFusedColumns = 28; // the default route's fused mixer serves 1..28 columns
     MixProblem p = make_mix_problem();
     DeviceArena ws(ops::hyper_connection_mix_workspace_capacity_bytes(p.down_w, p.up_w, g_policy,
                                                                      kStreams, kRank, kWidest));
@@ -397,7 +398,7 @@ void section_hyper_connection_mix() {
                 }
                 vs_fused.equal = false;
             }
-            if (width > 16) {
+            if (width > kFusedColumns) {
                 const Diff wc = diff_bf16(run.x.data() + static_cast<std::size_t>(c) * kHidden,
                                          wide.x.data() + static_cast<std::size_t>(c) * kHidden, kHidden);
                 if (!wc.equal) {
@@ -410,7 +411,7 @@ void section_hyper_connection_mix() {
             }
         }
         record("hyper_connection_mix", "width " + std::to_string(width) + " vs width 1", vs_fused);
-        if (width > 16) {
+        if (width > kFusedColumns) {
             record("hyper_connection_mix", "width " + std::to_string(width) + " vs width 512", vs_composed);
         }
     }

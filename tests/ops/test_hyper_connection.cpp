@@ -7,12 +7,13 @@
 //   inject = 2 sigmoid(z[rank:] / S); u = W_up m; x = (1/S) sum_s sigmoid(u[sH + d]) Rn[sH + d].
 //
 // Cases: Flash-Next's geometry (S = 4, H = 2560, rank 320) with and without injects at T = 1, 4, 5,
-// 8, 9, 16 (the fused route) and 17, 64, 96, 97, 129, 193 (the composed route; with Q8 weights and
-// more than 96 columns its up projection and collapse run as one kernel, whose tile changes at 129
-// columns and leaves partial token tiles at 97, 129 and 193); column invariance of the fused route
-// (each column of a 16-column call bit-identical to that column alone, and a 5-column call equal to
-// the 16-column call's first five); one graph-captured call bit-identical to the eager call; the
-// workspace capacity covers every T. Criteria: the fused route rounds only x to BF16 (FP32
+// 8, 9, 16, 17, 28 (the fused route; above 16 columns its collapse loops over token groups) and 29,
+// 64, 96, 97, 129, 193 (the composed route; with Q8 weights and more than 96 columns its up projection
+// and collapse run as one kernel, whose tile changes at 129 columns and leaves partial token tiles at
+// 97, 129 and 193); column invariance of the fused route (each column of a 28-column call
+// bit-identical to that column alone, and a 5-column call equal to the 28-column call's first five);
+// one graph-captured call bit-identical to the eager call; the
+// workspace capacity covers every T; hyper_connection_inject_mix equal to inject then mix bit for bit. Criteria: the fused route rounds only x to BF16 (FP32
 // intermediates), so |x - ref| <= 2^-8 |ref| + 2^-12 rms(ref), and injects to 1e-5 relative + 1e-6; the
 // composed route rounds Rn, z, m and u to BF16, so its bound is 2^-5 |ref| + 2^-6 rms(ref) and
 // injects to 2^-7 relative + 2^-9.
@@ -323,6 +324,54 @@ void compare(const Result& got, const Reference& ref, bool fused, bool inject, c
     }
 }
 
+// hyper_connection_inject_mix against hyper_connection_inject then hyper_connection_mix: the updated
+// residual, x and the injects (written over the injects applied, as the Forward calls it) bit for bit.
+void check_inject_mix(Problem& p, int T, bool inject_out, infernix::WorkspaceArena& ws, cudaStream_t stream,
+                      const std::string& tag) {
+    const auto r = residual(T, 9000U + static_cast<std::uint32_t>(T));
+    std::vector<std::uint16_t> y(static_cast<std::size_t>(kH) * T);
+    std::vector<float> a(static_cast<std::size_t>(kS) * T);
+    std::uint32_t state = 31U + static_cast<std::uint32_t>(T);
+    for (auto& v : y) { v = t::f32_to_bf16(uniform(state)); }
+    for (auto& v : a) { v = 1.0F + uniform(state); }
+    struct Out {
+        std::vector<std::uint16_t> r, x;
+        std::vector<float> inject;
+    };
+    const auto go = [&](bool fused) {
+        Device rd(r.size() * 2), yd(y.size() * 2), ad(a.size() * 4), xd(static_cast<std::size_t>(kH) * T * 2);
+        t::cuda_check(cudaMemcpy(rd.p, r.data(), r.size() * 2, cudaMemcpyHostToDevice), "residual");
+        t::cuda_check(cudaMemcpy(yd.p, y.data(), y.size() * 2, cudaMemcpyHostToDevice), "y");
+        t::cuda_check(cudaMemcpy(ad.p, a.data(), a.size() * 4, cudaMemcpyHostToDevice), "inject");
+        Tensor R(rd.p, DType::BF16, {kW, T});
+        const Tensor Y(yd.p, DType::BF16, {kH, T});
+        Tensor A(ad.p, DType::FP32, {kS, T});
+        const Tensor w(p.norm_device->p, DType::BF16, {kW});
+        Tensor x(xd.p, DType::BF16, {kH, T});
+        const auto policy = infernix::ops::LinearPolicy::A16Only;
+        if (fused) {
+            infernix::ops::hyper_connection_inject_mix(Y, A, R, w, p.down_w, p.up_w, policy, kS, kRank, kEps, x,
+                                                       inject_out ? &A : nullptr, ws, stream);
+        } else {
+            infernix::ops::hyper_connection_inject(Y, A, R, stream);
+            infernix::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, policy, kS, kRank, kEps, x,
+                                                inject_out ? &A : nullptr, ws, stream);
+        }
+        t::cuda_check(cudaStreamSynchronize(stream), "sync");
+        Out out{std::vector<std::uint16_t>(r.size()), std::vector<std::uint16_t>(static_cast<std::size_t>(kH) * T),
+                std::vector<float>(a.size())};
+        t::cuda_check(cudaMemcpy(out.r.data(), rd.p, out.r.size() * 2, cudaMemcpyDeviceToHost), "residual");
+        t::cuda_check(cudaMemcpy(out.x.data(), xd.p, out.x.size() * 2, cudaMemcpyDeviceToHost), "x");
+        t::cuda_check(cudaMemcpy(out.inject.data(), ad.p, out.inject.size() * 4, cudaMemcpyDeviceToHost), "inject");
+        return out;
+    };
+    const Out separate = go(false), joined = go(true);
+    const std::string label = tag + " inject_mix T=" + std::to_string(T);
+    check(joined.r == separate.r, label + ": the updated residual equals inject then mix");
+    check(joined.x == separate.x, label + ": x equals inject then mix");
+    check(joined.inject == separate.inject, label + ": the injects equal inject then mix");
+}
+
 } // namespace
 
 int main() {
@@ -340,18 +389,18 @@ int main() {
                 p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 193);
             infernix::WorkspaceArena ws(capacity);
             const std::string tag = std::string(codec == Codec::Q8 ? "q8 " : "bf16 ") + (inject ? "inject" : "no inject");
-            for (const int T : {1, 4, 5, 8, 9, 16, 17, 64, 96, 97, 129, 193}) {
+            for (const int T : {1, 4, 5, 8, 9, 16, 17, 28, 29, 64, 96, 97, 129, 193}) {
                 const auto r     = residual(T, 1000U + static_cast<std::uint32_t>(T));
                 const Result got = run(p, r, T, inject, ws, stream);
-                compare(got, oracle(r, p.norm, p.down_values, p.down_rows, p.up_values, T), T <= 16, inject,
+                compare(got, oracle(r, p.norm, p.down_values, p.down_rows, p.up_values, T), T <= 28, inject,
                         tag + " T=" + std::to_string(T));
                 check(ws.peak_used() <= capacity, tag + ": the workspace capacity covers T=" + std::to_string(T));
             }
             // Column invariance of the fused route.
-            const auto r16    = residual(16, 4242U);
-            const Result all  = run(p, r16, 16, inject, ws, stream);
+            const auto r16    = residual(28, 4242U);
+            const Result all  = run(p, r16, 28, inject, ws, stream);
             bool same         = true;
-            for (int c = 0; c < 16 && same; ++c) {
+            for (int c = 0; c < 28 && same; ++c) {
                 const std::vector<std::uint16_t> one(r16.begin() + static_cast<std::ptrdiff_t>(c) * kW,
                                                      r16.begin() + static_cast<std::ptrdiff_t>(c + 1) * kW);
                 const Result alone = run(p, one, 1, inject, ws, stream);
@@ -359,12 +408,14 @@ int main() {
                        (!inject || std::equal(alone.inject.begin(), alone.inject.end(),
                                               all.inject.begin() + static_cast<std::ptrdiff_t>(c) * kS));
             }
-            check(same, tag + ": each column of a 16-column call equals that column alone");
+            check(same, tag + ": each column of a 28-column call equals that column alone");
             const std::vector<std::uint16_t> r5(r16.begin(), r16.begin() + 5 * kW);
             const Result five = run(p, r5, 5, inject, ws, stream);
             check(std::equal(five.x.begin(), five.x.end(), all.x.begin()), tag + ": a 5-column call equals the first five");
             const Result captured = run(p, r5, 5, inject, ws, stream, true);
             check(captured.x == five.x && captured.inject == five.inject, tag + ": a graph-captured call equals the eager call");
+            // One column takes the fused route's injecting kernels; 2 and 29 columns the two steps.
+            for (const int T : {1, 2, 29}) { check_inject_mix(p, T, inject, ws, stream, tag); }
         }
         // Shapes that disagree are refused.
         {

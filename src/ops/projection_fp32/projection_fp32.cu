@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <limits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -138,33 +139,47 @@ __global__ void __launch_bounds__(Threads)
     }
 }
 
-// Wide calls (prefill chunks). The narrow mapping re-reads a CTA's weight rows for every eight
-// columns and reads nine 16-byte words per 64 FMAs: a 4K-token router call takes ~0.75 ms at
-// ~14 TFLOP/s. Here a CTA owns a kWideRows x kWideColumns output tile and walks K in slices of 256
-// elements, which is exactly one 8-element chunk per lane: in slice s lane l handles chunk
-// 32 s + l, the narrow kernels' l-th lane partial in the same order. Each slice's weight rows and
-// x columns are staged with cp.async (double-buffered); a warp owns a 4-row x 8-column sub-tile, so
-// a lane loads 12 16-byte words per 256 FMAs. After the last slice each warp reduces its partials
-// by the same butterfly, so the bits equal the narrow kernels' (an output's summation still
-// depends only on K).
-// 512 threads: a lane's 32 accumulators and 32 widened weights need more than the 64 registers a
-// 1,024-thread CTA allows (that version spilled and ran at 1.6 ms).
-constexpr int kWideRows        = 32; // output rows per CTA
-constexpr int kWideColumns     = 16; // output columns per CTA
-constexpr int kWideTileRows    = 4;  // per warp
-constexpr int kWideTileColumns = 8;
-constexpr int kWideRowWarps    = kWideRows / kWideTileRows;       // 8
-constexpr int kWideColumnWarps = kWideColumns / kWideTileColumns; // 2
-constexpr int kWideThreads     = kWideRowWarps * kWideColumnWarps * 32;
-constexpr int kSliceChunks     = 32; // chunks per K slice: one per lane
-constexpr int kStageWords      = (kWideRows + kWideColumns) * kSliceChunks; // 16-byte words per stage
-constexpr int kWideSharedBytes = 2 * kStageWords * 16;
-constexpr int kWideMinColumns  = 64; // narrower calls keep the narrow mapping (same bits)
+// Wide calls (prefill chunks and verification rounds of 21 or more columns). The narrow mapping
+// re-reads a CTA's weight rows for every eight columns. Here a CTA owns an output tile and walks K in
+// slices of 256 elements, which is exactly one 8-element chunk per lane: in slice s lane l handles
+// chunk 32 s + l, the narrow kernels' l-th lane partial in the same order. Each slice's weight rows
+// and x columns are staged with cp.async (three stages, one barrier per slice); a warp owns a
+// TileRows x TileColumns sub-tile and multiplies BF16 operands without widening them (fma8_bf16).
+// After the last slice each warp reduces its partials by the same butterfly, so the bits equal the
+// narrow kernels' (an output's summation still depends only on K).
+// [513, 2560] router, RTX PRO 6000 (2026-10-24): the earlier 4 x 8 tile with widened operands took
+// 360 / 1358 us at 4,096 / 16,384 columns (~30 TFLOP/s); the small shape below takes 8 us from 21 to
+// 64 columns (the narrow mappings 10-18 us) and 33 us at 512, the large one 195-209 / 743-778 us at
+// 4,096 / 16,384 (55-58 TFLOP/s; FHFMA.BF16 peaks at ~110).
+template <int TileRows, int TileColumns, int RowWarps, int ColumnWarps, int Stages, int MinBlocks>
+struct WideShape {
+    static constexpr int kTileRows    = TileRows; // per warp
+    static constexpr int kTileColumns = TileColumns;
+    static constexpr int kRowWarps    = RowWarps;
+    static constexpr int kStages      = Stages;
+    static constexpr int kMinBlocks   = MinBlocks;
+    static constexpr int kRows        = TileRows * RowWarps; // output rows per CTA
+    static constexpr int kColumns     = TileColumns * ColumnWarps;
+    static constexpr int kThreads     = RowWarps * ColumnWarps * 32;
+    static constexpr int kStageWords  = (kRows + kColumns) * 32; // 16-byte words per stage
+    static constexpr int kSharedBytes = Stages * kStageWords * 16;
+    static_assert(Stages >= 2 && (TileRows * TileColumns) % 32 == 0);
+    static_assert((kRows * 32) % kThreads == 0 && (kColumns * 32) % kThreads == 0);
+};
+// 16 x 16 tiles, two CTAs per SM, up to 512 columns; 32 x 32 tiles, one CTA per SM, beyond.
+using WideSmall = WideShape<4, 8, 4, 2, 3, 2>;
+using WideLarge = WideShape<4, 16, 8, 2, 3, 1>;
+constexpr int kSliceChunks         = 32; // chunks per K slice: one per lane
+// Narrower calls keep the narrow mappings (same bits). In a round's graph the row mapping loads a
+// row's whole K before its dependency wait, which the wide kernel's two staged slices do not match:
+// T1 rounds of 18 columns took 0.6 % longer on the wide kernel, 20 and 21 tied, 22-48 ran 0.4-2.0 %
+// faster.
+constexpr int kWideMinColumns      = 21;
+constexpr int kWideLargeMinColumns = 513;
 // Calls up to this many columns give each warp one row (one CTA per four rows and eight columns): a
 // 12-column DFlash2 verification round's 513-row router took 27 us in the four-rows-per-warp mapping's
 // 34 CTAs (RTX PRO 6000, 2026-10-21). Same bits as the other mapping.
 constexpr int kRowMappingMaxColumns = 32;
-static_assert(kWideThreads == 512 && kStageWords % kWideThreads == 0);
 
 // The address of chunk `chunk` (8 elements) of output row `row`.
 __device__ __forceinline__ const uint4* row_chunk(const Segments& segments, int row, int k, int chunk) {
@@ -180,6 +195,16 @@ __device__ __forceinline__ const uint4* row_chunk(const Segments& segments, int 
     return reinterpret_cast<const uint4*>(data + static_cast<std::size_t>(row - begin) * k) + chunk;
 }
 
+// acc = fma(w[i], x[i], acc) for the eight BF16 elements in order. The mixed-precision FMA takes
+// each BF16 operand exactly as its FP32 widening, so it rounds as fmaf on widened values does, and it
+// reads either half of a register (FHFMA.BF16 on sm_120a), which leaves no conversion instructions.
+__device__ __forceinline__ void fma8_bf16(const uint4& w, const uint4& x, float& acc) {
+    const auto* wv = reinterpret_cast<const unsigned short*>(&w);
+    const auto* xv = reinterpret_cast<const unsigned short*>(&x);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(acc) : "h"(wv[i]), "h"(xv[i])); }
+}
+
 __device__ __forceinline__ void widen8(const uint4& packed, float (&out)[8]) {
     const auto* v = reinterpret_cast<const bf16*>(&packed);
 #pragma unroll
@@ -192,76 +217,122 @@ __device__ __forceinline__ void stage16(uint4* dst, const void* src, bool valid)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(valid ? 16 : 0) : "memory");
 }
 
-__global__ void __launch_bounds__(kWideThreads, 1)
+template <class Shape>
+__global__ void __launch_bounds__(Shape::kThreads, Shape::kMinBlocks)
     projection_wide_kernel(const bf16* __restrict__ x, int k, int columns, Segments segments, float* __restrict__ out) {
-    extern __shared__ uint4 stage[]; // [2][rows then columns][kSliceChunks]
+    constexpr int kTileRows = Shape::kTileRows, kTileColumns = Shape::kTileColumns, kStages = Shape::kStages;
+    constexpr int kStageWords = Shape::kStageWords, kThreads = Shape::kThreads, kCtaRows = Shape::kRows;
+    extern __shared__ uint4 stage[]; // [kStages][rows then columns][kSliceChunks]
     const int chunks       = k / 8;
     const int slices       = (chunks + kSliceChunks - 1) / kSliceChunks;
     const int rows         = total_rows(segments);
-    const int first_row    = static_cast<int>(blockIdx.x) * kWideRows;
-    const int first_column = static_cast<int>(blockIdx.y) * kWideColumns;
-    const auto issue = [&](int slice, int buffer) {
-        uint4* base = stage + buffer * kStageWords;
+    const int first_row    = static_cast<int>(blockIdx.x) * kCtaRows;
+    const int first_column = static_cast<int>(blockIdx.y) * Shape::kColumns;
+    // Slice `slice`'s weight rows, then its x columns, into stage slice % kStages.
+    const auto issue_rows = [&](int slice) {
+        uint4* base = stage + (slice % kStages) * kStageWords;
 #pragma unroll
-        for (int u = 0; u < kStageWords / kWideThreads; ++u) {
-            const int i     = static_cast<int>(threadIdx.x) + u * kWideThreads;
-            const int line  = i / kSliceChunks;
-            const int chunk = slice * kSliceChunks + i % kSliceChunks;
-            if (line < kWideRows) {
-                const int row    = first_row + line;
-                const bool valid = row < rows && chunk < chunks;
-                stage16(base + i, valid ? static_cast<const void*>(row_chunk(segments, row, k, chunk)) : x, valid);
-            } else {
-                const int column = first_column + line - kWideRows;
-                const bool valid = column < columns && chunk < chunks;
-                stage16(base + i, valid ? static_cast<const void*>(x + static_cast<std::size_t>(column) * k + 8 * chunk) : x,
-                        valid);
-            }
+        for (int u = 0; u < kCtaRows * kSliceChunks / kThreads; ++u) {
+            const int i      = static_cast<int>(threadIdx.x) + u * kThreads;
+            const int row    = first_row + i / kSliceChunks;
+            const int chunk  = slice * kSliceChunks + i % kSliceChunks;
+            const bool valid = row < rows && chunk < chunks;
+            stage16(base + i, valid ? static_cast<const void*>(row_chunk(segments, row, k, chunk)) : x, valid);
         }
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    };
+    const auto issue_columns = [&](int slice) {
+        uint4* base = stage + (slice % kStages) * kStageWords + kCtaRows * kSliceChunks;
+#pragma unroll
+        for (int u = 0; u < Shape::kColumns * kSliceChunks / kThreads; ++u) {
+            const int i      = static_cast<int>(threadIdx.x) + u * kThreads;
+            const int column = first_column + i / kSliceChunks;
+            const int chunk  = slice * kSliceChunks + i % kSliceChunks;
+            const bool valid = column < columns && chunk < chunks;
+            stage16(base + i, valid ? static_cast<const void*>(x + static_cast<std::size_t>(column) * k + 8 * chunk) : x,
+                    valid);
+        }
     };
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
-    const int r0 = (warp % kWideRowWarps) * kWideTileRows;
-    const int c0 = (warp / kWideRowWarps) * kWideTileColumns;
-    float sums[kWideTileRows][kWideTileColumns] = {};
-    issue(0, 0);
+    const int r0 = (warp % Shape::kRowWarps) * kTileRows;
+    const int c0 = (warp / Shape::kRowWarps) * kTileColumns;
+    float sums[kTileRows][kTileColumns] = {};
+    // Launched as a programmatic dependent: the weights are immutable, so the first stages' weight
+    // loads precede the wait. They join the first commit group, which slice 0 waits for.
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) {
+        if (s < slices) { issue_rows(s); }
+    }
+    pdl::enter();
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) {
+        if (s < slices) { issue_columns(s); }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    }
+    const bool active = first_row + r0 < rows; // warp-uniform: a warp with no row skips the FMAs
     for (int s = 0; s < slices; ++s) {
-        if (s + 1 < slices) {
-            issue(s + 1, (s + 1) & 1);
-            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
-        } else {
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-        }
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2) : "memory");
+        // Every warp has finished slice s - 1, whose buffer the issue below overwrites.
         __syncthreads();
-        if (s * kSliceChunks + lane < chunks) { // the narrow kernels' loop ends at the last chunk too
-            const uint4* base = stage + (s & 1) * kStageWords;
-            float wf[kWideTileRows][8];
+        if (s + kStages - 1 < slices) {
+            issue_rows(s + kStages - 1);
+            issue_columns(s + kStages - 1);
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        if (active && s * kSliceChunks + lane < chunks) { // the narrow kernels' loop ends at the last chunk too
+            const uint4* base = stage + (s % kStages) * kStageWords;
+            uint4 w[kTileRows];
 #pragma unroll
-            for (int r = 0; r < kWideTileRows; ++r) { widen8(base[(r0 + r) * kSliceChunks + lane], wf[r]); }
+            for (int r = 0; r < kTileRows; ++r) { w[r] = base[(r0 + r) * kSliceChunks + lane]; }
 #pragma unroll
-            for (int c = 0; c < kWideTileColumns; ++c) {
-                float xf[8];
-                widen8(base[(kWideRows + c0 + c) * kSliceChunks + lane], xf);
+            for (int c = 0; c < kTileColumns; ++c) {
+                const uint4 xc = base[(kCtaRows + c0 + c) * kSliceChunks + lane];
 #pragma unroll
-                for (int r = 0; r < kWideTileRows; ++r) {
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) { sums[r][c] = fmaf(wf[r][i], xf[i], sums[r][c]); }
-                }
+                for (int r = 0; r < kTileRows; ++r) { fma8_bf16(w[r], xc, sums[r][c]); }
             }
         }
-        __syncthreads(); // the next iteration's issue overwrites this buffer
+    }
+    // The butterfly as a reduce-scatter: at each offset a lane keeps the half of its outputs whose
+    // half matches its lane bit and adds its partner's copy of them, so lane l ends with outputs
+    // l * n .. l * n + n - 1 (n = outputs per lane / 32) in row-major order of the warp's sub-tile.
+    // Every output still takes the xor 16..1 tree, own value first.
+    constexpr int kOutputs = kTileRows * kTileColumns;
+    float v[kOutputs];
+#pragma unroll
+    for (int r = 0; r < kTileRows; ++r) {
+#pragma unroll
+        for (int c = 0; c < kTileColumns; ++c) { v[r * kTileColumns + c] = sums[r][c]; }
     }
 #pragma unroll
-    for (int r = 0; r < kWideTileRows; ++r) {
-        const int row = first_row + r0 + r;
+    for (int offset = 16, half = kOutputs / 2; offset > 0; offset >>= 1, half >>= 1) {
+        const bool upper = (lane & offset) != 0;
 #pragma unroll
-        for (int c = 0; c < kWideTileColumns; ++c) {
-            const int column = first_column + c0 + c;
-            float v          = sums[r][c];
-            for (int offset = 16; offset > 0; offset >>= 1) { v += __shfl_xor_sync(0xFFFFFFFFU, v, offset); }
-            if (lane == 0 && row < rows && column < columns) { out[static_cast<std::size_t>(column) * rows + row] = v; }
+        for (int j = 0; j < half; ++j) {
+            const float keep = upper ? v[j + half] : v[j];
+            const float send = upper ? v[j] : v[j + half];
+            v[j]             = keep + __shfl_xor_sync(0xFFFFFFFFU, send, offset);
         }
     }
+    constexpr int kPerLane = kOutputs / 32;
+#pragma unroll
+    for (int j = 0; j < kPerLane; ++j) {
+        const int o = lane * kPerLane + j;
+        const int row = first_row + r0 + o / kTileColumns, column = first_column + c0 + o % kTileColumns;
+        if (row < rows && column < columns) { out[static_cast<std::size_t>(column) * rows + row] = v[j]; }
+    }
+}
+
+template <class Shape>
+void launch_wide(const bf16* x, int k, int rows, int columns, const Segments& segments, float* out,
+                 cudaStream_t stream) {
+    static const bool configured = [] {
+        return cudaFuncSetAttribute(projection_wide_kernel<Shape>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    Shape::kSharedBytes) == cudaSuccess;
+    }();
+    require(configured, "the wide kernel's shared memory could not be configured");
+    CUDA_CHECK(pdl::launch_consumer({dim3((rows + Shape::kRows - 1) / Shape::kRows,
+                                          (columns + Shape::kColumns - 1) / Shape::kColumns),
+                                     dim3(Shape::kThreads), Shape::kSharedBytes, stream},
+                                    projection_wide_kernel<Shape>, x, k, columns, segments, out));
 }
 
 // The q8_g32_fp16 form: row r's codes start at r * padded_k, its FP16 scales at r * padded_k / 32.
@@ -364,21 +435,30 @@ __global__ void projection_q4_kernel(const bf16* __restrict__ x, int k, int padd
 // eight columns per CTA, so 9..16 columns read every weight twice, and it gives each warp one row at a
 // time, so each staged x chunk is widened again for every row: the BF16 head [248320, 2560] took
 // 1.04 ms at 8 columns and 1.5 ms at 9-16 against a 0.71 ms DRAM floor. Here a CTA stages all of a
-// call's columns (up to 16) once, each warp preloads all of its two rows' chunks before the first FMA,
-// and each x chunk is widened once for both rows. Lane l still accumulates chunks l, l + 32, ... in
-// order per (row, column) and the warp reduces by the same butterfly, so the bits equal the narrow
-// kernels' at every width.
+// pass's columns once, each warp preloads all of its two rows' chunks before the first FMA, and each x
+// chunk is widened once for both rows. Lane l still accumulates chunks l, l + 32, ... in order per
+// (row, column) and the warp reduces by the same butterfly, so the bits equal the narrow kernels' at
+// every width. A pass holds up to 16 columns, or 17..19 in one pass of a wider body; wider calls run
+// balanced passes, each reading the weights once, where the narrow mapping read them once per eight
+// columns (q8_g32_fp16 [248320, 2560], RTX PRO 6000, 2026-10-24: 18 / 24 / 32 columns 1871 / 2107 /
+// 2801 -> 1186 / 1810 / 2142 us). A persistent variant (one CTA per SM walking row pairs with the
+// next pair's chunks in a second register buffer) was slower at every width (705-1516 us at 1-16).
 constexpr int kTallThreads     = 256;
 constexpr int kTallWarps       = kTallThreads / 32;
 constexpr int kTallRowsPerWarp = 2;
-constexpr int kTallMaxColumns  = 16;
+constexpr int kTallMaxColumns  = 16; // per pass of the common body
+// 17..19 columns take a 19-column body in one pass (19 x 2560 BF16 columns fill a CTA's 99 KB);
+// its larger unrolled body costs ~5 % per call at 16 columns or fewer, so they keep the 16-column one.
+constexpr int kTallWideColumns = 19;
+constexpr int kTallMaxShared   = 101376;
 constexpr int kTallMinRows     = 32768;
+// The BF16 heads keep the tall mapping for 8..16 columns (tensor-core heads take 1..16).
+constexpr int kTallMaxColumnsBf16 = 16;
 // From these widths the tall mapping is faster (RTX 5090, [248320, 2560], 2026-10-08): BF16 840 vs
 // 1043 us at 8 columns and 869 vs 1500 at 9; q8_g32_fp16 841 vs 1209 at 9 but slower up to 8
 // (799 vs 762), where the narrow mapping stays near the DRAM floor.
 constexpr int kTallMinColumnsBf16 = 8;
 constexpr int kTallMinColumnsQ8   = 9;
-constexpr std::size_t kTallMaxSharedBytes = static_cast<std::size_t>(kTallMaxColumns) * kMaxK * sizeof(bf16);
 
 struct TallBf16 {
     Segments segments;
@@ -407,7 +487,7 @@ struct TallQ8 {
     }
 };
 
-template <class Codec>
+template <class Codec, int MaxColumns>
 __global__ void __launch_bounds__(kTallThreads, 1)
     projection_tall_kernel(const bf16* __restrict__ x, int k, int columns, int rows, Codec codec,
                            float* __restrict__ out) {
@@ -436,7 +516,7 @@ __global__ void __launch_bounds__(kTallThreads, 1)
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncthreads();
     // 2. Per chunk in lane order: widen both rows' weights, then each column's x once.
-    float sums[kTallRowsPerWarp][kTallMaxColumns] = {};
+    float sums[kTallRowsPerWarp][MaxColumns] = {};
 #pragma unroll
     for (int i = 0; i < kMaxLaneChunks; ++i) {
         const int chunk = lane + 32 * i;
@@ -445,7 +525,7 @@ __global__ void __launch_bounds__(kTallThreads, 1)
 #pragma unroll
         for (int r = 0; r < kTallRowsPerWarp; ++r) { Codec::decode(w[r][i], wf[r]); }
 #pragma unroll
-        for (int column = 0; column < kTallMaxColumns; ++column) {
+        for (int column = 0; column < MaxColumns; ++column) {
             if (column < columns) {
                 float xf[8];
                 widen8(staged[column * chunks + chunk], xf);
@@ -461,7 +541,7 @@ __global__ void __launch_bounds__(kTallThreads, 1)
     for (int r = 0; r < kTallRowsPerWarp; ++r) {
         const int row = first_row + r;
 #pragma unroll
-        for (int column = 0; column < kTallMaxColumns; ++column) {
+        for (int column = 0; column < MaxColumns; ++column) {
             if (column < columns) {
                 float v = sums[r][column];
                 for (int offset = 16; offset > 0; offset >>= 1) { v += __shfl_xor_sync(0xFFFFFFFFU, v, offset); }
@@ -471,17 +551,39 @@ __global__ void __launch_bounds__(kTallThreads, 1)
     }
 }
 
-template <class Codec>
-void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& codec, Tensor& out, cudaStream_t stream) {
+template <class Codec, int MaxColumns>
+void launch_tall_pass(const bf16* x, int k, int columns, int rows, const Codec& codec, float* out,
+                      cudaStream_t stream) {
     static const bool configured = [] {
-        return cudaFuncSetAttribute(projection_tall_kernel<Codec>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(kTallMaxSharedBytes)) == cudaSuccess;
+        return cudaFuncSetAttribute(projection_tall_kernel<Codec, MaxColumns>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, kTallMaxShared) == cudaSuccess;
     }();
     require(configured, "the tall kernel's shared memory could not be configured");
     const int rows_per_cta   = kTallWarps * kTallRowsPerWarp;
     const std::size_t staged = static_cast<std::size_t>(columns) * k * sizeof(bf16);
-    projection_tall_kernel<Codec><<<(rows + rows_per_cta - 1) / rows_per_cta, kTallThreads, staged, stream>>>(
-        static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
+    require(staged <= static_cast<std::size_t>(kTallMaxShared), "the tall pass's columns exceed shared memory");
+    projection_tall_kernel<Codec, MaxColumns>
+        <<<(rows + rows_per_cta - 1) / rows_per_cta, kTallThreads, staged, stream>>>(x, k, columns, rows, codec, out);
+}
+
+// 17..19 columns in one pass of the 19-column body when they fit; otherwise passes of at most 16
+// columns, balanced, each reading the weights once.
+template <class Codec>
+void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& codec, Tensor& out, cudaStream_t stream) {
+    const auto* xs = static_cast<const bf16*>(x.data);
+    auto* os       = static_cast<float*>(out.data);
+    if (columns > kTallMaxColumns && columns <= kTallWideColumns &&
+        static_cast<std::size_t>(columns) * k * sizeof(bf16) <= static_cast<std::size_t>(kTallMaxShared)) {
+        return launch_tall_pass<Codec, kTallWideColumns>(xs, k, columns, rows, codec, os, stream);
+    }
+    const int capacity = std::min(kTallMaxColumns, kTallMaxShared / (k * static_cast<int>(sizeof(bf16))));
+    const int passes   = (columns + capacity - 1) / capacity;
+    const int per_pass = (columns + passes - 1) / passes;
+    for (int c0 = 0; c0 < columns; c0 += per_pass) {
+        launch_tall_pass<Codec, kTallMaxColumns>(xs + static_cast<std::size_t>(c0) * k, k,
+                                                 std::min(per_pass, columns - c0), rows, codec,
+                                                 os + static_cast<std::size_t>(c0) * rows, stream);
+    }
 }
 
 // BF16 vocabulary heads at 1..16 columns: the tensor-core mapping, one route for every width, at the
@@ -495,10 +597,10 @@ bool mma_route(int rows, int columns, bool supported, detail::ProjectionRoute ro
            columns <= detail::kProjectionMmaMaxColumns;
 }
 
-bool tall_route(int rows, int columns, int min_columns, detail::ProjectionRoute route) {
+bool tall_route(int rows, int columns, int min_columns, int max_columns, detail::ProjectionRoute route) {
     if (route == detail::ProjectionRoute::Tall) { return true; }
     if (route == detail::ProjectionRoute::Narrow) { return false; }
-    return rows >= kTallMinRows && columns >= min_columns && columns <= kTallMaxColumns;
+    return rows >= kTallMinRows && columns >= min_columns && columns <= max_columns;
 }
 
 } // namespace
@@ -529,7 +631,7 @@ void detail::projection_fp32_route(const Tensor& x, const Weight& weight, Tensor
             "out must be FP32 [N, T]");
     const dim3 grid((rows + kRowsPerCta - 1) / kRowsPerCta, (columns + kColumns - 1) / kColumns);
     const std::size_t staged = static_cast<std::size_t>(std::min(kColumns, columns)) * k * sizeof(bf16);
-    if (!q4 && columns <= kTallMaxColumns && tall_route(rows, columns, kTallMinColumnsQ8, route)) {
+    if (!q4 && tall_route(rows, columns, kTallMinColumnsQ8, std::numeric_limits<int>::max(), route)) {
         launch_tall(x, k, columns, rows,
                     TallQ8{static_cast<const std::int8_t*>(weight.qdata), static_cast<const __half*>(weight.scales),
                            padded_k},
@@ -580,17 +682,17 @@ void detail::projection_fp32_route(const Tensor& x, std::span<const Tensor* cons
     if (segments.count == 1 &&
         mma_route(rows, columns, detail::projection_fp32_bf16_mma_supported(rows, k, columns), route)) {
         detail::projection_fp32_bf16_mma(x, segments.data[0], rows, out, stream);
-    } else if (columns <= kTallMaxColumns && tall_route(rows, columns, kTallMinColumnsBf16, route)) {
+    } else if (columns <= kTallMaxColumnsBf16 &&
+               tall_route(rows, columns, kTallMinColumnsBf16, kTallMaxColumnsBf16, route)) {
         launch_tall(x, k, columns, rows, TallBf16{segments, k}, out, stream);
-    } else if (columns >= kWideMinColumns) {
-        static const bool configured = [] {
-            return cudaFuncSetAttribute(projection_wide_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kWideSharedBytes) == cudaSuccess;
-        }();
-        require(configured, "the wide kernel's shared memory could not be configured");
-        projection_wide_kernel<<<dim3((rows + kWideRows - 1) / kWideRows, (columns + kWideColumns - 1) / kWideColumns),
-                                 kWideThreads, kWideSharedBytes, stream>>>(
-            static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
+    } else if (route != detail::ProjectionRoute::Narrow && columns >= kWideMinColumns) {
+        const auto* xd = static_cast<const bf16*>(x.data);
+        auto* od       = static_cast<float*>(out.data);
+        if (columns < kWideLargeMinColumns) {
+            launch_wide<WideSmall>(xd, k, rows, columns, segments, od, stream);
+        } else {
+            launch_wide<WideLarge>(xd, k, rows, columns, segments, od, stream);
+        }
     } else if (columns <= kRowMappingMaxColumns) {
         constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
         CUDA_CHECK(pdl::launch_consumer({dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups.y), dim3(threads),

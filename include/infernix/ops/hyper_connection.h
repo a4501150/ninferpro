@@ -38,9 +38,9 @@ namespace infernix::ops {
 /// down carries the S injection rows and inject receives FP32 [S, T]. eps > 0.
 ///
 /// Routes (private, chosen from the weights and T only): Q8_G32_FP16 RowSplit weights of the
-/// registered geometry (S = 4, H = 2560, rank a multiple of 8 up to 512) at T <= 16 run two fused
-/// kernels with every intermediate (Rn, z, m, u) in FP32, so a column's result does not depend on
-/// T within 1..16. Other weights and wider calls run the norm, linear (with `policy`), gates,
+/// registered geometry (S = 4, H = 2560, rank a multiple of 8 up to 512) at T <= 28 (T <= 16 where
+/// the norm weight is not 16-byte aligned) run two fused kernels with every intermediate (Rn, z, m,
+/// u) in FP32, so a column's result does not depend on T within that range. Other weights and wider calls run the norm, linear (with `policy` and `routes`), gates,
 /// linear and collapse steps with BF16 intermediates; with a Q8_G32_FP16 RowSplit W_up and 4 streams,
 /// calls of more than 96 columns compute the up linear and the collapse in one kernel that keeps u
 /// on chip, with the same bits as the separate steps. `workspace` is caller-owned transient
@@ -48,12 +48,23 @@ namespace infernix::ops {
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
-                          WorkspaceArena& workspace, cudaStream_t stream);
+                          WorkspaceArena& workspace, cudaStream_t stream,
+                          LinearRoutes routes = LinearRoutes::Exact);
 
 /// The workspace hyper_connection_mix needs for every T in [1, max_tokens].
 [[nodiscard]] std::size_t hyper_connection_mix_workspace_capacity_bytes(
     const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,
     std::int32_t rank, std::int32_t max_tokens);
+
+/// hyper_connection_inject(y, inject_in, residual) followed by hyper_connection_mix(residual, ...,
+/// x, inject_out), with the same bits. inject_out may be inject_in (the mix then overwrites the injects
+/// it applied) or null. The fused route's one-column kernels apply the injection inside the mix (no
+/// separate inject kernel); every other call runs the two steps.
+void hyper_connection_inject_mix(const Tensor& y, const Tensor& inject_in, Tensor& residual,
+                                 const Tensor& norm_weight, const Weight& down, const Weight& up,
+                                 LinearPolicy policy, std::int32_t streams, std::int32_t rank, float eps,
+                                 Tensor& x, Tensor* inject_out, WorkspaceArena& workspace, cudaStream_t stream,
+                                 LinearRoutes routes = LinearRoutes::Exact);
 
 /// residual[s*H+d,t] = bf16(residual[s*H+d,t] + inject[s,t] * y[d,t]). y: BF16 [H, T];
 /// inject: FP32 [S, T]; residual: BF16 [S*H, T], updated in place.

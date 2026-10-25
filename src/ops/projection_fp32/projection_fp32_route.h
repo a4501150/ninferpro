@@ -15,7 +15,7 @@ namespace infernix::ops::detail {
 
 enum class ProjectionRoute {
     Automatic, // what projection_fp32 selects
-    Narrow,    // the narrow (or, from 64 columns, wide) mapping
+    Narrow,    // the narrow mappings at every width (never the wide one)
     Tall,      // the tall mapping (BF16 and q8_g32_fp16, at most 16 columns)
     Mma,       // the tensor-core mapping (one BF16 segment, at most 16 columns)
 };

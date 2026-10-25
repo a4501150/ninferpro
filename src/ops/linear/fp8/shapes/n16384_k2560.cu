@@ -5,13 +5,13 @@
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_launch.cuh"
 #include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"
+#include "ops/linear/fp8/fp8_decode_routes.cuh"
 
 namespace infernix::ops::detail {
 namespace {
 using Geometry = Fp8Geometry<16384, 2560>;
-using Gemv     = Fp8A16GemvSchedule<8, 2, 16, 1, Fp8CodeCache::Default, 2, 2>;
-using Simt     = Fp8A16SimtSchedule<4, 2, 16, 8, 1, Fp8SimtActivationAccess::TokenPacked, Fp8CodeCache::Streaming, 1,
-                                    Fp8SimtBlockOrder::RowsContiguous, 1>;
+using Gemv     = Fp8N16384K2560Gemv;
+using Simt     = Fp8N16384K2560Simt;
 using TmaT128R128 = Fp8A16TmaMmaSchedule<128, 128, 4, 4, 2, 1>;
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -45,5 +45,6 @@ void launch_invariant(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
 } // namespace
 
 const Fp8LinearShape kFp8N16384K2560{16384,   2560, launch_a16, nullptr, uses_a8, nullptr,
-                                     launch_invariant, launch_fp8_a8_pair<Geometry>, kPairMinTokens};
+                                     launch_invariant, launch_fp8_a8_pair<Geometry>, kPairMinTokens,
+                                     launch_fp8_a8_pair_rows<Geometry>};
 } // namespace infernix::ops::detail

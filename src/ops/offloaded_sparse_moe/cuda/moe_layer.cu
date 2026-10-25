@@ -302,10 +302,10 @@ __global__ void __launch_bounds__(kThreads)
 // The record a job reads where it lies: its frame, its streamed ring slot or, in a call without
 // staging, its host record (an unserved one reports an error and gives nullptr). Sets `miss`, with
 // nullptr, for a record the pass must stage.
-__device__ __forceinline__ const std::uint8_t* in_place_record(const MoeExpertSource& source, int expert, bool& miss) {
-    miss            = false;
-    const int frame = source.frames[expert];
-    const int slot  = source.prefetched != nullptr ? source.prefetched[expert] : -1;
+// in_place_record with the expert's frames[] and prefetched[] entries already read.
+__device__ __forceinline__ const std::uint8_t* in_place_record_at(const MoeExpertSource& source, int expert, int frame,
+                                                                  int slot, bool& miss) {
+    miss = false;
     if (frame >= 0) { return source.frame_base + static_cast<std::uint64_t>(frame) * frame_pitch(source); }
     if (slot >= 0) { // streamed by the caller (F2)
         return source.prefetch_base +
@@ -319,6 +319,11 @@ __device__ __forceinline__ const std::uint8_t* in_place_record(const MoeExpertSo
     // SSD-only and not a CPU job (a fetch channel needs staging): the passes skip it.
     if (record == nullptr) { report_error(source, offloaded_moe::kErrorUnservedRecord); }
     return record;
+}
+
+__device__ __forceinline__ const std::uint8_t* in_place_record(const MoeExpertSource& source, int expert, bool& miss) {
+    return in_place_record_at(source, expert, source.frames[expert],
+                              source.prefetched != nullptr ? source.prefetched[expert] : -1, miss);
 }
 
 constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
@@ -449,59 +454,81 @@ __global__ void __launch_bounds__(kThreads)
 // One warp routes column t: exact top-k by repeated arg-max with lower-id ties, then the weights.
 // Every array index is a compile-time constant (unrolled loops), so the values stay in registers;
 // the selection and softmax order are fixed. Lane k < top_k returns the k-th selected id.
+// The selection order of route_column: a larger logit first, then the smaller expert id. A logit's
+// key orders as the float compares (-0 as +0; NaN below every number, never selected while a number
+// remains).
+__device__ __forceinline__ unsigned route_key(float v) {
+    if (v != v) { return 0U; }
+    const unsigned u = __float_as_uint(v == 0.0F ? 0.0F : v);
+    return (u & 0x80000000U) != 0U ? ~u : (u | 0x80000000U);
+}
+__device__ __forceinline__ float route_value(unsigned key) {
+    return __uint_as_float((key & 0x80000000U) != 0U ? (key & 0x7FFFFFFFU) : ~key);
+}
+
 __device__ __forceinline__ int route_column(const float* __restrict__ logits, int experts, int top_k, int t,
                                             std::int32_t* __restrict__ ids, float* __restrict__ weights,
                                             float* __restrict__ shared_gate) {
     const int lane      = threadIdx.x % 32;
     const float* column = logits + static_cast<std::size_t>(t) * (experts + 1);
-    // 512 experts: 16 per lane.
+    // 512 experts: 16 per lane (expert lane + 32 i), every load issued before any is used.
     constexpr int kPerLane = 16;
-    float values[kPerLane];
+    float raw[kPerLane];
 #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-        const int e = lane + 32 * i;
-        values[i]   = e < experts ? column[e] : -INFINITY;
-    }
+    for (int i = 0; i < kPerLane; ++i) { raw[i] = column[min(lane + 32 * i, experts - 1)]; }
     const float score = lane == 0 ? column[experts] : 0.0F;
-    // Lane k keeps the k-th selection.
+    unsigned key[kPerLane]; // 0 past the experts: below every key, never selected
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) { key[i] = lane + 32 * i < experts ? route_key(raw[i]) : 0U; }
+    // The lane's earliest choice: the largest key, the lowest index among equal ones.
+    unsigned best_key = 0;
+    int best_i        = 0;
+    const auto lane_best = [&] {
+        best_key = key[0];
+        best_i   = 0;
+#pragma unroll
+        for (int i = 1; i < kPerLane; ++i) {
+            if (key[i] > best_key) {
+                best_key = key[i];
+                best_i   = i;
+            }
+        }
+    };
+    lane_best();
+    // Lane k keeps the k-th selection. A selected expert stays a candidate at -inf, as it was.
+    constexpr unsigned kRemoved = 0x007FFFFFU; // route_key(-inf)
     float selected = -INFINITY;
     int chosen     = 0;
+#pragma unroll 1
     for (int k = 0; k < top_k; ++k) {
-        float best   = -INFINITY;
-        int best_id  = 0x7FFFFFFF;
-#pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-            const int e = lane + 32 * i;
-            if (e < experts && (values[i] > best || (values[i] == best && e < best_id))) {
-                best    = values[i];
-                best_id = e;
-            }
-        }
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float other    = __shfl_xor_sync(0xFFFFFFFFU, best, offset);
-            const int other_id   = __shfl_xor_sync(0xFFFFFFFFU, best_id, offset);
-            if (other > best || (other == best && other_id < best_id)) {
-                best    = other;
-                best_id = other_id;
-            }
-        }
+        const unsigned m = __reduce_max_sync(0xFFFFFFFFU, best_key);
+        const int id     = static_cast<int>(__reduce_min_sync(
+            0xFFFFFFFFU, best_key == m ? static_cast<unsigned>(lane + 32 * best_i) : 0xFFFFFFFFU));
         if (lane == k) {
-            selected = best;
-            chosen   = best_id;
+            selected = route_value(m);
+            chosen   = id;
         }
+        if (lane == id % 32) {
 #pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-            if (lane + 32 * i == best_id) { values[i] = -INFINITY; }
+            for (int i = 0; i < kPerLane; ++i) {
+                if (i == best_i) { key[i] = kRemoved; }
+            }
+            lane_best();
         }
     }
     // softmax over all experts then renormalized over the selected ones equals the softmax of the
     // selected logits. Every lane sums them in selection order.
-    const float top = __shfl_sync(0xFFFFFFFFU, selected, 0);
-    float sum       = 0.0F;
-    for (int k = 0; k < top_k; ++k) { sum += expf(__shfl_sync(0xFFFFFFFFU, selected, k) - top); }
+    const float top  = __shfl_sync(0xFFFFFFFFU, selected, 0);
+    const float mine = expf(selected - top);
+    float sum        = 0.0F;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        const float term = __shfl_sync(0xFFFFFFFFU, mine, k);
+        if (k < top_k) { sum += term; }
+    }
     if (lane < top_k) {
         ids[static_cast<std::size_t>(t) * top_k + lane]     = chosen;
-        weights[static_cast<std::size_t>(t) * top_k + lane] = expf(selected - top) / sum;
+        weights[static_cast<std::size_t>(t) * top_k + lane] = mine / sum;
     }
     if (lane == 0) { shared_gate[t] = 1.0F / (1.0F + expf(-score)); }
     return chosen;
@@ -527,7 +554,7 @@ constexpr int kDispatchThreads = 1024;
 // Inclusive scans of the counts and of the used flags run within each warp by shuffles, then
 // across the warp totals (in the caller's shared `warp_totals`); the results are integers, so any
 // scan order gives the same values.
-__device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* __restrict__ offsets,
+__device__ __forceinline__ int dispatch_scan(int c, int experts, std::int32_t* __restrict__ offsets,
                                               std::int32_t* cursor, std::int32_t* __restrict__ jobs,
                                               std::int32_t* __restrict__ job_count,
                                               std::int32_t (&warp_totals)[2][kDispatchThreads / 32]) {
@@ -575,6 +602,7 @@ __device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* 
         offsets[experts] = sum;
         *job_count       = used;
     }
+    return e < experts && c > 0 ? used - 1 : -1;
 }
 
 // The whole dispatch of a call of at most kDispatchThreads entries in one CTA: the count with
@@ -582,7 +610,8 @@ __device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* 
 // scan, the scatter, and the optional route-log copy of the ids. Same results as the three-kernel
 // route below.
 // The caller has cleared `count` and synchronized; thread i < entries holds entry i's expert `id`.
-__device__ __forceinline__ void dispatch_small(int id, int entries, int experts, const MoeDispatch& dispatch,
+// Returns the job index of expert i (thread i), or -1 when it has no entries.
+__device__ __forceinline__ int dispatch_small(int id, int entries, int experts, const MoeDispatch& dispatch,
                                                std::int32_t* __restrict__ route_log,
                                                std::int32_t (&count)[kDispatchThreads],
                                                std::int32_t (&cursor)[kDispatchThreads],
@@ -595,9 +624,10 @@ __device__ __forceinline__ void dispatch_small(int id, int entries, int experts,
     __syncthreads();
     const int c = count[i];
     if (i < experts) { dispatch.counts[i] = c; }
-    dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
+    const int job = dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
     __syncthreads();
     if (i < entries) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+    return job;
 }
 
 __global__ void __launch_bounds__(kDispatchThreads)
@@ -610,7 +640,7 @@ __global__ void __launch_bounds__(kDispatchThreads)
     const int i = threadIdx.x;
     count[i]    = 0;
     __syncthreads();
-    dispatch_small(i < entries ? ids[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
+    (void)dispatch_small(i < entries ? ids[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
 }
 
 // Calls of at most this many columns (and kDispatchThreads entries) route and dispatch in one CTA,
@@ -656,7 +686,7 @@ __global__ void __launch_bounds__(kDispatchThreads)
                 std::int32_t* __restrict__ job_count) {
     __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
     const int e = threadIdx.x;
-    dispatch_scan(e < experts ? counts[e] : 0, experts, offsets, cursor, jobs, job_count, warp_totals);
+    (void)dispatch_scan(e < experts ? counts[e] : 0, experts, offsets, cursor, jobs, job_count, warp_totals);
 }
 
 __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries,
@@ -722,7 +752,7 @@ __device__ __forceinline__ void e2m1x2_word_to_half2(std::uint32_t word, std::ui
         : "r"(word));
 }
 
-// Lane l = 8q + i's integer shares (P_q of rows i and i + 8) of one unit against one activation word.
+// The integer shares (P_q of rows i and i + 8) of one unit's code word (q, i) against one activation word.
 __device__ __forceinline__ void unit_shares(std::uint32_t code_word, std::uint32_t act_word, int& lo, int& hi) {
     std::uint32_t w[4], a[4];
     e2m1x2_word_to_half2(code_word, w);
@@ -740,25 +770,31 @@ __device__ __forceinline__ void unit_shares(std::uint32_t code_word, std::uint32
 // Exact sums of one column against `Groups` row groups: this warp's units over blocks b = warp,
 // warp + kWarps, ... of every group (the groups of a block share its activation word), the int64
 // sums of rows i and i + 8 per lane, then the four lanes of a row reduced so that lanes 0..15 hold
-// row (lane & 15) of each group.
+// row (lane & 15) of each group. Any order gives the same integers.
 template <int Groups>
 __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes* acts, std::int64_t (&s)[Groups]) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int q = lane >> 3, i = lane & 7;
+    const int slot = lane >> 3, i = lane & 7;
     std::int64_t lo[Groups], hi[Groups];
 #pragma unroll
     for (int g = 0; g < Groups; ++g) { lo[g] = hi[g] = 0; }
-    for (int b = warp; b < blocks; b += kWarps) {
+    // Lane 8 slot + i takes rows i and i + 8 of blocks b = warp + kWarps (4 n + slot), all four quads:
+    // |P_q| <= 576, so a row's block sum is at most 2304 and times Sw < 2^18 still fits int32.
+    for (int b = warp + kWarps * slot; b < blocks; b += 4 * kWarps) {
         const ActCodes& a = acts[b];
-        const std::uint32_t act_word = a.dup[q];
-        const std::int32_t sa        = a.scale;
+        const std::int32_t sa = a.scale;
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
             const std::uint8_t* unit = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
-            const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i);
-            int p_lo, p_hi;
-            unit_shares(code_word, act_word, p_lo, p_hi);
-            // |P_q| <= 576 and Sw < 2^18: P_q * Sw fits int32.
+            int p_lo = 0, p_hi = 0;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i);
+                int share_lo, share_hi;
+                unit_shares(code_word, a.dup[q], share_lo, share_hi);
+                p_lo += share_lo;
+                p_hi += share_hi;
+            }
             lo[g] += static_cast<std::int64_t>(p_lo * canon::e4m3_scaled(unit[128 + i])) * sa;
             hi[g] += static_cast<std::int64_t>(p_hi * canon::e4m3_scaled(unit[136 + i])) * sa;
         }
@@ -1103,60 +1139,72 @@ void launch_encode_x_acts(const Tensor& x, const moe::wide::ExpertsWorkspace& la
     check_launch("A16 encode x");
 }
 
-// Register-streamed A16 units. Lane l = 8q + i of a warp reads code word (q, i) of a unit (rows i in
-// the low nibbles and i + 8 in the high ones at k = 4q .. 4q+3) and the two rows' scale bytes
-// straight from the record, a batch of units ahead of the one it computes. Its shares P_bq * Sw of
-// the two rows are exact int64 terms, and the four lanes of a row sum to P_b * Sw, so the row
-// sums are the exact sums of design §16.2.1 (any order gives the same integers).
-struct UnitWord {
-    std::uint32_t codes;
-    std::uint32_t scales; // byte 0: row i's scale word, byte 1: row i + 8's
+// Register-streamed A16 units. A unit is 128 code bytes, word (q, i) at 32 q + 4 i holding rows i (low
+// nibbles) and i + 8 (high) at k = 4q .. 4q+3, then the 16 rows' scale bytes. A warp takes four units at a
+// time: lane l = 8 s + i reads rows i and i + 8 of unit s, its four code words and two scale bytes, a
+// batch of units ahead of the one it computes. A row's block product P_b (the doubled E2M1 codes times
+// the 16 X values) is below 2^29 in magnitude (design §16.2.1), so its dp4a partial sums wrap in 32 bits
+// to the exact P_b, which then takes the row's scale once: P_b * Sw is the exact int64 term, and the row
+// sums are the exact sums of §16.2.1 (any order gives the same integers).
+struct UnitRows {
+    std::uint32_t codes[4]; // words (q, i), q = 0..3
+    std::uint32_t scales;   // byte 0: row i's scale word, byte 1: row i + 8's
 };
 
-__device__ __forceinline__ UnitWord load_unit_word(const std::uint8_t* unit, int q, int i) {
-    UnitWord w;
-    w.codes  = __ldg(reinterpret_cast<const unsigned*>(unit + 32 * q + 4 * i));
+__device__ __forceinline__ UnitRows load_unit_rows(const std::uint8_t* unit, int i) {
+    UnitRows w;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) { w.codes[q] = __ldg(reinterpret_cast<const unsigned*>(unit + 32 * q + 4 * i)); }
     w.scales = static_cast<std::uint32_t>(__ldg(unit + 128 + i)) | (static_cast<std::uint32_t>(__ldg(unit + 136 + i)) << 8);
     return w;
 }
 
-__device__ __forceinline__ void a16_shares(const UnitWord& w, const A16Act& a, int q, std::int64_t& lo_row,
-                                           std::int64_t& hi_row) {
-    const int c0 = static_cast<int>(canon::e2m1_x2_quad(w.codes & 0x0F0F0F0FU));
-    const int c1 = static_cast<int>(canon::e2m1_x2_quad((w.codes >> 4) & 0x0F0F0F0FU));
-    const std::uint32_t l = a.lo[q], m = a.mid[q];
-    const std::int32_t h  = a.hi[q];
-    // Wrapping assembly: the true four-term sums fit int32.
-    const unsigned p0 = static_cast<unsigned>(dp4a_su(c0, l, 0)) + (static_cast<unsigned>(dp4a_su(c0, m, 0)) << 8) +
-                        (static_cast<unsigned>(__dp4a(c0, h, 0)) << 16);
-    const unsigned p1 = static_cast<unsigned>(dp4a_su(c1, l, 0)) + (static_cast<unsigned>(dp4a_su(c1, m, 0)) << 8) +
-                        (static_cast<unsigned>(__dp4a(c1, h, 0)) << 16);
+// P_b * Sw of rows i (lo) and i + 8 (hi) of one unit against its column block `a`.
+__device__ __forceinline__ void a16_unit_terms(const UnitRows& w, const A16Act& a, std::int64_t& lo_row,
+                                               std::int64_t& hi_row) {
+    int l0 = 0, m0 = 0, h0 = 0, l1 = 0, m1 = 0, h1 = 0;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int c0 = static_cast<int>(canon::e2m1_x2_quad(w.codes[q] & 0x0F0F0F0FU));
+        const int c1 = static_cast<int>(canon::e2m1_x2_quad((w.codes[q] >> 4) & 0x0F0F0F0FU));
+        l0 = dp4a_su(c0, a.lo[q], l0);
+        m0 = dp4a_su(c0, a.mid[q], m0);
+        h0 = __dp4a(c0, a.hi[q], h0);
+        l1 = dp4a_su(c1, a.lo[q], l1);
+        m1 = dp4a_su(c1, a.mid[q], m1);
+        h1 = __dp4a(c1, a.hi[q], h1);
+    }
+    // Wrapping assembly: the true block sums fit int32.
+    const unsigned p0 = static_cast<unsigned>(l0) + (static_cast<unsigned>(m0) << 8) + (static_cast<unsigned>(h0) << 16);
+    const unsigned p1 = static_cast<unsigned>(l1) + (static_cast<unsigned>(m1) << 8) + (static_cast<unsigned>(h1) << 16);
     lo_row += static_cast<std::int64_t>(static_cast<int>(p0)) * canon::e4m3_scaled(w.scales & 0xFFU);
     hi_row += static_cast<std::int64_t>(static_cast<int>(p1)) * canon::e4m3_scaled((w.scales >> 8) & 0xFFU);
 }
 
 constexpr int kA16WarpUnits = 20; // units per warp: a gate/up row group's 160 blocks or half of a down group's 40 x 4
+constexpr int kA16WarpSteps = kA16WarpUnits / 4;
 static_assert(moe::kGateUpBlocks == kWarps * kA16WarpUnits && 4 * moe::kDownBlocks == kWarps * kA16WarpUnits);
 
-// A lane's words of the warp's units j = 0..19, block base + j * stride of `matrix`, all in flight at
-// once (prefetching four or ten at a time measured slower). They stay in registers for every column
-// of the job, so a job of n columns reads its weights once.
-__device__ __forceinline__ void load_warp_units(const std::uint8_t* matrix, int base, int stride, int q, int i,
-                                                UnitWord (&w)[kA16WarpUnits]) {
+// A lane's rows of the warp's units j = 0..19 (unit j = 4 step + s), block base + j * stride of `matrix`,
+// all in flight at once. They stay in registers for every column of the job, so a job of n columns reads
+// its weights once.
+__device__ __forceinline__ void load_warp_units(const std::uint8_t* matrix, int base, int stride,
+                                                UnitRows (&w)[kA16WarpSteps]) {
+    const int lane = threadIdx.x % 32, s = lane >> 3, i = lane & 7;
 #pragma unroll
-    for (int j = 0; j < kA16WarpUnits; ++j) {
-        w[j] = load_unit_word(matrix + static_cast<std::size_t>(base + j * stride) * moe::kUnitBytes, q, i);
+    for (int step = 0; step < kA16WarpSteps; ++step) {
+        w[step] = load_unit_rows(matrix + static_cast<std::size_t>(base + (4 * step + s) * stride) * moe::kUnitBytes, i);
     }
 }
 
-// The warp's exact sums of rows i (lo) and i + 8 (hi) of one row group over its units for one
-// column's acts [blocks]. Lanes 0..7 hold the sums on return.
-__device__ __forceinline__ void a16_row_sums(const UnitWord (&w)[kA16WarpUnits], int base, int stride,
+// The warp's exact sums of rows i (lo) and i + 8 (hi) of one row group over its units for one column's
+// acts [blocks]. Lanes 0..7 hold the sums on return.
+__device__ __forceinline__ void a16_row_sums(const UnitRows (&w)[kA16WarpSteps], int base, int stride,
                                              const A16Act* acts, std::int64_t& lo, std::int64_t& hi) {
-    const int lane = threadIdx.x % 32, q = lane >> 3;
+    const int lane = threadIdx.x % 32, s = lane >> 3;
     lo = hi = 0;
 #pragma unroll
-    for (int j = 0; j < kA16WarpUnits; ++j) { a16_shares(w[j], acts[base + j * stride], q, lo, hi); }
+    for (int step = 0; step < kA16WarpSteps; ++step) { a16_unit_terms(w[step], acts[base + (4 * step + s) * stride], lo, hi); }
 #pragma unroll
     for (int offset = 8; offset <= 16; offset <<= 1) {
         lo += __shfl_xor_sync(0xFFFFFFFFU, lo, offset);
@@ -1164,9 +1212,12 @@ __device__ __forceinline__ void a16_row_sums(const UnitWord (&w)[kA16WarpUnits],
     }
 }
 
-// Two CTAs per SM: the register cap (at most 128) measured faster than 1 (136-146 registers) and 3
-// (80) at op level, most at two columns per expert (T = 12: 214 -> 173 us).
-constexpr int kA16RowsMinCtas = 2;
+// Three CTAs per SM (80 registers, no spills): with a row pair's four quads per lane (one scale and one
+// int64 product per unit) the passes took 33 / 109 / 191 us at T = 1 / 6 / 12 (decode route, frames, cold
+// L2, RTX PRO 6000, 2026-10-24), against 33 / 113 / 194 at two and 37 / 121 / 210 with a quad per lane.
+// A persistent variant (two CTAs per SM double-buffering each item's weights through shared memory)
+// was slower at T = 12 (234 us).
+constexpr int kA16RowsMinCtas = 3;
 
 struct GateUpRowShared16 {
     A16Act acts[moe::kGateUpBlocks];
@@ -1197,8 +1248,8 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
     if (moe::wide_route(count, scales)) { return; }
     const std::uint8_t* matrix = record + static_cast<std::size_t>(g) * moe::kGateUpBlocks * moe::kUnitBytes;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    UnitWord w[kA16WarpUnits];
-    load_warp_units(matrix, warp, kWarps, lane >> 3, lane & 7, w);
+    UnitRows w[kA16WarpSteps];
+    load_warp_units(matrix, warp, kWarps, w);
     for (int c = 0; c < count; ++c) {
         if (c > 0) { __syncthreads(); } // every warp has read the previous column's acts and y
         const int token = dispatch.entries[first + c] / top_k;
@@ -1227,6 +1278,58 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
                 canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
         }
     }
+}
+
+// The down pass's column encode: encode_a16_columns' exponent and blocks for one h row of
+// kIntermediate elements, with thread t < kIntermediate / 8 holding elements 8t .. 8t+7 in registers
+// for both the column's exponent and its two quads of block t / 2. Ends with a barrier.
+__device__ __forceinline__ void encode_a16_h(const std::uint16_t* column, A16Act* acts, int* emax,
+                                             unsigned (&key)[kWarps][1]) {
+    constexpr int kVectors = static_cast<int>(moe::kIntermediate) / 8;
+    static_assert(kVectors <= kThreads && moe::kIntermediate % 16 == 0);
+    const int t = static_cast<int>(threadIdx.x), lane = t % 32, warp = t / 32;
+    unsigned words[4] = {};
+    if (t < kVectors) {
+        const uint4 v = reinterpret_cast<const uint4*>(column)[t];
+        words[0] = v.x;
+        words[1] = v.y;
+        words[2] = v.z;
+        words[3] = v.w;
+    }
+    unsigned m = 0;
+#pragma unroll
+    for (int w = 0; w < 4; ++w) { m = max(m, max(words[w] & 0x7FFFU, (words[w] >> 16) & 0x7FFFU)); }
+    m = __reduce_max_sync(0xFFFFFFFFU, m);
+    if (lane == 0) { key[warp][0] = m; }
+    __syncthreads();
+    if (t == 0) {
+        unsigned k = 0;
+        for (int w = 0; w < kWarps; ++w) { k = max(k, key[w][0]); }
+        emax[0] = a16_column_exponent(k);
+    }
+    __syncthreads();
+    if (t < kVectors) {
+        const int e = emax[0];
+        A16Act& out = acts[t / 2];
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int q = 2 * (t % 2) + half;
+            std::uint32_t lo = 0, mid = 0, hi = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const unsigned word = words[2 * half + j / 2];
+                const auto h  = static_cast<std::uint16_t>(j % 2 == 0 ? word & 0xFFFFU : word >> 16);
+                const auto xv = static_cast<std::uint32_t>(e == canon::kA16NonFinite ? 0 : canon::a16_value(h, e));
+                lo |= (xv & 0xFFU) << (8 * j);
+                mid |= ((xv >> 8) & 0xFFU) << (8 * j);
+                hi |= ((xv >> 16) & 0xFFU) << (8 * j);
+            }
+            out.lo[q]  = lo;
+            out.mid[q] = mid;
+            out.hi[q]  = static_cast<std::int32_t>(hi);
+        }
+    }
+    __syncthreads();
 }
 
 struct DownRowShared16 {
@@ -1263,19 +1366,17 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
         if (moe::wide_route(count, scales)) { record = nullptr; }
     }
     const int group = kDownGroups * tile + warp / 2, base = (warp % 2) * kA16WarpUnits;
-    UnitWord w[kA16WarpUnits];
+    UnitRows w[kA16WarpSteps];
     if (record != nullptr) {
         load_warp_units(record + moe::kGateUpBytes + static_cast<std::size_t>(group) * moe::kDownBlocks * moe::kUnitBytes,
-                        base, 1, lane >> 3, lane & 7, w);
+                        base, 1, w);
     }
     pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
     for (int c = 0; c < count; ++c) {
         __syncthreads();
-        const auto column = [&](int) {
-            return h_plane + static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements;
-        };
-        encode_a16_columns<1>(column, 1, moe::kIntermediate, sm.acts, sm.emax, sm.key);
+        encode_a16_h(h_plane + static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements, sm.acts, sm.emax,
+                     sm.key);
         std::int64_t lo, hi;
         a16_row_sums(w, base, 1, sm.acts, lo, hi);
         if (lane < 8) {
@@ -1610,18 +1711,21 @@ __global__ void __launch_bounds__(kDispatchThreads)
         return;
     }
     count[i] = 0;
+    // Thread e reads expert e's frame and slot while the warps route.
+    const int frame = i < experts ? source.frames[i] : -1;
+    const int slot  = i < experts && source.prefetched != nullptr ? source.prefetched[i] : -1;
     if (warp < columns) {
         const int id = route_column(logits, experts, top_k, warp, ids, weights, shared_gate);
         if (lane < top_k) { routed[warp * top_k + lane] = id; }
     }
     __syncthreads();
     const int entries = columns * top_k;
-    dispatch_small(i < entries ? routed[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
-    __syncthreads(); // the job list and count are written
-    const int jobs = min(*dispatch.job_count, max_jobs);
-    for (int j = i; j < jobs; j += kDispatchThreads) {
+    // The thread of each used expert records its job (job j is the j-th used expert in id order).
+    const int job = dispatch_small(i < entries ? routed[i] : 0, entries, experts, dispatch, route_log, count, cursor,
+                                   warp_totals);
+    if (job >= 0 && job < max_jobs) {
         bool miss;
-        job_records[j] = in_place_record(source, dispatch.jobs[j], miss);
+        job_records[job] = in_place_record_at(source, i, frame, slot, miss);
     }
 }
 static_assert(kEncodeActsThreads % 32 == 0 && kEncodeActsThreads <= kDispatchThreads);
@@ -1796,17 +1900,40 @@ __global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const fl
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
-    float sum = 0.0F;
-    for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
-        sum += weights[static_cast<std::size_t>(t) * top_k + k] *
-               __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
+    // Every load is issued before the sums use any (one L2 round trip, not one per expert).
+    constexpr int kMaxTopK = 16, kMaxStreams = 4;
+    float w[kMaxTopK], o[kMaxTopK];
+#pragma unroll
+    for (int k = 0; k < kMaxTopK; ++k) {
+        if (k < top_k) {
+            w[k] = weights[static_cast<std::size_t>(t) * top_k + k];
+            o[k] = __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
+        }
     }
-    sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
-    const float v           = __bfloat162float(__float2bfloat16_rn(sum));
+    const float gate        = shared_gate[t];
+    const float own         = __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
-    for (int s = 0; s < streams; ++s) {
-        bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
-        r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+    float a[kMaxStreams], r[kMaxStreams];
+#pragma unroll
+    for (int s = 0; s < kMaxStreams; ++s) {
+        if (s < streams) {
+            a[s] = inject[static_cast<std::size_t>(t) * streams + s];
+            r[s] = __bfloat162float(residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d]);
+        }
+    }
+    float sum = 0.0F;
+#pragma unroll
+    for (int k = 0; k < kMaxTopK; ++k) { // fixed rank order: placement-invariant
+        if (k < top_k) { sum += w[k] * o[k]; }
+    }
+    sum += gate * own;
+    const float v = __bfloat162float(__float2bfloat16_rn(sum));
+#pragma unroll
+    for (int s = 0; s < kMaxStreams; ++s) {
+        if (s < streams) {
+            residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d] =
+                __float2bfloat16_rn(r[s] + a[s] * v);
+        }
     }
 }
 
@@ -2186,9 +2313,9 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
     const int hidden = shared.ne[0], columns = shared.ne[1], top_k = routing.weights.ne[0];
     const int streams = inject.ne[0];
     require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && routing.weights.ne[1] == columns &&
-                inject.ne[1] == columns && streams > 0 && residual.ne[0] == streams * hidden &&
-                residual.ne[1] == columns,
-            "combine inject shapes disagree");
+                inject.ne[1] == columns && streams > 0 && streams <= 4 && top_k > 0 && top_k <= 16 &&
+                residual.ne[0] == streams * hidden && residual.ne[1] == columns,
+            "combine inject shapes disagree (at most 4 streams and top-16)");
     CUDA_CHECK(pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
                                     combine_inject_kernel, static_cast<const bf16*>(outputs.data),
                                     static_cast<const float*>(routing.weights.data),

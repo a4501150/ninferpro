@@ -218,9 +218,10 @@ void bf16_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::uint3
     for (auto* p : devices) { cudaFree(p); }
 }
 
-// Prefill widths take the wide mapping (64 columns and more): every column's bits must equal the
-// narrow mapping's for the same column (calls of at most 63 columns), and sampled columns meet the
-// FP64 bound. Widths straddle the 128-column CTA range and the 16-column pass.
+// Verification and prefill widths take the wide mapping (21 columns and more, two tile shapes split
+// at 513): every column's bits must equal the narrow mapping's for the same column (forced, calls of
+// at most 63 columns), and sampled columns meet the FP64 bound. Widths straddle both shapes' column
+// tiles and the shape seam.
 void bf16_wide_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::int32_t t, std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> d(0.0F, 0.05F);
@@ -244,16 +245,16 @@ void bf16_wide_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::
     auto* dx    = device(bits);
     float* dout = nullptr;
     cudaMalloc(&dout, sizeof(float) * n * t);
-    const auto run = [&](std::int32_t first, std::int32_t width) {
+    const auto run = [&](std::int32_t first, std::int32_t width, infernix::ops::detail::ProjectionRoute route) {
         Tensor x(dx + static_cast<std::size_t>(first) * k, DType::BF16, {k, width});
         Tensor out(dout + static_cast<std::size_t>(first) * n, DType::FP32, {n, width});
-        infernix::ops::projection_fp32(x, weights, out, nullptr);
+        infernix::ops::detail::projection_fp32_route(x, weights, out, route, nullptr);
         if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("projection bf16 wide failed"); }
         std::vector<float> host(static_cast<std::size_t>(n) * width);
         cudaMemcpy(host.data(), out.data, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
         return host;
     };
-    const std::vector<float> wide = run(0, t);
+    const std::vector<float> wide = run(0, t, infernix::ops::detail::ProjectionRoute::Automatic);
     if (t >= 4096) { // informational: the prefill router's kernel time (not a check)
         Tensor x(dx, DType::BF16, {k, t}), out(dout, DType::FP32, {n, t});
         cudaEvent_t begin, end;
@@ -272,7 +273,7 @@ void bf16_wide_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::
     long differing = 0;
     for (std::int32_t first = 0; first < t; first += 63) {
         const std::int32_t width   = std::min(63, t - first);
-        const std::vector<float> narrow = run(first, width);
+        const std::vector<float> narrow = run(first, width, infernix::ops::detail::ProjectionRoute::Narrow);
         for (std::int32_t c = 0; c < width; ++c) {
             if (std::memcmp(narrow.data() + static_cast<std::size_t>(c) * n,
                             wide.data() + static_cast<std::size_t>(first + c) * n, sizeof(float) * n) != 0) {
@@ -361,7 +362,11 @@ int main() {
         bf16_case({1000, 37}, 2560, 13);
         bf16_case({129}, 2560, 14);           // one segment
         bf16_case({7, 300, 1, 64}, 1024, 15); // four segments, one of a single row
-        bf16_wide_case({512, 1}, 2560, 64, 31);    // the narrowest wide call
+        bf16_wide_case({512, 1}, 2560, 21, 30);    // the narrowest wide call
+        bf16_wide_case({512, 1}, 2560, 48, 32);    // a DFlash2 verification round (6 x 8)
+        bf16_wide_case({512, 1}, 2560, 64, 31);
+        bf16_wide_case({512, 1}, 2560, 512, 33);   // the small shape's widest call
+        bf16_wide_case({512, 1}, 2560, 513, 35);   // the large shape's narrowest
         bf16_wide_case({512, 1}, 2560, 4096, 37);  // a 4096-token prefill chunk's router
         bf16_wide_case({7, 300, 1, 64}, 3072, 301, 41); // K at its limit, partial CTA range and pass
         bf16_wide_case({129}, 1024, 135, 43);
