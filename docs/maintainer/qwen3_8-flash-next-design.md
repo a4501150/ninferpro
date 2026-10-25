@@ -3623,6 +3623,28 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   tokens, +2.8 % at 1024). They change the reduction order, so they need a fast path with its own
   model-level gates; recipe C does not run `q8-sliced-k`, and adding them to it would change that
   path's qualified arithmetic on Dense8.
+- **Router without widening (2026-10-24, RTX PRO 6000, this fork).** The FP32 router [513, 2560]
+  (`projection_fp32`, router and shared-expert score as two segments) took 5.2 % of a 16K prefill:
+  the wide mapping ran at ~30 TFLOP/s, 57 % of issue slots busy, a third of its instructions BF16
+  widenings and butterfly shuffles. The wide kernel now multiplies through `fma.rn.f32.bf16`
+  (`FHFMA.BF16` on sm_120a), which takes each BF16 operand as its exact FP32 widening and reads
+  either half of a register, so it rounds as fmaf on widened values and needs no conversions; the
+  butterfly runs as a reduce-scatter (each output keeps the xor 16..1 tree, 31 shuffles per lane
+  instead of 160); one barrier per slice over three cp.async stages, weight slices staged before the
+  PDL wait. Two tile shapes: 16 x 16 CTAs (two per SM) from 21 to 512 columns, 32 x 32 beyond.
+  Bit-identical: output hashes equal the previous build's at 19 widths from 1 to 16,384, the
+  projection test now forces the narrow mapping as its reference (the Narrow route had taken the wide
+  kernel from 64 columns, so those comparisons had been wide against wide) and finds no column
+  differing at 21, 48, 64, 512, 513 and 4,096 columns and its other shapes; T1, T1-exact and T2
+  unchanged. Per call: 4,096 / 16,384 columns 358 / 1,358 -> 195-209 / 743-778 us; 21-64 columns
+  10-18 -> 8 us. T1, previous build first, A/B twice: 6 x 4 24.97 / 25.04 -> 24.83 / 24.86 ms, 8 x 3
+  25.24 / 25.30 -> 25.10 / 25.16, 6 x 8 37.43 / 37.52 -> 36.97 / 37.02; rounds up to 20 columns keep
+  the narrow mappings (18 columns had taken 0.6 % longer on the wide kernel in a round's graph, 20
+  and 21 tied). Prefill (`infernix_bench`, FP8 KV, base/new/new/base twice): pp4096 +2.1 / +2.2 %,
+  pp16384 +2.1 / +2.3 %, pp32768 +2.1 / +2.2 %, pp512 +0.2 / +0.8 %. The large shape reaches about
+  half of FHFMA's ~110 TFLOP/s (ncu: barrier, shared-load throttle and short-scoreboard stalls with
+  16 warps per SM); 8 x 8 and 8 x 16 warp tiles, 1,024-thread CTAs and two CTAs per SM of the large
+  tile measured slower.
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of
