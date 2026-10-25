@@ -76,6 +76,26 @@ void project_rows(const Tensor& x, const LinearParameters& p, std::span<Tensor* 
     ops::linear_rows(x, p.weight, parts, column ? ops::LinearPolicy::A16ColumnInvariant : p.policy, work, s, routes);
 }
 
+// project_rows(x, first, first_parts) and project_rows(x, second, second_parts), two projections of one
+// input, as one ops::linear_group (one launch where the pair has a composition) when neither is a GGUF
+// import and both take the same policy.
+void project_group(const Tensor& x, const LinearParameters& first, std::span<Tensor* const> first_parts,
+                   ops::LinearRoutes first_routes, const LinearParameters& second,
+                   std::span<Tensor* const> second_parts, ops::LinearRoutes second_routes, WorkspaceArena& work,
+                   cudaStream_t s, bool invariant) {
+    const auto policy = [&](const LinearParameters& p) {
+        const bool column = invariant && ops::linear_column_invariant_supported(p.weight.qtype, p.weight.n, p.weight.k);
+        return column ? ops::LinearPolicy::A16ColumnInvariant : p.policy;
+    };
+    if (!first.is_ggml() && !second.is_ggml() && policy(first) == policy(second)) {
+        ops::linear_group(x, first.weight, first_parts, first_routes, second.weight, second_parts, second_routes,
+                          policy(first), work, s);
+        return;
+    }
+    project_rows(x, first, first_parts, work, s, first_routes, invariant);
+    project_rows(x, second, second_parts, work, s, second_routes, invariant);
+}
+
 // Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly.
 void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s) {
     if (table.layout == QuantLayout::GgmlRows) {
@@ -608,10 +628,14 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
             // Q8 (Dense8): the projection writes q/k/v and z to their destinations itself.
             ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, dense_routes());
         } else {
-            Tensor* parts[] = {&qkv, &z};
-            project_rows(x, p.projection, parts, work_, s, dense_routes(), fast_.column_invariant);
+            Tensor* parts[]    = {&qkv, &z};
+            Tensor* ab_parts[] = {&ab};
+            project_group(x, p.projection, parts, dense_routes(), p.control, ab_parts, ops::LinearRoutes::Exact, work_,
+                          s, fast_.column_invariant);
         }
-        project(x, p.control, ab, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
+        if (ggml || p.projection.weight.qtype == QType::Q8_G32_FP16) {
+            project(x, p.control, ab, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
+        }
     }
     // Verification and prefill chunks evaluate the gates once for their recurrence; decode evaluates
     // them inside the recurrent update, except a GGUF import's (its third input holds A itself), whose
@@ -724,9 +748,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         if (p.index_projection) {
             Tensor* parts[]       = {&qf, &gate, &kf, &vf};
             Tensor* index_parts[] = {&iqf, &ik};
-            project_rows(x, p.projection, parts, work_, s, dense_routes(), fast_.column_invariant);
-            project_rows(x, *p.index_projection, index_parts, work_, s, dense_routes(),
-                         fast_.column_invariant);
+            project_group(x, p.projection, parts, dense_routes(), *p.index_projection, index_parts, dense_routes(),
+                          work_, s, fast_.column_invariant);
         } else {
             Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
             project_rows(x, p.projection, parts, work_, s, dense_routes(), fast_.column_invariant);

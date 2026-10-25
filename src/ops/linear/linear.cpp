@@ -4,6 +4,7 @@
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/group/linear_group.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
@@ -176,15 +177,17 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
     dispatch_linear(x, w, out, policy, routes, &workspace, stream);
 }
 
-void linear_rows(const Tensor& x, const Weight& w, std::span<Tensor* const> parts, LinearPolicy policy,
-                 WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
+namespace {
+// Checks linear_rows' parts and fills `targets` with their row ranges; whether a route may store
+// them itself (row-FP8, at most kMaxParts parts, each a multiple of eight rows).
+// Checks linear_rows' parts and fills `targets` with their row ranges; whether a kernel can store
+// them itself (at most kMaxParts parts, each a multiple of eight rows).
+bool collect_row_parts(const Tensor& x, const Weight& w, std::span<Tensor* const> parts, LinearPolicy policy,
+                       detail::LinearBf16RowParts& targets) {
     if (parts.empty()) { throw std::invalid_argument("linear_rows: no parts"); }
-    if (!valid_linear_routes(routes)) { throw std::invalid_argument("linear: unsupported route set"); }
     const std::int32_t T = x.ne[1];
     std::int32_t rows    = 0;
-    bool direct          = w.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
-                  parts.size() <= static_cast<std::size_t>(detail::LinearBf16RowParts::kMaxParts);
-    detail::LinearBf16RowParts targets{};
+    bool direct          = parts.size() <= static_cast<std::size_t>(detail::LinearBf16RowParts::kMaxParts);
     for (std::size_t i = 0; i < parts.size(); ++i) {
         const Tensor& part = *parts[i];
         if (part.dtype != DType::BF16 || !part.is_contiguous() || part.ne[1] != T || part.ne[2] != 1 ||
@@ -206,12 +209,47 @@ void linear_rows(const Tensor& x, const Weight& w, std::span<Tensor* const> part
     if (direct) {
         // The complete output's checks, on a stand-in with its shape (it is never written).
         validate_linear_semantics(x, w, Tensor(parts[0]->data, DType::BF16, {w.n, T}), policy);
-        if (detail::fp8_dispatch_rows(x, w, targets, policy, routes, &workspace, stream)) { return; }
     }
+    return direct;
+}
+} // namespace
+
+void linear_rows(const Tensor& x, const Weight& w, std::span<Tensor* const> parts, LinearPolicy policy,
+                 WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
+    if (!valid_linear_routes(routes)) { throw std::invalid_argument("linear: unsupported route set"); }
+    if (parts.size() == 1) {
+        linear(x, w, *parts[0], policy, workspace, stream, routes);
+        return;
+    }
+    detail::LinearBf16RowParts targets{};
+    if (collect_row_parts(x, w, parts, policy, targets) && w.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+        detail::fp8_dispatch_rows(x, w, targets, policy, routes, &workspace, stream)) {
+        return;
+    }
+    const std::int32_t T = x.ne[1];
     auto scope = workspace.scope();
     Tensor out = workspace.alloc(DType::BF16, {w.n, T});
     linear(x, w, out, policy, workspace, stream, routes);
     split_rows(out, parts, stream);
+}
+
+void linear_group(const Tensor& x, const Weight& first, std::span<Tensor* const> first_parts,
+                  LinearRoutes first_routes, const Weight& second, std::span<Tensor* const> second_parts,
+                  LinearRoutes second_routes, LinearPolicy policy, WorkspaceArena& workspace,
+                  cudaStream_t stream) {
+    if (!valid_linear_routes(first_routes) || !valid_linear_routes(second_routes)) {
+        throw std::invalid_argument("linear: unsupported route set");
+    }
+    detail::LinearBf16RowParts first_targets{}, second_targets{};
+    // The composed problems register no route flag at the widths they compose, so either call's
+    // flags select the same routes the composition runs.
+    if (collect_row_parts(x, first, first_parts, policy, first_targets) &&
+        collect_row_parts(x, second, second_parts, policy, second_targets) &&
+        detail::linear_group_composed(x, first, first_targets, second, second_targets, policy, stream)) {
+        return;
+    }
+    linear_rows(x, first, first_parts, policy, workspace, stream, first_routes);
+    linear_rows(x, second, second_parts, policy, workspace, stream, second_routes);
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

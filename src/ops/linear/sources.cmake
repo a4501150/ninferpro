@@ -1,5 +1,6 @@
 target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/linear.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/group/linear_group.cu"
 )
 
 include("${CMAKE_CURRENT_LIST_DIR}/bf16/sources.cmake")

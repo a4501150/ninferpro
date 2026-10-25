@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_skinny.cuh"
+#include "ops/linear/bf16/bf16_decode_routes.cuh"
 
 #include <algorithm>
 #include <cstddef>
@@ -20,7 +21,7 @@ void bf16_skinny_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
     if (weight.n <= kSkinnySmallNRows && weight.k <= 8 * 32 * kSkinnySmallNPreload) {
         launch_bf16_skinny_gemv<Tokens, 2, 1, kSkinnySmallNPreload>(x, weight, out, stream);
     } else {
-        launch_bf16_skinny_gemv<Tokens, 8, 2, 0>(x, weight, out, stream);
+        launch_bf16_skinny_gemv<Tokens, kBf16SkinnyWarps, kBf16SkinnyRowsPerWarp, 0>(x, weight, out, stream);
     }
 }
 

@@ -229,6 +229,19 @@ void linear_rows(const Tensor& x, const Weight& w, std::span<Tensor* const> part
                  WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact);
 
 /**
+ * @brief Two independent projections of one input: linear_rows(x, first, first_parts) and
+ * linear_rows(x, second, second_parts), each with its own route flags.
+ *
+ * @details Each output has the bits of its own call. Registered pairs at registered widths run in one
+ * launch (Qwen3.8-Flash-Next's GDN q/k/v/z with a/b, and attention q/gate/k/v with the QSA index
+ * projection, at T = 1 under A16Only); every other call runs the two in order.
+ */
+void linear_group(const Tensor& x, const Weight& first, std::span<Tensor* const> first_parts,
+                  LinearRoutes first_routes, const Weight& second, std::span<Tensor* const> second_parts,
+                  LinearRoutes second_routes, LinearPolicy policy, WorkspaceArena& workspace,
+                  cudaStream_t stream);
+
+/**
  * Whether the registered problem `[output_rows, input_rows]` of `qtype` has an A16ColumnInvariant
  * route (one route at every T whose column bits do not depend on the call's other columns).
  */

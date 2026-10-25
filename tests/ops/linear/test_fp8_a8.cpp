@@ -18,6 +18,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -649,6 +650,79 @@ int linear_rows_equal_split() {
     return failures;
 }
 
+// linear_group: Qwen3.8-Flash-Next's GDN q/k/v/z (row-FP8) with a/b (BF16), and attention q/gate/k/v
+// (row-FP8) with the QSA index projection (BF16), composed into one launch at T = 1 and run in order
+// at T = 2, equal the separate calls' outputs bit for bit.
+int linear_group_equals_separate() {
+    struct Case {
+        const char* label;
+        std::int32_t first_n;
+        std::vector<std::int32_t> first_parts;
+        std::int32_t second_n;
+        std::vector<std::int32_t> second_parts;
+    };
+    const Case cases[] = {
+        {"GDN q/k/v/z + a/b", 16384, {10240, 6144}, 96, {96}},
+        {"attention q/gate/k/v + index", 13312, {4096, 4096, 2560, 2560}, 640, {512, 128}},
+    };
+    int failures       = 0;
+    std::uint32_t seed = 1307U;
+    for (const Case& c : cases) {
+        DeviceProblem first(c.first_n, 2560, seed++);
+        const auto second_host = make_bf16_weight(c.second_n, 2560, seed++);
+        DeviceBuffer second_weight(second_host.payload.size());
+        second_weight.copy_from_host(second_host.payload.data(), second_host.payload.size());
+        const Weight second = second_host.device_weight(second_weight.p);
+        for (const std::int32_t t : {1, 2}) {
+            const std::vector<std::uint16_t> bits = outlier_activations(2560, t, seed++);
+            DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
+            x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
+            const auto first_full  = run_linear(first.view, x, t, ops::LinearPolicy::A16Only, ops::LinearRoutes::Exact);
+            const auto second_full = run_linear(second, x, t, ops::LinearPolicy::A16Only, ops::LinearRoutes::Exact);
+            DeviceArena workspace(static_cast<std::size_t>(c.first_n + c.second_n) * t * sizeof(std::uint16_t) + 4096);
+            std::vector<DeviceBuffer> buffers;
+            std::vector<Tensor> tensors;
+            buffers.reserve(c.first_parts.size() + c.second_parts.size());
+            tensors.reserve(buffers.capacity());
+            for (const auto* rows_list : {&c.first_parts, &c.second_parts})
+                for (const std::int32_t rows : *rows_list) {
+                    buffers.emplace_back(static_cast<std::size_t>(rows) * t * sizeof(std::uint16_t));
+                    tensors.emplace_back(buffers.back().p, DType::BF16, std::initializer_list<std::int32_t>{rows, t});
+                }
+            std::vector<Tensor*> first_parts, second_parts;
+            for (std::size_t i = 0; i < tensors.size(); ++i)
+                (i < c.first_parts.size() ? first_parts : second_parts).push_back(&tensors[i]);
+            const Tensor input(x.p, DType::BF16, {2560, t});
+            ops::linear_group(input, first.view, first_parts, ops::LinearRoutes::Exact, second, second_parts,
+                              ops::LinearRoutes::Exact, ops::LinearPolicy::A16Only, workspace, nullptr);
+            test::cuda_check(cudaDeviceSynchronize(), "linear_group");
+            std::int64_t differing = 0;
+            std::size_t buffer     = 0;
+            for (const auto& [rows_list, full, n] :
+                 {std::tuple{&c.first_parts, &first_full, c.first_n}, std::tuple{&c.second_parts, &second_full, c.second_n}}) {
+                std::int32_t begin = 0;
+                for (const std::int32_t rows : *rows_list) {
+                    std::vector<std::uint16_t> part(static_cast<std::size_t>(rows) * t);
+                    buffers[buffer++].copy_to_host(part.data(), part.size() * sizeof(std::uint16_t));
+                    for (std::int32_t token = 0; token < t; ++token)
+                        for (std::int32_t r = 0; r < rows; ++r)
+                            differing += part[static_cast<std::size_t>(token) * rows + r] !=
+                                         (*full)[static_cast<std::size_t>(token) * n + begin + r];
+                    begin += rows;
+                }
+            }
+            const std::string label = std::string("linear_group ") + c.label + " T=" + std::to_string(t);
+            if (differing != 0) {
+                std::cerr << "FAIL " << label << ": " << differing << " values differ from the separate calls\n";
+                ++failures;
+            } else {
+                std::cout << "ok   " << label << " equals the separate calls\n";
+            }
+        }
+    }
+    return failures;
+}
+
 int main() {
     if (!infernix::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -657,7 +731,7 @@ int main() {
     try {
         const int failures = run_fp8_a8() + run_flash_next_fp8_a8_pair() + pair_quantizer_exact() +
                              pair_deterministic() + run_flash_next_pair_outliers() +
-                             pair_admission_seams() + linear_rows_equal_split();
+                             pair_admission_seams() + linear_rows_equal_split() + linear_group_equals_separate();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A8 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -100,12 +100,13 @@ __device__ __forceinline__ void accumulate_rows(const Fp8CodePack<Values> (&code
     }
 }
 
+// The GEMV's work for CTA `cta` (blockIdx.x in its own kernel; a block's index when composed,
+// ops/common/blocks.cuh).
 template <class Schedule, class Output, class Epilogue, class RowPolicy>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_gemv_kernel(
+__device__ __forceinline__ void fp8_a16_gemv_cta(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
     const __nv_bfloat16* __restrict__ row_scales, Output output, Epilogue epilogue,
-    RowPolicy row_policy, int rows, int input_rows) {
+    RowPolicy row_policy, int rows, int input_rows, int cta) {
     constexpr bool PairRows       = RowPolicy::kPaired;
     const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kValuesPerPhase = kWarpSize * Schedule::kValuesPerLane;
@@ -118,7 +119,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
     const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
     const int row_begin =
-        static_cast<int>(blockIdx.x) * kStoredRowsPerCta + warp * kStoredRowsPerWarp;
+        cta * kStoredRowsPerCta + warp * kStoredRowsPerWarp;
     const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
     pdl::enter_streaming(); // launched as a programmatic dependent
@@ -143,8 +144,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
     }
     pdl::trigger_dependents();
 
-    const auto destination = linear_output_tile<kStoredRowsPerCta>(
-        output, static_cast<int>(blockIdx.x) * kStoredRowsPerCta);
+    const auto destination = linear_output_tile<kStoredRowsPerCta>(output, cta * kStoredRowsPerCta);
     if constexpr (PairRows) {
         float totals[Schedule::kRowsPerWarp];
 #pragma unroll
@@ -186,5 +186,33 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
         }
     }
 }
+
+template <class Schedule, class Output, class Epilogue, class RowPolicy>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_gemv_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
+    const __nv_bfloat16* __restrict__ row_scales, Output output, Epilogue epilogue,
+    RowPolicy row_policy, int rows, int input_rows) {
+    fp8_a16_gemv_cta<Schedule>(x, weight_codes, row_scales, output, epilogue, row_policy, rows, input_rows,
+                               static_cast<int>(blockIdx.x));
+}
+
+// The GEMV as a block (ops/common/blocks.cuh): T = 1, complete row and K tiles.
+template <class Schedule, class Output, class Epilogue, class RowPolicy>
+struct Fp8A16GemvBlock {
+    static constexpr int kThreads = Schedule::kThreads;
+    const __nv_bfloat16* x;
+    const std::uint8_t* codes;
+    const __nv_bfloat16* scales;
+    Output output;
+    Epilogue epilogue;
+    RowPolicy row_policy;
+    int rows, k;
+
+    [[nodiscard]] int ctas() const { return rows / Schedule::kBlockRows; }
+    __device__ __forceinline__ void run(int cta) const {
+        fp8_a16_gemv_cta<Schedule>(x, codes, scales, output, epilogue, row_policy, rows, k, cta);
+    }
+};
 
 } // namespace infernix::ops::detail

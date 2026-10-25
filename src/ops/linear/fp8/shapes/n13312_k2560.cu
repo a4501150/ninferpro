@@ -4,12 +4,13 @@
 // chain, so a column has the same bits at every width (design §11.3).
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_launch.cuh"
+#include "ops/linear/fp8/fp8_decode_routes.cuh"
 #include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"
 
 namespace infernix::ops::detail {
 namespace {
 using Geometry = Fp8Geometry<13312, 2560>;
-using Gemv     = Fp8A16GemvSchedule<8, 2, 16, 1, Fp8CodeCache::Default, 2, 2>;
+using Gemv     = Fp8N13312K2560Gemv;
 using Simt     = Fp8A16SimtSchedule<4, 2, 16, 8, 1, Fp8SimtActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
                                     Fp8SimtBlockOrder::RowsContiguous, 1>;
 using TmaT64R256  = Fp8A16TmaMmaSchedule<64, 256, 2, 8, 2, 1>;

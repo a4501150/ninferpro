@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/blocks.cuh"
+
 #include "ops/linear/bf16/bf16_schedule.cuh"
 #include "ops/common/math.cuh"
 #include "ops/linear/common/epilogue.cuh"
@@ -202,11 +204,12 @@ compute_bf16_gemv_rows(const __nv_bfloat16* activation, const __nv_bfloat16* wei
     }
 }
 
+// The GEMV's work for CTA `cta` (blockIdx.x in its own kernel; a block's index when composed,
+// ops/common/blocks.cuh).
 template <class Schedule, class Output, class Epilogue>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
-    Epilogue epilogue, int input_rows) {
+__device__ __forceinline__ void bf16_a16_gemv_cta(const __nv_bfloat16* __restrict__ x,
+                                                  const __nv_bfloat16* __restrict__ weight, Output output,
+                                                  Epilogue epilogue, int input_rows, int cta) {
     const int K = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
 
     __shared__ Bf16GemvSharedStorage<Schedule> shared;
@@ -217,7 +220,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
         const auto* source = reinterpret_cast<const Bf16GemvPack<8>*>(x);
         for (int pack = threadIdx.x; pack < K / 8; pack += Schedule::kThreads)
             destination[pack] = source[pack];
-        __syncthreads();
+        blocks::cta_sync<Schedule::kThreads>();
         activation = reinterpret_cast<const __nv_bfloat16*>(activation_raw);
     }
 
@@ -225,7 +228,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
     const int warp         = static_cast<int>(threadIdx.x) / kWarpSize;
     const int row_group    = warp / Schedule::kWarpsPerRow;
     const int warp_in_row  = warp % Schedule::kWarpsPerRow;
-    const int cta_row0     = static_cast<int>(blockIdx.x) * Schedule::kBlockRows;
+    const int cta_row0     = cta * Schedule::kBlockRows;
     const int row0         = cta_row0 + row_group * Schedule::kRowsPerWarp;
     const auto destination = linear_output_tile<Schedule::kBlockRows>(output, cta_row0);
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
@@ -258,7 +261,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
                 shared.partials[row_group][local_row][warp_in_row] = warp_totals[local_row];
             }
         }
-        __syncthreads();
+        blocks::cta_sync<Schedule::kThreads>();
         if (warp_in_row == 0) {
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -274,5 +277,33 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
         }
     }
 }
+
+template <class Schedule, class Output, class Epilogue>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_gemv_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
+    Epilogue epilogue, int input_rows) {
+    bf16_a16_gemv_cta<Schedule>(x, weight, output, epilogue, input_rows, static_cast<int>(blockIdx.x));
+}
+
+// The GEMV as a block (ops/common/blocks.cuh): T = 1, complete row and K tiles, the activation read
+// in place. Its own kernel is an ordinary launch, so the block waits for the launch's dependencies.
+template <class Schedule, class Output, class Epilogue>
+struct Bf16A16GemvBlock {
+    static_assert(Schedule::kActivationAccess == Bf16ActivationAccess::Direct,
+                  "a composed GEMV reads the activation in place (no dynamic shared memory)");
+    static constexpr int kThreads = Schedule::kThreads;
+    const __nv_bfloat16* x;
+    const __nv_bfloat16* weight;
+    Output output;
+    Epilogue epilogue;
+    int rows, k;
+
+    [[nodiscard]] int ctas() const { return rows / Schedule::kBlockRows; }
+    __device__ __forceinline__ void run(int cta) const {
+        pdl::wait_for_dependencies();
+        bf16_a16_gemv_cta<Schedule>(x, weight, output, epilogue, k, cta);
+    }
+};
 
 } // namespace infernix::ops::detail
