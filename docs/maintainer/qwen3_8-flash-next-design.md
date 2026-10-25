@@ -3658,6 +3658,19 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   +3.2 / +3.2 %, pp16384 +3.1 / +3.3 %, pp32768 +3.1 / +3.3 %, pp512 +2.4 / +2.0 %. T1 6 x 8 (48
   columns, past the GDN pair admission) 37.01 / 37.03 -> 36.85 / 36.85 ms; narrower rounds unchanged.
   The exact route keeps its split copies.
+- **The general BF16 GEMM in 64 x 64 tiles (2026-10-24, RTX PRO 6000, this fork).** Recipe C's BF16
+  QSA indexer projection [640, 2560] has no tuned BF16 route: from 65 columns it ran
+  `bf16_general_gemm_kernel` (32 x 32 tiles, 2 x 2 outputs per thread, operands widened per FMA), 3.9 ms
+  per 16K-token call, 13.6 TFLOP/s, 3.3 % of prefill. The general GEMM now runs 64 x 64 tiles with 4 x 4
+  outputs per thread, BF16 operands multiplied by `fma.rn.f32.bf16` and K slices staged as k-pair
+  words; every output is still one fmaf chain over k = 0..K-1 from zero with K padded to 32, so the
+  bits are unchanged (output hashes equal the previous build's at nine shapes, K 40 and 72 among them,
+  and the QAT BF16 vocabulary head [248320, 5120]); calls with K % 8 != 0 keep the old kernel. Per call:
+  [640, 2560] 227-384 -> 74-84 us from 65 to 1,024 columns, 1,065 -> 266 us at 4,096, 3,858 -> 905 at
+  16,384; [248320, 5120] at 65 columns 17.7 -> 7.3 ms. 128 x 128 tiles of 8 x 8 were as fast or slower
+  everywhere. T1, T1-exact and T2 unchanged (decode rounds up to 64 columns run the skinny kernel).
+  Prefill (`infernix_bench`, FP8 KV, base/new/new/base twice): pp4096 +2.7 / +2.9 %, pp16384 +2.6 /
+  +2.8 %, pp32768 +2.4 / +2.7 %, pp512 +2.7 / +2.1 %.
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of
