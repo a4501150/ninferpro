@@ -3666,14 +3666,16 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   launch, synchronizes with a named barrier of its own threads, and waits for the launch's
   dependencies itself), so a fused kernel is a composition of the same bodies the standalone kernels
   run, and a later persistent decode kernel can chain them. First use: `ops::linear_group`, two
-  independent projections of one input, which at T = 1 under A16Only launches the GDN q/k/v/z GEMV
-  (row-FP8, straight into its q/k/v and z tensors) beside the a/b GEMV (BF16), and the attention
-  q/gate/k/v GEMV beside the QSA index projection's skinny GEMV; the a/b and index GEMVs no longer
-  wait for the q/k/v/z GEMV and its split. The schedules both routes use live in
-  `fp8_decode_routes.cuh` / `bf16_decode_routes.cuh`, so the composition has the standalone routes'
-  bits (`infernix_linear_fp8_a8_test`: both pairs equal the separate calls at T = 1 and 2; T1,
-  T1-exact and T2 unchanged). T1 (FP8 KV, base/new/new/base): 1 x 1 5.513 / 5.518 -> 5.398 / 5.398
-  ms (-2.1 %); wider rounds, which the composition does not cover yet, unchanged.
+  independent projections of one input, which at decode widths (T <= 8) under A16Only launches the
+  GDN q/k/v/z GEMV or SIMT tile (row-FP8, straight into its q/k/v and z tensors) beside the a/b
+  GEMV or SIMT tile (BF16), and the attention q/gate/k/v GEMV or SIMT tile beside the QSA index
+  projection's skinny GEMV; the a/b and index projections no longer wait for the q/k/v/z projection
+  and its split. The schedules both routes use live in `fp8_decode_routes.cuh` /
+  `bf16_decode_routes.cuh`, so the composition has the standalone routes' bits
+  (`infernix_linear_fp8_a8_test`: both pairs equal the separate calls at T = 1, 2, 3, 5 and 8; T1,
+  T1-exact and T2 unchanged). T1 (FP8 KV, base/new/new/base, ms): 1 x 1 5.514 / 5.505 -> 5.395 /
+  5.396 (-2.1 %), 2 x 1 -2.1 %, 4 x 1 -1.6 %, 6 x 1 -1.0 %, 1 x 4 -1.7 %; 8 x 1 and 1 x 8 (8
+  columns) unchanged (+0.1 / 0.0 %).
 - **QSA index projection on tensor cores (`bf16-index-mma`, 2026-10-25, RTX PRO 6000, this fork).**
   Recipe C's BF16 QSA indexer projection [640, 2560] has no tuned exact route: the exact route of
   the construction-exact configurations takes its column-invariant sliced-K route, and every other

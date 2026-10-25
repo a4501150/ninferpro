@@ -651,8 +651,8 @@ int linear_rows_equal_split() {
 }
 
 // linear_group: Qwen3.8-Flash-Next's GDN q/k/v/z (row-FP8) with a/b (BF16), and attention q/gate/k/v
-// (row-FP8) with the QSA index projection (BF16), composed into one launch at T = 1 and run in order
-// at T = 2, equal the separate calls' outputs bit for bit.
+// (row-FP8) with the QSA index projection (BF16), composed into one launch at decode widths (T <= 8),
+// equal the separate calls' outputs bit for bit.
 int linear_group_equals_separate() {
     struct Case {
         const char* label;
@@ -673,7 +673,7 @@ int linear_group_equals_separate() {
         DeviceBuffer second_weight(second_host.payload.size());
         second_weight.copy_from_host(second_host.payload.data(), second_host.payload.size());
         const Weight second = second_host.device_weight(second_weight.p);
-        for (const std::int32_t t : {1, 2}) {
+        for (const std::int32_t t : {1, 2, 3, 5, 8}) {
             const std::vector<std::uint16_t> bits = outlier_activations(2560, t, seed++);
             DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
             x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/blocks.cuh"
+
 // Reusable row-scaled FP8 CUDA-core mainloop for a compile-time number of BF16 activation
 // columns. A CTA owns one row tile and one compile-time token tile, reusing each decoded weight
 // pair across that token tile before advancing K. Output, epilogue, and row policies let fused
@@ -46,10 +48,11 @@ struct Fp8SimtSharedStorage {
     alignas(16) __nv_bfloat16 activation[kActivationElements];
 };
 
+// The SIMT tile's work for CTA `cta` (blockIdx.x in its own kernel; a block's index when composed,
+// ops/common/blocks.cuh).
 template <class Schedule, class Output, class Epilogue, class RowPolicy>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_simt_kernel(
-    Fp8A16Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy) {
+__device__ __forceinline__ void fp8_a16_simt_cta(Fp8A16Operands operands, Output output, Epilogue epilogue,
+                                                 RowPolicy row_policy, int cta) {
     // Streams its weights through the main loop: wait for the producer first, and let dependents
     // launch only once that loop is done.
     pdl::enter_streaming();
@@ -69,7 +72,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
     const int kRowBlocks            = operands.rows / Schedule::kBlockRows;
     const int kTokenTiles = (ActiveTokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
 
-    const int linear_block = static_cast<int>(blockIdx.x);
+    const int linear_block = cta;
     int row_block;
     int token_tile;
     if (kTokenTiles == 1) {
@@ -121,7 +124,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
 
         Fp8ActivationPack<Schedule::kValuesPerLane> activation[Schedule::kBlockTokens];
         if constexpr (Schedule::kActivationAccess == Fp8SimtActivationAccess::SharedPhase) {
-            __syncthreads();
+            blocks::cta_sync<Schedule::kThreads>();
 #pragma unroll
             for (int local_token = 0; local_token < Schedule::kBlockTokens; ++local_token) {
                 if (token0 + local_token < ActiveTokens) {
@@ -170,7 +173,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
         }
 
         if constexpr (Schedule::kActivationAccess == Fp8SimtActivationAccess::SharedPhase) {
-            __syncthreads();
+            blocks::cta_sync<Schedule::kThreads>();
         }
     }
     pdl::trigger_dependents();
@@ -253,5 +256,32 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
         }
     }
 }
+
+template <class Schedule, class Output, class Epilogue, class RowPolicy>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_simt_kernel(
+    Fp8A16Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy) {
+    fp8_a16_simt_cta<Schedule>(operands, output, epilogue, row_policy, static_cast<int>(blockIdx.x));
+}
+
+// The SIMT tile as a block (ops/common/blocks.cuh): complete row and K tiles, at most the schedule's
+// token capacity.
+template <class Schedule, class Output, class Epilogue, class RowPolicy>
+struct Fp8A16SimtBlock {
+    static constexpr int kThreads = Schedule::kThreads;
+    Fp8A16Operands operands;
+    Output output;
+    Epilogue epilogue;
+    RowPolicy row_policy;
+
+    [[nodiscard]] int ctas() const {
+        const int capacity = Schedule::kTokenCapacity ? Schedule::kTokenCapacity : operands.tokens;
+        return operands.rows / Schedule::kBlockRows *
+               ((capacity + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens);
+    }
+    __device__ __forceinline__ void run(int cta) const {
+        fp8_a16_simt_cta<Schedule>(operands, output, epilogue, row_policy, cta);
+    }
+};
 
 } // namespace infernix::ops::detail

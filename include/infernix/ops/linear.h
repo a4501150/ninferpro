@@ -234,7 +234,7 @@ void linear_rows(const Tensor& x, const Weight& w, std::span<Tensor* const> part
  *
  * @details Each output has the bits of its own call. Registered pairs at registered widths run in one
  * launch (Qwen3.8-Flash-Next's GDN q/k/v/z with a/b, and attention q/gate/k/v with the QSA index
- * projection, at T = 1 under A16Only); every other call runs the two in order.
+ * projection, at T <= 8 under A16Only); every other call runs the two in order.
  */
 void linear_group(const Tensor& x, const Weight& first, std::span<Tensor* const> first_parts,
                   LinearRoutes first_routes, const Weight& second, std::span<Tensor* const> second_parts,

@@ -11,6 +11,9 @@ using Bf16N96K2560Gemv = Bf16ScheduleInstance<
     Bf16A16GemvSchedule<4, 2, 1, 8, 4, Bf16ActivationAccess::Direct, Bf16WeightCache::Default,
                         Bf16PhaseOrder::Sequential, 1, 1, 4, 2>,
     2560>;
+// ... and at T = 2 .. 8.
+using Bf16N96K2560Simt = Bf16A16SimtSchedule<8, 2, 1, 8, 4, 2, Bf16SimtActivationAccess::WarpPacked, Bf16WeightCache::Default,
+                                             Bf16PhaseOrder::Sequential, 1, 4, 1, 2, 2>;
 // The skinny GEMV instance of decode-sized BF16 calls of more than 256 rows (bf16_general.cu), such
 // as the QSA index projection [640, 2560]; every skinny instance has the same bits.
 inline constexpr int kBf16SkinnyWarps       = 8;

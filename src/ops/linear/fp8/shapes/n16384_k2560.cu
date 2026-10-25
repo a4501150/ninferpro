@@ -11,8 +11,7 @@ namespace infernix::ops::detail {
 namespace {
 using Geometry = Fp8Geometry<16384, 2560>;
 using Gemv     = Fp8N16384K2560Gemv;
-using Simt     = Fp8A16SimtSchedule<4, 2, 16, 8, 1, Fp8SimtActivationAccess::TokenPacked, Fp8CodeCache::Streaming, 1,
-                                    Fp8SimtBlockOrder::RowsContiguous, 1>;
+using Simt     = Fp8N16384K2560Simt;
 using TmaT128R128 = Fp8A16TmaMmaSchedule<128, 128, 4, 4, 2, 1>;
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {

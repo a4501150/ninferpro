@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/blocks.cuh"
+
 // Contiguous BF16 x BF16 SIMT core with exact or runtime column extents.
 //
 // Each row group owns RowsPerWarp output rows. WarpsPerRow warps cover disjoint K slices, and
@@ -179,18 +181,20 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
     }
 }
 
+// The SIMT tile's work for CTA (cta_row, cta_token) (blockIdx in its own kernel; a block's index
+// when composed, ops/common/blocks.cuh).
 template <class Schedule, class Output, class Epilogue>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_simt_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
-    Epilogue epilogue, int input_rows, int tokens, int token_offset) {
+__device__ __forceinline__ void bf16_a16_simt_cta(const __nv_bfloat16* __restrict__ x,
+                                                  const __nv_bfloat16* __restrict__ weight, Output output,
+                                                  Epilogue epilogue, int input_rows, int tokens, int token_offset,
+                                                  int cta_row, int cta_token) {
     constexpr int ActiveTokens = Schedule::kBlockTokens;
     const int K                = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     // A whole-call specialization must not carry an unused token-grid offset through its
     // unrolled load loop: that extends register lifetimes at the small-T occupancy boundary.
     constexpr bool whole_call = Schedule::kTokenCapacity > 0;
     const int token_begin =
-        whole_call ? 0 : token_offset + static_cast<int>(blockIdx.y) * ActiveTokens;
+        whole_call ? 0 : token_offset + cta_token * ActiveTokens;
     const int live_tokens = Schedule::kExactTokens
                                 ? ActiveTokens
                                 : (whole_call ? tokens : min(ActiveTokens, tokens - token_begin));
@@ -198,7 +202,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     const int row_group    = warp / Schedule::kWarpsPerRow;
     const int warp_in_row  = warp % Schedule::kWarpsPerRow;
-    const int cta_row0     = blockIdx.x * Schedule::kBlockRows;
+    const int cta_row0     = cta_row * Schedule::kBlockRows;
     const int row0         = cta_row0 + row_group * Schedule::kRowsPerWarp;
     const auto destination = linear_output_tile<Schedule::kBlockRows>(output, cta_row0);
     float accumulators[Schedule::kRowsPerWarp][ActiveTokens][Schedule::kAccumulatorChains] = {};
@@ -241,7 +245,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         }
     }
     if constexpr (Schedule::kWarpsPerRow > 1) {
-        __syncthreads();
+        blocks::cta_sync<Schedule::kThreads>();
         if (warp_in_row == 0) {
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -274,4 +278,35 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         }
     }
 }
+template <class Schedule, class Output, class Epilogue>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_simt_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
+    Epilogue epilogue, int input_rows, int tokens, int token_offset) {
+    bf16_a16_simt_cta<Schedule>(x, weight, output, epilogue, input_rows, tokens, token_offset,
+                                static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y));
+}
+
+// The SIMT tile as a block (ops/common/blocks.cuh): complete row and K tiles, the call's token tiles
+// as its own kernel's grid.y (one token slice). Its own kernel is an ordinary launch, so the block
+// waits for the launch's dependencies.
+template <class Schedule, class Output, class Epilogue>
+struct Bf16A16SimtBlock {
+    static constexpr int kThreads = Schedule::kThreads;
+    const __nv_bfloat16* x;
+    const __nv_bfloat16* weight;
+    Output output;
+    Epilogue epilogue;
+    int rows, k, tokens;
+
+    [[nodiscard]] int ctas() const {
+        return rows / Schedule::kBlockRows * ((tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens);
+    }
+    __device__ __forceinline__ void run(int cta) const {
+        pdl::wait_for_dependencies();
+        const int row_ctas = rows / Schedule::kBlockRows;
+        bf16_a16_simt_cta<Schedule>(x, weight, output, epilogue, k, tokens, 0, cta % row_ctas, cta / row_ctas);
+    }
+};
+
 } // namespace infernix::ops::detail

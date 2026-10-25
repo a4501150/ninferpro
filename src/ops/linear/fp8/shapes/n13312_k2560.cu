@@ -11,8 +11,7 @@ namespace infernix::ops::detail {
 namespace {
 using Geometry = Fp8Geometry<13312, 2560>;
 using Gemv     = Fp8N13312K2560Gemv;
-using Simt     = Fp8A16SimtSchedule<4, 2, 16, 8, 1, Fp8SimtActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
-                                    Fp8SimtBlockOrder::RowsContiguous, 1>;
+using Simt     = Fp8N13312K2560Simt;
 using TmaT64R256  = Fp8A16TmaMmaSchedule<64, 256, 2, 8, 2, 1>;
 using TmaT128R128 = Fp8A16TmaMmaSchedule<128, 128, 4, 4, 2, 1>;
 
