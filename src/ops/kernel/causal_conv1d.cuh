@@ -307,33 +307,35 @@ __global__ void causal_conv1d_snapshot_decode_kernel(
     __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
     const std::int32_t* __restrict__ snapshot_base_slot, Output out,
     std::int32_t C, std::int64_t slot_stride) {
+    // One channel per thread (the launcher covers C). The weights, the round's slots and the state
+    // (last written by an earlier round) load before the wait; only x comes from the producer.
+    const std::int64_t c64 = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t C64 = static_cast<std::int64_t>(C);
+    const bool live        = c64 < C64;
+    const std::int32_t c   = live ? static_cast<std::int32_t>(c64) : 0;
+    const std::int64_t base = static_cast<std::int64_t>(*initial_slot) * slot_stride;
+    const std::int64_t into = static_cast<std::int64_t>(*snapshot_base_slot) * slot_stride;
+    const __nv_bfloat16* init = conv_states + base;
+    const float w0 = __bfloat162float(weight[c]), w1 = __bfloat162float(weight[C64 + c]);
+    const float w2 = __bfloat162float(weight[2 * C64 + c]), w3 = __bfloat162float(weight[3 * C64 + c]);
+    const __nv_bfloat16 s0 = init[c];
+    const __nv_bfloat16 s1 = init[C64 + c];
+    const __nv_bfloat16 s2 = init[2 * C64 + c];
     pdl::enter(); // launched as a programmatic dependent (snapshot launcher)
-    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
-    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
-    const std::int64_t C64    = static_cast<std::int64_t>(C);
-    const __nv_bfloat16* init =
-        conv_states + static_cast<std::int64_t>(*initial_slot) * slot_stride;
+    if (!live) { return; }
+    const __nv_bfloat16 x0 = x[c];
 
-    for (std::int64_t c64 = start; c64 < C64; c64 += stride) {
-        const std::int32_t c   = static_cast<std::int32_t>(c64);
-        const __nv_bfloat16 s0 = init[c];
-        const __nv_bfloat16 s1 = init[C64 + c];
-        const __nv_bfloat16 s2 = init[2 * C64 + c];
-        const __nv_bfloat16 x0 = x[c];
+    float acc = 0.0f;
+    acc += w0 * __bfloat162float(s0);
+    acc += w1 * __bfloat162float(s1);
+    acc += w2 * __bfloat162float(s2);
+    acc += w3 * __bfloat162float(x0);
 
-        float acc = 0.0f;
-        acc += __bfloat162float(weight[c]) * __bfloat162float(s0);
-        acc += __bfloat162float(weight[C64 + c]) * __bfloat162float(s1);
-        acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
-        acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
-
-        *out.column(c64).at(0) = __float2bfloat16_rn(silu(acc));
-        __nv_bfloat16* snapshot =
-            conv_states + static_cast<std::int64_t>(*snapshot_base_slot) * slot_stride;
-        snapshot[c]           = s1;
-        snapshot[C64 + c]     = s2;
-        snapshot[2 * C64 + c] = x0;
-    }
+    *out.column(c64).at(0) = __float2bfloat16_rn(silu(acc));
+    __nv_bfloat16* snapshot = conv_states + into;
+    snapshot[c]           = s1;
+    snapshot[C64 + c]     = s2;
+    snapshot[2 * C64 + c] = x0;
 }
 
 template <class Output>
@@ -388,13 +390,13 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
     const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
     const std::int32_t* snapshot_base_slots, Output out, std::int32_t C, std::int32_t width,
     std::int64_t slot_stride) {
-    pdl::enter(); // launched as a programmatic dependent
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
-    const std::int64_t c64   = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t C64   = static_cast<std::int64_t>(C);
-    if (c64 >= C64) { return; }
-
-    const std::int32_t valid = Masked ? valid_columns[batch] : width;
+    const std::int64_t at    = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const bool live          = at < C64;
+    const std::int64_t c64   = live ? at : 0;
+    // The weights, the round's slots and the state (last written by an earlier round) load before the
+    // wait; x (and the valid columns) come after it.
     const __nv_bfloat16* init =
         conv_states + static_cast<std::int64_t>(initial_state_slots[batch]) * slot_stride;
     __nv_bfloat16 s0            = init[c64];
@@ -404,6 +406,9 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
     const float w1              = __bfloat162float(weight[C64 + c64]);
     const float w2              = __bfloat162float(weight[2 * C64 + c64]);
     const float w3              = __bfloat162float(weight[3 * C64 + c64]);
+    pdl::enter(); // launched as a programmatic dependent
+    if (!live) { return; }
+    const std::int32_t valid    = Masked ? valid_columns[batch] : width;
     const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
     const auto destination      = out.column(c64);
 
