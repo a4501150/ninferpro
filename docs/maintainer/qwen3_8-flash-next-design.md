@@ -3679,6 +3679,14 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   Two later compositions from these blocks kept the bits but measured slower at T1 1 x 1 (a
   per-head GDN decode chain +0.4 %, a persistent projection-plus-chain kernel with a grid barrier
   +2.8 %) and stay on branch `exp/gdn-chain`; a one-column expert gate/up kernel (+0.6 %) was dropped.
+  The A16 expert pair (gate/up rows, then down rows; 27.6 MB at 1 x 1, a floor of about 16.6 us
+  against a plain streaming kernel's 1.77 TB/s) takes 21.7 us per layer (per-CTA timestamps, 54
+  layers): gate/up's first wave keeps DRAM busy to about 7.5 us, the second wave and the down CTAs
+  start only as first-wave CTAs finish their math, and the down CTAs, which issue their weight loads
+  only once resident, finish 3 to 5 us after gate/up's last CTA. Two bit-identical fixes did not pay:
+  down CTAs waiting on their own job's gate/up row groups (branch `exp/moe-job-ready`; 1 x 1
+  unchanged, 6 x 2 +0.9 %, 6 x 3 +1.7 %) and an L2 prefetch of the down weights from gate/up (+1.5 to
+  +2.5 %, it delays gate/up's first wave by the bytes it moves earlier).
 - **QSA index projection on tensor cores (`bf16-index-mma`, 2026-10-25, RTX PRO 6000, this fork).**
   Recipe C's BF16 QSA indexer projection [640, 2560] has no tuned exact route: the exact route of
   the construction-exact configurations takes its column-invariant sliced-K route, and every other
