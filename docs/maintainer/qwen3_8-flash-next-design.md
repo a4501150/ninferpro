@@ -3671,6 +3671,15 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   everywhere. T1, T1-exact and T2 unchanged (decode rounds up to 64 columns run the skinny kernel).
   Prefill (`infernix_bench`, FP8 KV, base/new/new/base twice): pp4096 +2.7 / +2.9 %, pp16384 +2.6 /
   +2.8 %, pp32768 +2.4 / +2.7 %, pp512 +2.7 / +2.1 %.
+- **Two-term x formed once per token (2026-10-24, RTX PRO 6000, this fork).** The wide route's
+  `quantize_x_terms_kernel` formed each wide entry's two-term A4 x from its token's row, so a token's
+  terms were computed once per routed expert (ten times at top-10): 654 us per layer at 16K tokens.
+  `x_token_terms_kernel` now forms every token's row scale and terms once (replacing
+  `x_row_scale_kernel`) into a per-token plane (`x_token_terms`, 2,880 bytes per column of workspace),
+  and `copy_x_terms_kernel` copies each entry's token row into the entry plane the GEMM's TMA maps
+  read. The rows are fully written, so the planes hold the same bytes: T1, T1-exact and T2 unchanged,
+  `infernix_offloaded_moe_wide_test` passes. Prefill (`infernix_bench`, FP8 KV, base/new/new/base
+  twice): pp4096 +0.9 / +1.0 %, pp16384 +0.8 / +0.9 %, pp32768 +0.7 / +0.9 %, pp512 +1.3 / +2.9 %.
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of
