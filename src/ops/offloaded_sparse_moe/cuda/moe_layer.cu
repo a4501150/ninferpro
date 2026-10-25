@@ -1900,17 +1900,40 @@ __global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const fl
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
-    float sum = 0.0F;
-    for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
-        sum += weights[static_cast<std::size_t>(t) * top_k + k] *
-               __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
+    // Every load is issued before the sums use any (one L2 round trip, not one per expert).
+    constexpr int kMaxTopK = 16, kMaxStreams = 4;
+    float w[kMaxTopK], o[kMaxTopK];
+#pragma unroll
+    for (int k = 0; k < kMaxTopK; ++k) {
+        if (k < top_k) {
+            w[k] = weights[static_cast<std::size_t>(t) * top_k + k];
+            o[k] = __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
+        }
     }
-    sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
-    const float v           = __bfloat162float(__float2bfloat16_rn(sum));
+    const float gate        = shared_gate[t];
+    const float own         = __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
-    for (int s = 0; s < streams; ++s) {
-        bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
-        r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+    float a[kMaxStreams], r[kMaxStreams];
+#pragma unroll
+    for (int s = 0; s < kMaxStreams; ++s) {
+        if (s < streams) {
+            a[s] = inject[static_cast<std::size_t>(t) * streams + s];
+            r[s] = __bfloat162float(residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d]);
+        }
+    }
+    float sum = 0.0F;
+#pragma unroll
+    for (int k = 0; k < kMaxTopK; ++k) { // fixed rank order: placement-invariant
+        if (k < top_k) { sum += w[k] * o[k]; }
+    }
+    sum += gate * own;
+    const float v = __bfloat162float(__float2bfloat16_rn(sum));
+#pragma unroll
+    for (int s = 0; s < kMaxStreams; ++s) {
+        if (s < streams) {
+            residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d] =
+                __float2bfloat16_rn(r[s] + a[s] * v);
+        }
     }
 }
 
@@ -2290,9 +2313,9 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
     const int hidden = shared.ne[0], columns = shared.ne[1], top_k = routing.weights.ne[0];
     const int streams = inject.ne[0];
     require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && routing.weights.ne[1] == columns &&
-                inject.ne[1] == columns && streams > 0 && residual.ne[0] == streams * hidden &&
-                residual.ne[1] == columns,
-            "combine inject shapes disagree");
+                inject.ne[1] == columns && streams > 0 && streams <= 4 && top_k > 0 && top_k <= 16 &&
+                residual.ne[0] == streams * hidden && residual.ne[1] == columns,
+            "combine inject shapes disagree (at most 4 streams and top-16)");
     CUDA_CHECK(pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
                                     combine_inject_kernel, static_cast<const bf16*>(outputs.data),
                                     static_cast<const float*>(routing.weights.data),
