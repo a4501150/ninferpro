@@ -1080,7 +1080,7 @@ void test_combine_inject(int columns, int top_k, int streams, std::uint32_t seed
 
 // moe_route_dispatch, captured (so its kernel runs as a programmatic dependent) and replayed on new
 // logits, against the oracles: ids exactly the top-k with lower-id ties (the logits repeat values
-// so ties occur), weights and shared gate against the FP64 formula, the dispatch exact as in
+// so ties occur, -0 among the zeros), weights and shared gate against the FP64 formula, the dispatch exact as in
 // test_dispatch, and every output bit equal to moe_route followed by moe_dispatch. Up to 32
 // columns take the one-kernel route, 33 the two calls.
 void test_route_dispatch(int experts, int columns, int top_k, std::uint32_t seed) {
@@ -1091,6 +1091,10 @@ void test_route_dispatch(int experts, int columns, int top_k, std::uint32_t seed
         std::uniform_int_distribution<int> level(-64, 64);
         std::vector<float> logits(logit_count);
         for (auto& v : logits) { v = static_cast<float>(level(rng)) / 16.0F; } // 129 levels: many ties
+        // Half the zeros negative: -0 and +0 compare equal, so they tie by id too.
+        for (auto& v : logits) {
+            if (v == 0.0F && (rng() & 1U) != 0U) { v = -0.0F; }
+        }
         return logits;
     };
     const auto alloc = [](std::size_t bytes) {

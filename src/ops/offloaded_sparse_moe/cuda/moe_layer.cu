@@ -302,10 +302,10 @@ __global__ void __launch_bounds__(kThreads)
 // The record a job reads where it lies: its frame, its streamed ring slot or, in a call without
 // staging, its host record (an unserved one reports an error and gives nullptr). Sets `miss`, with
 // nullptr, for a record the pass must stage.
-__device__ __forceinline__ const std::uint8_t* in_place_record(const MoeExpertSource& source, int expert, bool& miss) {
-    miss            = false;
-    const int frame = source.frames[expert];
-    const int slot  = source.prefetched != nullptr ? source.prefetched[expert] : -1;
+// in_place_record with the expert's frames[] and prefetched[] entries already read.
+__device__ __forceinline__ const std::uint8_t* in_place_record_at(const MoeExpertSource& source, int expert, int frame,
+                                                                  int slot, bool& miss) {
+    miss = false;
     if (frame >= 0) { return source.frame_base + static_cast<std::uint64_t>(frame) * frame_pitch(source); }
     if (slot >= 0) { // streamed by the caller (F2)
         return source.prefetch_base +
@@ -319,6 +319,11 @@ __device__ __forceinline__ const std::uint8_t* in_place_record(const MoeExpertSo
     // SSD-only and not a CPU job (a fetch channel needs staging): the passes skip it.
     if (record == nullptr) { report_error(source, offloaded_moe::kErrorUnservedRecord); }
     return record;
+}
+
+__device__ __forceinline__ const std::uint8_t* in_place_record(const MoeExpertSource& source, int expert, bool& miss) {
+    return in_place_record_at(source, expert, source.frames[expert],
+                              source.prefetched != nullptr ? source.prefetched[expert] : -1, miss);
 }
 
 constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
@@ -449,59 +454,81 @@ __global__ void __launch_bounds__(kThreads)
 // One warp routes column t: exact top-k by repeated arg-max with lower-id ties, then the weights.
 // Every array index is a compile-time constant (unrolled loops), so the values stay in registers;
 // the selection and softmax order are fixed. Lane k < top_k returns the k-th selected id.
+// The selection order of route_column: a larger logit first, then the smaller expert id. A logit's
+// key orders as the float compares (-0 as +0; NaN below every number, never selected while a number
+// remains).
+__device__ __forceinline__ unsigned route_key(float v) {
+    if (v != v) { return 0U; }
+    const unsigned u = __float_as_uint(v == 0.0F ? 0.0F : v);
+    return (u & 0x80000000U) != 0U ? ~u : (u | 0x80000000U);
+}
+__device__ __forceinline__ float route_value(unsigned key) {
+    return __uint_as_float((key & 0x80000000U) != 0U ? (key & 0x7FFFFFFFU) : ~key);
+}
+
 __device__ __forceinline__ int route_column(const float* __restrict__ logits, int experts, int top_k, int t,
                                             std::int32_t* __restrict__ ids, float* __restrict__ weights,
                                             float* __restrict__ shared_gate) {
     const int lane      = threadIdx.x % 32;
     const float* column = logits + static_cast<std::size_t>(t) * (experts + 1);
-    // 512 experts: 16 per lane.
+    // 512 experts: 16 per lane (expert lane + 32 i), every load issued before any is used.
     constexpr int kPerLane = 16;
-    float values[kPerLane];
+    float raw[kPerLane];
 #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-        const int e = lane + 32 * i;
-        values[i]   = e < experts ? column[e] : -INFINITY;
-    }
+    for (int i = 0; i < kPerLane; ++i) { raw[i] = column[min(lane + 32 * i, experts - 1)]; }
     const float score = lane == 0 ? column[experts] : 0.0F;
-    // Lane k keeps the k-th selection.
+    unsigned key[kPerLane]; // 0 past the experts: below every key, never selected
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) { key[i] = lane + 32 * i < experts ? route_key(raw[i]) : 0U; }
+    // The lane's earliest choice: the largest key, the lowest index among equal ones.
+    unsigned best_key = 0;
+    int best_i        = 0;
+    const auto lane_best = [&] {
+        best_key = key[0];
+        best_i   = 0;
+#pragma unroll
+        for (int i = 1; i < kPerLane; ++i) {
+            if (key[i] > best_key) {
+                best_key = key[i];
+                best_i   = i;
+            }
+        }
+    };
+    lane_best();
+    // Lane k keeps the k-th selection. A selected expert stays a candidate at -inf, as it was.
+    constexpr unsigned kRemoved = 0x007FFFFFU; // route_key(-inf)
     float selected = -INFINITY;
     int chosen     = 0;
+#pragma unroll 1
     for (int k = 0; k < top_k; ++k) {
-        float best   = -INFINITY;
-        int best_id  = 0x7FFFFFFF;
-#pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-            const int e = lane + 32 * i;
-            if (e < experts && (values[i] > best || (values[i] == best && e < best_id))) {
-                best    = values[i];
-                best_id = e;
-            }
-        }
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float other    = __shfl_xor_sync(0xFFFFFFFFU, best, offset);
-            const int other_id   = __shfl_xor_sync(0xFFFFFFFFU, best_id, offset);
-            if (other > best || (other == best && other_id < best_id)) {
-                best    = other;
-                best_id = other_id;
-            }
-        }
+        const unsigned m = __reduce_max_sync(0xFFFFFFFFU, best_key);
+        const int id     = static_cast<int>(__reduce_min_sync(
+            0xFFFFFFFFU, best_key == m ? static_cast<unsigned>(lane + 32 * best_i) : 0xFFFFFFFFU));
         if (lane == k) {
-            selected = best;
-            chosen   = best_id;
+            selected = route_value(m);
+            chosen   = id;
         }
+        if (lane == id % 32) {
 #pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-            if (lane + 32 * i == best_id) { values[i] = -INFINITY; }
+            for (int i = 0; i < kPerLane; ++i) {
+                if (i == best_i) { key[i] = kRemoved; }
+            }
+            lane_best();
         }
     }
     // softmax over all experts then renormalized over the selected ones equals the softmax of the
     // selected logits. Every lane sums them in selection order.
-    const float top = __shfl_sync(0xFFFFFFFFU, selected, 0);
-    float sum       = 0.0F;
-    for (int k = 0; k < top_k; ++k) { sum += expf(__shfl_sync(0xFFFFFFFFU, selected, k) - top); }
+    const float top  = __shfl_sync(0xFFFFFFFFU, selected, 0);
+    const float mine = expf(selected - top);
+    float sum        = 0.0F;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        const float term = __shfl_sync(0xFFFFFFFFU, mine, k);
+        if (k < top_k) { sum += term; }
+    }
     if (lane < top_k) {
         ids[static_cast<std::size_t>(t) * top_k + lane]     = chosen;
-        weights[static_cast<std::size_t>(t) * top_k + lane] = expf(selected - top) / sum;
+        weights[static_cast<std::size_t>(t) * top_k + lane] = mine / sum;
     }
     if (lane == 0) { shared_gate[t] = 1.0F / (1.0F + expf(-score)); }
     return chosen;
@@ -527,7 +554,7 @@ constexpr int kDispatchThreads = 1024;
 // Inclusive scans of the counts and of the used flags run within each warp by shuffles, then
 // across the warp totals (in the caller's shared `warp_totals`); the results are integers, so any
 // scan order gives the same values.
-__device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* __restrict__ offsets,
+__device__ __forceinline__ int dispatch_scan(int c, int experts, std::int32_t* __restrict__ offsets,
                                               std::int32_t* cursor, std::int32_t* __restrict__ jobs,
                                               std::int32_t* __restrict__ job_count,
                                               std::int32_t (&warp_totals)[2][kDispatchThreads / 32]) {
@@ -575,6 +602,7 @@ __device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* 
         offsets[experts] = sum;
         *job_count       = used;
     }
+    return e < experts && c > 0 ? used - 1 : -1;
 }
 
 // The whole dispatch of a call of at most kDispatchThreads entries in one CTA: the count with
@@ -582,7 +610,8 @@ __device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* 
 // scan, the scatter, and the optional route-log copy of the ids. Same results as the three-kernel
 // route below.
 // The caller has cleared `count` and synchronized; thread i < entries holds entry i's expert `id`.
-__device__ __forceinline__ void dispatch_small(int id, int entries, int experts, const MoeDispatch& dispatch,
+// Returns the job index of expert i (thread i), or -1 when it has no entries.
+__device__ __forceinline__ int dispatch_small(int id, int entries, int experts, const MoeDispatch& dispatch,
                                                std::int32_t* __restrict__ route_log,
                                                std::int32_t (&count)[kDispatchThreads],
                                                std::int32_t (&cursor)[kDispatchThreads],
@@ -595,9 +624,10 @@ __device__ __forceinline__ void dispatch_small(int id, int entries, int experts,
     __syncthreads();
     const int c = count[i];
     if (i < experts) { dispatch.counts[i] = c; }
-    dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
+    const int job = dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
     __syncthreads();
     if (i < entries) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+    return job;
 }
 
 __global__ void __launch_bounds__(kDispatchThreads)
@@ -610,7 +640,7 @@ __global__ void __launch_bounds__(kDispatchThreads)
     const int i = threadIdx.x;
     count[i]    = 0;
     __syncthreads();
-    dispatch_small(i < entries ? ids[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
+    (void)dispatch_small(i < entries ? ids[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
 }
 
 // Calls of at most this many columns (and kDispatchThreads entries) route and dispatch in one CTA,
@@ -656,7 +686,7 @@ __global__ void __launch_bounds__(kDispatchThreads)
                 std::int32_t* __restrict__ job_count) {
     __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
     const int e = threadIdx.x;
-    dispatch_scan(e < experts ? counts[e] : 0, experts, offsets, cursor, jobs, job_count, warp_totals);
+    (void)dispatch_scan(e < experts ? counts[e] : 0, experts, offsets, cursor, jobs, job_count, warp_totals);
 }
 
 __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries,
@@ -1681,18 +1711,21 @@ __global__ void __launch_bounds__(kDispatchThreads)
         return;
     }
     count[i] = 0;
+    // Thread e reads expert e's frame and slot while the warps route.
+    const int frame = i < experts ? source.frames[i] : -1;
+    const int slot  = i < experts && source.prefetched != nullptr ? source.prefetched[i] : -1;
     if (warp < columns) {
         const int id = route_column(logits, experts, top_k, warp, ids, weights, shared_gate);
         if (lane < top_k) { routed[warp * top_k + lane] = id; }
     }
     __syncthreads();
     const int entries = columns * top_k;
-    dispatch_small(i < entries ? routed[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
-    __syncthreads(); // the job list and count are written
-    const int jobs = min(*dispatch.job_count, max_jobs);
-    for (int j = i; j < jobs; j += kDispatchThreads) {
+    // The thread of each used expert records its job (job j is the j-th used expert in id order).
+    const int job = dispatch_small(i < entries ? routed[i] : 0, entries, experts, dispatch, route_log, count, cursor,
+                                   warp_totals);
+    if (job >= 0 && job < max_jobs) {
         bool miss;
-        job_records[j] = in_place_record(source, dispatch.jobs[j], miss);
+        job_records[job] = in_place_record_at(source, i, frame, slot, miss);
     }
 }
 static_assert(kEncodeActsThreads % 32 == 0 && kEncodeActsThreads <= kDispatchThreads);
