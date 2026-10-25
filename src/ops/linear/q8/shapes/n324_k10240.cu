@@ -46,4 +46,36 @@ Q8Launch select_q8_n324_k10240_invariant(std::int32_t tokens) {
     return select_q8_sliced_k_invariant<10240, 16>(tokens);
 }
 
+namespace {
+template <int KWarps, int Tokens, int RowTiles = 1>
+constexpr Q8Launch kSlicedK = launch_q8_sliced_k_invariant<Q8SlicedKInvariant<10240, KWarps, Tokens, RowTiles>>;
+
+// The q8-sliced-k fast path for the two 10240-K down projections (2026-10-24, RTX PRO 6000): the
+// hyper-connection mixes of verification rounds wider than the fused route (29-64 columns) and of
+// prefill chunks up to 2048 columns. The exact routes' single K chain holds them at 24-125 us from 9
+// to 2048 columns; the sliced-K tiles take 12-104 us there, with fewer K warps and wider token tiles
+// as the width grows (at T = 48 16 K warps took 22.5 us against 57 for the register-streamed route;
+// at T = 512 eight K warps 37 us against 96; at T = 2048 four 98 us against 125). Beyond 2048 columns
+// the exact route's tiles serve.
+Q8Launch select_k10240_down_fast(std::int32_t tokens, Q8Launch (*exact)(std::int32_t)) {
+    if (tokens <= 5) return exact(tokens);
+    if (tokens <= 8) return kSlicedK<16, 8>;
+    if (tokens <= 16) return kSlicedK<16, 16>;
+    if (tokens <= 256) return kSlicedK<16, 16, 2>;
+    if (tokens <= 512) return kSlicedK<8, 32, 2>;
+    if (tokens <= 1024) return kSlicedK<4, 32, 2>;
+    if (tokens <= 2048) return kSlicedK<4, 64, 2>;
+    return exact(tokens);
+}
+} // namespace
+
+Q8Launch select_q8_n324_k10240_fast(std::int32_t tokens) {
+    return select_k10240_down_fast(tokens, select_q8_n324_k10240);
+}
+
+// The final mixer down shares the hyper-connection down's K and its table (N 320 against 324).
+Q8Launch select_q8_n320_k10240_fast(std::int32_t tokens) {
+    return select_k10240_down_fast(tokens, select_q8_n320_k10240);
+}
+
 } // namespace infernix::ops::detail

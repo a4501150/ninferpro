@@ -504,7 +504,7 @@ Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, 
                         ops::linear_column_invariant_supported(p.up.weight.qtype, p.up.weight.n, p.up.weight.k);
     ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight,
                               column ? ops::LinearPolicy::A16ColumnInvariant : p.down.policy, S, rank,
-                              config_.rms_norm_eps, x, p.combine ? inject : nullptr, work_, s);
+                              config_.rms_norm_eps, x, p.combine ? inject : nullptr, work_, s, dense_routes());
     return x;
 }
 

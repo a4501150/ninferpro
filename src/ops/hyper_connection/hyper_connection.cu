@@ -223,7 +223,7 @@ std::size_t composed_bytes(const Weight& down, const Weight& up, LinearPolicy po
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
-                          WorkspaceArena& workspace, cudaStream_t stream) {
+                          WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
     require(contiguous_2d(residual, DType::BF16) && contiguous_2d(x, DType::BF16) &&
                 contiguous_2d(norm_weight, DType::BF16) && streams > 0 && rank > 0,
             "mix requires contiguous BF16 tensors");
@@ -250,7 +250,7 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     Tensor normalized = workspace.alloc(DType::BF16, {residual.ne[0], T});
     hyper_connection_norm(residual, norm_weight, streams, eps, normalized, stream);
     Tensor z = workspace.alloc(DType::BF16, {down.n, T});
-    linear(normalized, down, z, policy, workspace, stream);
+    linear(normalized, down, z, policy, workspace, stream, routes);
     Tensor m = workspace.alloc(DType::BF16, {rank, T});
     hyper_connection_gates(z, rank, streams, m, inject, stream);
     if (invariant ? detail::hc_up_collapse_supported(up, hidden, streams)
@@ -260,7 +260,7 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
         return;
     }
     Tensor u = workspace.alloc(DType::BF16, {up.n, T});
-    linear(m, up, u, policy, workspace, stream);
+    linear(m, up, u, policy, workspace, stream, routes);
     hyper_connection_collapse(u, normalized, streams, x, stream);
 }
 

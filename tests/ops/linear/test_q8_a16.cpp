@@ -96,14 +96,18 @@ int q8_a16_conformance() {
         calls.push_back({17, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8});
         calls.push_back({64, CallForm::Policy, infernix::ops::LinearPolicy::AllowA4});
         // The q8-sliced-k fast routes (LinearRoutes::Q8SlicedK) meet the same criterion on every route and
-        // at each seam of the two fast tables; other shapes run their exact route under Fast.
+        // at each seam of the two fast tables, as do the hc-sliced-k routes (LinearRoutes::Q8HcSlicedK)
+        // of the hyper-connection mix; other shapes run their exact route under Fast.
         const bool fast_shape = (shape.n == 16384 && shape.k == 2560) || (shape.n == 2560 && shape.k == 6144);
+        const bool down_shape = (shape.n == 324 || shape.n == 320) && shape.k == 10240;
         for (int t : fast_shape ? std::vector<int>{1,  2,  3,  5,  7,  8,  9,  15, 16, 17, 23,  24,  25,  31,
                                                    32, 33, 39, 40, 41, 47, 48, 49, 50, 51, 62,  63,  64,  65,
                                                    95, 96, 97, 127, 128, 129, 256, 511, 512, 513, 4096}
-                                : std::vector<int>{1, 8, 64}) {
+                     : down_shape ? std::vector<int>{5, 6, 8, 9, 16, 17, 256, 257, 512, 513, 1024, 1025, 2048, 2049}
+                                  : std::vector<int>{1, 8, 64}) {
             calls.push_back({t, CallForm::Policy, infernix::ops::LinearPolicy::A16Only, false,
-                             infernix::ops::LinearRoutes::Q8SlicedK});
+                             down_shape ? infernix::ops::LinearRoutes::Q8HcSlicedK
+                                        : infernix::ops::LinearRoutes::Q8SlicedK});
         }
         for (int t : {1, 5, 40}) {
             calls.push_back({t, CallForm::Policy, infernix::ops::LinearPolicy::A16Only, true,

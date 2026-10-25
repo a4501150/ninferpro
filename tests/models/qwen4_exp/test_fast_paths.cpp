@@ -148,6 +148,21 @@ int main() {
                           "gdn-compensated does not apply where the exact route runs the chunked GDN prefill");
     }
 
+    // hc-sliced-k routes recipe C's Q8 hyper-connection mix by its call's width; FP8 KV only.
+    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256}) {
+        const q::FastPathConfiguration recipe_c{DenseKernels::Fp8Row, false, kv};
+        failures += check(q::fast_path_applies(FastPath::HcSlicedK, recipe_c, options),
+                          "hc-sliced-k applies to recipe C");
+        const q::FastPathSelection hc{.configuration = recipe_c, .paths = {FastPath::HcSlicedK}};
+        failures += check(hc.forward().dense_routes == infernix::ops::LinearRoutes::Q8HcSlicedK &&
+                              !hc.forward().column_invariant && !hc.request_invariant(),
+                          "hc-sliced-k sets its route and couples a column to its call's width");
+        failures += check(q::fast_path_qualified(FastPath::HcSlicedK, recipe_c) == (kv == KvCacheStorage::Fp8E4M3Row256),
+                          "hc-sliced-k is qualified on recipe C with FP8 KV");
+    }
+    failures += check(!q::fast_path_applies(FastPath::HcSlicedK, dense8, options),
+                      "hc-sliced-k does not apply to Dense8 (q8-sliced-k's configuration)");
+
     q::FastPathSelection selection{.configuration = dense8, .paths = {}};
     const auto exact = selection.forward();
     failures += check(exact.dense_routes == infernix::ops::LinearRoutes::Exact && !exact.gdn_conv_fused &&

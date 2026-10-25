@@ -163,9 +163,14 @@ enum class FastPath : std::uint8_t {
     // arithmetic then depends on where its calls start, which prefix-cache resumes share between
     // requests. Without it those calls stay recurrent.
     GdnCompensated,
+    // Qwen3.8-Flash-Next with FP8 dense kernels: the Q8 hyper-connection mix ([324,10240] and
+    // [320,10240]) of calls of 6-2048 columns runs sliced-K routes (ops::LinearRoutes::Q8HcSlicedK)
+    // whose K split depends on the call's width, instead of the exact MMA tiles. A column's bits then
+    // depend on its call's width. Without it the mix stays on the exact tiles.
+    HcSlicedK,
 };
 
-inline constexpr std::array<FastPath, 23> kFastPaths{
+inline constexpr std::array<FastPath, 24> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -177,7 +182,8 @@ inline constexpr std::array<FastPath, 23> kFastPaths{
     FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
     FastPath::AdaptiveMtp,         FastPath::FreeCacheResume,
     FastPath::Preemption,          FastPath::IdleWidePrefill,
-    FastPath::GgmlBf16Prefill,     FastPath::GdnCompensated};
+    FastPath::GgmlBf16Prefill,     FastPath::GdnCompensated,
+    FastPath::HcSlicedK};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -204,6 +210,7 @@ inline constexpr std::array<FastPath, 23> kFastPaths{
     case FastPath::GdnF16Accumulate: return "gdn-f16-accumulate";
     case FastPath::GgmlBf16Prefill: return "ggml-bf16-prefill";
     case FastPath::GdnCompensated: return "gdn-compensated";
+    case FastPath::HcSlicedK: return "hc-sliced-k";
     }
     return "unknown";
 }

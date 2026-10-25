@@ -18,6 +18,8 @@ struct ShapeEntry {
     ShapeSelector fast = nullptr;
     // The shape's A16ColumnInvariant routes, or null where it registers none.
     ShapeSelector invariant = nullptr;
+    // The shape's LinearRoutes::Q8HcSlicedK routes, or null where it has none.
+    ShapeSelector hc_fast = nullptr;
 };
 
 template <class Geometry>
@@ -43,8 +45,10 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 2560, select_q8_n2560_k2560, nullptr, select_q8_n2560_k2560_invariant},
     ShapeEntry{1280, 2560, select_q8_n1280_k2560, nullptr, select_q8_n1280_k2560_invariant},
     ShapeEntry{2560, 6144, select_q8_n2560_k6144, select_q8_n2560_k6144_fast, select_q8_n2560_k6144_invariant},
-    ShapeEntry{324, 10240, select_q8_n324_k10240, nullptr, select_q8_n324_k10240_invariant},
-    ShapeEntry{320, 10240, select_q8_n320_k10240, nullptr, select_q8_n320_k10240_invariant},
+    ShapeEntry{324, 10240, select_q8_n324_k10240, nullptr, select_q8_n324_k10240_invariant,
+               select_q8_n324_k10240_fast},
+    ShapeEntry{320, 10240, select_q8_n320_k10240, nullptr, select_q8_n320_k10240_invariant,
+               select_q8_n320_k10240_fast},
     ShapeEntry{10240, 320, select_q8_n10240_k320, nullptr, select_q8_n10240_k320_invariant},
     ShapeEntry{2560, 640, select_q8_n2560_k640, nullptr, select_q8_n2560_k640_invariant},
     // NInfer's tunings for its own 2560-wide groupings.
@@ -73,6 +77,7 @@ Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t, Li
     for (const auto& entry : kShapes) {
         if (entry.n != n || entry.k != k) continue;
         if (has_route(routes, LinearRoutes::Q8SlicedK) && entry.fast != nullptr) return entry.fast(t);
+        if (has_route(routes, LinearRoutes::Q8HcSlicedK) && entry.hc_fast != nullptr) return entry.hc_fast(t);
         return entry.select(t);
     }
     return select_q8_generic(n, k, t);

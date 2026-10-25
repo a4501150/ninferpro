@@ -59,6 +59,9 @@ enum class LinearRoutes : std::uint8_t {
     /// ggml-bf16-prefill: GGUF projections of 32 or more columns on BF16 tensor cores with FP32 sums
     /// (ops::ggml_linear) instead of the exact A16 integer tiles.
     GgmlBf16Wide = 16,
+    /// hc-sliced-k: Q8 [324,10240] and [320,10240] (Qwen3.8-Flash-Next's hyper-connection mix) on
+    /// sliced-K routes at 6-2048 columns instead of the exact MMA tiles.
+    Q8HcSlicedK = 32,
 };
 
 [[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
@@ -70,7 +73,7 @@ enum class LinearRoutes : std::uint8_t {
 }
 
 [[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
-    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{31}) == 0;
+    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{63}) == 0;
 }
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
@@ -184,7 +187,9 @@ enum class LinearRoutes : std::uint8_t {
  * which accumulate in a different order from the exact routes; a column's bits then depend on the
  * call's T. Under LinearRoutes::Fp8A8Pair, FP8 [16384,2560], [13312,2560], [2560,6144], [1280,2560]
  * and [2560,640] at T >= 17, unless a single-term A8 route is selected, carry each activation column
- * as two E4M3 terms with their own scales on the 8-bit Tensor Core path. Every other problem runs its
+ * as two E4M3 terms with their own scales on the 8-bit Tensor Core path. Under
+ * LinearRoutes::Q8HcSlicedK, Q8 [324,10240] and [320,10240] at 6 <= T <= 2048 run sliced-K routes
+ * whose K split depends on T. Every other problem runs its
  * exact route under a flag it does not register. Under A16ColumnInvariant every flag is ignored:
  * the column-invariant route is the exact route's. Every route meets the A16 criterion; the
  * workspace query covers the two-term route's scratch.

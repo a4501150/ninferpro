@@ -40,7 +40,7 @@ namespace infernix::ops {
 /// Routes (private, chosen from the weights and T only): Q8_G32_FP16 RowSplit weights of the
 /// registered geometry (S = 4, H = 2560, rank a multiple of 8 up to 512) at T <= 28 (T <= 16 where
 /// the norm weight is not 16-byte aligned) run two fused kernels with every intermediate (Rn, z, m,
-/// u) in FP32, so a column's result does not depend on T within that range. Other weights and wider calls run the norm, linear (with `policy`), gates,
+/// u) in FP32, so a column's result does not depend on T within that range. Other weights and wider calls run the norm, linear (with `policy` and `routes`), gates,
 /// linear and collapse steps with BF16 intermediates; with a Q8_G32_FP16 RowSplit W_up and 4 streams,
 /// calls of more than 96 columns compute the up linear and the collapse in one kernel that keeps u
 /// on chip, with the same bits as the separate steps. `workspace` is caller-owned transient
@@ -48,7 +48,8 @@ namespace infernix::ops {
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
-                          WorkspaceArena& workspace, cudaStream_t stream);
+                          WorkspaceArena& workspace, cudaStream_t stream,
+                          LinearRoutes routes = LinearRoutes::Exact);
 
 /// The workspace hyper_connection_mix needs for every T in [1, max_tokens].
 [[nodiscard]] std::size_t hyper_connection_mix_workspace_capacity_bytes(

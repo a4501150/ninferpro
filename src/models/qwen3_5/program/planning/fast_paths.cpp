@@ -310,6 +310,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::GdnF16Accumulate: return true;
     case FastPath::GgmlBf16Prefill: return false; // Qwen3.8-Flash-Next's GGUF imports only
     case FastPath::GdnCompensated: return false;  // Qwen3.8-Flash-Next's construction-exact configurations only
+    case FastPath::HcSlicedK: return false;       // Qwen3.8-Flash-Next's hyper-connection mix only
     }
     return false;
 }

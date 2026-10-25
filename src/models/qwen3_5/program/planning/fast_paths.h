@@ -65,7 +65,8 @@ struct FastPathConfiguration {
     case FastPath::AdaptiveMtp:
     case FastPath::IdleWidePrefill:
     case FastPath::GgmlBf16Prefill:
-    case FastPath::GdnCompensated: return true;
+    case FastPath::GdnCompensated:
+    case FastPath::HcSlicedK: return true;
     }
     return false;
 }

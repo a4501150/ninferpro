@@ -764,8 +764,8 @@ experts' 4-bit activations cost; pass `--ngram-volume` to the gate when the volu
 (`infernix_qwen4_exp_score_real_test`): on 3,000 tokens the perplexity matches, top-1 agrees at
 every position, and the RAM and SSD expert tiers give the same output. Its qualified paths are
 the three request-coupling paths (every configuration), sampled MTP drafts, the three
-Q8 dense-kernel paths (Dense8), FP16 GDN (IQ3_S and FP8) and recipe C's expert and FP8 pair paths
-(6.7).
+Q8 dense-kernel paths (Dense8), FP16 GDN (IQ3_S and FP8) and recipe C's expert, FP8 pair,
+compensated GDN and hyper-connection sliced-K paths (6.7).
 
 ### 6.6 Calibration and comparison with other engines
 
@@ -894,6 +894,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | Qwen3.8-Flash-Next: `gdn-compensated` | GDN calls of 16+ tokens in the construction-exact configurations (recipe C with BF16, INT8 or FP8 KV) | recipe C with INT8 or FP8 KV (BF16 KV is the reference's own exact route, not gated; 6.8) |
+| Qwen3.8-Flash-Next: `hc-sliced-k` | the Q8 hyper-connection mix ([324, 10240], [320, 10240]) of recipe C at 29-2,048 columns | recipe C with FP8 KV (INT8 fails its decode tail, below; other formats not gated) |
 | `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B and FP8, every format; IQ3_S, every format but BF16 (fails there, under `ggml-bf16-prefill`); not the 35B-A3B or Dense8 (no gain beyond spread, below) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
@@ -1989,6 +1990,38 @@ p99.9 1.13). Against the recurrent fast route's own prefill (INT8) the compensat
 INT8 / FP8, chunks 896 / 1,792 / 3,584 / 7,168) against the recurrent fast route: -4.2 / -4.3 /
 -5.1 / -5.6 % and -4.4 / -4.9 / -5.2 / -5.8 %. The exact route's bits are unchanged (`t1-exact`
 equals its record); the fast route's T1 hashes changed again, its decode times did not.
+
+**`hc-sliced-k`: sliced-K routes for recipe C's hyper-connection mix (2026-10-24).** The mix's
+Q8 [324, 10240] and [320, 10240] projections run through `ops::linear` above the fused route (29 or
+more columns; 17 without an aligned norm). Their exact route is one MMA chain over K = 10,240 in
+tiles of 32-128 columns, 24-125 us per call from 9 to 2,048 columns with a few dozen CTAs on 188
+SMs. Under `LinearRoutes::Q8HcSlicedK` the same problems take sliced-K routes from 6 to 2,048
+columns (16 x 8 and 16 x 16 tiles up to 16 columns, then grouped tiles of 16, 8 and 4 rows with 2
+K-groups up to 2,048); the K split depends on the call's width, so a column's bits depend on its
+call (a request-coupling path, column-invariant routes off). Beyond 2,048 columns the exact tiles
+stay. A separate path from `q8-sliced-k`: that path's approval is Dense8's, and changing its
+kernels would need Dense8's gates again. The Op meets the A16 criterion at every seam of the table
+(`infernix_linear_q8_a16_test`). Joint gates with recipe C's qualified paths against the
+construction-exact reference (decode: MTP 4 at concurrency 8, so the verifications are 40 columns
+wide and take the path, with warm 3,000-token resumes; prefill: quick corpus, chunks 896-7,168):
+
+| Gate | KV | TV excess (bound) | Top-1 excess (bound) | KL excess (bound) | NLL excess | p99.9 KL ratio |
+|---|---|---:|---:|---:|---:|---:|
+| decode, 256 segments | FP8 | 1.3e-3 (1.7e-3) | 1.2e-3 (3.6e-3) | 4.7e-4 (8.5e-4) | -1.6e-3 | 0.91 |
+| prefill, quick corpus | FP8 | — | 1.0e-3 (1.6e-3) | 6.0e-4 (6.8e-4) | -1.3e-4 | 1.07 |
+| decode, 256 segments | INT8 | 1.8e-3 (2.2e-3) | 4.8e-3 (7.3e-3, fails) | 1.1e-3 (1.4e-3) | -1.7e-3 | 1.64 (fails) |
+| prefill, quick corpus | INT8 | — | 2.2e-3 (2.6e-3) | 9.2e-4 (1.1e-3) | -4.6e-4 | 1.09 |
+
+The INT8 decode run is a clear fail (its tail ratio is more than 10 % over the cap), so it is not
+registered. The qualified fast route without the path, in the same run, also fails there (top-1
+bound 5.5e-3, p99.9 1.27; it passed at 1,024 segments). A 1,024-segment extension of both was run
+as a control and passes (with the path: top-1 2.7e-3, bound 3.7e-3, p99.9 1.24; without: 2.6e-3,
+1.11), but under 6.1 a clear fail does not take the extension. Timing (round bench, FP8 KV,
+base/new/new/base): 6 x 6 30.89 / 30.97 -> 30.14 / 30.15 ms, 6 x 8 35.92 / 36.01 -> 34.02 / 34.05,
+8 x 8 41.39 / 41.53 -> 39.17 / 39.21; rounds of 28 columns or fewer run the fused route and are
+unchanged (1 x 4 to 6 x 3 within 0.3 %). Prefill (`infernix_bench`, FP8 KV): pp256 4,632 / 4,634 ->
+5,468 / 5,344 tok/s, pp512 7,142 / 7,144 -> 7,703 / 7,832, pp1024 9,563 / 9,438 -> 9,754 / 9,756,
+pp2048 12,296 / 12,203 -> 12,242 / 12,270 (no gain at 2,048).
 
 **Prefill head gather-before-mix (2026-10-23).** `Forward::finish` mixed the residual over the
 call's full width before gathering the logit columns, so the LM head's arithmetic depended on the

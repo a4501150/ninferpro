@@ -3680,6 +3680,15 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   read. The rows are fully written, so the planes hold the same bytes: T1, T1-exact and T2 unchanged,
   `infernix_offloaded_moe_wide_test` passes. Prefill (`infernix_bench`, FP8 KV, base/new/new/base
   twice): pp4096 +0.9 / +1.0 %, pp16384 +0.8 / +0.9 %, pp32768 +0.7 / +0.9 %, pp512 +1.3 / +2.9 %.
+- **Hyper-connection mix on sliced-K routes (`hc-sliced-k`, 2026-10-24, RTX PRO 6000, this fork).**
+  Above the fused route (29 or more columns) the mix's Q8 [324, 10240] and [320, 10240] projections
+  ran one MMA chain over K = 10,240 in a few dozen CTAs, 24-125 us per call from 9 to 2,048 columns.
+  The `hc-sliced-k` fast path (`LinearRoutes::Q8HcSlicedK`, `select_q8_n324_k10240_fast`) runs them
+  on sliced-K routes from 6 to 2,048 columns; beyond, the exact tiles stay. It is qualified on recipe
+  C with FP8 KV only (INT8 fails its decode tail; model-quality.md 6.7). T1 (FP8 KV, base/new twice):
+  6 x 6 -2.5 %, 6 x 8 -5.4 %, 8 x 8 -5.5 %; 28 columns or fewer unchanged. Prefill: pp256 +17 %,
+  pp512 +9 %, pp1024 +2 %, pp2048 unchanged. The exact route's bits are unchanged (`t1-exact`); the
+  fast route's T1 hashes are re-recorded (each lane's 1,024-token context prefill takes the path).
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of
