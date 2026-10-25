@@ -17,7 +17,7 @@
 #include "core/pdl.cuh"
 #include "ops/kernel/gdn_gate_values.cuh"
 #include "ops/kernel/rmsnorm.cuh"
-#include "ops/linear_attention/gated_delta_net/recurrent.cuh"
+#include "ops/linear_attention/gated_delta_net/decode_chain.cuh"
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -28,179 +28,14 @@ namespace infernix::ops {
 namespace detail::gated_delta_net {
 namespace {
 
-namespace cg = cooperative_groups;
-
-constexpr int kHalves       = 2;
-constexpr int kHalfRows     = kStateDim / kHalves;
-constexpr int kChainWarps   = kHalfRows / kDvPerWarp; // half the head's rows: 16 warps of 4 rows
-constexpr int kChainThreads = kChainWarps * kWarpSize;
-constexpr int kConvTaps     = 4;
-
-struct ChainArgs {
-    const __nv_bfloat16* qkv; // [C, B]: q | k | v channels of each sequence
-    const __nv_bfloat16* conv_weight; // [taps][C]
-    __nv_bfloat16* conv_states;       // slots of [taps - 1][C]
-    std::int64_t conv_slot_stride;
-    const __nv_bfloat16* gate_a; // [Hv] per sequence at gate_ld
-    const __nv_bfloat16* gate_b;
-    std::int64_t gate_a_ld, gate_b_ld;
-    const float* a_log;
-    const float* dt_bias;
-    float* ssm_states; // slots of [Hv][128][128]
-    std::int64_t state_slot_stride;
-    const std::int32_t* slots; // each sequence's slot, read and written in place (both pools)
-    const __nv_bfloat16* norm_weight; // [128]
-    const __nv_bfloat16* z;           // [128] per (sequence, value head)
-    __nv_bfloat16* out;               // [128] per (sequence, value head)
-    head_map heads;
-    int channels;
-    float scale;
-    float eps;
-};
-
-// run_recurrent_sequence's access to one head's q, k, v and output in shared memory.
-struct ChainAccess {
-    const __nv_bfloat16* q;
-    const __nv_bfloat16* k;
-    const __nv_bfloat16* v;
-    __nv_bfloat16* o;
-    __nv_bfloat16 a, b;
-    float a_log, dt_bias;
-    float scale;
-
-    __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates&, std::int32_t) const { return k; }
-    __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates&, std::int32_t) const { return v; }
-    __device__ __forceinline__ const __nv_bfloat16* query_ptr(const RecurrentCoordinates&, std::int32_t) const { return q; }
-    __device__ __forceinline__ __nv_bfloat16* output_ptr(const RecurrentCoordinates&, std::int32_t) const { return o; }
-    __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates&, std::int32_t) const {
-        float g_value = 0.0f, beta_value = 0.0f;
-        gdn_gate_values(a, b, a_log, dt_bias, g_value, beta_value);
-        return {make_uint2(__float_as_uint(g_value), __float_as_uint(beta_value)), g_value, beta_value};
-    }
-};
-
 template <RmsEpilogue Epilogue>
 __global__ void __launch_bounds__(kChainThreads, 2) gdn_decode_chain_kernel(const ChainArgs args) {
-    __shared__ __align__(16) __nv_bfloat16 q_s[kStateDim];
-    __shared__ __align__(16) __nv_bfloat16 k_s[kStateDim];
-    __shared__ __align__(16) __nv_bfloat16 v_s[kStateDim];
-    __shared__ __align__(16) __nv_bfloat16 o_s[kStateDim];
-    __shared__ __align__(16) __nv_bfloat16 w_s[kStateDim]; // the norm's weight and the head's z row
-    __shared__ __align__(16) __nv_bfloat16 z_s[kStateDim];
-    const int t = static_cast<int>(threadIdx.x), lane = t % kWarpSize, warp = t / kWarpSize;
-    const int head = static_cast<int>(blockIdx.x) / kHalves, half = static_cast<int>(blockIdx.x) % kHalves;
-    const int batch = static_cast<int>(blockIdx.y);
-    const int qk_head = args.heads.qk_head(head);
-    const RecurrentCoordinates coord{lane,
-                                     warp,
-                                     batch,
-                                     0,
-                                     warp / kNumWarps,
-                                     static_cast<std::uint32_t>(head),
-                                     static_cast<std::uint32_t>(qk_head),
-                                     static_cast<std::uint32_t>(half * kHalfRows + warp * kDvPerWarp),
-                                     static_cast<std::uint32_t>(lane * kQkPerLane)};
-    const std::int64_t slot = args.slots[batch];
-
-    // Before the wait (both states were last written by an earlier round; the slot comes from the
-    // round's ingress): the state tile, and for threads 0..319 one channel's taps and state - q and
-    // k of the key head, then v of this half.
-    float* state_base = args.ssm_states + slot * args.state_slot_stride +
-                        static_cast<std::int64_t>(head) * kStateDim * kStateDim;
-    __align__(16) float state[kDvPerWarp][kQkPerLane];
-    load_state_tile(state, state_base, coord);
-    const int part = t / kStateDim, i = part < 2 ? t % kStateDim : half * kHalfRows + t % kStateDim;
-    const int key_width = args.heads.H_qk * kStateDim;
-    const int c = part == 0 ? qk_head * kStateDim + i
-                : part == 1 ? key_width + qk_head * kStateDim + i
-                            : 2 * key_width + head * kStateDim + i;
-    const bool convolves = t < 2 * kStateDim + kHalfRows;
-    const std::int64_t C = args.channels;
-    __nv_bfloat16* conv = args.conv_states + slot * args.conv_slot_stride;
-    float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f, w3 = 0.0f;
-    __nv_bfloat16 s0{}, s1{}, s2{};
-    if (convolves) {
-        w0 = __bfloat162float(args.conv_weight[c]);
-        w1 = __bfloat162float(args.conv_weight[C + c]);
-        w2 = __bfloat162float(args.conv_weight[2 * C + c]);
-        w3 = __bfloat162float(args.conv_weight[3 * C + c]);
-        s0 = conv[c];
-        s1 = conv[C + c];
-        s2 = conv[2 * C + c];
-    }
-    const float a_log = args.a_log[head], dt_bias = args.dt_bias[head];
-    const std::int64_t row = (static_cast<std::int64_t>(batch) * args.heads.H_v + head) * (kStateDim / 2);
-    const bool norms = half == 0 && warp == 0;
-    __nv_bfloat162 w_pair[2] = {}, z_pair[2] = {};
-    if (norms) {
-#pragma unroll
-        for (int k = 0; k < 2; ++k) { w_pair[k] = reinterpret_cast<const __nv_bfloat162*>(args.norm_weight)[lane + 32 * k]; }
-    }
+    __shared__ ChainShared sm;
+    const ChainPlace at = chain_place(args, static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y));
+    ChainPreload p;
+    chain_preload(args, at, p);
     pdl::enter_streaming();
-
-    if (norms) {
-#pragma unroll
-        for (int k = 0; k < 2; ++k) { z_pair[k] = reinterpret_cast<const __nv_bfloat162*>(args.z)[row + lane + 32 * k]; }
-    }
-
-    // 1. The convolution (causal_conv1d's snapshot decode arithmetic).
-    __nv_bfloat16 x0{};
-    if (convolves) {
-        x0 = args.qkv[static_cast<std::int64_t>(batch) * C + c];
-        float acc = 0.0f;
-        acc += w0 * __bfloat162float(s0);
-        acc += w1 * __bfloat162float(s1);
-        acc += w2 * __bfloat162float(s2);
-        acc += w3 * __bfloat162float(x0);
-        __nv_bfloat16* destination = part == 0 ? q_s : part == 1 ? k_s : v_s;
-        destination[i]             = __float2bfloat16_rn(silu(acc));
-        if (part == 2) { // this half's own channels
-            conv[c]         = s1;
-            conv[C + c]     = s2;
-            conv[2 * C + c] = x0;
-        }
-    }
-    // Every CTA of the key head's cluster has read its q/k state (and this CTA's q, k, v are in
-    // shared memory) before the first one updates that state.
-    cg::this_cluster().sync();
-    if (convolves && part < 2 && cg::this_cluster().block_rank() == 0) {
-        conv[c]         = s1;
-        conv[C + c]     = s2;
-        conv[2 * C + c] = x0;
-    }
-
-    // 2. The recurrent update (gated_delta_net_batch_update_gating's loop) into the first half's o_s:
-    // the second half writes its rows across the cluster.
-    cg::cluster_group cluster = cg::this_cluster();
-    __nv_bfloat16* row_out = half == 0 ? o_s : cluster.map_shared_rank(o_s, cluster.block_rank() - 1);
-    const std::int64_t gate_column = batch;
-    const ChainAccess access{q_s,
-                             k_s,
-                             v_s,
-                             row_out,
-                             args.gate_a[gate_column * args.gate_a_ld + head],
-                             args.gate_b[gate_column * args.gate_b_ld + head],
-                             a_log,
-                             dt_bias,
-                             args.scale};
-    run_recurrent_sequence<true, OutputEffects>(state, access, coord, 1);
-    store_state_tile(state, state_base, coord);
-    cluster.sync(); // both halves' rows are in the first half's o_s
-
-    // 3. The gated RMSNorm of the head's output row, by the first half with the second's rows.
-    if (norms) {
-#pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            reinterpret_cast<__nv_bfloat162*>(w_s)[lane + 32 * k] = w_pair[k];
-            reinterpret_cast<__nv_bfloat162*>(z_s)[lane + 32 * k] = z_pair[k];
-        }
-        __syncwarp();
-        rmsnorm_warp_row_bf16x2<Epilogue, true>(reinterpret_cast<const __nv_bfloat162*>(o_s),
-                                                reinterpret_cast<const __nv_bfloat162*>(w_s),
-                                                reinterpret_cast<const __nv_bfloat162*>(z_s),
-                                                reinterpret_cast<__nv_bfloat162*>(args.out) + row, kStateDim,
-                                                args.eps, lane);
-    }
+    chain_finish<Epilogue>(args, at, p, sm);
 }
 
 } // namespace

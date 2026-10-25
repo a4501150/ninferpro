@@ -28,6 +28,7 @@
 #include "infernix/ops/speculative_round.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <vector>
 #include <cmath>
@@ -595,6 +596,10 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     // the FP32 projection rather than its BF16 rounding. Verification and prefill stay composed.
     const bool decode     = batch.verify == nullptr && batch.width <= 1;
     const bool fused_conv = fast_.gdn_conv_fused && decode && p.projection.weight.qtype == QType::Q8_G32_FP16;
+    // Experiment: the projection and the decode chain in one persistent launch (INFERNIX_MEGA=1).
+    static const bool mega_enabled = std::getenv("INFERNIX_MEGA") != nullptr;
+    const bool mega = mega_enabled && decode && !fused_conv && !g.a_direct && T == 1 && !fast_.column_invariant &&
+                      p.projection.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && !p.projection.is_ggml();
     Tensor qkv;
     if (!fused_conv) { qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_.alloc(DType::BF16, {C, T}); }
     Tensor z  = work_.alloc(DType::BF16, {VW, T});
@@ -634,7 +639,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         } else if (p.projection.weight.qtype == QType::Q8_G32_FP16) {
             // Q8 (Dense8): the projection writes q/k/v and z to their destinations itself.
             ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, dense_routes());
-        } else {
+        } else if (!mega) {
             Tensor* parts[]    = {&qkv, &z};
             Tensor* ab_parts[] = {&ab};
             project_group(x, p.projection, parts, dense_routes(), p.control, ab_parts, ops::LinearRoutes::Exact, work_,
@@ -696,6 +701,20 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         // One position per sequence (decode), as the composed calls below in one launch.
         auto layer          = state_.gdn->layer_view(index);
         Tensor chain_normed = work_.alloc(DType::BF16, {DV, NV * T});
+        if (mega && ops::gated_delta_net_decode_middle_persistent(
+                        x, p.projection.weight, qkv, z, p.control.weight, ab, p.convolution, layer.conv, p.a_log,
+                        p.dt_bias, scale, layer.recurrent, batch.slots, p.norm, gate_kind, config_.rms_norm_eps, NK,
+                        chain_normed, s)) {
+            Tensor y = work_.alloc(DType::BF16, {H, T});
+            project(chain_normed.view({VW, T}), p.output, y, work_, s, dense_routes(), fast_.column_invariant);
+            return y;
+        }
+        if (mega) {
+            Tensor* parts[]    = {&qkv, &z};
+            Tensor* ab_parts[] = {&ab};
+            project_group(x, p.projection, parts, dense_routes(), p.control, ab_parts, ops::LinearRoutes::Exact, work_,
+                          s, fast_.column_invariant);
+        }
         ops::gated_delta_net_decode_chain(qkv, p.convolution, layer.conv, ab.slice(0, 0, NV), ab.slice(0, NV, NV),
                                           p.a_log, p.dt_bias, scale, layer.recurrent, batch.slots, p.norm,
                                           z.view({DV, NV * T}), gate_kind, config_.rms_norm_eps, NK, chain_normed, s);

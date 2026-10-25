@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "core/weight.h"
 #include "infernix/ops/gated_rmsnorm.h"
 #include "infernix/ops/speculative_tree.h"
 
@@ -132,6 +133,16 @@ void gated_delta_net_decode_chain(const Tensor& qkv, const Tensor& conv_weight, 
                                   const Tensor& b, const Tensor& A_log, const Tensor& dt_bias, float scale,
                                   Tensor& ssm_states, const Tensor& slots, const Tensor& norm_weight, const Tensor& z,
                                   RmsGate gate, float eps, std::int32_t qk_heads, Tensor& out, cudaStream_t stream);
+
+/// Experiment: the GDN decode input projection (q/k/v/z FP8 and a/b BF16 of x, one column) and
+/// gated_delta_net_decode_chain in one persistent launch with a grid barrier between them. False
+/// (nothing launched) outside its geometry or when the grid cannot hold the chain.
+bool gated_delta_net_decode_middle_persistent(const Tensor& x, const Weight& qkvz, Tensor& qkv, Tensor& z,
+                                              const Weight& ab_weight, Tensor& ab, const Tensor& conv_weight,
+                                              Tensor& conv_states, const Tensor& A_log, const Tensor& dt_bias,
+                                              float scale, Tensor& ssm_states, const Tensor& slots,
+                                              const Tensor& norm_weight, RmsGate gate, float eps,
+                                              std::int32_t qk_heads, Tensor& out, cudaStream_t stream);
 
 /**
  * Op: gated_delta_net_replay_record

@@ -3,6 +3,7 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net/replay.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net/recurrent.cu"
   "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net/decode_chain.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net/decode_middle_persistent.cu"
   "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net/recurrent_prefill.cu"
   "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net/chunked/prepare.cu"
   "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net/chunked/recurrence.cu"
