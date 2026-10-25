@@ -3607,6 +3607,22 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   body stalled on instruction fetch). The head still costs 1.4-2.4 times its 377 us floor at 5-16
   columns (tall 662-1073 us, narrow 479-1421 us): one CTA of 8 warps per SM never overlaps a CTA's
   weight loads with another's FMAs.
+- **Hyper-connection down tiles beyond 2048 columns (2026-10-24, RTX PRO 6000, this fork).** In a
+  16K prefill chunk the composed mix's [324, 10240] Q8 down projection ran the 48 x 64 MMA tile, 664 us
+  per call (96 calls). Each MMA tile runs one CTA per SM, and its time steps up by 50-100 us where its
+  CTA count passes a multiple of the 188 SMs, so the best of the r48_t64, r64_t128, r96_t96 and
+  r128_t80 tiles changes with the width. The exact A16 selector now takes, per width range, a tile not
+  just past a step: 1.01 times the fastest of the four at worst over every 128-column step from 2048
+  to 16384, where r48_t64 alone took 1.19 times as long in total and 1.35 at worst (590 against 664 us
+  at T = 16384). Bit-identical: every tile accumulates an output over K in one order, and the output
+  hashes of all five tiles and the exact route agree at T 2049, 4096, 4513, 9000, 13616 and 16384; T1
+  and T2 unchanged. Prefill (`infernix_bench`, FP8 KV, every expert in VRAM, base/new/new/base twice;
+  the machine drifted 2-3 % across the session): pp16384 +0.4 % / +0.7 %, pp4096 +0.04 % / +0.2 %.
+  Not adopted: from 6 to 2048 columns the sliced-K tiles (16 down to 4 K warps, two row tiles) take
+  20-104 us against the exact route's 96-125 (at 512 columns 37 against 96 us; prefill +7.7 % at 512
+  tokens, +2.8 % at 1024). They change the reduction order, so they need a fast path with its own
+  model-level gates; recipe C does not run `q8-sliced-k`, and adding them to it would change that
+  path's qualified arithmetic on Dense8.
 - **TMA tile stage release (2026-10-21, RTX PRO 6000, this fork).** The T1 round harness's
   determinism check found C = 6 decode rounds nondeterministic on the exact route too: 3-12 % of
   replays from one state differed. The first wrong values were always one warp's 16 output rows of

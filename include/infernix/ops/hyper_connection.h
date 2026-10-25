@@ -38,9 +38,9 @@ namespace infernix::ops {
 /// down carries the S injection rows and inject receives FP32 [S, T]. eps > 0.
 ///
 /// Routes (private, chosen from the weights and T only): Q8_G32_FP16 RowSplit weights of the
-/// registered geometry (S = 4, H = 2560, rank a multiple of 8 up to 512) at T <= 16 run two fused
-/// kernels with every intermediate (Rn, z, m, u) in FP32, so a column's result does not depend on
-/// T within 1..16. Other weights and wider calls run the norm, linear (with `policy`), gates,
+/// registered geometry (S = 4, H = 2560, rank a multiple of 8 up to 512) at T <= 28 (T <= 16 where
+/// the norm weight is not 16-byte aligned) run two fused kernels with every intermediate (Rn, z, m,
+/// u) in FP32, so a column's result does not depend on T within that range. Other weights and wider calls run the norm, linear (with `policy`), gates,
 /// linear and collapse steps with BF16 intermediates; with a Q8_G32_FP16 RowSplit W_up and 4 streams,
 /// calls of more than 96 columns compute the up linear and the collapse in one kernel that keeps u
 /// on chip, with the same bits as the separate steps. `workspace` is caller-owned transient

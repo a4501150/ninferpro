@@ -17,11 +17,24 @@ Q8Launch select_q8_n324_k10240(std::int32_t tokens) {
     if (tokens <= 8) return launch_q8_a16_simt_r1_t8_w8;
     if (tokens <= 64) return launch_q8_a16_stream_linear<Stream<16, 8>>;
     if (tokens <= 96) return launch_q8_a16_mma_r32_t96;
-    // Beyond 96 columns (prefill chunks): the MMA tile sweep of 2026-10-05 (fn/rigs/layer/q8tiles2.bat,
-    // RTX 5090). Every MMA tile accumulates each output over K in the same order, so their bits are
-    // identical (checked at every swept point); only speed differs.
+    // Beyond 96 columns (prefill chunks): every MMA tile accumulates each output over K in the same
+    // order, so their bits are identical (checked at every swept point); only speed differs. Up to
+    // 2048 columns the single K chain holds every tile at 96-125 us (the tile sweep of 2026-10-05,
+    // fn/rigs/layer/q8tiles2.bat, RTX 5090). Beyond it a tile runs one CTA per SM, so its time steps
+    // up by 50-100 us wherever its CTA count passes a multiple of the RTX PRO 6000's 188 SMs; each
+    // range takes a tile not just past a step (2026-10-24, RTX PRO 6000: the fastest of four tiles in
+    // every 128-column step from 2048 to 16384 and on both sides of each boundary, 1.01 times the
+    // fastest at worst; the 48 x 64 tile alone took 1.19 times as long in total and 1.35 at worst,
+    // 664 against 590 us at T = 16384).
     if (tokens <= 1024) return launch_q8_a16_mma_r32_t64;
-    return launch_q8_a16_mma_r48_t64;
+    if (tokens <= 2048) return launch_q8_a16_mma_r48_t64;
+    if (tokens <= 3968) return launch_q8_a16_mma_r64_t128;  // 6 x 31 CTAs
+    if (tokens <= 4512) return launch_q8_a16_mma_r96_t96;   // 4 x 47
+    if (tokens <= 5120) return launch_q8_a16_mma_r48_t64;   // 7 x 80
+    if (tokens <= 7936) return launch_q8_a16_mma_r64_t128;  // 6 x 62
+    if (tokens <= 9024) return launch_q8_a16_mma_r96_t96;   // 4 x 94
+    if (tokens <= 10000) return launch_q8_a16_mma_r128_t80; // 3 x 125
+    return launch_q8_a16_mma_r64_t128;
 }
 
 // A16ColumnInvariant: the 16-K-warp sliced-K contraction at every T. The MMA tiles' single K chain
