@@ -451,12 +451,6 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
-        } else if (!request_options.execution.thinking.budget &&
-                   semantics.enable_thinking != false) {
-            request_options.execution.thinking.budget = thinking_answer_room_budget(
-                options_, request_options.execution.requested_output_tokens,
-                prompt.summary().prompt_tokens);
-            prepared.thinking_budget = request_options.execution.thinking.budget;
         }
         prepared.prompt_tokens           = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.media                   = prompt.summary().media;

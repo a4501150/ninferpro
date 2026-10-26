@@ -878,48 +878,17 @@ int main() {
         to_request_options(request, thinking_budget, semantics, thinking_budget.allow_prefix_reuse)
                 .execution.thinking.budget == 37,
         "thinking-enabled request did not inherit the server budget");
-    // Without a budget, thinking leaves the answer a quarter of what the request can generate (at
-    // least 256, at most half) from 1024 tokens; below that, or with --no-thinking-answer-room, it
-    // may use all. What it can generate is max_tokens bounded by the context the prompt leaves.
+    // max_tokens covers thinking and answer: without the request's or the server's budget,
+    // thinking may use all of it.
     {
-        GenerationRequest capped;
-        capped.max_tokens            = 8192;
-        const auto capped_semantics  = resolve_prompt_semantics(capped, defaults);
-        failures += check(!to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget,
-                          "request translation set an answer-room budget before the prompt size was known");
-        ServeOptions long_context = defaults;
-        long_context.max_context  = 262144;
-        failures += check(thinking_answer_room_budget(long_context, 8192, 100) == 6144U,
-                          "a thinking request without a budget did not leave a quarter of max_tokens to answer");
-        failures += check(thinking_answer_room_budget(long_context, 1024, 100) == 768U,
-                          "the answer room did not keep its 256-token minimum");
-        failures += check(!thinking_answer_room_budget(long_context, 1023, 100),
-                          "the answer room applied below 1024 output tokens");
-        capped.thinking_budget     = 7000;
-        failures += check(to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget == 7000U,
+        GenerationRequest unbudgeted;
+        unbudgeted.max_tokens        = 128000;
+        const auto thinking_semantics = resolve_prompt_semantics(unbudgeted, defaults);
+        failures += check(!to_request_options(unbudgeted, defaults, thinking_semantics, true).execution.thinking.budget,
+                          "a thinking request without a budget got one from the server");
+        unbudgeted.thinking_budget = 7000;
+        failures += check(to_request_options(unbudgeted, defaults, thinking_semantics, true).execution.thinking.budget == 7000U,
                           "request translation dropped the request's own budget");
-        capped.thinking_budget.reset();
-        const auto no_room = parse({"infernix-serve", "model.ninfer", "--no-thinking-answer-room"});
-        failures += check(!no_room.thinking_answer_room && !thinking_answer_room_budget(no_room, 1024, 100),
-                          "--no-thinking-answer-room did not let thinking use all of max_tokens");
-
-        // 128,000 requested, 96,001 left by the context: the reserve comes from 96,001.
-        failures += check(thinking_answer_room_budget(long_context, 128000, 166144) == 72001U,
-                          "the answer room ignored the context the prompt leaves");
-        failures += check(thinking_answer_room_budget(long_context, 128000, 100000) == 96000U,
-                          "the answer room shrank a request the context does not bound");
-        failures += check(!thinking_answer_room_budget(long_context, 128000, 261200),
-                          "the answer room applied when the context leaves under 1024 tokens");
-        failures += check(!thinking_answer_room_budget(long_context, 128000, 262145),
-                          "the answer room applied to a prompt beyond max_context");
-        // The early close and one answer token always fit after an answer-room budget.
-        for (std::uint32_t prompt = 166000; prompt <= 166160; ++prompt) {
-            const std::uint32_t output = std::min(128000U, 262144U - prompt + 1U);
-            const auto budget = thinking_answer_room_budget(long_context, 128000, prompt);
-            failures += check(budget && output - *budget >= 256U,
-                              "an answer-room budget left the early close no room");
-            if (!budget || output - *budget < 256U) { break; }
-        }
     }
     request.enable_thinking = false;
     const auto non_thinking = resolve_prompt_semantics(request, thinking_budget);

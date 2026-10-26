@@ -302,21 +302,6 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
     return input;
 }
 
-std::optional<std::uint32_t> thinking_answer_room_budget(const ServeOptions& server,
-                                                         std::uint32_t requested_output_tokens,
-                                                         std::uint32_t prompt_tokens) {
-    if (!server.thinking_answer_room) { return std::nullopt; }
-    // The Engine's own output capacity: a prompt that fills the context still yields one token.
-    const std::uint32_t context_output =
-        prompt_tokens <= server.max_context ? server.max_context - prompt_tokens + 1U : 0U;
-    const std::uint32_t output = std::min(requested_output_tokens, context_output);
-    if (output < static_cast<std::uint32_t>(kThinkingAnswerRoomMinTokens)) { return std::nullopt; }
-    const std::uint32_t reserve =
-        std::min(std::max(static_cast<std::uint32_t>(kThinkingAnswerRoomMinReserve), output / 4U),
-                 output / 2U);
-    return output - reserve;
-}
-
 infernix::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ServeOptions& server,
                                           const ResolvedPromptSemantics& semantics,

@@ -16,9 +16,6 @@ namespace infernix::serve {
 // Protocol default when the client omits max_tokens. Engine independently
 // clamps the request to its effective context capacity.
 inline constexpr int kDefaultMaxTokens                    = 8192;
-// ServeOptions::thinking_answer_room's thresholds (as Strata 0.1.45's answer room).
-inline constexpr int kThinkingAnswerRoomMinTokens         = 1024;
-inline constexpr int kThinkingAnswerRoomMinReserve        = 256;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
@@ -101,13 +98,6 @@ struct ServeOptions {
     // or have its Claude-specific parts replaced by a short local-agent preamble.
     ClaudeCodePrompt claude_code_prompt = ClaudeCodePrompt::AsSent;
     std::optional<std::uint32_t> default_thinking_budget;
-    // A thinking request without a budget (its own or --default-thinking-budget) that can generate
-    // at least kThinkingAnswerRoomMinTokens gets a budget that leaves a quarter of that output (at
-    // least kThinkingAnswerRoomMinReserve, at most half) for the answer: max_tokens counts the
-    // thinking, so a long thought would otherwise end the request with no answer. The output is
-    // max_tokens bounded by the context the prompt leaves (thinking_answer_room_budget).
-    // --no-thinking-answer-room turns it off.
-    bool thinking_answer_room = true;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
     std::string thinking_budget_message;
