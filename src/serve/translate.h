@@ -38,4 +38,12 @@ infernix::RequestOptions to_request_options(const GenerationRequest& req, const 
                                           const ResolvedPromptSemantics& semantics,
                                           bool allow_prefix_reuse);
 
+// The thinking budget ServeOptions::thinking_answer_room gives a thinking request that has no
+// budget of its own, or none when the answer room is off or the output is too short. The output
+// is the request's limit bounded by the context the prepared prompt leaves, so a prompt near
+// max_context still leaves its answer a quarter of what can actually be generated.
+std::optional<std::uint32_t> thinking_answer_room_budget(const ServeOptions& server,
+                                                         std::uint32_t requested_output_tokens,
+                                                         std::uint32_t prompt_tokens);
+
 } // namespace infernix::serve

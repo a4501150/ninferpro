@@ -302,6 +302,21 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
     return input;
 }
 
+std::optional<std::uint32_t> thinking_answer_room_budget(const ServeOptions& server,
+                                                         std::uint32_t requested_output_tokens,
+                                                         std::uint32_t prompt_tokens) {
+    if (!server.thinking_answer_room) { return std::nullopt; }
+    // The Engine's own output capacity: a prompt that fills the context still yields one token.
+    const std::uint32_t context_output =
+        prompt_tokens <= server.max_context ? server.max_context - prompt_tokens + 1U : 0U;
+    const std::uint32_t output = std::min(requested_output_tokens, context_output);
+    if (output < static_cast<std::uint32_t>(kThinkingAnswerRoomMinTokens)) { return std::nullopt; }
+    const std::uint32_t reserve =
+        std::min(std::max(static_cast<std::uint32_t>(kThinkingAnswerRoomMinReserve), output / 4U),
+                 output / 2U);
+    return output - reserve;
+}
+
 infernix::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ServeOptions& server,
                                           const ResolvedPromptSemantics& semantics,
@@ -316,13 +331,6 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
-        // max_tokens counts the thinking: without a budget, leave the answer its room.
-        if (!options.execution.thinking.budget && server.thinking_answer_room &&
-            request.max_tokens >= kThinkingAnswerRoomMinTokens) {
-            const int reserve =
-                std::min(std::max(kThinkingAnswerRoomMinReserve, request.max_tokens / 4), request.max_tokens / 2);
-            options.execution.thinking.budget = static_cast<std::uint32_t>(request.max_tokens - reserve);
-        }
         // A token constraint owns every output step, so the guard's injected close has no room.
         if (request.token_constraint.empty()) { options.execution.thinking.loop = server.reasoning_loop; }
     }

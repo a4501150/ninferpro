@@ -453,10 +453,13 @@ tokens for every thinking-enabled request.
 `max_tokens` counts the thinking, so a request that thinks for its whole output limit ends with
 no answer (a harness that sends `max_completion_tokens: 8192` on every request hits this on hard
 tasks). A thinking request with no budget of its own and no `--default-thinking-budget` therefore
-gets one when `max_tokens` is at least 1,024: thinking closes early enough to leave the answer a
-quarter of `max_tokens` (at least 256 tokens, at most half), through the same early close as any
-budget. 8,192 leaves 2,048 for the answer, 1,024 leaves 256. Below 1,024 nothing changes, and
-`--no-thinking-answer-room` lets thinking use all of `max_tokens` again. The request log's
+gets one when it can generate at least 1,024 tokens: thinking closes early enough to leave the
+answer a quarter of that output (at least 256 tokens, at most half), through the same early close
+as any budget. The output is `max_tokens` bounded by the context the prompt leaves, so with
+`--max-context 262144`, `max_tokens` 128,000 leaves 32,000 for the answer after a short prompt
+but 24,000 of 96,001 after a 166,144-token prompt. 8,192 leaves 2,048 for the answer, 1,024 leaves
+256. Below 1,024 nothing changes, and `--no-thinking-answer-room` lets thinking use all of
+`max_tokens` again. The request log's
 `thinking_budget` shows the budget a request ran with.
 
 At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
