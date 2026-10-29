@@ -1562,6 +1562,36 @@ void test_disk_backed_blocks() {
     host_index.release_path(std::span<const NodeRef>(&kept.node, 1));
     host_index.unpin_node(host_path[0]);
     host_index.check_invariants();
+
+    // A Disk read in flight into the Host (a fetch) keeps a recomputed page private too: an attach
+    // would mark the Host copy valid with the bits read from the Disk after it, and would free the
+    // Disk slot the queued read still reads.
+    RecordingBackend fetch_backend;
+    PrefixCacheIndex fetch_index(disk_config(16, 8), fetch_backend);
+    const auto fetched_block = make_tokens(64, 302);
+    const auto fetch_path    = insert_sequence(fetch_index, fetch_backend, fetched_block);
+    const std::uint32_t fetch_slot = disk_backup_node(fetch_index, fetch_path[0]);
+    fetch_index.release_path(fetch_path);
+    require(fetch_index.evict_device_blocks(1) == 1 && fetch_index.node(fetch_path[0]).host == CopyState::Absent,
+            "the block is Disk-only");
+    fetch_index.pin_node(fetch_path[0]);
+    require(fetch_index.begin_host_fill(fetch_path[0]).has_value() &&
+                fetch_index.node(fetch_path[0]).host == CopyState::Filling,
+            "a fetch reads the Disk record into the Host");
+    const InsertResult recomputed = fetch_index.insert_block(
+        NodeRef{}, block_lookup_hashes(fetched_block, {})[0], fetched_block, 0, fetch_backend.allocate(), true);
+    require(!recomputed.inserted && recomputed.node == fetch_path[0] && !recomputed.device_attached,
+            "no attach while the block's Host copy is being read from the Disk");
+    require(fetch_index.node(fetch_path[0]).disk == CopyState::Resident &&
+                std::count(fetch_backend.disk_released.begin(), fetch_backend.disk_released.end(), fetch_slot) == 0 &&
+                fetch_backend.disk_replaced.empty(),
+            "the Disk record the fetch reads stays allocated");
+    fetch_backend.release_device_block(fetch_backend.next - 1);
+    fetch_index.complete_host_fill(fetch_path[0]);
+    require(fetch_index.node(fetch_path[0]).host == CopyState::Resident, "the fetch lands");
+    fetch_index.release_path(std::span<const NodeRef>(&recomputed.node, 1));
+    fetch_index.unpin_node(fetch_path[0]);
+    fetch_index.check_invariants();
 }
 
 // A Host snapshot written to the Disk keeps that copy when the Host tier evicts it, and the spill

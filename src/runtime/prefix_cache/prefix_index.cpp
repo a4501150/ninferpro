@@ -637,13 +637,15 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     if (const auto existing = find_child(parent, lookup_hash, block_tokens, extra)) {
         Node& node = nodes_[existing->index];
         InsertResult result{*existing, false, false};
-        // A Disk write in flight reads the Host record the page would displace: no attach then.
-        if (attach && node.device == CopyState::Absent && node.disk != CopyState::Filling) {
+        // A fill in flight reads a record the page would displace (a Disk write the Host record, a
+        // fetch the Disk record into the Host): no attach then, and the page stays private.
+        const bool filling = node.host == CopyState::Filling || node.disk == CopyState::Filling;
+        if (attach && node.device == CopyState::Absent && !filling) {
             // A host-only block recomputed by this sequence regains its Device copy.
             node.device_id = device_id;
             set_device(node, CopyState::Resident);
             result.device_attached = true;
-        } else if (attach && node.device == CopyState::Resident && node.pins == 0) {
+        } else if (attach && node.device == CopyState::Resident && node.pins == 0 && !filling) {
             // A block recomputed by this sequence whose Device copy nobody maps: the sequence's page
             // replaces it, so the two never hold two pages for one block (the sequence pins its
             // own, and an evictable copy would otherwise become pinned beside it).
@@ -655,9 +657,8 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
         // (a resume inside the block), so a Host record the page displaced no longer describes
         // the block: it would serve a later Host restore, and a snapshot over the path, bits the
         // recomputing sequence's own state contradicts. The record is dropped and the sequence's
-        // release writes the page back through. A Host fill in flight pins the node, so the
-        // record here is only ever resident or absent; so is the Disk record (a Disk fill
-        // in flight from the Device pins it, and one from the Host prevents the attach above).
+        // release writes the page back through. No fill is in flight once the page attached, so
+        // both records are only ever resident or absent here.
         if (result.device_attached && node.host == CopyState::Resident) {
             drop_node_host_copy(existing->index);
         }
