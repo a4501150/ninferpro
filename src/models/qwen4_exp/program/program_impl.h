@@ -2012,8 +2012,8 @@ public:
     }
 
     // While another lane decodes, a planned call wider than the beside-decode chunk runs as
-    // several: the engine runs one decode round per prefill call, so the decoding lanes keep
-    // streaming between them. The split lands on the GDN grid (the exact route's bits do not
+    // several: the engine runs one decode round per prefill call (a mixed round splits the same
+    // way, mixable_width), so the decoding lanes keep streaming between them. The split lands on the GDN grid (the exact route's bits do not
     // depend on it). Exact taps already end calls; a flexible tap is realized at the first
     // boundary at or past it, which a split can bring closer to its position.
     void split_beside_decode(Lane& lane, std::uint32_t index) {
@@ -2029,10 +2029,164 @@ public:
         lane.calls.insert(lane.calls.begin() + static_cast<std::ptrdiff_t>(lane.next_call), split);
     }
 
+    // ---- mixed rounds: a prompt call in a decode round's Forward ----
+    // The width of the prefilling lane's next call when it rides in a decode round, or 0 when it
+    // cannot. A mixed round has room for the call's columns beside every lane's widest round
+    // (columns >= chunk), so the call is split on the GDN grid as split_beside_decode splits it.
+    // The prompt's last call stays alone: it samples the first token, which a decode round's
+    // pending batch does not carry. A layer walk's span, a replay, an image prompt and the MTP
+    // drafter's chunk cells keep their own calls.
+    std::int32_t mixable_width(Lane& lane, std::uint32_t index) {
+        if (!options_.mixed_calls || mtp_ || scoring_ || walk_.active || lane.phase != Phase::Prefill || lane.replay ||
+            lane.vision || lane.calls.empty() || lane.next_call >= lane.calls.size() ||
+            lane.calls[lane.next_call] <= lane.state_tokens) {
+            return 0;
+        }
+        if (walk_span_end(lane, index) > lane.next_call) { return 0; }
+        const std::int32_t room = chunk_ - static_cast<std::int32_t>(options_.max_concurrency) * max_width_;
+        const std::uint32_t cap = static_cast<std::uint32_t>(std::max<std::int32_t>(
+            0, std::min<std::int32_t>(beside_decode_chunk_ != 0 ? static_cast<std::int32_t>(beside_decode_chunk_) : chunk_,
+                                      room)));
+        std::uint32_t end = lane.calls[lane.next_call];
+        if (end - lane.state_tokens > cap) { end = (lane.state_tokens + cap) / kResumeGrid * kResumeGrid; }
+        if (end <= lane.state_tokens || end >= lane.prefill_end) { return 0; }
+        return static_cast<std::int32_t>(end - lane.state_tokens);
+    }
+
+    bool can_mix(SequenceHandle prefill) {
+        const auto index = lane_of(prefill);
+        return mixable_width(lanes_[index], index) > 0;
+    }
+
+    MixedProgress mixed(SequenceHandle prefill, std::span<const SequenceHandle> sequences,
+                        std::span<const runtime::RoundBudget> budgets, runtime::TokenMaskProvider* masks) {
+        const auto start  = Clock::now();
+        const auto index  = lane_of(prefill);
+        Lane& lane        = lanes_[index];
+        const std::int32_t width = mixable_width(lane, index);
+        if (width == 0) { throw std::logic_error("Qwen4Exp: a mixed round's prompt call cannot ride in it"); }
+        for (const SequenceHandle& sequence : sequences) {
+            if (lane_of(sequence) == index) { throw std::logic_error("Qwen4Exp: a mixed round decodes its prefilling lane"); }
+        }
+        const auto begin = lane.state_tokens;
+        if (lane.calls[lane.next_call] != begin + static_cast<std::uint32_t>(width)) {
+            lane.calls.insert(lane.calls.begin() + static_cast<std::ptrdiff_t>(lane.next_call),
+                              begin + static_cast<std::uint32_t>(width));
+        }
+        ++lane.next_call;
+        const nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
+                                            static_cast<std::uint64_t>(width));
+        // The ring is lent before the round's before_round publishes the tables its frames left.
+        mixed_ = {.active   = true,
+                  .lane     = index,
+                  .slot     = static_cast<std::int32_t>(index),
+                  .begin    = static_cast<std::int32_t>(begin),
+                  .width    = width,
+                  .streamed = stream_chunk(width)};
+        struct Close {
+            MixedPrefill& m;
+            ~Close() { m.active = false; }
+        } close{mixed_};
+        PendingBatch pending = decode(sequences, budgets, masks); // synchronized: its acceptance or draw
+        check_expert_error();
+        lane.state_tokens += static_cast<std::uint32_t>(width);
+        if (dflash2_) { lane.dflash_frontier = lane.state_tokens; }
+        prefix_after_prefill_call(lane, index, false);
+        // The round's settle credits the call's routes with the decode rows' (one residency round);
+        // the prompt's seeding counts its columns, which follow the decode rows'.
+        note_prompt_routes(lane, width, deferred_.columns);
+        deferred_.prefill_columns = width;
+        // The call's time is no decode round's cost sample.
+        last_round_steps_ = -1;
+        last_round_extra_ = -1;
+        return MixedProgress{
+            .prefill = prefill_progress(lane, index, static_cast<std::int32_t>(begin), width,
+                                        static_cast<std::uint32_t>(width), false, 0, start),
+            .pending = std::move(pending)};
+    }
+
+    // The mixed round's prompt call after the round's `rows` rows of `decode_columns` columns: its
+    // tokens, positions and n-gram rows at the following columns, its RoPE positions as their own
+    // [width, 3] block after the rows' and its block start, slot and table row after theirs.
+    void stage_mixed_prefill(std::int32_t rows, std::int32_t decode_columns) {
+        Lane& lane                  = lanes_[mixed_.lane];
+        const std::int32_t D        = decode_columns, P = mixed_.width;
+        auto* ids                   = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.ids);
+        auto* positions             = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
+        for (std::int32_t i = 0; i < P; ++i) {
+            ids[D + i]       = lane.history[static_cast<std::size_t>(mixed_.begin + i)];
+            positions[D + i] = mixed_.begin + i;
+        }
+        const auto first = static_cast<std::uint32_t>(mixed_.begin);
+        stage_rope(lane.rope, first, P, io_words(io_layout_.rope + 12ULL * D, 3ULL * P), P, 0);
+        stage_rope_value(block_start_rope(lane.rope, first, static_cast<std::uint32_t>(r_)),
+                         io_words(io_layout_.block_rope + 12ULL * rows, 3), 1, 0);
+        reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots)[rows] = mixed_.slot;
+        reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows)[rows]  = mixed_.slot;
+        stage_ngram(lane, lane.history, mixed_.begin, P, static_cast<std::size_t>(D));
+    }
+
+    // The mixed round's Forward (eager: the prompt call's width needs the wide arena, which no graph
+    // may capture): the decode or verification rows as their round runs them, the prompt call after
+    // them, then the call's DFlash2 window into its lane's ring. The caller staged and uploaded the
+    // io (io_prefix of every column) and ran before_round.
+    void run_mixed(std::int32_t batch, std::int32_t width, const execution::ForwardVerify* verify) {
+        const cudaStream_t s = device_.stream;
+        Lane& lane           = lanes_[mixed_.lane];
+        const std::int32_t D = batch * width, P = mixed_.width, T = D + P;
+        const bool streamed  = mixed_.streamed;
+        split_call_          = streamed && split_policy_ && T <= split_columns();
+        if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_); }
+        try {
+            const WideWork wide(*this, T);
+            require_tier_round();
+            set_expert_route();
+            auto* base                  = static_cast<std::byte*>(io_device_.p);
+            execution::ForwardBatch fb  = io_batch(base, batch, width, D);
+            fb.ids                      = Tensor(base + io_layout_.ids, DType::I32, {T});
+            fb.positions                = Tensor(base + io_layout_.positions, DType::I32, {T});
+            fb.ngram_rows               = Tensor(base + io_layout_.ngram, DType::U8,
+                                                 {dim(ngram_table().row_bytes), dim(hash_.heads()), T});
+            fb.verify                   = verify;
+            fb.layer_waits              = prefix_waits(lane);
+            fb.stream                   = streamed;
+            fb.split                    = split_call_;
+            execution::ForwardPrefillPart part{
+                .width            = P,
+                .rope_positions   = Tensor(base + io_layout_.rope + 12ULL * D, DType::I32, {P, 3}),
+                .block_start_rope = Tensor(base + io_layout_.block_rope + 12ULL * batch, DType::I32, {1, 3}),
+                .slots            = Tensor(base + io_layout_.slots + 4ULL * batch, DType::I32, {1}),
+                .table_rows       = Tensor(base + io_layout_.rows + 4ULL * batch, DType::I32, {1}),
+                .host_slots       = std::span<const std::int32_t>(&mixed_.slot, 1)};
+            if (dflash2_) {
+                fb.draft_features      = dflash_feature_columns(0, D);
+                const auto [column, n] = dflash_call_region(P);
+                part.draft_features    = dflash_feature_columns(column, n);
+            }
+            if (head_saved_.p != nullptr) { fb.head_residual_out = head_saved_column(mixed_.lane); }
+            fb.prefill_part = &part;
+            Tensor logits(logits32_.p, DType::FP32, {vocab_, D});
+            forward_->run(fb, logits);
+            if (dflash2_) {
+                // A restore into the lane's ring or a copy-out of it lands first (dflash2_call_context).
+                dflash2_wait_copies(lane);
+                const auto [column, n] = dflash_call_region(P);
+                dflash2_context(column, n, mixed_.begin + P - n, mixed_.slot);
+            }
+        } catch (...) {
+            if (streamed) { expert_stream_->end(); }
+            split_call_ = false;
+            throw;
+        }
+        if (streamed) { expert_stream_->end(); }
+        split_call_ = false;
+        residency_->enqueue_route_download(s, T);
+    }
+
     // Prompt seeding (design §19.3.27): a prefill call's per-token routes, read from the route log
     // its after_round is about to apply, add to the lane's prompt uses. A layer walk's span counts
-    // its last chunk, the one its route log holds.
-    void note_prompt_routes(Lane& lane, std::int32_t width) {
+    // its last chunk, the one its route log holds; a mixed round's call starts at column `first`.
+    void note_prompt_routes(Lane& lane, std::int32_t width, std::int32_t first = 0) {
         if (width <= 0) { return; }
         const std::uint32_t L = c_.num_hidden_layers, E = c_.moe.experts, K = c_.moe.top_k;
         if (lane.prompt_uses.size() != static_cast<std::size_t>(L) * E) {
@@ -2042,7 +2196,7 @@ public:
         const std::int32_t* routes = residency_->route_host();
         const std::size_t stride   = residency_->route_stride();
         for (std::uint32_t l = 0; l < L; ++l) {
-            const std::int32_t* ids = routes + static_cast<std::size_t>(l) * stride;
+            const std::int32_t* ids = routes + static_cast<std::size_t>(l) * stride + static_cast<std::size_t>(first) * K;
             std::uint32_t* uses     = lane.prompt_uses.data() + static_cast<std::size_t>(l) * E;
             for (std::size_t i = 0; i < static_cast<std::size_t>(width) * K; ++i) {
                 const std::int32_t expert = ids[i];
@@ -2357,15 +2511,27 @@ public:
         // and releases them to the gate before ple_embed (design §12.3, n-gram S4b); a round that
         // warms or captures its graph reads them first.
         // A round whose rows are all in the host cache reads nothing, so it stages them first.
-        const bool gated = graphs_[static_cast<std::size_t>(batch - 1)].executable.ready() &&
+        // A mixed round reads every row first: its eager Forward uploads them with the io.
+        const bool gated = !mixed_.active && graphs_[static_cast<std::size_t>(batch - 1)].executable.ready() &&
                            !decode_rows_cached(round_lanes, round_positions);
         stage_decode(round_lanes, round_positions);
+        if (mixed_.active) { stage_mixed_prefill(batch, batch); }
         const std::uint32_t word = next_gate_word();
         if (!gated) {
             stage_decode_rows(round_lanes, round_positions);
             publish_pinned_word(gate_ready(), word);
         }
-        run_decode(batch, round_positions[0]);
+        if (mixed_.active) {
+            if (one_column_divisor() != 0) {
+                *reinterpret_cast<std::int32_t*>(host_io() + io_layout_.divisor) = plain_divisor(round_positions[0]);
+            }
+            upload_pinned(io_device_.p, io_host_.data(), io_prefix(batch + mixed_.width), device_.stream);
+            if (cpu_service_) { cpu_service_->wake(); }
+            residency_->before_round(device_.stream, /*landing=*/true, /*walking=*/false);
+            run_mixed(batch, 1, nullptr);
+        } else {
+            run_decode(batch, round_positions[0]);
+        }
         GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch) - io_layout_.ngram};
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(round_lanes, round_positions, [&] {
@@ -2711,8 +2877,18 @@ private:
         std::uint32_t tokens  = 0;
         bool live             = false; // only the verification's accepted columns count
         bool pending          = false;
+        std::int32_t prefill_columns = 0; // a mixed round's prompt call, after the rows' columns
     };
     DeferredRound deferred_;
+    // The mixed round in flight (mixed): its prompt call's lane and columns.
+    struct MixedPrefill {
+        bool active        = false;
+        std::uint32_t lane = 0;
+        std::int32_t slot  = 0; // the lane, as the Forward's host slot
+        std::int32_t begin = 0, width = 0;
+        bool streamed      = false;
+    };
+    MixedPrefill mixed_;
 
     void settle_round() {
         if (!deferred_.pending) { return; }
@@ -2726,9 +2902,14 @@ private:
                                                                        static_cast<std::size_t>(deferred_.columns))
                                        : std::span<const std::uint8_t>{});
         }
-        residency_->after_round(device_.stream, deferred_.columns, budget,
-                                deferred_.live ? std::span<const std::uint8_t>(live_.data(),
-                                                                               static_cast<std::size_t>(deferred_.columns))
+        // A mixed round's prompt call counts with its rows (every one of its columns live).
+        const auto columns = static_cast<std::size_t>(deferred_.columns + deferred_.prefill_columns);
+        if (deferred_.live && deferred_.prefill_columns > 0) {
+            if (live_.size() < columns) { live_.resize(columns); }
+            std::fill(live_.begin() + deferred_.columns, live_.begin() + static_cast<std::ptrdiff_t>(columns), 1);
+        }
+        residency_->after_round(device_.stream, static_cast<std::int32_t>(columns), budget,
+                                deferred_.live ? std::span<const std::uint8_t>(live_.data(), columns)
                                                : std::span<const std::uint8_t>{});
         apply_vram_target(false);
     }
@@ -5025,24 +5206,31 @@ private:
         };
         const std::uint32_t word = next_gate_word();
         DecodeGraph& graph = verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
-        const bool gated   = graph.executable.ready();
+        // A mixed round reads every row first: its eager Forward uploads them with the io.
+        const bool gated   = !mixed_.active && graph.executable.ready();
         if (!gated) {
             read_rows();
             publish_pinned_word(gate_ready(), word);
         }
-        upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
+        if (mixed_.active) { stage_mixed_prefill(batch, batch * W); }
+        upload_pinned(io_device_.p, io_host_.data(), mixed_.active ? io_prefix(batch * W + mixed_.width) : io_layout_.ngram, s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
-        const execution::NgramRowGate gate = row_gate();
-        replay(graph, [&] {
+        if (mixed_.active) {
             const execution::ForwardVerify view = verify_view(batch, W);
-            forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true);
-        });
+            run_mixed(batch, W, &view);
+        } else {
+            const execution::NgramRowGate gate = row_gate();
+            replay(graph, [&] {
+                const execution::ForwardVerify view = verify_view(batch, W);
+                forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true);
+            });
+        }
         // From here an enqueued gate waits for `word`: an error before it is published still
         // publishes it (over zeroed rows), so the stream drains and the error keeps its class.
         GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
-        residency_->enqueue_route_download(s, batch * W);
+        if (!mixed_.active) { residency_->enqueue_route_download(s, batch * W); }
 
         // Acceptance on the device, from BF16-rounded logits as in plain decode (design 16.5).
         Tensor wide(logits32_.p, DType::FP32, {vocab_, batch * W});

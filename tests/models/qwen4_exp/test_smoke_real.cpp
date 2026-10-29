@@ -9,10 +9,12 @@
 //               prefix cache; a media request encodes in the boot's placement (every expert in VRAM
 //               allocates its window) and in a switched placement (the window is lent); an
 //               expert-placement switch to half the experts in VRAM applies and the engine keeps
-//               generating; the switch back applies.
+//               generating; the switch back applies. A long prompt arriving while five requests
+//               decode rides in their rounds (mixed rounds) and every request completes.
 //   exact       The exact route (--disable-fast-paths): each prompt's greedy tokens alone equal the
 //               golden tokens (--check FILE; --record FILE writes them), and equal them again with all
-//               six in flight, resumed from the prefix cache, and after the placement switch.
+//               six in flight, resumed from the prefix cache, beside a long prompt's mixed rounds
+//               (and the long prompt's tokens equal it alone), and after the placement switch.
 //
 // --prefix-cache-disk DIR adds the prefix cache's Disk tier (DIR emptied first, removed after) and
 // --host-context-mib N sizes its RAM tier (0: off), as the server flags do.
@@ -73,6 +75,27 @@ Tokens long_prompt(infernix::Engine& engine) {
     Tokens tokens = engine.tokenize_text(text);
     tokens.resize(std::min<std::size_t>(tokens.size(), 1400));
     return tokens;
+}
+
+// A prompt of more than one beside-decode call (its first can ride in a decode round, its last
+// samples alone) that fits the smoke test's KV beside five requests, unlike long_prompt's text.
+Tokens mixed_prompt(infernix::Engine& engine) {
+    std::string text;
+    for (int i = 0; i < 60; ++i) {
+        text += "Entry " + std::to_string(i) +
+                ": the night crew checked the valve seals, logged the tank levels and noted any "
+                "vibration on the second compressor before handing over to the morning shift. ";
+    }
+    Tokens tokens = engine.tokenize_text(text);
+    tokens.resize(std::min<std::size_t>(tokens.size(), 1500));
+    return tokens;
+}
+
+// Five of the prompts with the mixed prompt arriving after them: its calls run while they decode.
+std::vector<Tokens> beside_mixed(const std::vector<Tokens>& prompts, const Tokens& mixed) {
+    std::vector<Tokens> out(prompts.begin(), prompts.begin() + (kLanes - 1));
+    out.push_back(mixed);
+    return out;
 }
 
 int check(bool ok, const std::string& what) {
@@ -235,6 +258,17 @@ int production(const Setup& setup, std::uint32_t tokens) {
                 static_cast<unsigned long long>(drafted), static_cast<unsigned long long>(accepted));
     failures += check(complete, "every concurrent request generated " + std::to_string(tokens) + " tokens");
     failures += check(drafted > 0 && accepted > 0, "DFlash2 drafted and its drafts were accepted");
+    {
+        const Tokens mixed_text = mixed_prompt(engine);
+        const auto before       = engine.runtime_stats().mixed_rounds;
+        const auto mixed        = run_all(engine, beside_mixed(prompts, mixed_text), tokens, false);
+        const auto rounds       = engine.runtime_stats().mixed_rounds - before;
+        bool done = true;
+        for (const auto& r : mixed) { done = done && r.generated_token_ids.size() == tokens; }
+        failures += check(rounds > 0 && done, "a " + std::to_string(mixed_text.size()) +
+                                                  "-token prompt beside five decoding requests rides in " +
+                                                  std::to_string(rounds) + " mixed rounds and every request completes");
+    }
     const Tokens long_text = long_prompt(engine);
     (void)run_all(engine, {long_text}, tokens, true);
     const auto again = run_all(engine, {long_text}, tokens, true).front();
@@ -306,6 +340,25 @@ int exact(const Setup& setup, std::uint32_t tokens, const std::filesystem::path&
         failures += check(together[i].generated_token_ids == solo[i],
                           "prompt " + std::to_string(i) + " with six in flight equals it alone (" +
                               first_difference(together[i].generated_token_ids, solo[i]) + ")");
+    }
+    // A long prompt arriving while five requests decode: its calls ride in their rounds, split where
+    // the prompt alone does not split them; the exact route's bits depend on neither.
+    {
+        const Tokens mixed_text = mixed_prompt(engine);
+        const Tokens alone      = run_all(engine, {mixed_text}, tokens, false).front().generated_token_ids;
+        const auto before       = engine.runtime_stats().mixed_rounds;
+        const auto mixed        = run_all(engine, beside_mixed(prompts, mixed_text), tokens, false);
+        const auto rounds       = engine.runtime_stats().mixed_rounds - before;
+        failures += check(rounds > 0, "a " + std::to_string(mixed_text.size()) + "-token prompt beside five decoding requests rides in " +
+                                          std::to_string(rounds) + " mixed rounds");
+        for (std::size_t i = 0; i + 1 < kLanes; ++i) {
+            failures += check(mixed[i].generated_token_ids == solo[i],
+                              "prompt " + std::to_string(i) + " beside the mixed rounds equals it alone (" +
+                                  first_difference(mixed[i].generated_token_ids, solo[i]) + ")");
+        }
+        failures += check(mixed.back().generated_token_ids == alone,
+                          "the prompt prefilled in mixed rounds equals it alone (" +
+                              first_difference(mixed.back().generated_token_ids, alone) + ")");
     }
     // The cold run that publishes the prompt's tail tap splits its last call there, as the resumed
     // run's call does (the exact route is bit-exact for the same call boundaries).

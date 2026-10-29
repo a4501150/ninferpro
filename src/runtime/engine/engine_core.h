@@ -2000,6 +2000,67 @@ private:
         publish_runtime_stats();
     }
 
+    // The prefill turn this cycle would run, when its next call can ride in the decode round
+    // (a Program with mixed rounds, Qwen3.8-Flash-Next): no context transaction is open, and the lane
+    // holds its unit, is not cancelled and prefills (a replay keeps its own calls).
+    std::optional<std::uint32_t> mixable_prefill() {
+        if constexpr (requires { instance_.program->can_mix(std::declval<const SequenceHandle&>()); }) {
+            if (instance_.program->has_context_transaction()) { return std::nullopt; }
+            auto prefill_slots = slots_;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (!runnable_units_[lane] ||
+                    (prefill_slots[lane] &&
+                     prefill_slots[lane]->cancelled.load(std::memory_order_acquire))) {
+                    prefill_slots[lane].reset();
+                }
+            }
+            const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
+            if (!lane) { return std::nullopt; }
+            const auto& request = slots_[*lane];
+            if (!request->is_prefilling() || !request->sequence ||
+                !instance_.program->can_mix(*request->sequence)) {
+                return std::nullopt;
+            }
+            return lane;
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    // A decode round whose Forward also runs `lane`'s next prompt call: the round commits as
+    // run_decode_round's, then the call's progress resolves as run_prefill_step's (never its
+    // prompt's last call, so it holds no pending token).
+    void run_mixed_round(const RoundMembership& membership, std::uint32_t lane,
+                         const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        if constexpr (requires { instance_.program->can_mix(std::declval<const SequenceHandle&>()); }) {
+            nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
+                                           static_cast<std::uint64_t>(membership.size));
+            const auto request = slots_[lane];
+            ProgramCallScope program_call(*this);
+            RoundMasks masks;
+            bool constrained = false;
+            for (std::size_t row = 0; row < membership.size; ++row) {
+                masks.outputs[row] = &slots_[membership.lane_span()[row]]->output;
+                constrained |= masks.outputs[row]->constrained();
+            }
+            auto progress = instance_.program->mixed(*request->sequence, membership.sequence_span(),
+                                                     membership.budget_span(), constrained ? &masks : nullptr);
+            program_call.finish(progress.pending.execution_timing());
+            ++cumulative_stats_.mixed_rounds;
+            if (!request->first_output_timing) {
+                record_execution_work(request->prefill_work, progress.prefill.timing);
+            }
+            commit_pending(std::move(progress.pending), membership.lane_span(), true, cancelled_at_unit_start);
+            resolve_prefill_progress(request, std::move(progress.prefill), cancelled_at_unit_start);
+            publish_runtime_stats();
+        } else {
+            (void)membership;
+            (void)lane;
+            (void)cancelled_at_unit_start;
+            throw std::logic_error("the Program has no mixed rounds");
+        }
+    }
+
     void run_control_batch(const ControlMembership& membership) {
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
@@ -2360,9 +2421,20 @@ private:
                     }
                     decode = selected;
                 }
+                // With a Program that mixes, the prefill turn's call can ride in the decode round:
+                // one Forward runs both, and the turn is taken.
+                std::optional<std::uint32_t> mixed_lane;
                 if (!decode.empty()) {
                     set_host_work_class(HostWorkClass::Decode, decode.lane_span());
-                    run_decode_round(decode, cancelled);
+                    mixed_lane = mixable_prefill();
+                    if (mixed_lane) {
+                        const auto request = slots_[*mixed_lane];
+                        run_mixed_round(decode, *mixed_lane, cancelled);
+                        scheduler_.prefill_executed(*mixed_lane, max_concurrency_);
+                        update_recovery(request);
+                    } else {
+                        run_decode_round(decode, cancelled);
+                    }
                     executed = true;
                 }
                 if (instance_.program->has_context_transaction()) {
@@ -2384,7 +2456,9 @@ private:
                         prefill_slots[lane].reset();
                     }
                 }
-                if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
+                const auto prefill_lane =
+                    mixed_lane ? std::nullopt : scheduler_.next_prefill(prefill_slots, max_concurrency_);
+                if (const auto lane = prefill_lane) {
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
                     if (request->is_replaying()) {

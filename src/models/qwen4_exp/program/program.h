@@ -252,6 +252,13 @@ struct PrefillProgress {
     std::optional<PromptReadout> readout;
 };
 
+// A decode round with one prompt call in its Forward (Program::mixed): the round's pending batch,
+// committed as decode's, and the prompt call's progress (never its last call, so it samples nothing).
+struct MixedProgress {
+    PrefillProgress prefill;
+    PendingBatch pending;
+};
+
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
     GenerationTimings timings;
@@ -367,6 +374,10 @@ struct ProgramOptions {
     std::uint32_t prefill_chunk   = 1024;
     // Prompt tokens per call while another lane decodes; 0 or at least prefill_chunk: no cap.
     std::uint32_t prefill_chunk_beside_decode = 0;
+    // A prompt's calls may ride in the decode rounds' Forward (Program::mixed). Only where it keeps
+    // the route's contract: the column-invariant exact route (bit for bit) or a request-coupled fast
+    // route (the decode rows' columns take the mixed width's routes).
+    bool mixed_calls = false;
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
@@ -663,6 +674,14 @@ public:
                                       std::span<const runtime::RoundBudget> budgets,
                                       runtime::ExecutionTiming* failed_timing = nullptr,
                                       runtime::TokenMaskProvider* masks       = nullptr);
+    // Whether the prefilling sequence's next call can ride in a decode round (mixed): not its
+    // prompt's last call, nor a layer walk's, a replay's, an image prompt's or an MTP Program's.
+    [[nodiscard]] bool can_mix(SequenceHandle prefill);
+    // decode(sequences) whose Forward also runs `prefill`'s next prompt call (can_mix), split to
+    // fit the round: one call, one pending batch of the decode rows.
+    [[nodiscard]] MixedProgress mixed(SequenceHandle prefill, std::span<const SequenceHandle> sequences,
+                                      std::span<const runtime::RoundBudget> budgets,
+                                      runtime::TokenMaskProvider* masks = nullptr);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences, std::span<const TokenId> row_major_tokens,
                          std::uint32_t row_stride,

@@ -1719,6 +1719,8 @@ struct RuntimeStats {
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds             = 0;
     std::uint64_t decode_row_rounds         = 0;
+    // Decode rounds whose Forward also ran a prompt call (Qwen3.8-Flash-Next's mixed rounds).
+    std::uint64_t mixed_rounds              = 0;
     std::uint32_t running_requests          = 0;
     std::uint32_t prefilling_requests       = 0;
     std::uint32_t decode_ready_requests     = 0;

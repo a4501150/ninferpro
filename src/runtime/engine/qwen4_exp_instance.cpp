@@ -556,6 +556,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The fast paths qualified for this configuration (docs/maintainer/model-quality.md section 6.7).
     const models::qwen4_exp::FastPathSelection fast = models::qwen4_exp::select_fast_paths(instance->parameters, options);
     program_options.fast_paths        = fast.forward();
+    program_options.mixed_calls       = program_options.fast_paths.column_invariant || !fast.request_invariant();
     program_options.pair_speculation  = fast.selected(FastPath::AdaptiveSpeculation);
     program_options.free_cache_resume = fast.selected(FastPath::FreeCacheResume) || fast.construction_exact();
     program_options.preemption        = fast.selected(FastPath::Preemption);

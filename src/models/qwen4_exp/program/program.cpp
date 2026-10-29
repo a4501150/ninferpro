@@ -112,6 +112,13 @@ PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::spa
     return impl_->decode(sequences, budgets, masks);
 }
 
+bool Program::can_mix(SequenceHandle prefill) { return impl_->can_mix(prefill); }
+
+MixedProgress Program::mixed(SequenceHandle prefill, std::span<const SequenceHandle> sequences,
+                             std::span<const runtime::RoundBudget> budgets, runtime::TokenMaskProvider* masks) {
+    return impl_->mixed(prefill, sequences, budgets, masks);
+}
+
 runtime::ExecutionTiming Program::append_forced_tokens(std::span<const SequenceHandle> sequences,
                                                        std::span<const TokenId> row_major_tokens,
                                                        std::uint32_t row_stride,
