@@ -46,6 +46,12 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
     across restarts by a journal; the RAM tier spills cold snapshots to it or, at
     `--host-context-mib 0`, captures write through; it replaces this model's whole-file save;
   - batched DFlash2 drafting at any round size with an online cost fit;
+  - prefill beside decode for Qwen3.8-Flash-Next: while another lane decodes, a prompt's calls are
+    split to `--prefill-chunk-beside-decode` and each but the last rides in the decode round's
+    Forward (mixed rounds, `ForwardBatch::prefill_part`); only the column-invariant exact route
+    (where the bits equal the separate calls') and request-coupled fast routes mix;
+  - tool-call grammar fixes: under a constrained auto contract a call opener inside Markdown code
+    is text, and the turn may end inside its thinking (non-strict calls there are recovered);
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
 
 ### Mechanism and policy

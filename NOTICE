@@ -36,6 +36,13 @@ Modifications made in this product (summary; see README.md for details):
   kept across restarts by a journal, spilled from the RAM tier or, with the
   RAM tier off, written through; it replaces this model's whole-file save.
 - Batched DFlash2 drafting at any round size with an online cost fit.
+- Prefill beside decode for Qwen3.8-Flash-Next: while another request decodes,
+  prompt calls are split (--prefill-chunk-beside-decode) and each but the
+  prompt's last runs inside the decode round's Forward (mixed rounds; bit for
+  bit the separate calls on the construction-exact exact route).
+- Tool-call grammar fixes: call openers inside Markdown code stay text under a
+  constrained auto contract, and such a turn may end inside its thinking
+  (non-strict calls there are recovered).
 - Linux VRAM spill detection fix (no WDDM budget).
 
 Third-party components keep their own licenses; see third_party/ and
