@@ -2737,7 +2737,7 @@ private:
     // The monitor thread: wakes an idle engine when the cache should resize; without an elastic
     // pool, warns once per pressure episode that nothing absorbs it.
     void on_vram_snapshot(const VramSnapshot& snapshot) {
-        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
         if (kv_idle_due() && waker_) { waker_(); }
         if (control_) {
             const auto d = control_->decide(snapshot, pool_now_, frames_now_, vram_seconds(), true);
@@ -2760,7 +2760,7 @@ private:
 
 public:
     void set_maintenance_waker(std::function<void()> waker) {
-        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
         waker_ = std::move(waker);
     }
 
@@ -3502,11 +3502,14 @@ public:
                                             std::to_string(resized.frames) + " frames, RAM tier " +
                                             std::to_string(tier_resident_slots()) + " slots");
                 }
-                frames_now_        = resized.frames;
-                pool_now_          = residency_->pool_bytes();
-                // The switch names the pool's size from here on: the control law may shrink below
-                // it under pressure and grow back to it, but never past it.
-                placement_ceiling_ = resized.frames;
+                {
+                    const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
+                    frames_now_ = resized.frames;
+                    pool_now_   = residency_->pool_bytes();
+                    // The switch names the pool's size from here on: the control law may shrink
+                    // below it under pressure and grow back to it, but never past it.
+                    placement_ceiling_ = resized.frames;
+                }
                 // A grow backs new frames without filling them; the resident refill walks the
                 // usage-rank order into them between rounds (a shrink needs none: its survivors
                 // demoted through the tier on the way down, the rest backfilled by the tier fill).
@@ -3537,11 +3540,13 @@ public:
                            (placement_fill_.active ? ", resident refill started" : "") +
                            (tier_backfill_.active ? ", RAM tier fill started" : ""));
             } else if (!request.pinned.empty()) {
+                const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
                 placement_ceiling_ = before;
                 diagnostic("expert placement switched: " + std::to_string(residency_->pinned_keys_total()) +
                            " keys pinned over " + std::to_string(before) + " frames, RAM tier " +
                            std::to_string(tier_resident_slots()) + " slots");
             } else {
+                const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
                 placement_ceiling_ = before;
                 diagnostic("expert placement switched: " + std::to_string(residency_->pinned_keys_total()) +
                            " keys pinned released over " + std::to_string(before) + " frames, RAM tier " +
@@ -3592,7 +3597,7 @@ public:
     // so a tick that is not done can re-arm it and the refill also advances while the engine
     // idles, when no round would call apply_vram_target.
     void wake_maintenance() {
-        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
         if (waker_) { waker_(); }
     }
 
@@ -3834,7 +3839,7 @@ public:
             shrink_kv(true);
         }
         if (!control_) { return; }
-        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
         const auto d = control_->decide(monitor_->latest(), pool_now_, frames_now_, vram_seconds(), idle);
         // An explicit placement (a count or a file, at startup or through /admin/expert-placement)
         // names the pool's size: the control law may shrink below it under another program's VRAM
@@ -5894,7 +5899,9 @@ private:
     DeviceLayout plan_;
     std::unique_ptr<VramBudgetSource> vram_;
     VramSizing sizing_;
-    std::mutex vram_mutex_; // the control law, the waker and the cache size the monitor reads
+    // The control law, the waker and the cache size the monitor reads. Recursive: the control path
+    // resizes the KV pool (shrink_kv, grow_kv) with it held, and other callers take it there.
+    std::recursive_mutex vram_mutex_;
     std::optional<VramControl> control_;
     std::function<void()> waker_;
     std::uint32_t frames_now_ = 0, startup_frames_ = 0;
@@ -6159,7 +6166,7 @@ private:
         std::uint32_t target       = backed + (need - pool_->available_pages());
         target = std::min(pool_->capacity_pages(), (target + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
         if (target - backed < need - pool_->available_pages()) { return false; }
-        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
         const std::size_t added    = kv_mapped_bytes(plan_, target) - kv_vmm_->mapped_bytes();
         const std::uint64_t stride = residency_->frame_bytes();
         const std::uint32_t frames = residency_->frames();
@@ -6212,7 +6219,7 @@ private:
         }
         target = std::max(target, plan_.kv_base_pages);
         if (target == pool_->backed_pages()) { return; }
-        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
         device_.synchronize();
         const std::size_t before = kv_vmm_->mapped_bytes();
         pool_->set_backed_pages(target);
