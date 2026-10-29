@@ -92,6 +92,13 @@ infernix_add_test(infernix_qwen4_exp_memory_plan_test
   LIBRARIES infernix_model_loading)
 
 # Prefix-cache state images and page records on synthetic Device pools (no model; skips without a GPU).
+if(NOT WIN32)
+  # The prefix cache Disk tier's journal, manifest and lock (cuFile on a temporary file).
+  infernix_add_test(infernix_qwen4_exp_prefix_disk_store_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_disk_store.cpp"
+    LIBRARIES infernix_model_runtime)
+endif()
+
 infernix_add_test(infernix_qwen4_exp_prefix_state_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_state_image.cpp"
   LIBRARIES infernix_model_runtime)

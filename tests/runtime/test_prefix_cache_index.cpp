@@ -39,6 +39,10 @@ public:
         live.erase(id);
     }
 
+    void release_disk_record(std::span<const std::uint32_t> slots) noexcept override {
+        disk_released.push_back(slots.front());
+    }
+
     std::uint32_t allocate() {
         const std::uint32_t id = next++;
         live.insert(id);
@@ -46,6 +50,7 @@ public:
     }
 
     std::vector<std::uint32_t> released;
+    std::vector<std::uint32_t> disk_released;
     std::set<std::uint32_t> live;
     std::uint32_t next = 1;
 };
@@ -142,6 +147,39 @@ void backup_snapshot(PrefixCacheIndex& index, SnapshotRef snapshot) {
     index.complete_snapshot_host_fill(snapshot);
     index.unpin_snapshot(snapshot);
     index.check_invariants();
+}
+
+constexpr double kAnyClaim = std::numeric_limits<double>::infinity();
+
+PrefixIndexConfig disk_config(std::uint32_t host_slabs, std::uint32_t disk_slots) {
+    PrefixIndexConfig config = small_config(host_slabs, 0);
+    config.disk_slots        = disk_slots;
+    return config;
+}
+
+std::uint32_t disk_backup_node(PrefixCacheIndex& index, NodeRef node, double claim = kAnyClaim) {
+    index.pin_node(node);
+    const auto slot = index.begin_node_disk_fill(node, claim);
+    require(slot.has_value(), "no Disk slot for a block backup");
+    index.complete_node_disk_fill(node);
+    index.unpin_node(node);
+    index.check_invariants();
+    return *slot;
+}
+
+// Publishes a Disk-born snapshot at the end of `anchor`'s block, or `tail` tokens past it.
+SnapshotRef publish_on_disk(PrefixCacheIndex& index, NodeRef anchor, std::span<const TokenId> tail = {},
+                            double claim = kAnyClaim) {
+    auto image = index.reserve_disk_image(!tail.empty(), claim);
+    require(image.has_value(), "no Disk slots for a snapshot image");
+    const std::uint32_t frontier =
+        (anchor.valid() ? (index.node(anchor).depth + 1U) * kBlockTokens : 0U) +
+        static_cast<std::uint32_t>(tail.size());
+    const PublishResult result = index.publish_disk_snapshot(anchor, frontier, tail, std::nullopt,
+                                                             std::move(*image), SnapshotKind::Tap);
+    require(result.created, "Disk-born snapshot not created");
+    index.check_invariants();
+    return result.snapshot;
 }
 
 void test_hashes() {
@@ -1417,14 +1455,264 @@ void test_cost_model() {
     require(cost.call_seconds(1) == cost.chunk_seconds, "rho >= 1 charges a full call for any width");
 }
 
-void test_random_stress() {
-    std::mt19937 rng(1234);
+// Disk copies back blocks and images: losing the Device copy keeps them, a match prices them at
+// the Disk rate, a Device fill restores from the Disk, and a recomputed page drops the record.
+void test_disk_backed_blocks() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(disk_config(0, 32), backend);
+    const auto tokens = make_tokens(64 * 3, 300);
+    const auto path   = insert_sequence(index, backend, tokens);
+    std::vector<std::uint32_t> slots;
+    for (const NodeRef node : path) { slots.push_back(disk_backup_node(index, node)); }
+    const SnapshotRef tap = publish_on_disk(index, path[2]);
+    require(index.snapshot(tap).disk == CopyState::Resident && index.snapshot(tap).disk_slots.size() == 4 &&
+                index.snapshot(tap).host == CopyState::Absent && index.snapshot(tap).device_slot == kNoId,
+            "a Disk-born snapshot has only its Disk copy");
+    require(index.stats().disk_free_slots == 32 - 3 - 4, "blocks and the image take their slots");
+    index.release_path(path);
+
+    require(index.evict_device_blocks(3) == 3, "every Device copy is evictable");
+    require(index.stats().unbacked_node_losses == 0 && index.valid(path[2]) && index.valid(tap),
+            "Disk-backed blocks survive the loss of their Device copy");
+    for (const NodeRef node : path) {
+        require(index.node(node).device == CopyState::Absent && index.node(node).disk == CopyState::Resident,
+                "the block is Disk-only");
+    }
+    auto prompt = tokens;
+    prompt.push_back(5);
+    const auto hashes       = block_lookup_hashes(prompt, {});
+    const auto n            = static_cast<std::uint32_t>(prompt.size());
+    const MatchResult match = index.match(prompt, hashes, {}, n);
+    require(match.candidates.size() == 1, "the Disk snapshot is matched");
+    const MatchCandidate& candidate = match.candidates[0];
+    require(candidate.host_only_blocks == 3 && candidate.disk_only_blocks == 3 && candidate.image_on_disk_only &&
+                candidate.restore_bytes == 0 && candidate.disk_bytes == 3U * (1U << 20U) + (4U << 20U),
+            "a Disk-only candidate reads its blocks and image from the Disk");
+    const AdmissionChoice choice = index.choose(match, n);
+    require(choice.candidate == 0U, "a cheap Disk read beats recomputing the prefix");
+    PrefixIndexConfig slow_disk               = disk_config(0, 32);
+    slow_disk.cost.disk_bytes_per_second      = 1.0e6;
+    index.set_cost(slow_disk.cost);
+    require(!index.choose(match, n).candidate, "a Disk read slower than the prefill loses to the root");
+    index.set_cost(disk_config(0, 32).cost);
+
+    // Restore the path to the Device from its Disk copies.
+    index.acquire_path(match.path);
+    for (const NodeRef node : match.path) {
+        index.begin_device_fill(node, backend.allocate());
+        index.complete_device_fill(node);
+    }
+    index.release_path(match.path);
+    index.check_invariants();
+    require(index.node(path[0]).disk == CopyState::Resident, "a Device restore keeps the Disk copy");
+
+    // A recomputed page displaces the record: the Disk copy no longer describes the block.
+    require(index.evict_device_blocks(1) == 1, "one Device copy evicted");
+    const NodeRef last = path[2];
+    require(index.node(last).device == CopyState::Absent, "the deepest block went first");
+    index.acquire_path(std::span<const NodeRef>(path.data(), 2));
+    const std::uint32_t id = backend.allocate();
+    const InsertResult reinserted = index.insert_block(
+        path[1], hashes[2], std::span<const TokenId>(prompt.data() + 128, kBlockTokens), 0, id, true);
+    require(!reinserted.inserted && reinserted.device_attached && reinserted.node == last,
+            "the Disk-only block adopts the recomputed page");
+    require(index.node(last).disk == CopyState::Absent &&
+                std::count(backend.disk_released.begin(), backend.disk_released.end(), slots[2]) == 1,
+            "the displaced Disk record is released");
+    index.release_path(std::span<const NodeRef>(path.data(), 3));
+    index.check_invariants();
+
+    // A Disk write in flight from the Host record keeps a recomputed page private.
+    RecordingBackend host_backend;
+    PrefixCacheIndex host_index(disk_config(16, 8), host_backend);
+    const auto host_path = insert_sequence(host_index, host_backend, make_tokens(64, 301));
+    backup_node(host_index, host_path[0]);
+    host_index.release_path(host_path);
+    require(host_index.evict_device_blocks(1) == 1, "the Host-backed copy goes");
+    host_index.pin_node(host_path[0]);
+    require(host_index.begin_node_disk_fill(host_path[0], kAnyClaim).has_value(), "Disk fill from the Host");
+    const auto block = make_tokens(64, 301);
+    const InsertResult kept = host_index.insert_block(NodeRef{}, block_lookup_hashes(block, {})[0], block, 0,
+                                                      host_backend.allocate(), true);
+    require(!kept.device_attached, "no attach while the Host record is being written to the Disk");
+    host_backend.release_device_block(host_backend.next - 1);
+    host_index.complete_node_disk_fill(host_path[0]);
+    host_index.release_path(std::span<const NodeRef>(&kept.node, 1));
+    host_index.unpin_node(host_path[0]);
+    host_index.check_invariants();
+}
+
+// A Host snapshot written to the Disk keeps that copy when the Host tier evicts it, and the spill
+// candidates follow the Host eviction order within a slab budget.
+void test_disk_spill_and_host_eviction() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(disk_config(16, 32), backend);
+    const auto tokens = make_tokens(64 * 2, 310);
+    const auto path   = insert_sequence(index, backend, tokens);
+    for (const NodeRef node : path) { backup_node(index, node); }
+    auto shallow_image = index.reserve_host_image(false, kAnyClaim);
+    auto deep_image    = index.reserve_host_image(false, kAnyClaim);
+    require(shallow_image && deep_image, "two Host images fit");
+    const SnapshotRef shallow =
+        index.publish_host_snapshot(path[0], 64, {}, std::nullopt, std::move(*shallow_image), SnapshotKind::Tap)
+            .snapshot;
+    const SnapshotRef deep =
+        index.publish_host_snapshot(path[1], 128, {}, std::nullopt, std::move(*deep_image), SnapshotKind::Tap)
+            .snapshot;
+    index.release_path(path);
+    index.check_invariants();
+
+    const auto one  = index.disk_spill_candidates(4);
+    const auto both = index.disk_spill_candidates(16);
+    require(one.size() == 1 && both.size() == 2 && both[0] == one[0], "candidates are coldest first within the budget");
+
+    // Spill both: the path blocks first, then the image.
+    for (const SnapshotRef snapshot : both) {
+        index.pin_snapshot(snapshot);
+        require(index.begin_snapshot_disk_fill(snapshot), "Disk slots for the image");
+        require(index.snapshot(snapshot).disk == CopyState::Filling, "the image is being written");
+        require(index.disk_spill_candidates(16).size() == (snapshot == both[0] ? 1U : 0U),
+                "a snapshot being written is no candidate");
+        index.complete_snapshot_disk_fill(snapshot);
+        index.unpin_snapshot(snapshot);
+    }
+    for (const NodeRef node : path) { (void)disk_backup_node(index, node); }
+    require(index.disk_spill_candidates(16).empty(), "spilled snapshots are no candidates");
+
+    // The Host tier needs every slab: both images give up their Host copies and stay on the Disk.
+    auto first  = index.reserve_host_image(false, kAnyClaim);
+    auto second = index.reserve_host_image(false, kAnyClaim);
+    auto third  = index.reserve_host_image(false, kAnyClaim);
+    require(first && second && third, "the Host tier is reclaimed for new images");
+    require(index.valid(shallow) && index.valid(deep) && index.snapshot(deep).host == CopyState::Absent &&
+                index.snapshot(deep).disk == CopyState::Resident,
+            "an evicted Host snapshot keeps its Disk copy");
+    index.check_invariants();
+    index.release_host_image(std::move(*first));
+    index.release_host_image(std::move(*second));
+    index.release_host_image(std::move(*third));
+
+    auto prompt = tokens;
+    prompt.push_back(9);
+    const auto hashes       = block_lookup_hashes(prompt, {});
+    const MatchResult match = index.match(prompt, hashes, {}, static_cast<std::uint32_t>(prompt.size()));
+    require(match.candidates.size() == 2 && match.candidates[0].snapshot == deep &&
+                match.candidates[0].image_on_disk_only,
+            "the deep snapshot is matched from the Disk");
+    index.check_invariants();
+}
+
+// The Disk tier evicts dead blocks, then superseded snapshots, then the GDSF minimum within the claim.
+void test_disk_eviction_order() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(disk_config(0, 11), backend);
+    const auto a = insert_sequence(index, backend, make_tokens(64, 320));
+    const auto b = insert_sequence(index, backend, make_tokens(64, 321));
+    const auto c = insert_sequence(index, backend, make_tokens(64, 322));
+    (void)disk_backup_node(index, a[0]);
+    const SnapshotRef on_a = publish_on_disk(index, a[0]);
+    const SnapshotRef on_b = publish_on_disk(index, b[0]);
+    const std::uint32_t dead_slot = disk_backup_node(index, c[0]);
+    index.release_path(a);
+    index.release_path(b);
+    index.release_path(c);
+    require(index.stats().disk_free_slots == 1, "one slot is left");
+
+    // A claim below every retained snapshot only reclaims the dead block's Disk copy.
+    require(!index.reserve_disk_image(false, 0.0).has_value(), "no retained snapshot yields to a zero claim");
+    require(index.stats().disk_dead_reclaims == 1 && index.node(c[0]).disk == CopyState::Absent &&
+                index.node(c[0]).device == CopyState::Resident &&
+                std::count(backend.disk_released.begin(), backend.disk_released.end(), dead_slot) == 1,
+            "the dead block gives up its Disk copy and keeps its Device copy");
+    index.check_invariants();
+
+    // A superseded snapshot goes first, whatever the claim.
+    const std::uint32_t b_first = index.snapshot(on_b).disk_slots.front();
+    require(index.supersede(on_b), "the snapshot on b is superseded");
+    const auto image = index.reserve_disk_image(false, 0.0);
+    require(image.has_value() && !index.valid(on_b) && index.valid(on_a) &&
+                std::count(backend.disk_released.begin(), backend.disk_released.end(), b_first) == 1,
+            "the superseded Disk-only snapshot is evicted and its record released");
+    require(index.stats().disk_snapshot_evictions == 1, "one Disk snapshot eviction");
+    index.check_invariants();
+}
+
+// A Disk tier's records rebuild an empty index at their slots, with conflicts refused.
+void test_disk_rebuild() {
+    RecordingBackend backend;
+    const PrefixIndexConfig config = disk_config(0, 24);
+    PrefixCacheIndex source(config, backend);
+    const auto tokens = make_tokens(64 * 3, 330);
+    const auto path   = insert_sequence(source, backend, tokens);
+    for (const NodeRef node : path) { (void)disk_backup_node(source, node); }
+    const auto tail             = make_tokens(10, 331);
+    const SnapshotRef shallow   = publish_on_disk(source, path[0]);
+    const SnapshotRef with_tail = publish_on_disk(source, path[2], tail);
+    source.release_path(path);
+    require(source.snapshot(with_tail).disk_slots.size() == 5, "a tail takes its own slot");
+
+    RecordingBackend target_backend;
+    PrefixCacheIndex target(config, target_backend);
+    target.begin_disk_rebuild();
+    require_throws([&] { (void)target.reserve_disk_image(false, kAnyClaim); }, "no allocation during a rebuild");
+    std::vector<NodeRef> rebuilt;
+    for (const NodeRef node : path) {
+        const BlockIdentity identity = source.block_identity(node);
+        const auto restored = target.restore_disk_block(rebuilt.empty() ? NodeRef{} : rebuilt.back(),
+                                                        identity.lookup_hash, identity.tokens, identity.extra,
+                                                        source.node(node).disk_slot);
+        require(restored.has_value(), "a Disk block is rebuilt");
+        rebuilt.push_back(*restored);
+    }
+    const BlockIdentity first = source.block_identity(path[0]);
+    require(!target.restore_disk_block(NodeRef{}, first.lookup_hash, first.tokens, first.extra, 23).has_value(),
+            "a duplicate block is refused");
+    const auto taken = make_tokens(64, 332);
+    require(!target.restore_disk_block(NodeRef{}, block_lookup_hashes(taken, {})[0], taken, 0,
+                                       source.node(path[1]).disk_slot)
+                 .has_value(),
+            "a block at a slot already rebuilt is refused");
+    const SnapshotView shallow_view = source.snapshot(shallow);
+    const SnapshotView tail_view    = source.snapshot(with_tail);
+    require(target.restore_disk_snapshot(rebuilt[0], 64, {}, shallow_view.kind, 3, false, shallow_view.disk_slots)
+                .has_value(),
+            "the shallow snapshot is rebuilt");
+    require(!target.restore_disk_snapshot(rebuilt[1], 128, {}, SnapshotKind::Tap, 0, false, shallow_view.disk_slots)
+                 .has_value(),
+            "a snapshot at slots already rebuilt is refused");
+    const auto restored_tail =
+        target.restore_disk_snapshot(rebuilt[2], 202, tail, tail_view.kind, 0, false, tail_view.disk_slots);
+    require(restored_tail.has_value(), "the tail snapshot is rebuilt");
+    target.end_disk_rebuild();
+    target.check_invariants();
+    require(target.stats().disk_free_slots == source.stats().disk_free_slots &&
+                target.snapshot(*restored_tail).hits == 0 && target.stats().nodes == 3,
+            "the rebuilt index holds what the source held");
+
+    auto prompt = tokens;
+    prompt.insert(prompt.end(), tail.begin(), tail.end());
+    prompt.push_back(4);
+    const auto hashes       = block_lookup_hashes(prompt, {});
+    const auto n            = static_cast<std::uint32_t>(prompt.size());
+    const MatchResult match = target.match(prompt, hashes, {}, n);
+    require(match.candidates.size() == 2 && match.candidates[0].frontier == 202 && match.candidates[0].tail_on_disk_only &&
+                match.candidates[0].disk_bytes == 3U * (1U << 20U) + (4U << 20U) + (1U << 20U),
+            "a rebuilt tail snapshot is matched from the Disk");
+    // New allocations after the rebuild avoid the rebuilt slots.
+    (void)publish_on_disk(target, rebuilt[1]);
+    target.check_invariants();
+}
+
+void test_random_stress(bool disk) {
+    std::mt19937 rng(disk ? 4321 : 1234);
     for (int round = 0; round < 20; ++round) {
         RecordingBackend backend;
         PrefixIndexConfig config = small_config(40, 3);
         config.max_nodes         = 128;
         config.max_snapshots     = 16;
+        config.disk_slots        = disk ? 30U : 0U;
         PrefixCacheIndex index(config, backend);
+        const auto any_or_none = [&] { return rng() % 2U ? std::numeric_limits<double>::infinity() : 0.0; };
         // A small vocabulary of shared prefixes so paths overlap.
         std::vector<std::vector<TokenId>> prompts;
         for (int p = 0; p < 6; ++p) {
@@ -1482,7 +1770,25 @@ void test_random_stress() {
                         }
                         index.unpin_node(result.node);
                     }
-                    if (rng() % 3U == 0) {
+                    if (disk && index.node(result.node).disk == CopyState::Absent && rng() % 2U) {
+                        index.pin_node(result.node);
+                        if (index.begin_node_disk_fill(result.node, any_or_none())) {
+                            if (rng() % 4U) {
+                                index.complete_node_disk_fill(result.node);
+                            } else {
+                                index.abort_node_disk_fill(result.node);
+                            }
+                        }
+                        index.unpin_node(result.node);
+                    }
+                    if (disk && rng() % 4U == 0) {
+                        if (auto image = index.reserve_disk_image(false, any_or_none())) {
+                            const PublishResult published = index.publish_disk_snapshot(
+                                result.node, (index.node(result.node).depth + 1U) * kBlockTokens, {},
+                                std::nullopt, std::move(*image), SnapshotKind::Tap);
+                            if (published.created) { published_snapshots.push_back(published.snapshot); }
+                        }
+                    } else if (rng() % 3U == 0) {
                         if (const auto slot = index.acquire_device_slot(
                                 rng() % 2U ? std::numeric_limits<double>::infinity() : 0.0)) {
                             const PublishResult published = index.publish_snapshot(
@@ -1496,6 +1802,17 @@ void test_random_stress() {
                                 index.pin_snapshot(published.snapshot);
                                 if (index.begin_snapshot_host_fill(published.snapshot)) {
                                     index.complete_snapshot_host_fill(published.snapshot);
+                                }
+                                index.unpin_snapshot(published.snapshot);
+                            }
+                            if (disk && published.created && index.valid(published.snapshot) && rng() % 2U) {
+                                index.pin_snapshot(published.snapshot);
+                                if (index.begin_snapshot_disk_fill(published.snapshot)) {
+                                    if (rng() % 4U) {
+                                        index.complete_snapshot_disk_fill(published.snapshot);
+                                    } else {
+                                        index.abort_snapshot_disk_fill(published.snapshot);
+                                    }
                                 }
                                 index.unpin_snapshot(published.snapshot);
                             }
@@ -1742,7 +2059,12 @@ int main() {
         test_queue_holds();
         test_insert_without_attach();
         test_cost_model();
-        test_random_stress();
+        test_disk_backed_blocks();
+        test_disk_spill_and_host_eviction();
+        test_disk_eviction_order();
+        test_disk_rebuild();
+        test_random_stress(false);
+        test_random_stress(true);
         test_tap_planner();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
