@@ -358,8 +358,11 @@ the end of that thinking, there is nothing but complete calls to declared tools 
 those calls become the structured turn (logged at Info severity). The thinking before them stays
 reasoning and is never published as content. Nothing is recovered when the thinking was closed,
 when the turn published any content, when it ended at the output limit, context capacity or a
-cancellation, or when prose or a cut call follows the last call. Constrained tool output (below) is
-well formed by construction and does not use either recovery.
+cancellation, or when prose or a cut call follows the last call. Constrained tool calls (below) are
+well formed by construction and do not use the first recovery. An `auto` constrained turn may also
+end inside its thinking, and in tolerant mode the same rule recovers the calls written there when
+they go to non-strict tools (their values were never checked) and, without parallel calls, there
+is only one; a required or named choice, or a JSON answer, still needs the closed thinking.
 
 ### Tool constraints
 
@@ -408,7 +411,9 @@ Raw values cannot contain the delimiter `\n</parameter>`; unsatisfiable required
 Integer arguments use signed 64-bit values; number arguments use finite binary64-compatible
 representations. Unsupported schemas fail with HTTP 400 before generation.
 
-For `auto` without JSON output, text can precede the first call. Required/named choices start directly with calls
+For `auto` without JSON output, text can precede the first call. A `<tool_call>` inside a
+Markdown code fence or inline code of that text is a quoted example under the constraint too: it
+stays content and does not start a call, by the same rule as the unconstrained route. Required/named choices start directly with calls
 (after thinking, if enabled). Once a constrained call starts, the suffix consists of complete calls
 and model EOS. Active tool constraints require model EOS and reject custom stop strings.
 For ordinary non-strict auto calls that need custom stops, select `tool_constraints:"auto"`.

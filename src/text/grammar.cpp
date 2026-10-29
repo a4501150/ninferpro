@@ -102,8 +102,9 @@ std::string quoted(unsigned char c) {
 }
 
 // A small DFA consumes through the first complete delimiter, including delimiters split across
-// tokens. Concatenation keeps the user's rule names in their own namespace.
-xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
+// tokens. Concatenation keeps the user's rule names in their own namespace. With `open`, the
+// grammar is instead every text that holds no complete delimiter: a turn that ends in its thinking.
+xgrammar::Grammar reasoning_prefix(std::string_view delimiter, bool open = false) {
     std::string alphabet(delimiter);
     std::sort(alphabet.begin(), alphabet.end());
     alphabet.erase(std::unique(alphabet.begin(), alphabet.end()), alphabet.end());
@@ -115,16 +116,20 @@ xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
             next += static_cast<char>(c);
             std::size_t matched = std::min(next.size(), delimiter.size());
             while (matched && !next.ends_with(delimiter.substr(0, matched))) { --matched; }
-            source += quoted(c);
-            if (matched != delimiter.size()) { source += " s" + std::to_string(matched); }
-            source += " | ";
+            if (matched == delimiter.size()) {
+                if (open) continue;
+                source += quoted(c) + " | ";
+                continue;
+            }
+            source += quoted(c) + " s" + std::to_string(matched) + " | ";
         }
         source += "[^";
         for (unsigned char c : alphabet) {
             const auto escaped = quoted(c);
             source += escaped.substr(1, escaped.size() - 2);
         }
-        source += "] s0\n";
+        source += "] s0";
+        source += open ? " | \"\"\n" : "\n";
     }
     return xgrammar::Grammar::FromEBNF(source);
 }
@@ -179,7 +184,9 @@ public:
     Impl(std::vector<std::string> vocab_, std::vector<std::int32_t> eos_, std::size_t bytes)
         : vocab(std::move(vocab_)), eos(std::move(eos_)),
           tokenizer(vocab, xgrammar::VocabType::RAW, static_cast<int>(vocab.size()), eos),
-          compiler(tokenizer, 1, true, static_cast<std::int64_t>(bytes)) {}
+          // Threads compute the token masks of a grammar's positions in parallel; a request's
+          // first grammar (a new tool set) waits on its compile.
+          compiler(tokenizer, 8, true, static_cast<std::int64_t>(bytes)) {}
 
     std::vector<std::string> vocab;
     std::vector<std::int32_t> eos;
@@ -195,7 +202,8 @@ public:
     xgrammar::GrammarMatcher matcher;
     int vocabulary;
     std::size_t words;
-    int tentative = 0;
+    int tentative          = 0;
+    bool reasoning_may_end = false;
     ConstraintObservation observed;
 
     void fill(std::span<std::uint32_t> target) {
@@ -219,21 +227,27 @@ GrammarCompiler::~GrammarCompiler() = default;
 std::unique_ptr<GrammarSession>
 GrammarCompiler::compile_model(std::string_view identity,
                                const std::function<xgrammar::Grammar()>& build,
-                               std::string_view close, std::string_view continuation) {
-    const std::string key =
-        "model:" + std::to_string(close.size()) + ":" + std::string(close) + std::string(identity);
+                               std::string_view close, std::string_view continuation,
+                               bool reasoning_may_end) {
+    const bool may_end    = reasoning_may_end && !close.empty();
+    const std::string key = "model:" + std::string(may_end ? "open:" : "") +
+                            std::to_string(close.size()) + ":" + std::string(close) +
+                            std::string(identity);
     xgrammar::CompilationCacheAccess access;
     auto compiled = impl_->compiler.CompileCachedGrammar(
         key,
         [&] {
             auto grammar = build();
-            return close.empty() ? grammar
-                                 : xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
+            if (close.empty()) return grammar;
+            auto closed = xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
+            return may_end ? xgrammar::Grammar::Union({reasoning_prefix(close, true), closed})
+                           : closed;
         },
         &access);
     auto session =
         std::make_unique<GrammarSession::Impl>(compiled, static_cast<int>(impl_->vocab.size()));
     session->observed.cache = cache_access(access);
+    session->reasoning_may_end = may_end;
     if (!continuation.empty() && !session->matcher.AcceptString(std::string(continuation)))
         throw RequestError(RequestErrorKind::InvalidToolConstraint,
                            "assistant continuation is not a prefix of the tool grammar");
@@ -314,6 +328,8 @@ GrammarSession::GrammarSession(GrammarSession&&) noexcept            = default;
 GrammarSession& GrammarSession::operator=(GrammarSession&&) noexcept = default;
 
 std::size_t GrammarSession::mask_words() const noexcept { return impl_->words; }
+
+bool GrammarSession::reasoning_may_end() const noexcept { return impl_->reasoning_may_end; }
 
 std::uint64_t GrammarSession::masks(std::span<const std::int32_t> drafts,
                                     std::span<std::uint32_t> words) {

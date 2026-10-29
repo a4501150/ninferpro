@@ -33,6 +33,8 @@ public:
     void confirm() noexcept;
     void discard();
     [[nodiscard]] std::size_t mask_words() const noexcept;
+    // Whether the turn may end before the reasoning close (its thinking then stays open).
+    [[nodiscard]] bool reasoning_may_end() const noexcept;
     void observe(bool timings, double prepare_seconds = 0.0) noexcept;
     void uploaded(std::size_t bytes) noexcept;
     [[nodiscard]] ConstraintObservation observation() const;
@@ -53,10 +55,12 @@ public:
     [[nodiscard]] std::unique_ptr<GrammarSession> compile(const OutputConstraint& constraint,
                                                           std::string_view reasoning_close,
                                                           std::string_view continuation);
-    // Model-owned composition, built only on a miss in the same bounded compiler cache.
+    // Model-owned composition, built only on a miss in the same bounded compiler cache. With
+    // `reasoning_may_end`, the model's EOS is also allowed before `reasoning_close`.
     [[nodiscard]] std::unique_ptr<GrammarSession>
     compile_model(std::string_view identity, const std::function<xgrammar::Grammar()>& build,
-                  std::string_view reasoning_close, std::string_view continuation);
+                  std::string_view reasoning_close, std::string_view continuation,
+                  bool reasoning_may_end = false);
 
 private:
     class Impl;

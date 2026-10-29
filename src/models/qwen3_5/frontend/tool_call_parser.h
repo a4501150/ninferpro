@@ -20,9 +20,9 @@ struct ParsedToolCallOutput {
 };
 
 // The Markdown code state of answer text read so far: an open ``` or ~~~ fence, and the
-// backticks of the current paragraph. A tool-call marker of free output inside a fence or inline
-// code is a quoted example and stays text. Only the text before a marker decides, so streamed
-// and whole outputs agree.
+// backticks of the current paragraph. A tool-call marker inside a fence or inline code is a quoted
+// example and stays text, on the constrained route too (its grammar applies the same rule). Only
+// the text before a marker decides, so streamed and whole outputs agree.
 class MarkdownCodeTracker {
 public:
     void feed(std::string_view text);
@@ -40,7 +40,7 @@ private:
 // Parse Qwen's XML-like tool-call format. In tolerant mode, a complete function call is
 // recovered even when the model adds malformed wrapper markup, a trailing suffix, or stops at
 // its output budget before the closing tags; the strict parser keeps its all-or-nothing
-// behavior. For free output, a marker inside Markdown code is text; `code` is the code state of
+// behavior. A marker inside Markdown code is text; `code` is the code state of
 // the text before `text`.
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,

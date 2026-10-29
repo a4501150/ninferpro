@@ -993,11 +993,10 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  const ToolCallOutputContract& contract,
                                                  bool tolerant, MarkdownCodeTracker code) {
     const std::string_view source(text);
-    // A marker of free output inside Markdown code is a quoted example, never a call. Candidates
+    // A marker inside Markdown code is a quoted example, never a call. Candidates
     // only move forward, so the tracker reads each byte once.
     std::size_t tracked = 0;
     const auto quoted   = [&](std::size_t at) {
-        if (contract.constrained) { return false; }
         code.feed(source.substr(tracked, at - tracked));
         tracked = at;
         return code.in_code();
@@ -1096,7 +1095,7 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
             if (matches_any_marker(pending_tag_, tool_call_only)) {
                 MarkdownCodeTracker before_marker = code_;
                 before_marker.feed(trailing_whitespace_);
-                if (!contract_->constrained && before_marker.in_code()) {
+                if (before_marker.in_code()) {
                     // A quoted example inside Markdown code: the marker is text.
                     publish(trailing_whitespace_);
                     trailing_whitespace_.clear();
@@ -1169,12 +1168,26 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reaso
     if (!contract_) { return {}; }
 
     // Only a turn the model ended itself recovers calls from its open thinking; an output,
-    // context or cancellation cut leaves a call it was still deliberating over unexecuted.
-    if (tolerant_ && !contract_->constrained && reason == FinishReason::StopToken &&
-        !open_reasoning.empty() && !fed_content_) {
+    // context or cancellation cut leaves a call it was still deliberating over unexecuted. The
+    // grammar never checked thinking, so a constrained turn keeps only what its grammar would have
+    // admitted without checking values: calls to non-strict tools, one unless parallel.
+    if (tolerant_ && reason == FinishReason::StopToken && !open_reasoning.empty() &&
+        !fed_content_ && !(contract_->constrained && contract_->required)) {
         ParsedToolCallOutput recovered =
             parse_open_reasoning_calls(open_reasoning, max_tool_name_length_, *contract_);
-        if (recovered.is_tool_call_response) {
+        const auto admitted = [&] {
+            if (!contract_->constrained) return true;
+            if (!contract_->parallel && recovered.tool_calls.size() > 1) return false;
+            return std::all_of(recovered.tool_calls.begin(), recovered.tool_calls.end(),
+                               [&](const GeneratedToolCall& call) {
+                                   return std::any_of(
+                                       contract_->tools.begin(), contract_->tools.end(),
+                                       [&](const auto& tool) {
+                                           return tool.name == call.name && !tool.strict;
+                                       });
+                               });
+        };
+        if (recovered.is_tool_call_response && admitted()) {
             return Terminal{.content     = {},
                             .tool_calls  = std::move(recovered.tool_calls),
                             .diagnostics = recovered.diagnostics};

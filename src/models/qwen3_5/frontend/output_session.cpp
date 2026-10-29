@@ -415,7 +415,9 @@ public:
           split_reasoning(starts_in_reasoning && !output.raw),
           collect_open_reasoning(split_reasoning && output.tolerant_tool_calls &&
                                  tool_call_output_ != nullptr &&
-                                 !tool_call_output_->constrained && grammar_ == nullptr),
+                                 (grammar_ == nullptr ? !tool_call_output_->constrained
+                                                      : tool_call_output_->constrained &&
+                                                            grammar_->reasoning_may_end())),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length, output.tolerant_tool_calls),
           grammar(std::move(grammar_)), combined(combined_) {

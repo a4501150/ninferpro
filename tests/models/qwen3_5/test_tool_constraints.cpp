@@ -1,3 +1,4 @@
+#include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/tool_contract.h"
 #include "models/qwen3_5/frontend/tool_grammar.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
@@ -179,10 +180,121 @@ void selected_contracts(infernix::text::GrammarCompiler& compiled) {
     }
 }
 
+// Feeds `text` and reports whether it was admitted and which of `probes` may follow it.
+struct Fed {
+    bool admitted = false;
+    bool eos      = false;
+    bool other    = false; // a byte that cannot continue a call opener's framing
+};
+
+Fed feed(infernix::text::GrammarCompiler& compiler,
+         const frontend::ToolCallOutputContract& contract, std::string_view close,
+         std::string_view text) {
+    auto matcher = frontend::compile_tool_grammar(compiler, contract, close, {});
+    std::vector<std::uint32_t> words(matcher->mask_words());
+    for (unsigned char c : text) {
+        if (matcher->masks({}, words) || !(words[c / 32] & (1u << (c % 32)))) return {};
+        matcher->accept(c);
+        matcher->confirm();
+    }
+    (void)matcher->masks({}, words);
+    return {true, (words[256 / 32] & 1u) != 0, (words['x' / 32] & (1u << ('x' % 32))) != 0};
+}
+
+// The grammar and the decoder agree with MarkdownCodeTracker on where a call opener is quoted:
+// random answer text before an opener, against the tracker as the oracle.
+void quoted_openers(infernix::text::GrammarCompiler& compiled) {
+    const auto basic = contract(schema({{"type", "string"}}), false);
+    const std::vector<std::string_view> pieces{
+        "`", "``", "```", "~~~", "~", "\n", "\n\n", " ", "\t", "  ", "a", "word", "<", "<tool_",
+        "<tool_call", "```py", "x```", "\r", "é"};
+    std::uint64_t seed = 0x9e3779b97f4a7c15ull;
+    const auto next    = [&] {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        return seed;
+    };
+    std::size_t quoted = 0, opened = 0;
+    for (int trial = 0; trial < 600; ++trial) {
+        std::string prefix;
+        const auto length = next() % 14;
+        for (std::uint64_t i = 0; i < length; ++i) prefix += pieces[next() % pieces.size()];
+        // A prefix that already holds an unquoted opener would start its own call.
+        if (prefix.find("<tool_call>") != std::string::npos) continue;
+        frontend::MarkdownCodeTracker tracker;
+        tracker.feed(prefix);
+        const bool in_code = tracker.in_code();
+        const auto at      = feed(compiled, *basic, {}, prefix + "<tool_call>");
+        require(at.admitted, "the grammar refused answer text");
+        require(at.other == in_code, "the grammar and the code tracker disagree on an opener");
+        frontend::ToolCallOutputDecoder decoder(basic, 64);
+        const auto text = prefix + call("v");
+        require(feed(compiled, *basic, {}, text).eos, "the grammar refused text and a call");
+        std::string published;
+        for (char c : text) published += decoder.feed(std::string_view(&c, 1));
+        const auto result = decoder.finish();
+        require(result.tool_calls.size() == (in_code ? 0u : 1u),
+                "the decoder and the grammar disagree on an opener");
+        if (in_code)
+            require(published + result.content == text, "quoted call text was not published");
+        (in_code ? quoted : opened) += 1;
+    }
+    require(quoted > 50 && opened > 50, "the random answers did not cover both cases");
+
+    // The 2026-10-29 incident: prose quoting the markup in inline code had been forced into a call.
+    const std::string prose = "14 of its reasoning blocks contain leaked `<tool_call>`/"
+                              "`<function=...>`/`<parameter=...>` XML.";
+    const auto quoted_prose = feed(compiled, *basic, {}, prose);
+    require(quoted_prose.admitted && quoted_prose.eos, "quoted markup did not stay answer text");
+    frontend::ToolCallOutputDecoder decoder(basic, 64);
+    const auto published = decoder.feed(prose);
+    const auto result    = decoder.finish();
+    require(result.tool_calls.empty() && published + result.content == prose,
+            "quoted markup became a call");
+    require(!feed(compiled, *basic, {}, "Calling it: <tool_call>").other,
+            "an unquoted opener no longer starts a call");
+}
+
+// A turn of an auto contract may end in its thinking; tolerant recovery then keeps the calls the
+// model wrote there. Without the end, such a turn could only write more calls (2026-10-28).
+void open_thinking(infernix::text::GrammarCompiler& compiled) {
+    const std::string_view close = frontend::kCanonicalReasoningCloseSerialization;
+    const auto loose             = contract(schema({{"type", "string"}}), false);
+    const auto thinking          = "Let me look.\n\n" + call("ls");
+    require(feed(compiled, *loose, close, thinking).eos, "an auto turn cannot end in its thinking");
+    require(feed(compiled, *loose, close, "Done." + std::string(close) + "Answer.").eos,
+            "a closed thinking lost its answer");
+    require(!feed(compiled, *loose, close, "Done." + std::string(close) + "<tool_call>").other,
+            "the close no longer leads into the answer grammar");
+    infernix::ToolChoice required;
+    required.mode       = infernix::ToolChoiceMode::Required;
+    const auto forced   = contract(schema({{"type", "string"}}), false, required);
+    require(!feed(compiled, *forced, close, thinking).eos, "a required call ended in thinking");
+
+    const auto recover = [&](const auto& bound, std::string_view reasoning) {
+        frontend::ToolCallOutputDecoder decoder(bound, 64, true);
+        return decoder.finish(infernix::FinishReason::StopToken, reasoning).tool_calls.size();
+    };
+    require(recover(loose, thinking) == 1, "a constrained turn lost the call in its thinking");
+    require(recover(contract(schema({{"type", "string"}}), true), thinking) == 0,
+            "a strict call was recovered without its value check");
+    infernix::ToolChoice single;
+    single.parallel = false;
+    require(recover(contract(schema({{"type", "string"}}), false, single),
+                    thinking + "\n" + call("pwd")) == 0,
+            "recovery admitted calls a single-call contract refuses");
+    frontend::ToolCallOutputDecoder strict_mode(loose, 64, false);
+    require(strict_mode.finish(infernix::FinishReason::StopToken, thinking).tool_calls.empty(),
+            "recovery ran without tolerant mode");
+}
+
 void run() {
     auto compiled = compiler();
     basic_contracts(compiled);
     selected_contracts(compiled);
+    quoted_openers(compiled);
+    open_thinking(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =
