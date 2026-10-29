@@ -14,7 +14,11 @@
 //               golden tokens (--check FILE; --record FILE writes them), and equal them again with all
 //               six in flight, resumed from the prefix cache, and after the placement switch.
 //
+// --prefix-cache-disk DIR adds the prefix cache's Disk tier (DIR emptied first, removed after) and
+// --host-context-mib N sizes its RAM tier (0: off), as the server flags do.
+//
 //   infernix_qwen4_exp_smoke_real_test [--check FILE | --record FILE] [--tokens N]
+//                                      [--prefix-cache-disk DIR] [--host-context-mib N]
 
 #include "infernix/engine.h"
 
@@ -28,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -90,6 +95,8 @@ struct Setup {
     const char* artifact = nullptr;
     const char* ngram    = nullptr;
     const char* drafter  = nullptr;
+    std::filesystem::path disk;              // the Disk tier's directory (empty: none)
+    std::optional<std::uint64_t> host_bytes; // the RAM tier (unset: the default)
 };
 
 infernix::EngineOptions production_options(const Setup& setup, bool fast_paths) {
@@ -106,6 +113,11 @@ infernix::EngineOptions production_options(const Setup& setup, bool fast_paths) 
     options.speculative.draft_tokens_auto  = true;
     options.speculative.proposal_head      = infernix::ProposalHead::Optimized;
     options.enable_vision                  = true; // production's --vision (serve_infernix.sh)
+    if (!setup.disk.empty()) {
+        options.context_cache.hybrid.disk_directory      = setup.disk;
+        options.context_cache.hybrid.persistent_identity = "smoke";
+    }
+    if (setup.host_bytes) { options.context_cache.host_capacity_bytes = *setup.host_bytes; }
     return options;
 }
 
@@ -334,6 +346,10 @@ int main(int argc, char** argv) {
             check_path = argv[++i];
         } else if (arg == "--record" && i + 1 < argc) {
             record_path = argv[++i];
+        } else if (arg == "--prefix-cache-disk" && i + 1 < argc) {
+            setup.disk = argv[++i];
+        } else if (arg == "--host-context-mib" && i + 1 < argc) {
+            setup.host_bytes = std::stoull(argv[++i]) << 20U;
         } else if (arg == "--tokens" && i + 1 < argc) {
             tokens = static_cast<std::uint32_t>(std::stoul(argv[++i]));
         } else {
@@ -341,11 +357,14 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    std::error_code ignored;
+    if (!setup.disk.empty()) { std::filesystem::remove_all(setup.disk, ignored); }
     try {
         const auto t0 = std::chrono::steady_clock::now();
         int failures  = production(setup, tokens);
         failures += exact(setup, tokens, check_path, record_path);
         std::printf("%s in %.1f s\n", failures == 0 ? "PASS" : "FAIL", seconds_since(t0));
+        if (!setup.disk.empty()) { std::filesystem::remove_all(setup.disk, ignored); }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& e) {
         std::printf("FAIL: %s\n", e.what());

@@ -109,8 +109,8 @@ int main() {
         failures += check(
             seen.records.back().severity == OperationalSeverity::Warning &&
                 contains(seen.records.back().message, "exiting without saving the prefix cache") &&
-                contains(seen.records.back().message, "previous file is kept"),
-            "exiting during the save must say the previous file is kept");
+                contains(seen.records.back().message, "saved before is kept"),
+            "exiting during the save must say what was saved before is kept");
     }
 
     {

@@ -477,7 +477,7 @@ conversation's next turn resumes from a snapshot of the model state and prefills
 tokens; KV blocks are shared across requests. `infernix` (one request) runs without it.
 
 - **Host RAM.** Snapshots (116 MB each) and KV blocks live in one pinned Host pool,
-  `--host-context-mib` (default 8192, must be positive; it comes out of the RAM the automatic
+  `--host-context-mib` (default 8192; 0 only with `--prefix-cache-disk`; it comes out of the RAM the automatic
   `--expert-ram-mib` and `--expert-pin-mib` leave the experts). It is pinned at startup and counted in the
   RAM ledger (`prefix cache` in the ledger line that `--log-level debug` prints). `--no-prefix-reuse` turns the cache off and frees
   that RAM for the experts.
@@ -494,13 +494,17 @@ tokens; KV blocks are shared across requests. `infernix` (one request) runs with
 - **Exactness.** A resumed request computes what the request that left the snapshot computed; it
   may differ from an uncached run where two tokens are near ties. `--no-prefix-reuse` gives
   uncached runs.
-- `--prefix-cache-file PATH` saves the Host tier when the server stops and restores it at the next
-  start, as for Qwen3.5 ([serving](serving.md)); a file from another artifact, KV format, drafter
-  or `infernix-serve` build is ignored and replaced. `--prefix-cache-save-mins N` also saves it
-  every N minutes while serving (only when it changed; requests wait while the file is written, a
-  few seconds for several GB; the file is replaced only once the new one is complete). Each save
-  rewrites the whole file, so a short interval adds a lot of SSD wear: prefer 15-60 minutes.
-- Not available for this model: `--device-snapshot-slots`.
+- **SSD tier.** `--prefix-cache-disk DIR` adds a tier on the SSD, `--prefix-cache-disk-gib N`
+  large (default 64), that keeps blocks and snapshots across restarts and can be larger than RAM
+  ([serving](serving.md)). With the Host pool, snapshots it would evict next are written to the
+  SSD once and the rest when the server stops; with `--host-context-mib 0` there is no Host pool
+  and every snapshot is written to the SSD when captured. A request whose source is only on the
+  SSD waits while it is read (about 110 MiB per snapshot), then resumes as from RAM. A restart
+  rebuilds the SSD tier's entries at once, without reading their data; another artifact, KV format,
+  drafter, size or `infernix-serve` build empties it. Transfers use cuFile: GPUDirect Storage with
+  the `nvidia_fs` module loaded, its compatibility mode otherwise.
+- Not available for this model: `--device-snapshot-slots`, `--prefix-cache-file` (use
+  `--prefix-cache-disk`).
 
 ## SSD expert tier
 

@@ -139,19 +139,15 @@ void Program::shutdown_cleanup() noexcept {
     impl_->report_cache_layers();
     impl_->release_all();
     impl_->save_expert_state();
-    impl_->save_prefix_cache_for_shutdown();
+    impl_->spill_prefix_cache_for_shutdown();
 }
 
-PrefixCachePersistence Program::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
-                                                         const StartupObserver& observer) {
-    return impl_->attach_prefix_cache_file(path, std::move(fingerprint), observer);
+PrefixCacheDiskOpen Program::attach_prefix_cache_disk(const std::filesystem::path& directory,
+                                                      std::string_view fingerprint) {
+    return impl_->attach_prefix_cache_disk(directory, fingerprint);
 }
 
-std::optional<PrefixCachePersistence> Program::prefix_shutdown_save() const { return impl_->prefix_shutdown_save(); }
-
-std::optional<PrefixCachePersistence> Program::save_prefix_cache_now(const CancellationView& abandoned) {
-    return impl_->save_prefix_cache_now(abandoned);
-}
+std::optional<PrefixCacheDiskSpill> Program::prefix_shutdown_spill() const { return impl_->prefix_shutdown_spill(); }
 
 ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target, const ScoreOptions& options) {
     return impl_->causal_score(std::move(prompt), first_target, options);

@@ -2872,7 +2872,7 @@ guide, is `--kv-dtype int8 --max-context 262144` at C=1, with the recipe-B artif
 | `--ngram-volume FILE` | `<artifact>.ngram` | N-gram table volume, which may sit on another NVMe drive (§12.3) |
 | `--no-prefix-reuse` | existing (reuse on in `infernix-serve`; `infernix` keeps the cache off) | Disables prefix reuse, for strict run-to-run reproducibility. **Reuse changes output at near-ties:** a resume equals its capturing lineage, not an uncached run (§19.3.1) |
 | `--host-context-mib N`, `--device-snapshot-slots N` | 8192 and 0 for this model | Prefix Host tier (§15.2); Device snapshot slots, 41.8 frames each; 0 MiB needs ≥ 1 slot |
-| `--prefix-cache-file PATH` | existing (off) | Prefix-cache persistence; for this model blocks also store `mtp_next` and snapshots their meta. Decided (default, 2026-10-04): built after P6, since any rebuild invalidates it (§19.3.1) |
+| `--prefix-cache-disk DIR`, `--prefix-cache-disk-gib N` | off, 64 | The prefix cache's Disk tier (§19.3.1), replacing `--prefix-cache-file` for this model (2026-10-29): blocks and snapshots across restarts, larger than RAM; `--host-context-mib 0` with it writes every snapshot through |
 | `--kv-capacity N\|auto` | existing | Plus one copy-on-write page per lane (0.34 frames each) for prefix resumes (§19.3.1) |
 | `--vision-offload auto\|on\|off` | `auto`: on here, off for Qwen3.5 | Vision weights in pinned host RAM, streamed per window (§19.3.2) |
 | `--kv-host-tier auto\|off\|TOKENS` | `auto` (65,536) | QSA KV host tier threshold (§9.6) |
@@ -4254,9 +4254,33 @@ lane-private.
 #### Binding `Qwen4ExpPrefixCache` (`src/models/qwen4_exp/program/prefix/`)
 
 Files `prefix_cache.{h,cpp}`, `prefix_program.cpp`, `state_image.{h,cpp}`, `call_plan.{h,cpp}`,
-`persist.cpp`. The binding owns `block id → DeviceKVPageLease`, `node → mtp_next` (4 B), the slab
-pool, the write-through queue, restore batches with per-layer events, copy-outs, capture records,
-the `PrefixIndexBackend` callbacks and `poll`/`drain`/`clear`.
+`disk_tier.cpp`, `disk_store.{h,cpp}`. The binding owns `block id → DeviceKVPageLease`, `node →
+mtp_next` (4 B), the slab pool, the write-through queue, restore batches with per-layer events,
+copy-outs, capture records, the Disk tier (its store, VRAM staging regions, spills, fetches and
+journal; hybrid-prefix-cache-spec §17), the `PrefixIndexBackend` callbacks and
+`poll`/`drain`/`clear`.
+
+- **Disk tier (2026-10-29).** `--prefix-cache-disk DIR` adds Disk slots of one slab each to the
+  index (a third residency, `prefix-cache-disk-gib`, default 64 GiB) and replaces the whole-file
+  save, which rewrote up to the whole Host tier every save interval and could never exceed RAM.
+  Transfers are cuFile batch I/O polled from `poll()`: on the T710 in compatibility mode, batch
+  reads reached 10.5 GiB/s from one thread where the stream-ordered `cuFileReadAsync` reached
+  2.9-3.6 GiB/s (2026-10-29, production running), so the restore's per-layer events stay on the
+  copy streams and a Disk read happens before the admission, which is deferred meanwhile. With the
+  Host tier, cold retained snapshots are spilled once (the Host eviction then keeps their Disk
+  copy); without it (`--host-context-mib 0`) captures write through from two VRAM staging regions
+  (2 × 125 slots, plus 64 block records: about 290 MB, taken from the expert frames). The
+  `cudaMemcpyDefault` copies of `state_image.cpp` and `DeviceKVPagePool::copy_host_run` let the
+  same capture and restore code address a region instead of Host slabs. cuFile 1.19 (CUDA 13.4)
+  forced two workarounds in `core/cufile_io`: its compatibility mode faults now and then inside
+  `cuFileBatchIOGetStatus` after batch reads into host memory (pinned or pageable, registered or
+  not; a standalone program reproduced it, device memory never), so host memory moves by
+  `pread`/`pwrite` on four queue threads; and a driver close followed by a reopen in one process
+  freed its pools twice, so the driver opens once per process and stays open. A sequence that
+  recomputes a block replaces its Disk record like its Host record (`insert_block`); the records
+  below it then link to a removed record, so the binding rewrites the block and journals them
+  again after it (under MTP every repeat of a prompt-end snapshot republishes its anchor block:
+  one block write each).
 
 - **Pages without refcounts.** Path pins keep a pinned node's Device copy (`prefix_index.h:24-27`);
   a lane holds private leases plus its path, and `insert_block` moves its lease to a new node or an
@@ -4359,9 +4383,8 @@ documented as a reproducibility trade-off, not a quality one.
   Device tail if F % 64 ≠ 0, the mismatched anchor if F % 64 == 0: exclusive cases; Host-only
   sources go straight into the private page; tap tails are Host-born). A whole-extent resume
   therefore fits at any C, all lanes at once; the source pin drops after activation, leaving E.
-- **Device snapshot slots: 0.** `--device-snapshot-slots N` adds packed slots (115.7 MB = 41.8
-  frames each; D2D capture under the existing slot policy); N ≥ 1 is required with
-  `--host-context-mib 0`.
+- **Device snapshot slots: 0.** The binding has none (`--device-snapshot-slots` is refused);
+  `--host-context-mib 0` needs the Disk tier instead.
 - **Host tier: one pinned slab pool, 4 GiB** (the §15.2 row; it replaced the earlier 2.0 GB
   checkpoint tier). Of 95.8 GiB the model pins 64.5 GiB, leaving ≈ 31 GiB; Vision adds 856 MiB of
   tower weights and ≥ 0.4 GB of pageable media buffers (§19.3.2). Resolved in the Program
@@ -4490,10 +4513,10 @@ GPU's staging reads; worker scheduling on P- and E-cores.
 | Flag | Qwen4Exp semantics |
 |---|---|
 | `--no-prefix-reuse` | Disables the cache: `allow_prefix_reuse = false` → `publish_continuation = false` (today hard-coded false, `program.cpp:389`) |
-| `--host-context-mib N` | **Default 8192** (4096 until 2026-10-17), clamped as above; 0 = Device-only (requires `--device-snapshot-slots ≥ 1`) |
+| `--host-context-mib N` | **Default 8192** (4096 until 2026-10-17), clamped as above; 0 only with `--prefix-cache-disk` (snapshots then write through to the Disk tier) |
 | `--device-snapshot-slots N` | **Default 0** (Qwen3.5: C + 1) |
 | `--cache-taps-per-request`, `--cache-tap-ladder`, `--cache-tap-min-gap` | Unchanged: 8 / max(4096, 2·chunk) / max(1024, chunk) |
-| `--prefix-cache-file PATH` | Unchanged; Qwen4Exp blocks persist `mtp_next`, snapshots their meta (after P6) |
+| `--prefix-cache-disk DIR`, `--prefix-cache-disk-gib N` | The Disk tier (2026-10-29); `--prefix-cache-file` and `--prefix-cache-save-mins` are rejected for Qwen4Exp |
 | `--kv-capacity N\|auto` | `auto` = `max_context × C`; both get the C spare pages (documented) |
 | `--use-original-prefix-caching` | Rejected for Qwen4Exp with a clear message (the flag and the original cache were removed on 2026-10-09) |
 

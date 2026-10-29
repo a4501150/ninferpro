@@ -265,6 +265,7 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         << product::format_pretty_percent(cache_ratio);
     if (metrics.prefix_reuse_path != infernix::PrefixReusePath::Root) {
         out << ", " << prefix_reuse_path_name(metrics.prefix_reuse_path);
+        if (metrics.prefix_from_disk) { out << ", from disk"; }
     }
     out << ") | TTFT " << product::format_pretty_duration(metrics.ttft_seconds) << " | total "
         << product::format_pretty_duration(metrics.total_seconds);
@@ -556,7 +557,14 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                    product::format_pretty_bytes(memory.available_after_startup_bytes));
 
     if (cache.enabled) {
-        logger_->info("prefix cache | on | {} in RAM", product::format_pretty_bytes(*cache.host_capacity_bytes));
+        const infernix::LoadSummary::PrefixCacheDisk& disk = service.load_summary().prefix_disk;
+        std::string tiers = *cache.host_capacity_bytes != 0
+                                ? product::format_pretty_bytes(*cache.host_capacity_bytes) + " in RAM"
+                                : std::string("RAM off");
+        if (disk.attached) {
+            tiers += ", " + product::format_pretty_bytes(disk.capacity_bytes) + " on disk (" + disk.mode + ")";
+        }
+        logger_->info("prefix cache | on | {}", tiers);
     } else {
         logger_->info("prefix cache | off");
     }

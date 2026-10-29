@@ -22,10 +22,14 @@
 //   The comparisons with cold runs need the artifact's exact route to be construction-exact
 //   (recipe C, bf16, int8 or fp8 KV; model-quality.md §6.8); under MTP the drafter's kernels are
 //   column-invariant there too, so the resumed run's drafted and accepted counts equal the cold run's.
-//   X12          (both modes) Engine 1 serves two chat turns and stops, saving its Host tier to a file;
-//                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
-//                Between the turns, Engine 1's periodic save writes the file once and, with the Host
-//                tier unchanged, not again.
+//   X12          (both modes) Engine 1 serves two chat turns and stops, spilling its Host tier to the
+//                Disk tier; Engine 2 rebuilds it and resumes turn 2 from it, generating what Engine 1 did.
+//   Disk tier    (both modes, own Engines) The zero-token resume through the Disk tier with the RAM
+//                tier on (the stop's spill) and off (write-through, fetched back in the same Engine),
+//                across a restart, after a damaged journal tail, with unreadable images (a miss), and
+//                with another build identity (emptied); and a small RAM tier that spills under
+//                pressure and serves a repeat back from the Disk tier. INFERNIX_TEST_DISK_DIR puts
+//                the tier on a given filesystem.
 //   one context  (MTP mode, own Engine with kv_capacity = max_context) A recomputed cached prefix
 //                replaces the cached copies instead of pinning them beside its pages: the request
 //                completes, equals its cold run, and the Engine keeps serving.
@@ -36,7 +40,7 @@
 //                sits within one tap separation of n — a one-call span's tail tap, an opener
 //                that realized just below n — skips the capture by value and its case asserts the
 //                fallback), a constrained repeat (the draws advance on the resumed sample), the
-//                repeat-then-repeat-again case, and the same reuse through the persistence file.
+//                repeat-then-repeat-again case, and the same reuse through the Disk tier.
 //                A second Engine at concurrency 2 repeats two graph-warmed prompts in parallel.
 //                Under MTP the snapshot is the transition with the drafter's pending cell unwritten,
 //                and each repeat's rounds, drafted and accepted counts equal its capturing run's
@@ -45,19 +49,22 @@
 //                round's step 0, so no count can see it); the block-aligned end exercises the
 //                anchor block published after the first round.
 //
-//   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain] [--zero]   (default: both modes;
-//   --zero runs only the zero-token and persistence scenarios, in the selected modes)
+//   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain] [--zero | --disk]   (default: both
+//   modes; --zero runs only the zero-token and persistence scenarios, --disk only the Disk tier's,
+//   in the selected modes)
 
 #include "test_temp_path.h"
 #include "kv_cache_storage.h"
 #include "infernix/engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -456,60 +463,185 @@ int run_zero_token(const char* artifact, const char* ngram, bool mtp) {
     return failures;
 }
 
-// The same whole-prompt reuse through the persistence file (X12's chat prompts are value-gated:
-// their openers realize within one separation of n, so they exercise the opener fallback): a
-// tap-free multi-call prompt's snapshot — its image carrying the saved head residual — saves at
-// the Engine's stop, restores into a fresh Engine, and the repeat still regenerates its first
-// token with no prefill at all. Under MTP the prompt ends on a block boundary, so the restored
-// snapshot's anchor is the block the capturing run published after its first round. Its own
-// engines, one alive at a time (a second boot beside a live Engine does not fit the model's
-// experts in VRAM and falls back to the RAM tier).
-int run_zero_token_from_file(const char* artifact, const char* ngram, bool mtp) {
-    std::printf("== the zero-token resume from the persistence file (%s, free cache resume)\n", mode_name(mtp));
-    const std::filesystem::path file = infernix::test::unique_temp_path("infernix_qwen4_exp_zero.cache");
+// The Disk tier's directory: INFERNIX_TEST_DISK_DIR puts it on a given filesystem (the SSD the
+// tier is meant for); otherwise it lives in the system temp directory.
+std::filesystem::path disk_directory(const char* name) {
+    const char* root = std::getenv("INFERNIX_TEST_DISK_DIR");
+    if (root != nullptr && *root != '\0') {
+        return std::filesystem::path(root) / infernix::test::unique_temp_path(name).filename();
+    }
+    return infernix::test::unique_temp_path(name);
+}
+
+void use_disk(infernix::EngineOptions& options, const std::filesystem::path& directory, const char* identity) {
+    options.context_cache.hybrid.disk_directory      = directory;
+    options.context_cache.hybrid.disk_capacity_bytes = 4ULL << 30;
+    options.context_cache.hybrid.persistent_identity = identity;
+}
+
+// Zeroes the slot file's first GiB: the index takes the lowest free slots, so every image these
+// scenarios wrote stops matching its journal record (and every block loses its bytes).
+void zero_used_slots(const std::filesystem::path& directory) {
+    std::fstream slots(directory / "slots.bin", std::ios::binary | std::ios::in | std::ios::out);
+    const std::uint64_t size = std::min<std::uint64_t>(std::filesystem::file_size(directory / "slots.bin"), 1ULL << 30);
+    const std::vector<char> zeros(1U << 20, 0);
+    for (std::uint64_t at = 0; at < size; at += zeros.size()) {
+        slots.write(zeros.data(), static_cast<std::streamsize>(std::min<std::uint64_t>(zeros.size(), size - at)));
+    }
+}
+
+// The same whole-prompt reuse through the Disk tier, in both data paths: with the RAM tier, the
+// snapshot reaches the Disk at the Engine's stop (the spill); without it (host 0), every capture
+// is written through, so a repeat in the same Engine already reads its image from the Disk. A
+// fresh Engine rebuilds the entries from the journal and the repeat regenerates its first token
+// with no prefill at all (a tap-free multi-call prompt; under MTP the prompt ends on a block
+// boundary, so the anchor is the block published after the first round). Then the tier's
+// failures give misses, not errors: a damaged journal tail keeps the records before it, images
+// whose header no longer matches their record are not resumed from, and another build identity
+// empties the tier. Its own engines, one alive at a time (a second boot beside a live Engine does
+// not fit the model's experts in VRAM).
+int run_zero_token_disk(const char* artifact, const char* ngram, bool mtp, bool host) {
+    std::printf("== the zero-token resume through the Disk tier (%s, RAM tier %s)\n", mode_name(mtp),
+                host ? "on" : "off");
+    const std::filesystem::path directory = disk_directory(host ? "qwen4_exp_zero_disk_ram" : "qwen4_exp_zero_disk");
     std::error_code ignored;
-    std::filesystem::remove(file, ignored);
+    std::filesystem::remove_all(directory, ignored);
     infernix::EngineOptions zero = base_options(artifact, ngram);
     use_mode(zero, mtp);
-    zero.context_cache.host_capacity_bytes = 8ULL << 30;
+    zero.context_cache.host_capacity_bytes = host ? 8ULL << 30 : 0U;
     zero.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(9216);
+    use_disk(zero, directory, "zero");
     const std::size_t tokens               = mtp ? 1536 : 1500;
+    const std::vector<infernix::TokenId> p = synthetic_tokens(tokens, 38);
     Run saved_run;
     int failures = 0;
-    {
-        infernix::EngineOptions o                = zero;
-        o.context_cache.hybrid.persistent_file     = file;
-        o.context_cache.hybrid.persistent_identity = "zero";
-        infernix::Engine saving(o);
-        const std::vector<infernix::TokenId> p = synthetic_tokens(tokens, 38);
-        saved_run                              = generate(saving, p, 48, true);
-        failures += check(saved_run.reused == 0, "the file's capturing run is cold");
-    } // the stop saves the file with the prompt-end snapshot retained (its own endpoint does not supersede it)
-    {
-        infernix::EngineOptions o                = zero;
-        o.context_cache.hybrid.persistent_file     = file;
-        o.context_cache.hybrid.persistent_identity = "zero";
-        infernix::Engine engine(o);
-        const infernix::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
-        failures += check(restore.restored && restore.snapshots > 0, "the zero-token file restores its snapshots");
-        const std::vector<infernix::TokenId> p = synthetic_tokens(tokens, 38);
+    const auto zero_token = [&](infernix::Engine& engine, const std::string& what) {
         const infernix::GenerationResult repeat = engine.generate(engine.prepare_tokens(p), greedy(48, true));
-        std::printf("        from file: reused %u, computed %u\n", repeat.reused_prompt_tokens,
+        std::printf("        %s: reused %u, computed %u\n", what.c_str(), repeat.reused_prompt_tokens,
                     repeat.computed_prefill_tokens);
         failures += check(repeat.reused_prompt_tokens == tokens && repeat.computed_prefill_tokens == 0,
-                          "the restored prompt-end snapshot serves a zero-token resume (reused " +
-                              std::to_string(repeat.reused_prompt_tokens) + ", computed " +
-                              std::to_string(repeat.computed_prefill_tokens) + ")");
+                          what + ": a zero-token resume (reused " + std::to_string(repeat.reused_prompt_tokens) +
+                              ", computed " + std::to_string(repeat.computed_prefill_tokens) + ")");
         failures += check(repeat.generated_token_ids == saved_run.tokens,
-                          "the restored zero-token resume equals the capturing run (" +
+                          what + ": equals the capturing run (" +
                               first_difference(repeat.generated_token_ids, saved_run.tokens) + ")");
         if (mtp) {
             failures += check(drafts_equal(repeat.speculative, saved_run.speculative),
-                              "the restored zero-token resume drafts as the capturing run (" +
+                              what + ": drafts as the capturing run (" +
                                   drafts_text(repeat.speculative, saved_run.speculative) + ")");
         }
+    };
+    {
+        infernix::Engine engine(zero);
+        const infernix::LoadSummary::PrefixCacheDisk disk = engine.load_summary().prefix_disk;
+        std::printf("        Disk tier: cuFile %s (%s)\n", disk.mode.c_str(), disk.reset_reason.c_str());
+        failures += check(disk.attached && !disk.reset_reason.empty() && disk.snapshots == 0,
+                          "a new Disk tier starts empty");
+        saved_run = generate(engine, p, 48, true);
+        failures += check(saved_run.reused == 0, "the capturing run is cold");
+        if (!host) {
+            zero_token(engine, "written through, the repeat");
+            const infernix::RuntimeStats stats = engine.runtime_stats();
+            std::printf("        Disk writes %llu images, %llu blocks; fetches %llu, %llu bytes read\n",
+                        static_cast<unsigned long long>(stats.hybrid_disk_image_writes),
+                        static_cast<unsigned long long>(stats.hybrid_disk_block_writes),
+                        static_cast<unsigned long long>(stats.hybrid_disk_fetches),
+                        static_cast<unsigned long long>(stats.hybrid_disk_read_bytes));
+            failures += check(stats.hybrid_disk_image_writes > 0 && stats.hybrid_disk_fetches > 0 &&
+                                  stats.hybrid_disk_failures == 0,
+                              "without the RAM tier the snapshot is written through and fetched back");
+        }
+    } // the stop spills the Host tier's snapshots (RAM tier on)
+    {
+        infernix::Engine engine(zero);
+        const infernix::LoadSummary::PrefixCacheDisk disk = engine.load_summary().prefix_disk;
+        std::printf("        rebuilt %llu snapshots and %llu blocks in %.3f s\n",
+                    static_cast<unsigned long long>(disk.snapshots), static_cast<unsigned long long>(disk.blocks),
+                    disk.seconds);
+        failures += check(disk.attached && disk.reset_reason.empty() && disk.snapshots > 0 && !disk.damaged,
+                          "a restarted Engine rebuilds the Disk tier's snapshots");
+        zero_token(engine, "after the restart, the repeat");
+        // RAM tier on: the fetched snapshot was promoted to the Host tier, which serves this one.
+        zero_token(engine, "after the restart, the repeat's repeat");
+        failures += check(engine.runtime_stats().hybrid_disk_fetches > 0, "the restarted Engine read the Disk tier");
     }
-    std::filesystem::remove(file, ignored);
+    {
+        // A torn record at the journal's end: the records before it still rebuild.
+        std::ofstream journal(directory / "catalog.log", std::ios::binary | std::ios::app);
+        journal.write("\x02\x40\x00\x00\x00torn", 9);
+    }
+    {
+        infernix::Engine engine(zero);
+        const infernix::LoadSummary::PrefixCacheDisk disk = engine.load_summary().prefix_disk;
+        std::printf("        after a damaged journal tail: rebuilt %llu snapshots and %llu blocks\n",
+                    static_cast<unsigned long long>(disk.snapshots), static_cast<unsigned long long>(disk.blocks));
+        failures += check(disk.damaged && disk.snapshots > 0, "a damaged journal tail keeps the records before it");
+        zero_token(engine, "after a damaged journal tail, the repeat");
+    }
+    zero_used_slots(directory);
+    {
+        infernix::Engine engine(zero);
+        const Run cold = generate(engine, p, 48, true);
+        const infernix::RuntimeStats stats = engine.runtime_stats();
+        std::printf("        damaged images: reused %u, Disk failures %llu\n", cold.reused,
+                    static_cast<unsigned long long>(stats.hybrid_disk_failures));
+        failures += check(cold.reused == 0 && cold.tokens == saved_run.tokens && stats.hybrid_disk_failures > 0,
+                          "an image whose header no longer matches its record is not resumed from (" +
+                              first_difference(cold.tokens, saved_run.tokens) + ")");
+    }
+    {
+        infernix::EngineOptions other = zero;
+        other.context_cache.hybrid.persistent_identity = "another build";
+        infernix::Engine engine(other);
+        const infernix::LoadSummary::PrefixCacheDisk disk = engine.load_summary().prefix_disk;
+        failures += check(!disk.reset_reason.empty() && disk.snapshots == 0 && disk.blocks == 0,
+                          "another build identity empties the Disk tier (" + disk.reset_reason + ")");
+    }
+    std::filesystem::remove_all(directory, ignored);
+    return failures;
+}
+
+// The RAM tier under pressure (room for three snapshot images): each new prompt's snapshots evict
+// the coldest Host entries, which were spilled to the Disk tier while the requests ran, so a
+// repeat of the first prompt still resumes with no prefill, reading its snapshot back from the Disk.
+int run_disk_pressure(const char* artifact, const char* ngram, bool mtp) {
+    std::printf("== the RAM tier spilling to the Disk tier under pressure (%s)\n", mode_name(mtp));
+    const std::filesystem::path directory = disk_directory("qwen4_exp_disk_pressure");
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    infernix::EngineOptions options = base_options(artifact, ngram);
+    use_mode(options, mtp);
+    options.context_cache.host_capacity_bytes = 400ULL << 20;
+    options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(9216);
+    use_disk(options, directory, "pressure");
+    int failures = 0;
+    {
+        infernix::Engine engine(options);
+        std::vector<Run> first;
+        for (std::uint32_t i = 0; i < 4; ++i) { first.push_back(generate(engine, synthetic_tokens(1500, 50 + i), 48, true)); }
+        const infernix::RuntimeStats spilled = engine.runtime_stats();
+        std::printf("        Disk writes %llu images, %llu blocks; Host evictions %llu\n",
+                    static_cast<unsigned long long>(spilled.hybrid_disk_image_writes),
+                    static_cast<unsigned long long>(spilled.hybrid_disk_block_writes),
+                    static_cast<unsigned long long>(spilled.hybrid_host_snapshot_evictions));
+        failures += check(spilled.hybrid_disk_image_writes > 0 && spilled.hybrid_host_snapshot_evictions > 0,
+                          "the RAM tier spilled snapshots before evicting them");
+        const Run repeat = generate(engine, synthetic_tokens(1500, 50), 48, true);
+        const infernix::RuntimeStats read = engine.runtime_stats();
+        std::printf("        repeat of the first prompt: reused %u; fetches %llu\n", repeat.reused,
+                    static_cast<unsigned long long>(read.hybrid_disk_fetches - spilled.hybrid_disk_fetches));
+        failures += check(repeat.reused == 1500 && read.hybrid_disk_fetches > spilled.hybrid_disk_fetches,
+                          "the first prompt's spilled snapshot serves its repeat from the Disk tier");
+        failures += check(repeat.tokens == first[0].tokens,
+                          "the repeat from the Disk tier equals the capturing run (" +
+                              first_difference(repeat.tokens, first[0].tokens) + ")");
+        if (mtp) {
+            failures += check(drafts_equal(repeat.speculative, first[0].speculative),
+                              "the repeat from the Disk tier drafts as the capturing run (" +
+                                  drafts_text(repeat.speculative, first[0].speculative) + ")");
+        }
+    }
+    std::filesystem::remove_all(directory, ignored);
     return failures;
 }
 
@@ -629,17 +761,16 @@ int run_one_context(const char* artifact, const char* ngram) {
     return failures;
 }
 
-// X12: the Host tier saved at an Engine's stop and loaded by the next Engine.
+// X12: the Host tier spilled to the Disk tier at an Engine's stop and rebuilt by the next Engine.
 int run_persistence(const char* artifact, const char* ngram, bool mtp) {
     std::printf("== persistence (X12, %s)\n", mode_name(mtp));
-    const std::filesystem::path file = infernix::test::unique_temp_path("infernix_qwen4_exp_x12.cache");
+    const std::filesystem::path directory = disk_directory("qwen4_exp_x12");
     std::error_code ignored;
-    std::filesystem::remove(file, ignored);
+    std::filesystem::remove_all(directory, ignored);
     const auto options = [&] {
-        infernix::EngineOptions o                       = base_options(artifact, ngram);
+        infernix::EngineOptions o = base_options(artifact, ngram);
         use_mode(o, mtp);
-        o.context_cache.hybrid.persistent_file     = file;
-        o.context_cache.hybrid.persistent_identity = "x12";
+        use_disk(o, directory, "x12");
         return o;
     };
     const infernix::ChatMessage system = message(infernix::ChatRole::System, rules_text());
@@ -649,39 +780,11 @@ int run_persistence(const char* artifact, const char* ngram, bool mtp) {
     std::vector<infernix::ChatMessage> turn2 = turn1;
     std::vector<infernix::TokenId> turn1_tokens;
     infernix::GenerationResult before;
-    std::filesystem::file_time_type periodic_write{};
     {
-        // Engine 1 also saves periodically (persistent_save_interval): after turn 1 the file appears
-        // while the Engine runs, through its .tmp, once the interval has passed after a change. A save
-        // during the request may find the Host tier still filling and the next one rewrite it; once
-        // the Host tier stops changing, the file holds the endpoint and is not rewritten.
-        infernix::EngineOptions o                       = options();
-        o.context_cache.hybrid.persistent_save_interval = std::chrono::seconds(1);
-        infernix::Engine engine(o);
-        failures += check(!engine.load_summary().prefix_cache.restored, "Engine 1 starts without a saved file");
-        failures += check(!std::filesystem::exists(file), "the periodic save starts without a file");
+        infernix::Engine engine(options());
+        failures += check(engine.load_summary().prefix_disk.snapshots == 0, "Engine 1 starts with an empty Disk tier");
         const infernix::GenerationResult r1 = chat_on(engine, turn1, 32);
         turn1_tokens = r1.generated_token_ids;
-        std::filesystem::path tmp = file;
-        tmp += ".tmp";
-        bool saved = false;
-        for (int i = 0; i < 300 && !saved; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            saved = std::filesystem::exists(file) && !std::filesystem::exists(tmp);
-        }
-        failures += check(saved, "the periodic save wrote the file while the Engine was idle");
-        bool settled = false;
-        for (int i = 0; i < 6 && saved && !settled; ++i) {
-            const auto written = std::filesystem::last_write_time(file, ignored);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1600)); // more than one interval
-            settled = std::filesystem::last_write_time(file, ignored) == written;
-        }
-        failures += check(settled, "an unchanged Host tier is not saved again");
-        const std::uintmax_t periodic_size = saved ? std::filesystem::file_size(file, ignored) : 0;
-        failures += check(periodic_size > (std::uintmax_t{64} << 20),
-                          "the settled periodic file holds turn 1's snapshot (" + std::to_string(periodic_size) +
-                              " bytes)");
-        periodic_write = std::filesystem::last_write_time(file, ignored);
         turn2.push_back(message(infernix::ChatRole::Assistant, r1.content));
         turn2.push_back(message(infernix::ChatRole::User, context + "And colour 3?"));
         before = chat_on(engine, turn2, 32);
@@ -689,7 +792,7 @@ int run_persistence(const char* artifact, const char* ngram, bool mtp) {
         // so the prompt-end capture is value-gated and the repeat resumes at the opener,
         // re-filling its 7-token tail call. It must still equal `before` (the exact route is
         // request-invariant); the gated capture's own zero-token path runs in the suite's own
-        // from-file scenario below, on a prompt with no nearby tap.
+        // from-Disk scenario below, on a prompt with no nearby tap.
         const infernix::GenerationResult before2 = chat_on(engine, turn2, 32);
         std::printf("        before2: reused %u, computed %u, %zu tokens (%s)\n",
                     before2.reused_prompt_tokens, before2.computed_prefill_tokens,
@@ -699,18 +802,14 @@ int run_persistence(const char* artifact, const char* ngram, bool mtp) {
                               before2.generated_token_ids == before.generated_token_ids,
                           "the repeat of a value-gated turn resumes at its opener (" +
                               first_difference(before2.generated_token_ids, before.generated_token_ids) + ")");
-    } // the stop saves the Host tier
-    std::error_code size_error;
-    const std::uintmax_t saved_bytes = std::filesystem::file_size(file, size_error);
-    failures += check(!size_error && saved_bytes > 0 && std::filesystem::last_write_time(file, ignored) != periodic_write,
-                      "the stop saved the Host tier (" + std::to_string(size_error ? 0U : saved_bytes) + " bytes)");
+    } // the stop spills the Host tier
     {
         infernix::Engine engine(options());
-        const infernix::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
-        std::printf("        restored %llu blocks and %llu snapshots (%s)\n",
-                    static_cast<unsigned long long>(restore.blocks), static_cast<unsigned long long>(restore.snapshots),
-                    restore.message.c_str());
-        failures += check(restore.restored && restore.snapshots > 0, "Engine 2 restores the saved snapshots");
+        const infernix::LoadSummary::PrefixCacheDisk restore = engine.load_summary().prefix_disk;
+        std::printf("        rebuilt %llu blocks and %llu snapshots\n",
+                    static_cast<unsigned long long>(restore.blocks), static_cast<unsigned long long>(restore.snapshots));
+        failures += check(restore.reset_reason.empty() && restore.snapshots > 0,
+                          "Engine 2 rebuilds the spilled snapshots");
         // Turn 2 again: Engine 1 left a snapshot at its own generation opener, so the restarted
         // Engine resumes there and repeats Engine 1's computation of turn 2.
         const infernix::GenerationResult after = chat_on(engine, turn2, 32);
@@ -748,7 +847,7 @@ int run_persistence(const char* artifact, const char* ngram, bool mtp) {
         failures += check(after.generated_token_ids == before.generated_token_ids,
                           "the restored resume equals Engine 1's turn 2 (" +
                               first_difference(after.generated_token_ids, before.generated_token_ids) + ")");
-        // The same restored opener serves the same repeat again: the from-file path is
+        // The same restored opener serves the same repeat again: the from-Disk path is
         // deterministic (a second divergence would be nondeterminism, not a state defect).
         const infernix::GenerationResult after2 = chat_on(engine, turn2, 32);
         failures += check(after2.computed_prefill_tokens <= 16U &&
@@ -758,31 +857,31 @@ int run_persistence(const char* artifact, const char* ngram, bool mtp) {
     }
     {
         // Turn 1's opener realized within one separation of its end, so its prompt-end capture
-        // is value-gated: a from-file repeat of turn 1 alone resumes at the opener and re-fills
+        // is value-gated: a from-Disk repeat of turn 1 alone resumes at the opener and re-fills
         // the 7-token cut. Engine 3 re-runs turn 1 (its transition state is r1's bit for bit)
         // and its stop saves the retained snapshots; Engine 4's repeat must still regenerate
         // r1's tokens exactly — the zero-token path itself runs on a tap-free prompt in the
-        // zero-token suite's own from-file scenario.
+        // zero-token suite's own from-Disk scenario.
         {
             infernix::Engine engine(options());
             const infernix::GenerationResult warm = chat_on(engine, turn1, 32);
             failures += check(warm.generated_token_ids == turn1_tokens,
                               "turn 1's re-run equals its cold run (" +
                                   first_difference(warm.generated_token_ids, turn1_tokens) + ")");
-        } // the stop saves the file with turn 1's retained snapshots
+        } // the stop spills turn 1's retained snapshots
         infernix::Engine engine(options());
         const infernix::GenerationResult repeat = chat_on(engine, turn1, 32);
-        std::printf("        turn 1 from file: reused %u of %u, computed %u, %zu tokens\n",
+        std::printf("        turn 1 from the Disk tier: reused %u of %u, computed %u, %zu tokens\n",
                     repeat.reused_prompt_tokens, repeat.prompt.prompt_tokens, repeat.computed_prefill_tokens,
                     repeat.generated_token_ids.size());
         failures += check(repeat.computed_prefill_tokens <= 16U,
-                          "turn 1's from-file repeat resumes at its opener (computed " +
+                          "turn 1's from-Disk repeat resumes at its opener (computed " +
                               std::to_string(repeat.computed_prefill_tokens) + ")");
         failures += check(repeat.generated_token_ids == turn1_tokens,
-                          "turn 1's from-file repeat equals its cold run (" +
+                          "turn 1's from-Disk repeat equals its cold run (" +
                               first_difference(repeat.generated_token_ids, turn1_tokens) + ")");
     }
-    std::filesystem::remove(file, ignored);
+    std::filesystem::remove_all(directory, ignored);
     return failures;
 }
 
@@ -796,12 +895,13 @@ int main(int argc, char** argv) {
         return 77;
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
-    bool plain = true, mtp = true, zero_only = false;
+    bool plain = true, mtp = true, zero_only = false, disk_only = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--mtp") { plain = false; }
         if (arg == "--plain") { mtp = false; }
         if (arg == "--zero") { zero_only = true; }
+        if (arg == "--disk") { disk_only = true; }
     }
     try {
         int failures = 0;
@@ -809,7 +909,8 @@ int main(int argc, char** argv) {
             for (const bool mode : {false, true}) {
                 if (mode ? !mtp : !plain) { continue; }
                 failures += run_zero_token(artifact, ngram, mode);
-                failures += run_zero_token_from_file(artifact, ngram, mode);
+                failures += run_zero_token_disk(artifact, ngram, mode, true);
+                failures += run_zero_token_disk(artifact, ngram, mode, false);
                 failures += run_zero_token_constrained(artifact, ngram, mode);
                 failures += run_zero_token_concurrency(artifact, ngram, mode);
                 failures += run_persistence(artifact, ngram, mode);
@@ -818,13 +919,26 @@ int main(int argc, char** argv) {
                         failures);
             return failures == 0 ? 0 : 1;
         }
+        if (disk_only) {
+            for (const bool mode : {false, true}) {
+                if (mode ? !mtp : !plain) { continue; }
+                failures += run_zero_token_disk(artifact, ngram, mode, false);
+                failures += run_zero_token_disk(artifact, ngram, mode, true);
+                failures += run_disk_pressure(artifact, ngram, mode);
+                failures += run_persistence(artifact, ngram, mode);
+            }
+            std::printf(failures == 0 ? "qwen4_exp Disk tier checks passed\n" : "FAIL: %d checks failed\n", failures);
+            return failures == 0 ? 0 : 1;
+        }
         if (plain) { failures += run_mode(artifact, ngram, false); }
         if (mtp) { failures += run_mode(artifact, ngram, true); }
         if (mtp) { failures += run_one_context(artifact, ngram); }
         for (const bool mode : {false, true}) {
             if (mode ? !mtp : !plain) { continue; }
             failures += run_zero_token(artifact, ngram, mode);
-            failures += run_zero_token_from_file(artifact, ngram, mode);
+            failures += run_zero_token_disk(artifact, ngram, mode, true);
+            failures += run_zero_token_disk(artifact, ngram, mode, false);
+            failures += run_disk_pressure(artifact, ngram, mode);
             failures += run_zero_token_constrained(artifact, ngram, mode);
             failures += run_zero_token_concurrency(artifact, ngram, mode);
             failures += run_persistence(artifact, ngram, mode);

@@ -278,8 +278,27 @@ DiskStore::~DiskStore() {
 }
 
 void DiskStore::replay(std::span<const std::byte> journal) {
-    std::map<std::uint32_t, DiskBlockRecord> blocks;
-    std::map<std::uint32_t, DiskSnapshotRecord> snapshots;
+    // A block's parent and a snapshot's anchor are the block record at that slot when the record
+    // is read: a slot freed and rewritten later holds another block, which the link must not reach.
+    // Each record keeps the position (epoch) of the record it links to.
+    struct Linked {
+        std::uint64_t epoch = 0;
+        std::uint64_t link  = 0; // the parent's or anchor's epoch; 0: root or unresolved
+        bool resolved       = false;
+    };
+    std::map<std::uint32_t, std::pair<DiskBlockRecord, Linked>> blocks;
+    std::map<std::uint32_t, std::pair<DiskSnapshotRecord, Linked>> snapshots;
+    std::uint64_t epoch = 0;
+    const auto link = [&](std::uint32_t slot) {
+        Linked out{.epoch = ++epoch};
+        if (slot == pc::kNoId) {
+            out.resolved = true;
+        } else if (const auto found = blocks.find(slot); found != blocks.end()) {
+            out.link     = found->second.second.epoch;
+            out.resolved = true;
+        }
+        return out;
+    };
     std::size_t at = 0;
     while (at < journal.size()) {
         Reader head(journal.subspan(at));
@@ -305,7 +324,10 @@ void DiskStore::replay(std::span<const std::byte> journal) {
                  in.value(record.extra) && in.value(record.mtp_next);
             for (TokenId& token : record.tokens) { ok = ok && in.value(token); }
             ok = ok && in.done() && record.slot < geometry_.slots;
-            if (ok) { blocks[record.slot] = record; }
+            if (ok) {
+                const Linked linked = link(record.parent_slot);
+                blocks[record.slot] = {record, linked};
+            }
             break;
         }
         case RecordType::Snapshot: {
@@ -322,7 +344,11 @@ void DiskStore::replay(std::span<const std::byte> journal) {
             ok = ok && in.value(kind) && kind <= static_cast<std::uint8_t>(pc::SnapshotKind::Boundary) &&
                  in.value(record.hits) && read_meta(in, record.meta) && in.done();
             record.kind = static_cast<pc::SnapshotKind>(kind);
-            if (ok) { snapshots[record.slots.front()] = std::move(record); }
+            if (ok) {
+                const Linked linked       = link(record.anchor_slot);
+                const std::uint32_t first = record.slots.front();
+                snapshots[first]          = {std::move(record), linked};
+            }
             break;
         }
         case RecordType::Removal: {
@@ -338,7 +364,9 @@ void DiskStore::replay(std::span<const std::byte> journal) {
             std::uint32_t first = 0, hits = 0;
             ok = in.value(first) && in.value(hits) && in.done();
             if (ok) {
-                if (const auto found = snapshots.find(first); found != snapshots.end()) { found->second.hits = hits; }
+                if (const auto found = snapshots.find(first); found != snapshots.end()) {
+                    found->second.first.hits = hits;
+                }
             }
             break;
         }
@@ -348,26 +376,29 @@ void DiskStore::replay(std::span<const std::byte> journal) {
             break;
         }
     }
-    // Blocks parents first; a block whose parent has no record cannot be rebuilt, nor can what lies
-    // below it.
-    std::unordered_multimap<std::uint32_t, std::uint32_t> children;
-    for (const auto& [slot, record] : blocks) { children.emplace(record.parent_slot, slot); }
-    std::vector<std::uint32_t> frontier{pc::kNoId};
-    std::unordered_map<std::uint32_t, bool> kept;
+    // Blocks parents first; a block whose parent record was not live when it was written cannot be
+    // rebuilt, nor can what lies below it. Children are keyed by their parent's epoch (0: root).
+    std::unordered_multimap<std::uint64_t, std::uint32_t> children;
+    for (const auto& [slot, entry] : blocks) {
+        if (entry.second.resolved) { children.emplace(entry.second.link, slot); }
+    }
+    std::vector<std::uint64_t> frontier{0};
+    std::unordered_map<std::uint64_t, bool> kept; // by epoch
     while (!frontier.empty()) {
-        const std::uint32_t parent = frontier.back();
+        const std::uint64_t parent = frontier.back();
         frontier.pop_back();
         const auto [begin, end] = children.equal_range(parent);
         for (auto it = begin; it != end; ++it) {
-            if (it->second == parent || kept.contains(it->second)) { continue; }
-            kept[it->second] = true;
-            blocks_.push_back(blocks.at(it->second));
-            frontier.push_back(it->second);
+            const auto& [record, linked] = blocks.at(it->second);
+            if (kept.contains(linked.epoch)) { continue; }
+            kept[linked.epoch] = true;
+            blocks_.push_back(record);
+            frontier.push_back(linked.epoch);
         }
     }
-    for (auto& [first, record] : snapshots) {
-        if (record.anchor_slot == pc::kNoId || kept.contains(record.anchor_slot)) {
-            snapshots_.push_back(std::move(record));
+    for (auto& [first, entry] : snapshots) {
+        if (entry.second.resolved && (entry.second.link == 0 || kept.contains(entry.second.link))) {
+            snapshots_.push_back(std::move(entry.first));
         }
     }
 }
@@ -379,7 +410,20 @@ void DiskStore::open_journal(bool truncate) {
 }
 
 void DiskStore::compact(std::span<const DiskBlockRecord> blocks, std::span<const DiskSnapshotRecord> snapshots) {
-    if (journal_.joinable()) { throw std::logic_error("prefix cache Disk tier compacted twice"); }
+    if (journal_.joinable()) {
+        // Every removal is durable before the journal is replaced, so every freed slot stays
+        // writable; the thread restarts on the new journal.
+        flush();
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        wake_.notify_all();
+        journal_.join();
+        stopping_ = false;
+        ::close(journal_fd_);
+        journal_fd_ = -1;
+    }
     std::vector<std::byte> bytes;
     for (const DiskBlockRecord& record : blocks) {
         const std::vector<std::byte> encoded = encode_block(record);

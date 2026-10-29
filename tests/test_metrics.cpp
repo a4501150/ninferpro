@@ -32,6 +32,8 @@ int main() {
     running.speculative_accepted_tokens = 3;
     running.running_requests            = 1;
     running.prefix_selections           = 2;
+    running.hybrid_disk_capacity_bytes  = 64;
+    running.hybrid_disk_write_bytes     = 7;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
     check(live.find("infernix_generation_tokens_total 5\n") != std::string::npos,
@@ -50,6 +52,9 @@ int main() {
     check(live.find("infernix_prefix_selections_total 2\n") != std::string::npos &&
               live.find("infernix_device_state_capacity_slots 3\n") != std::string::npos,
           "prefix-cache selections and StateImage capacity must be observable");
+    check(live.find("infernix_prefix_cache_disk_capacity_bytes 64\n") != std::string::npos &&
+              live.find("infernix_prefix_cache_disk_write_bytes_total 7\n") != std::string::npos,
+          "the prefix cache's Disk tier size and writes must be observable");
 
     GenerationOutcome outcome;
     outcome.finish_reason                            = FinishReason::OutputLimit;

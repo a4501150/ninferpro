@@ -232,9 +232,9 @@ int main(int argc, char** argv) {
         std::cout << infernix::serve::serve_usage_text(argv[0]);
         return 0;
     }
-    if (!options.context_cache.hybrid.persistent_file.empty()) {
-        options.context_cache.hybrid.persistent_identity = binary_identity(argv[0]);
-    }
+    const bool saves_prefix_cache =
+        !options.context_cache.hybrid.persistent_file.empty() || !options.context_cache.hybrid.disk_directory.empty();
+    if (saves_prefix_cache) { options.context_cache.hybrid.persistent_identity = binary_identity(argv[0]); }
     install_stop_handlers();
     // Token/level colouring is opt-in (--log-colours on); the default keeps the log plain.
     infernix::serve::set_operational_log_colours(options.log_colours);
@@ -257,7 +257,7 @@ int main(int argc, char** argv) {
     const infernix::PrefixCacheSaveControl save_control =
         options.context_cache.hybrid.persistent_save;
     StopControl stop_control(
-        !options.context_cache.hybrid.persistent_file.empty(),
+        saves_prefix_cache,
         {.show =
              [&](const infernix::serve::StopConsoleLine& line) {
                  if (console_line->enabled()) {

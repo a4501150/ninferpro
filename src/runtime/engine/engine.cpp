@@ -298,9 +298,16 @@ public:
     void stop() noexcept {
         if (stop_requested.exchange(true)) { return; }
         if (persists_prefix_cache()) {
+            const bool disk = std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core);
             runtime::publish_diagnostic(
-                options.diagnostic_observer, DiagnosticLevel::Info, "saving the prefix cache to %s",
-                options.context_cache.hybrid.persistent_file.string().c_str());
+                options.diagnostic_observer, DiagnosticLevel::Info,
+                !disk ? "saving the prefix cache to %s"
+                : options.context_cache.host_capacity_bytes.value_or(1U) == 0
+                    ? "finishing the prefix cache's writes to its Disk tier in %s"
+                    : "spilling the prefix cache to its Disk tier in %s",
+                (disk ? options.context_cache.hybrid.disk_directory : options.context_cache.hybrid.persistent_file)
+                    .string()
+                    .c_str());
         }
         std::visit(
             [](auto& state) {
@@ -310,17 +317,20 @@ public:
             core);
     }
 
+    // Qwen3.5 saves its Host tier to a file, Qwen3.8-Flash-Next spills it to its Disk tier.
     [[nodiscard]] bool persists_prefix_cache() const noexcept {
-        return (std::holds_alternative<std::unique_ptr<GenerationCore>>(core) ||
-                std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core)) &&
-               options.context_cache.enabled &&
+        if (!options.context_cache.enabled) { return false; }
+        if (std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core)) {
+            return !options.context_cache.hybrid.disk_directory.empty();
+        }
+        return std::holds_alternative<std::unique_ptr<GenerationCore>>(core) &&
                !options.context_cache.hybrid.persistent_file.empty();
     }
 
     void report_prefix_cache_save() const noexcept {
         try {
             if (qwen4) {
-                report_prefix_cache_save(qwen4->program->prefix_shutdown_save());
+                report_prefix_cache_save(qwen4->program->prefix_shutdown_spill());
             } else {
                 report_prefix_cache_save(active->program->hybrid_shutdown_save());
             }
@@ -330,7 +340,8 @@ public:
         } catch (...) {}
     }
 
-    // Either model's shutdown-save result (the same fields).
+    // Either model's shutdown-save result (the same fields): Qwen3.5's file save, or
+    // Qwen3.8-Flash-Next's spill (what it wrote to the Disk tier).
     template <class Result>
     void report_prefix_cache_save(const std::optional<Result>& result) const {
         if (!result) {

@@ -7,6 +7,8 @@
 #include "runtime/prefix_cache/block_hash.h"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 namespace infernix::models::qwen4_exp::detail {
 
@@ -18,19 +20,6 @@ constexpr std::uint32_t kBlock = pc::kBlockTokens;
 constexpr std::size_t kFlushWords = 10; // an MR3 flush call's staging words
 // Blocks one prefetch batch copies at most (one page each; 256 pages are ~240 MB, ~9 ms of H2D).
 constexpr std::uint32_t kPrefetchBatchBlocks = 256;
-
-PrefixCachePersistence public_result(const prefix::PersistResult& result) {
-    return PrefixCachePersistence{.ok                  = result.ok,
-                                  .message             = result.message,
-                                  .blocks              = result.blocks,
-                                  .snapshots           = result.snapshots,
-                                  .bytes               = result.bytes,
-                                  .seconds             = result.seconds,
-                                  .saved_blocks        = result.saved_blocks,
-                                  .saved_snapshots     = result.saved_snapshots,
-                                  .required_host_bytes = result.required_host_bytes,
-                                  .host_bytes          = result.host_bytes};
-}
 
 } // namespace
 
@@ -70,7 +59,8 @@ void ProgramImpl::create_prefix_cache() {
     config.taps       = options_.prefix_taps;
     config.kv_pages   = kv_pages_;
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
-                                                            options_.prefix_host_bytes);
+                                                            options_.prefix_host_bytes, options_.prefix_disk_bytes);
+    prefix_->set_compute_stream(device_.stream);
     if (options_.free_cache_resume) {
         // The zero-token resume's prompt-end captures stage their image through fixed Device slots
         // (a lane's replayed decode graphs cannot wait on capture events): two cover a burst of
@@ -95,42 +85,34 @@ void ProgramImpl::create_prefix_cache() {
     }
 }
 
-PrefixCachePersistence ProgramImpl::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
-                                                             const StartupObserver& observer) {
-    if (!prefix_) { return {.message = "the prefix cache is not enabled"}; }
-    if (path.empty()) { throw std::invalid_argument("prefix cache file path is empty"); }
-    PrefixCachePersistence loaded = public_result(prefix_->load(path, fingerprint, observer));
-    prefix_file_                  = path;
-    prefix_fingerprint_           = std::move(fingerprint);
-    prefix_saved_writes_          = prefix_->counters().host_write_bytes;
-    return loaded;
+PrefixCacheDiskOpen ProgramImpl::attach_prefix_cache_disk(const std::filesystem::path& directory,
+                                                          std::string_view fingerprint) {
+    if (!prefix_ || prefix_->disk_slots() == 0) { throw std::logic_error("Qwen4Exp: no prefix cache Disk tier was sized"); }
+    const prefix::DiskAttachResult opened = prefix_->attach_disk(directory, fingerprint);
+    return PrefixCacheDiskOpen{.mode              = cufile_mode_name(opened.mode),
+                               .reset_reason      = opened.reset_reason,
+                               .damaged           = opened.damaged,
+                               .blocks            = opened.blocks,
+                               .snapshots         = opened.snapshots,
+                               .dropped_blocks    = opened.dropped_blocks,
+                               .dropped_snapshots = opened.dropped_snapshots,
+                               .bytes             = opened.bytes,
+                               .staging_bytes     = prefix_->disk_staging_bytes(),
+                               .seconds           = opened.seconds};
 }
 
-std::optional<PrefixCachePersistence> ProgramImpl::save_prefix_cache_now(const CancellationView& abandoned) {
-    if (!prefix_ || prefix_file_.empty() || prefix_->counters().host_write_bytes == prefix_saved_writes_) {
-        return std::nullopt;
-    }
-    // As at shutdown: Host writes and copy-outs land, then the save reads the slabs (lanes pinning a
-    // path do not matter, the save only reads).
-    device_.synchronize();
-    prefix_->drain();
-    const std::uint64_t written = prefix_->counters().host_write_bytes;
-    PrefixCachePersistence saved = public_result(prefix_->save(prefix_file_, prefix_fingerprint_, abandoned));
-    if (saved.ok) { prefix_saved_writes_ = written; }
-    return saved;
-}
-
-// After every lane is released: Host writes and copy-outs land, then the save reads the slabs.
-void ProgramImpl::save_prefix_cache_for_shutdown() noexcept {
-    if (!prefix_ || prefix_file_.empty()) { return; }
+// After every lane is released: captures and writes land, then the Host tier's snapshots without a
+// Disk copy are spilled, the most valuable first.
+void ProgramImpl::spill_prefix_cache_for_shutdown() noexcept {
+    if (!prefix_ || !prefix_->disk_attached()) { return; }
     try {
         device_.synchronize();
         prefix_->drain();
-        // The product may abandon the save (a Ctrl+C during the stop). It counts as running only
+        // The product may abandon the spill (a Ctrl+C during the stop). It counts as running only
         // from here, so an exit never waits for the Device work above.
         const PrefixCacheSaveControl& control = options_.prefix_save;
         if (!control.begin()) {
-            prefix_shutdown_save_ = PrefixCachePersistence{.message = "abandoned before it began"};
+            prefix_shutdown_spill_ = PrefixCacheDiskSpill{.message = "abandoned before it began"};
             return;
         }
         struct Ended {
@@ -138,12 +120,18 @@ void ProgramImpl::save_prefix_cache_for_shutdown() noexcept {
             bool saved = false;
             ~Ended() { control.end(saved); }
         } ended{control};
-        prefix_shutdown_save_ = public_result(
-            prefix_->save(prefix_file_, prefix_fingerprint_, CancellationView([&control] { return control.abandoned(); })));
-        ended.saved = prefix_shutdown_save_->ok;
+        const prefix::DiskSpillResult spilled =
+            prefix_->spill_for_shutdown(CancellationView([&control] { return control.abandoned(); }));
+        prefix_shutdown_spill_ = PrefixCacheDiskSpill{.ok        = spilled.ok,
+                                                      .message   = spilled.message,
+                                                      .blocks    = spilled.blocks,
+                                                      .snapshots = spilled.snapshots,
+                                                      .bytes     = spilled.bytes,
+                                                      .seconds   = spilled.seconds};
+        ended.saved = spilled.ok;
     } catch (const std::exception& error) {
-        prefix_shutdown_save_ = PrefixCachePersistence{.message = error.what()};
-    } catch (...) { prefix_shutdown_save_ = PrefixCachePersistence{.message = "unknown error"}; }
+        prefix_shutdown_spill_ = PrefixCacheDiskSpill{.message = error.what()};
+    } catch (...) { prefix_shutdown_spill_ = PrefixCacheDiskSpill{.message = "unknown error"}; }
 }
 
 void ProgramImpl::pc_make_room(std::uint32_t pages) {
@@ -255,11 +243,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         // A lane-resident snapshot needs no image restore: its state is still in the lane.
         const std::optional<pc::SnapshotRef> resident =
             lane < lanes_.size() ? prefix_resident(lanes_[lane]) : std::nullopt;
-        for (pc::MatchCandidate& c : match.candidates) {
-            if (resident && *resident == c.snapshot && c.restore_bytes >= image_layout_.image_bytes) {
-                c.restore_bytes -= image_layout_.image_bytes;
-            }
-        }
+        prefix_credit(match.candidates, resident);
         const pc::AdmissionChoice choice = index.choose(match, n);
         std::vector<std::uint32_t> frontiers;
         for (const pc::MatchCandidate& c : match.candidates) { frontiers.push_back(c.frontier); }
@@ -383,6 +367,69 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
     }
     index.release_path(path);
     return started;
+}
+
+// Credits what needs no transfer, then leaves only sources restorable now: a lane-resident
+// snapshot's image is still in the lane, a landed fetch holds its source's Disk bytes in VRAM, and
+// any other Disk byte must be fetched first (prefix_disk_fetch).
+void ProgramImpl::prefix_credit(std::vector<pc::MatchCandidate>& candidates,
+                                std::optional<pc::SnapshotRef> resident) const {
+    for (pc::MatchCandidate& c : candidates) {
+        c.disk_bytes -= std::min(c.disk_bytes, prefix_->fetched_bytes(c));
+        if (resident && *resident == c.snapshot) {
+            std::uint64_t& bytes = c.image_on_disk_only ? c.disk_bytes : c.restore_bytes;
+            bytes -= std::min<std::uint64_t>(bytes, image_layout_.image_bytes);
+        }
+    }
+    std::erase_if(candidates, [](const pc::MatchCandidate& c) { return c.disk_bytes != 0; });
+}
+
+// The Disk tier (design §19.3.1): the source a fresh request would choose with every candidate
+// restorable is read before its admission when it lies (partly) only on the Disk, and a snapshot
+// of the prompt still being written through to the Disk is awaited. While other requests run, the
+// request is deferred (the Engine asks again), so their rounds never wait on the Disk; an idle
+// Engine has nothing else to run and waits here, at most kDiskWaitSeconds.
+bool ProgramImpl::prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt) {
+    if (!prefix_->disk_attached()) { return false; }
+    constexpr double kDiskWaitSeconds = 5.0;
+    const auto start                  = std::chrono::steady_clock::now();
+    const bool idle = std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& lane) { return lane.phase == Phase::Free; });
+    while (prefix_disk_pending(prompt)) {
+        if (!idle) { return true; }
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() > kDiskWaitSeconds) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    return false;
+}
+
+// Whether the prompt's admission must wait for the Disk tier: a fetch is running (the head's choice
+// may need it), a snapshot on the prompt's path is still being written through, or a fetch of the
+// source it would choose has just started.
+bool ProgramImpl::prefix_disk_pending(const qwen3_5::PreparedPromptData& prompt) {
+    prefix_->poll();
+    if (prefix_->fetch_running()) { return true; }
+    const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
+    if (n <= 1 || prompt.block_hashes.size() != n / kBlock) { return false; }
+    pc::PrefixCacheIndex& index = prefix_->index();
+    pc::MatchResult match       = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+    if (prefix_->disk_capture_pending(match.path, prompt.token_ids)) { return true; }
+    const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
+    const bool grid                           = !options_.free_cache_resume;
+    std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
+        return c.filling_blocks != 0 || prefix::inside_exclusion(c.frontier, spans) ||
+               prefix_->disk_unreadable(c.snapshot) ||
+               (grid && (c.frontier % kResumeGrid != 0 || index.snapshot(c.snapshot).kind == pc::SnapshotKind::Endpoint)) ||
+               (c.frontier == n && !c.head_residual);
+    });
+    for (pc::MatchCandidate& c : match.candidates) { c.disk_bytes -= std::min(c.disk_bytes, prefix_->fetched_bytes(c)); }
+    const pc::AdmissionChoice choice = index.choose(match, n);
+    if (!choice.candidate) { return false; }
+    const pc::MatchCandidate& c = match.candidates[*choice.candidate];
+    if (c.disk_bytes == 0) { return false; }
+    const std::span<const pc::NodeRef> path(match.path.data(), c.path_blocks);
+    return prefix_->start_fetch(c.snapshot, path);
 }
 
 std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
@@ -615,6 +662,8 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         }
         cache.note_hit(*s.snapshot);
         cache.unpin_snapshot(*s.snapshot); // the restore batch holds its own pin while it lands
+        // The fetch this admission waited for is consumed: the batch reads its region until it lands.
+        if (prefix_->fetch_holds(*s.snapshot)) { prefix_->release_fetch(); }
         lane.prefix.resume  = s.snapshot;
         lane.prefix.deepest = s.frontier;
         ++prefix_->counters().admissions;
@@ -780,6 +829,20 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     out.held_device_evictions   = index.held_device_evictions;
     out.held_snapshot_losses    = index.held_snapshot_losses;
     out.held_host_refusals      = index.held_host_refusals;
+    out.disk_slots              = prefix_->disk_slots();
+    out.disk_free_slots         = index.disk_free_slots;
+    out.disk_image_writes       = count.disk_image_writes;
+    out.disk_block_writes       = count.disk_block_writes;
+    out.disk_write_bytes        = count.disk_write_bytes;
+    out.disk_fetches            = count.disk_fetches;
+    out.disk_image_reads        = count.disk_image_reads;
+    out.disk_block_reads        = count.disk_block_reads;
+    out.disk_read_bytes         = count.disk_read_bytes;
+    out.disk_failures           = count.disk_failures;
+    out.disk_capture_skips      = count.disk_capture_skips;
+    out.disk_spill_skips        = count.disk_spill_skips;
+    out.disk_snapshot_evictions = index.disk_snapshot_evictions;
+    out.disk_dead_reclaims      = index.disk_dead_reclaims;
     return out;
 }
 

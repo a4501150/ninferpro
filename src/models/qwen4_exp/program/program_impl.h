@@ -1370,6 +1370,7 @@ public:
                 if (impl->vision && selection->frontier > 0) { impl->vision = plan_vision(data, selection->frontier); }
                 out.reused_tokens = selection->frontier;
                 out.reuse_path    = reuse_path_for(prefix_->index().snapshot(*selection->snapshot).kind);
+                out.from_disk     = prefix_->fetch_holds(*selection->snapshot);
             }
             impl->prefix = std::move(selection);
         }
@@ -1384,6 +1385,8 @@ public:
         const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
         std::vector<SourceCandidate> out;
         if (prefix_) {
+            // A source held only on the Disk tier is read first; the request waits for it.
+            if (b.reuse && maximum_frontier == UINT32_MAX && prefix_disk_fetch(data)) { return {}; }
             std::optional<PrefixSelection> chosen = prefix_select(data, b, kNoLane);
             const std::uint32_t reuse = chosen && chosen->snapshot ? chosen->frontier : 0U;
             // Coalescing only defers a fresh request (an empty list: the Engine asks again).
@@ -1539,7 +1542,8 @@ public:
         lane.begin = runtime::BeginSummary{.prompt_tokens        = lane.prompt_tokens,
                                            .reused_prompt_tokens = source.reused_tokens,
                                            .prefix_reuse_path =
-                                               source.reused_tokens ? source.reuse_path : PrefixReusePath::Root};
+                                               source.reused_tokens ? source.reuse_path : PrefixReusePath::Root,
+                                           .prefix_from_disk = source.reused_tokens != 0 && source.from_disk};
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(gate_stats_.p) + kGateStatsBytes * index, 0, kGateStatsBytes,
                                    device_.stream));
         lane.prefill_end = lane.prompt_tokens;
@@ -5971,19 +5975,23 @@ private:
     [[nodiscard]] std::array<std::span<const cudaEvent_t>, 2> prefix_waits(const Lane& lane) const noexcept;
     void mtp_flush_cell(Lane& lane, std::uint32_t index);
 
+    // Starts reading a fresh request's chosen source from the Disk tier when it is held only there,
+    // or finds such a read running: the request is then deferred (hybrid_sources).
+    [[nodiscard]] bool prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt);
+    [[nodiscard]] bool prefix_disk_pending(const qwen3_5::PreparedPromptData& prompt);
+    // Credits a lane-resident image and a landed fetch's bytes, then drops candidates that still
+    // need a Disk read.
+    void prefix_credit(std::vector<runtime::prefix_cache::MatchCandidate>& candidates,
+                       std::optional<runtime::prefix_cache::SnapshotRef> resident) const;
+
 public:
-    // Persistence of the Host tier (--prefix-cache-file).
-    PrefixCachePersistence attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
-                                                    const StartupObserver& observer);
-    void save_prefix_cache_for_shutdown() noexcept;
-    [[nodiscard]] std::optional<PrefixCachePersistence> prefix_shutdown_save() const { return prefix_shutdown_save_; }
-    [[nodiscard]] std::optional<PrefixCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
+    // The Disk tier (--prefix-cache-disk).
+    PrefixCacheDiskOpen attach_prefix_cache_disk(const std::filesystem::path& directory, std::string_view fingerprint);
+    void spill_prefix_cache_for_shutdown() noexcept;
+    [[nodiscard]] std::optional<PrefixCacheDiskSpill> prefix_shutdown_spill() const { return prefix_shutdown_spill_; }
 
 private:
-    std::filesystem::path prefix_file_;
-    std::string prefix_fingerprint_;
-    std::optional<PrefixCachePersistence> prefix_shutdown_save_;
-    std::uint64_t prefix_saved_writes_ = 0; // host_write_bytes at the last save or load
+    std::optional<PrefixCacheDiskSpill> prefix_shutdown_spill_;
 
 public:
     [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept;

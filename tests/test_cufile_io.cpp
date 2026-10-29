@@ -1,5 +1,5 @@
-// Core CuFileQueue: unbuffered cuFile batch writes and reads of host and device memory against a
-// byte oracle, transfers split into parts, a reopened file keeping its bytes, and the argument
+// Core CuFileQueue: unbuffered writes and reads of host memory (its POSIX threads) and device
+// memory (cuFile batches) against a byte oracle, many host reads in flight at once, transfers split into parts, a reopened file keeping its bytes, and the argument
 // checks. `INFERNIX_TEST_DISK_DIR` puts the file on a given filesystem (GPUDirect Storage needs a
 // local NVMe one); otherwise it lives in the system temp directory (compatibility mode).
 #include "test_temp_path.h"
@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <new>
@@ -165,6 +166,51 @@ void test_round_trips(const std::filesystem::path& path) {
     cuda(cudaFree(device), "cudaFree");
 }
 
+void test_many_in_flight(const std::filesystem::path& path) {
+    // Rounds of host and device reads, many in flight at once (cuFile 1.19's compatibility mode
+    // faulted in its batch status call on such host reads).
+    constexpr std::size_t kPiece = 64U << 10U;
+    constexpr std::size_t kPieces = kFile / kPiece;
+    CuFileQueue queue(path, kFile);
+    Aligned source(kFile);
+    fill(source.p, kFile, 9);
+    std::vector<CuFileQueue::Completion> done;
+    queue.submit({.op = CuFileQueue::Op::Write, .offset = 0, .bytes = kFile, .buffer = source.p, .tag = 0});
+    queue.wait(done);
+    check(all_ok(done, 1), "the file is written");
+    void* device = nullptr;
+    cuda(cudaMalloc(&device, kFile), "cudaMalloc");
+    (void)queue.register_buffer(device, kFile);
+    Aligned back(kFile);
+    bool same = true;
+    for (int round = 0; round < 20 && same; ++round) {
+        std::memset(back.p, 0, kFile);
+        for (std::size_t i = 0; i < kPieces; ++i) {
+            // Piece i lands at slot (i * 7) % kPieces, so a misplaced read shows.
+            const std::size_t at = (i * 7U) % kPieces * kPiece;
+            queue.submit({.op = CuFileQueue::Op::Read, .offset = i * kPiece, .bytes = kPiece, .buffer = back.p,
+                          .buffer_offset = at, .tag = i});
+            queue.submit({.op = CuFileQueue::Op::Read, .offset = i * kPiece, .bytes = kPiece, .buffer = device,
+                          .buffer_offset = at, .tag = kPieces + i});
+        }
+        done.clear();
+        queue.wait(done);
+        same = all_ok(done, 2 * kPieces);
+        for (std::size_t i = 0; same && i < kPieces; ++i) {
+            same = std::memcmp(back.p + (i * 7U) % kPieces * kPiece, source.p + i * kPiece, kPiece) == 0;
+        }
+    }
+    check(same, "host reads in flight together land at their offsets");
+    std::vector<std::byte> staged(kFile);
+    cuda(cudaMemcpy(staged.data(), device, kFile, cudaMemcpyDeviceToHost), "download");
+    same = true;
+    for (std::size_t i = 0; same && i < kPieces; ++i) {
+        same = std::memcmp(staged.data() + (i * 7U) % kPieces * kPiece, source.p + i * kPiece, kPiece) == 0;
+    }
+    check(same, "device reads in flight together land at their offsets");
+    cuda(cudaFree(device), "cudaFree");
+}
+
 void test_reopen(const std::filesystem::path& path) {
     // A reopened file of the same size keeps its bytes.
     CuFileQueue queue(path, kFile);
@@ -182,6 +228,7 @@ int main() {
     try {
         test_round_trips(path);
         test_reopen(path);
+        test_many_in_flight(path);
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         ++failures;

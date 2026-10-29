@@ -8,9 +8,12 @@
 
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <deque>
+#include <mutex>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -33,6 +36,19 @@ std::string cufile_error(const char* what, CUfileError_t status) {
 
 void check(CUfileError_t status, const char* what) {
     if (status.err != CU_FILE_SUCCESS) { throw std::runtime_error(cufile_error(what, status)); }
+}
+
+// cuFile 1.19 does not survive a driver close followed by a reopen in one process (its POSIX
+// pools are freed twice, or a later batch status call faults), and every Engine opens a queue.
+// The driver opens once per process and stays open until exit.
+void open_driver() {
+    static std::once_flag once;
+    static std::string failure;
+    std::call_once(once, [] {
+        const CUfileError_t status = cuFileDriverOpen();
+        if (status.err != CU_FILE_SUCCESS) { failure = cufile_error("cuFile driver open", status); }
+    });
+    if (!failure.empty()) { throw std::runtime_error(failure); }
 }
 
 bool final_status(CUfileStatus_t status) noexcept {
@@ -68,16 +84,32 @@ struct CuFileQueue::Impl {
     Options options;
     int fd              = -1;
     std::uint64_t bytes = 0;
-    bool driver_open    = false;
     CUfileHandle_t handle{};
     bool handle_registered = false;
     Mode mode              = Mode::Compatibility;
     std::vector<void*> registered;
     std::vector<Batch> batches;
     std::deque<Part> queued;
+    // Host memory moves by pread/pwrite on these threads: cuFile 1.19's compatibility mode
+    // faults now and then inside cuFileBatchIOGetStatus after batch reads into host memory
+    // (pinned or pageable, registered or not), and GPUDirect Storage has no direct path for host
+    // memory to offer.
+    struct HostDone {
+        Part part;
+        bool ok = true;
+        std::string error;
+    };
+    std::vector<std::thread> host_threads;
+    std::mutex host_mutex;
+    std::condition_variable host_wake;
+    std::deque<Part> host_queued;      // guarded by host_mutex
+    std::vector<HostDone> host_done;   // guarded by host_mutex
+    std::uint32_t host_outstanding = 0; // submitted to the threads, not yet reaped
+    bool host_stopping             = false;
     std::unordered_map<std::uint64_t, Parent> parents;
     std::uint64_t next_parent = 0;
     std::vector<Completion> completed;
+    std::vector<Part> host_parts; // submit's scratch
 
     void finish(const Part& part, bool ok, const std::string& error) {
         Parent& parent = parents.at(part.parent);
@@ -135,13 +167,9 @@ struct CuFileQueue::Impl {
             CUfileIOParams_t& params      = batch.params[i];
             params                        = CUfileIOParams_t{};
             params.mode                   = CUFILE_BATCH;
-            // cuFile 1.19's compatibility mode ignores devPtr_offset for host memory, registered
-            // or not (every entry moved the base's bytes), so host transfers address their bytes
-            // directly. Device memory keeps the registered base, which GPUDirect Storage needs.
-            params.u.batch.devPtr_base =
-                part.device ? part.buffer : static_cast<std::byte*>(part.buffer) + part.buffer_offset;
+            params.u.batch.devPtr_base   = part.buffer;
             params.u.batch.file_offset   = static_cast<off_t>(part.offset);
-            params.u.batch.devPtr_offset = part.device ? static_cast<off_t>(part.buffer_offset) : 0;
+            params.u.batch.devPtr_offset = static_cast<off_t>(part.buffer_offset);
             params.u.batch.size           = part.bytes;
             params.fh                     = handle;
             params.opcode                 = part.op == Op::Read ? CUFILE_READ : CUFILE_WRITE;
@@ -158,7 +186,50 @@ struct CuFileQueue::Impl {
         batch.outstanding = static_cast<std::uint32_t>(count);
     }
 
+    void host_main() noexcept {
+        for (;;) {
+            Part part;
+            {
+                std::unique_lock lock(host_mutex);
+                host_wake.wait(lock, [&] { return host_stopping || !host_queued.empty(); });
+                if (host_queued.empty()) { return; }
+                part = host_queued.front();
+                host_queued.pop_front();
+            }
+            HostDone done{part, true, {}};
+            auto* memory     = static_cast<std::byte*>(part.buffer) + part.buffer_offset;
+            std::size_t moved = 0;
+            while (moved < part.bytes) {
+                const auto offset = static_cast<off_t>(part.offset + moved);
+                const ssize_t n   = part.op == Op::Read ? ::pread(fd, memory + moved, part.bytes - moved, offset)
+                                                        : ::pwrite(fd, memory + moved, part.bytes - moved, offset);
+                if (n < 0 && errno == EINTR) { continue; }
+                if (n <= 0) {
+                    done.ok    = false;
+                    done.error = n < 0 ? std::string("Disk tier transfer failed: ") + std::strerror(errno)
+                                       : "Disk tier short transfer of " + std::to_string(moved) + " of " +
+                                             std::to_string(part.bytes) + " bytes";
+                    break;
+                }
+                moved += static_cast<std::size_t>(n);
+            }
+            std::lock_guard lock(host_mutex);
+            host_done.push_back(std::move(done));
+        }
+    }
+
+    void reap_host() {
+        std::vector<HostDone> done;
+        {
+            std::lock_guard lock(host_mutex);
+            done.swap(host_done);
+        }
+        for (const HostDone& d : done) { finish(d.part, d.ok, d.error); }
+        host_outstanding -= static_cast<std::uint32_t>(done.size());
+    }
+
     void progress() {
+        if (host_outstanding != 0) { reap_host(); }
         for (Batch& batch : batches) {
             if (batch.outstanding != 0) { reap(batch); }
         }
@@ -169,6 +240,7 @@ struct CuFileQueue::Impl {
     }
 
     [[nodiscard]] bool in_flight() const noexcept {
+        if (host_outstanding != 0) { return true; }
         for (const Batch& batch : batches) {
             if (batch.outstanding != 0) { return true; }
         }
@@ -184,21 +256,26 @@ struct CuFileQueue::Impl {
             if (batch.handle != nullptr) { cuFileBatchIODestroy(batch.handle); }
         }
         batches.clear();
+        {
+            std::lock_guard lock(host_mutex);
+            host_stopping = true;
+        }
+        host_wake.notify_all();
+        for (std::thread& thread : host_threads) { thread.join(); }
+        host_threads.clear();
         for (void* base : registered) { (void)cuFileBufDeregister(base); }
         registered.clear();
         if (handle_registered) { cuFileHandleDeregister(handle); }
         handle_registered = false;
         if (fd >= 0) { ::close(fd); }
         fd = -1;
-        if (driver_open) { (void)cuFileDriverClose(); }
-        driver_open = false;
     }
 };
 
 CuFileQueue::CuFileQueue(const std::filesystem::path& path, std::uint64_t bytes, Options options)
     : impl_(std::make_unique<Impl>()) {
     if (bytes == 0 || bytes % kAlignment != 0 || options.batch_depth == 0 || options.batches == 0 ||
-        options.max_part == 0 || options.max_part % kAlignment != 0) {
+        options.host_threads == 0 || options.max_part == 0 || options.max_part % kAlignment != 0) {
         throw std::invalid_argument("cuFile queue needs a 4 KiB-aligned size and positive depths");
     }
     Impl& impl   = *impl_;
@@ -220,8 +297,7 @@ CuFileQueue::CuFileQueue(const std::filesystem::path& path, std::uint64_t bytes,
         if (const int error = ::posix_fallocate(impl.fd, 0, static_cast<off_t>(bytes)); error != 0) {
             throw std::system_error(error, std::generic_category(), "cannot allocate " + path.string());
         }
-        check(cuFileDriverOpen(), "cuFile driver open");
-        impl.driver_open = true;
+        open_driver();
         CUfileDrvProps_t properties{};
         check(cuFileDriverGetProperties(&properties), "cuFile driver properties");
         impl.mode = (properties.nvfs.dstatusflags & (1U << CU_FILE_NVME_SUPPORTED)) != 0 ? Mode::Direct
@@ -235,6 +311,9 @@ CuFileQueue::CuFileQueue(const std::filesystem::path& path, std::uint64_t bytes,
         for (Impl::Batch& batch : impl.batches) {
             check(cuFileBatchIOSetUp(&batch.handle, options.batch_depth), "cuFile batch setup");
             batch.events.resize(options.batch_depth);
+        }
+        for (std::uint32_t i = 0; i < options.host_threads; ++i) {
+            impl.host_threads.emplace_back([&impl] { impl.host_main(); });
         }
     } catch (...) {
         impl.close();
@@ -250,6 +329,11 @@ std::uint64_t CuFileQueue::file_bytes() const noexcept { return impl_->bytes; }
 
 bool CuFileQueue::register_buffer(void* base, std::size_t bytes) {
     if (base == nullptr || bytes == 0) { throw std::invalid_argument("cuFile buffer is empty"); }
+    cudaPointerAttributes attributes{};
+    const bool device = cudaPointerGetAttributes(&attributes, base) == cudaSuccess &&
+                        attributes.type == cudaMemoryTypeDevice;
+    (void)cudaGetLastError();
+    if (!device) { return true; } // host memory never goes through cuFile
     if (cuFileBufRegister(base, bytes, 0).err != CU_FILE_SUCCESS) { return false; }
     impl_->registered.push_back(base);
     return true;
@@ -270,7 +354,7 @@ void CuFileQueue::submit(const Transfer& transfer) {
     const auto parts = static_cast<std::uint32_t>((transfer.bytes + impl.options.max_part - 1) / impl.options.max_part);
     impl.parents.emplace(parent, Impl::Parent{transfer.tag, parts, true, {}});
     for (std::size_t done = 0; done < transfer.bytes; done += impl.options.max_part) {
-        impl.queued.push_back(Impl::Part{
+        const Impl::Part part{
             .parent        = parent,
             .op            = transfer.op,
             .offset        = transfer.offset + done,
@@ -278,7 +362,21 @@ void CuFileQueue::submit(const Transfer& transfer) {
             .buffer        = transfer.buffer,
             .buffer_offset = transfer.buffer_offset + done,
             .device        = device,
-        });
+        };
+        if (device) {
+            impl.queued.push_back(part);
+        } else {
+            impl.host_parts.push_back(part);
+        }
+    }
+    if (!impl.host_parts.empty()) {
+        {
+            std::lock_guard lock(impl.host_mutex);
+            impl.host_queued.insert(impl.host_queued.end(), impl.host_parts.begin(), impl.host_parts.end());
+        }
+        impl.host_outstanding += static_cast<std::uint32_t>(impl.host_parts.size());
+        impl.host_parts.clear();
+        impl.host_wake.notify_all();
     }
 }
 

@@ -107,6 +107,21 @@ public:
         out.hybrid_held_snapshot_losses    = hybrid.held_snapshot_losses;
         out.hybrid_held_host_refusals      = hybrid.held_host_refusals;
         out.hybrid_tool_call_holds         = hybrid.tool_call_holds;
+        // The Disk tier (Qwen4Exp).
+        if constexpr (requires { hybrid.disk_slots; }) {
+            out.hybrid_disk_capacity_bytes     = hybrid.host_slab_bytes * hybrid.disk_slots;
+            out.hybrid_disk_used_bytes         = hybrid.host_slab_bytes * (hybrid.disk_slots - hybrid.disk_free_slots);
+            out.hybrid_disk_image_writes       = hybrid.disk_image_writes;
+            out.hybrid_disk_block_writes       = hybrid.disk_block_writes;
+            out.hybrid_disk_write_bytes        = hybrid.disk_write_bytes;
+            out.hybrid_disk_fetches            = hybrid.disk_fetches;
+            out.hybrid_disk_read_bytes         = hybrid.disk_read_bytes;
+            out.hybrid_disk_failures           = hybrid.disk_failures;
+            out.hybrid_disk_capture_skips      = hybrid.disk_capture_skips;
+            out.hybrid_disk_spill_skips        = hybrid.disk_spill_skips;
+            out.hybrid_disk_snapshot_evictions = hybrid.disk_snapshot_evictions;
+            out.hybrid_disk_dead_reclaims      = hybrid.disk_dead_reclaims;
+        }
     }
 
     // Holds the sources of the requests waiting for admission, in admission order

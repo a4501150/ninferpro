@@ -274,8 +274,8 @@ public:
     TransferWork copy_from_host(HostKVAllocationConstView source,
                                 std::span<const DeviceKVPageHandle> destination,
                                 cudaStream_t stream = nullptr) const;
-    // Record-addressed forms for caller-owned pinned host memory: page i is packed with `layout`
-    // at records[i]. Runs of consecutive physical pages whose records advance by one constant
+    // Record-addressed forms for caller-owned pinned host memory (or device memory, which the
+    // copies also take): page i is packed with `layout` at records[i]. Runs of consecutive physical pages whose records advance by one constant
     // pitch are copied as one strided transfer per plane. A strided transfer must stay inside one
     // pinned allocation and within the device's maximum copy pitch: `record_groups` (empty, or
     // one id per record) names the allocation each record lies in, and records of different

@@ -232,6 +232,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefix_cache      = true;
         // normalize_engine_options resolved every value for this architecture.
         program_options.prefix_host_bytes          = cache.host_capacity_bytes.value();
+        program_options.prefix_disk_bytes          = cache.hybrid.disk_capacity_bytes.value_or(0U);
         program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value();
         program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value();
         program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value();
@@ -611,10 +612,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     resolution.automatic_headroom_bytes      = sizing.headroom;
     resolution.planned_slack_bytes =
         after_weights > resolution.runtime_reservation_bytes ? after_weights - resolution.runtime_reservation_bytes : 0;
-    LoadSummary::PrefixCacheRestore restore;
-    if (const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
-        options.context_cache.enabled && !file.empty()) {
-        // Saved states depend on the n-gram rows: another volume's differ from the artifact's table.
+    LoadSummary::PrefixCacheDisk disk;
+    if (const std::filesystem::path& directory = options.context_cache.hybrid.disk_directory;
+        options.context_cache.enabled && !directory.empty()) {
+        // Stored states depend on the n-gram rows: another volume's differ from the artifact's table.
         std::string signature = "qwen4_exp;ngram=" + std::to_string(static_cast<int>(table.format)) + ":";
         for (const std::uint8_t byte : table.volume_id) {
             constexpr char kHex[] = "0123456789abcdef";
@@ -631,20 +632,21 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                 signature += kHex[std::to_integer<unsigned>(byte) & 15U];
             }
         }
-        const models::qwen4_exp::PrefixCachePersistence loaded = instance->program->attach_prefix_cache_file(
-            file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
-        restore = LoadSummary::PrefixCacheRestore{
-            .attempted           = true,
-            .restored            = loaded.ok,
-            .message             = loaded.message,
-            .blocks              = loaded.blocks,
-            .snapshots           = loaded.snapshots,
-            .bytes               = loaded.bytes,
-            .seconds             = loaded.seconds,
-            .saved_blocks        = loaded.saved_blocks,
-            .saved_snapshots     = loaded.saved_snapshots,
-            .required_host_bytes = loaded.required_host_bytes,
-            .host_bytes          = loaded.host_bytes,
+        const models::qwen4_exp::PrefixCacheDiskOpen opened =
+            instance->program->attach_prefix_cache_disk(directory, hybrid_cache_fingerprint(options, signature));
+        disk = LoadSummary::PrefixCacheDisk{
+            .attached          = true,
+            .mode              = opened.mode,
+            .reset_reason      = opened.reset_reason,
+            .damaged           = opened.damaged,
+            .capacity_bytes    = options.context_cache.hybrid.disk_capacity_bytes.value_or(0U),
+            .blocks            = opened.blocks,
+            .snapshots         = opened.snapshots,
+            .dropped_blocks    = opened.dropped_blocks,
+            .dropped_snapshots = opened.dropped_snapshots,
+            .bytes             = opened.bytes,
+            .staging_bytes     = opened.staging_bytes,
+            .seconds           = opened.seconds,
         };
     }
     program.complete();
@@ -662,7 +664,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.weight_formats       = {"bf16", "fp32", "nvfp4_mul"};
-    summary.prefix_cache         = std::move(restore);
+    summary.prefix_disk          = std::move(disk);
     summary.fast_path_configuration = models::qwen4_exp::describe(fast.configuration);
     for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
     summary.fast_paths_disabled        = !options.fast_paths;

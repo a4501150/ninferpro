@@ -9,8 +9,10 @@
 // - `catalog.log`: one record per Disk entry (a block, a snapshot, its removal, a snapshot's hits),
 //   each with a CRC. A record is written only after the slots it names are durable, and a slot is
 //   rewritten only after the removal of its previous record is durable, so a crash leaves at most
-//   records that were never written (their slots read as free). Replay stops at the first damaged
-//   record; startup then rewrites the journal with the live records only.
+//   records that were never written (their slots read as free). A block record follows its
+//   parent's and a snapshot record its anchor's: replay links each to the record live at that
+//   slot when it is read, so a link never reaches a block written later into a freed slot. Replay
+//   stops at the first damaged record; startup then rewrites the journal with the live records.
 // - `manifest`: the fingerprint and slot geometry. A mismatch clears the journal: nothing in the
 //   slot file is trusted.
 // - `lock`: held while the store is open, so two servers never share a directory.
@@ -90,7 +92,8 @@ public:
     [[nodiscard]] const std::string& reset_reason() const noexcept { return reset_reason_; }
     [[nodiscard]] bool damaged() const noexcept { return damaged_; }
     // Drops the replayed records (after the caller rebuilt the index from them) and rewrites the
-    // journal with `blocks` and `snapshots`, the ones the index kept.
+    // journal with `blocks` and `snapshots`, the ones the index kept; appends follow. A later call
+    // (the cache was emptied) first makes every appended record durable; it throws when that fails.
     void compact(std::span<const DiskBlockRecord> blocks, std::span<const DiskSnapshotRecord> snapshots);
 
     // Records whose slots have completed their writes. The record is written after those writes are

@@ -308,7 +308,7 @@ void LaneStateImage::copy_lane_to_host(std::uint32_t lane, const HostImage& imag
         for_each_segment_run(part.offset, part.bytes, image.segment_bytes,
                              [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t run) {
                                  CUDA_CHECK(cudaMemcpyAsync(image.segments[segment] + within, source + done, run,
-                                                            cudaMemcpyDeviceToHost, stream));
+                                                            cudaMemcpyDefault, stream));
                              });
     }
 }
@@ -323,7 +323,7 @@ void LaneStateImage::copy_group_to_host(std::uint32_t group, std::uint32_t lane,
         for_each_segment_run(part.offset, part.bytes, image.segment_bytes,
                              [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t run) {
                                  CUDA_CHECK(cudaMemcpyAsync(image.segments[segment] + within, source + done, run,
-                                                            cudaMemcpyDeviceToHost, stream));
+                                                            cudaMemcpyDefault, stream));
                              });
     }
 }
@@ -341,7 +341,7 @@ void LaneStateImage::copy_packed_to_host(const std::byte* packed, const HostImag
     for_each_segment_run(0, layout_->image_bytes, image.segment_bytes,
                          [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t run) {
                              CUDA_CHECK(cudaMemcpyAsync(image.segments[segment] + within, packed + done, run,
-                                                        cudaMemcpyDeviceToHost, stream));
+                                                        cudaMemcpyDefault, stream));
                          });
 }
 
@@ -355,7 +355,7 @@ void LaneStateImage::copy_group_from_host(std::uint32_t group, const HostImageCo
         for_each_segment_run(part.offset, part.bytes, image.segment_bytes,
                              [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t run) {
                                  CUDA_CHECK(cudaMemcpyAsync(destination + done, image.segments[segment] + within, run,
-                                                            cudaMemcpyHostToDevice, stream));
+                                                            cudaMemcpyDefault, stream));
                              });
     }
 }

@@ -691,6 +691,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"computed_prefill_tokens", outcome.metrics.computed_prefill_tokens},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
+             {"prefix_from_disk", outcome.metrics.prefix_from_disk},
              {"thinking_budget", outcome.thinking.configured_budget
                                      ? Json(*outcome.thinking.configured_budget)
                                      : Json(nullptr)},
@@ -869,7 +870,19 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"held_device_evictions", delta(&RuntimeStats::hybrid_held_device_evictions)},
                  {"held_snapshot_losses", delta(&RuntimeStats::hybrid_held_snapshot_losses)},
                  {"held_host_refusals", delta(&RuntimeStats::hybrid_held_host_refusals)},
-                 {"tool_call_holds", delta(&RuntimeStats::hybrid_tool_call_holds)}};
+                 {"tool_call_holds", delta(&RuntimeStats::hybrid_tool_call_holds)},
+                 {"disk_capacity_bytes", current.hybrid_disk_capacity_bytes},
+                 {"disk_used_bytes", current.hybrid_disk_used_bytes},
+                 {"disk_image_writes", delta(&RuntimeStats::hybrid_disk_image_writes)},
+                 {"disk_block_writes", delta(&RuntimeStats::hybrid_disk_block_writes)},
+                 {"disk_write_bytes", delta(&RuntimeStats::hybrid_disk_write_bytes)},
+                 {"disk_fetches", delta(&RuntimeStats::hybrid_disk_fetches)},
+                 {"disk_read_bytes", delta(&RuntimeStats::hybrid_disk_read_bytes)},
+                 {"disk_failures", delta(&RuntimeStats::hybrid_disk_failures)},
+                 {"disk_capture_skips", delta(&RuntimeStats::hybrid_disk_capture_skips)},
+                 {"disk_spill_skips", delta(&RuntimeStats::hybrid_disk_spill_skips)},
+                 {"disk_snapshot_evictions", delta(&RuntimeStats::hybrid_disk_snapshot_evictions)},
+                 {"disk_dead_reclaims", delta(&RuntimeStats::hybrid_disk_dead_reclaims)}};
     }
     return record.dump();
 }

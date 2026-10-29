@@ -4,8 +4,9 @@
 // kConfirmWindow, shown on the console's transient bottom line, so one stray press never cancels
 // running requests. Ctrl+Break, closing the console window and SIGTERM stop at once. The stop
 // closes the listener and fails running and queued requests; the Engine then saves the prefix
-// cache (--prefix-cache-file). While that runs, one more Ctrl+C abandons the save, whose
-// unfinished file the Engine deletes, and exits at once.
+// cache (--prefix-cache-file, or the spill to --prefix-cache-disk). While that runs, one more
+// Ctrl+C abandons the save (an unfinished file is deleted; what reached the Disk tier stays) and
+// exits at once.
 //
 // This is the state machine only: platform code delivers events with the current time, calls
 // expire() when the pending deadline passes, and supplies the console and process actions.

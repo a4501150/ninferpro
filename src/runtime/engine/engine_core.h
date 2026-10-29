@@ -880,6 +880,7 @@ private:
         if (request->begin) {
             result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
             result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+            result.prefix_from_disk     = request->begin->prefix_from_disk;
         }
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
@@ -1747,11 +1748,14 @@ private:
                     ++decision.current;
                     continue;
                 }
-                const BeginSummary begin{
+                BeginSummary begin{
                     .prompt_tokens        = request->base_plan->summary().prompt_tokens,
                     .reused_prompt_tokens = source.reused_tokens,
                     .prefix_reuse_path =
                         source.reused_tokens ? source.reuse_path : PrefixReusePath::Root};
+                if constexpr (requires { source.from_disk; }) {
+                    begin.prefix_from_disk = source.reused_tokens != 0 && source.from_disk;
+                }
                 if (restoring) {
                     std::erase(paused_, request);
                     observe_scheduling(request, GenerationSchedulingTransition::RestoreStarted,

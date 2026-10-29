@@ -198,6 +198,19 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             "Draft tokens accepted by native verification.");
     COUNTER(speculative_fallback_steps, "spec_decode_fallback_steps_total",
             "Speculative fallback steps without drafts.");
+    GAUGE(hybrid_disk_capacity_bytes, "prefix_cache_disk_capacity_bytes",
+          "Size of the prefix cache's Disk tier (0: none).");
+    GAUGE(hybrid_disk_used_bytes, "prefix_cache_disk_used_bytes", "Disk tier bytes holding entries.");
+    COUNTER(hybrid_disk_image_writes, "prefix_cache_disk_image_writes_total",
+            "Snapshot images written to the Disk tier.");
+    COUNTER(hybrid_disk_block_writes, "prefix_cache_disk_block_writes_total",
+            "KV block records written to the Disk tier.");
+    COUNTER(hybrid_disk_write_bytes, "prefix_cache_disk_write_bytes_total", "Bytes written to the Disk tier.");
+    COUNTER(hybrid_disk_fetches, "prefix_cache_disk_fetches_total",
+            "Reads of a resume source's Disk-only bytes.");
+    COUNTER(hybrid_disk_read_bytes, "prefix_cache_disk_read_bytes_total", "Bytes read from the Disk tier.");
+    COUNTER(hybrid_disk_failures, "prefix_cache_disk_failures_total",
+            "Failed Disk transfers and images that no longer match their record.");
     GAUGE(device_state_occupied_slots, "device_state_used_slots",
           "Occupied device StateImage slots.");
     gauge("device_state_capacity_slots",

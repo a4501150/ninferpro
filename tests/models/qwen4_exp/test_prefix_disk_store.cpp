@@ -1,11 +1,13 @@
 // The prefix cache Disk tier's store (disk_store.h): the journal replays blocks parents first and
-// snapshots with their meta, removals and hits apply, a damaged tail stops replay, a manifest
+// snapshots with their meta, a link reaches only the record live when it was written, removals
+// and hits apply, a damaged tail stops replay, a manifest
 // mismatch clears the journal, the directory is held by one store, and a freed slot becomes
 // writable only once its removal is durable. `INFERNIX_TEST_DISK_DIR` puts the store on a given
 // filesystem; otherwise it lives in the system temp directory.
 #include "../../test_temp_path.h"
 #include "models/qwen4_exp/program/prefix/disk_store.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -88,6 +90,11 @@ void run(const std::filesystem::path& directory) {
     const auto root  = block(0, pc::kNoId, 10);
     const auto child = block(5, 0, 20);
     const auto orphan = block(9, 30, 40); // its parent has no record
+    const auto early  = block(12, 13, 50); // written before its parent's record
+    const auto early_parent = block(13, pc::kNoId, 60);
+    const auto reused_parent = block(20, pc::kNoId, 70);
+    const auto stale_child   = block(21, 20, 80);
+    const auto reused        = block(20, pc::kNoId, 90);
     const auto tap   = snapshot({6, 7, 8, 11}, 5, 140, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     {
         DiskStore store(directory, "fingerprint-a", kGeometry);
@@ -100,24 +107,49 @@ void run(const std::filesystem::path& directory) {
         } catch (const std::runtime_error&) { refused = true; }
         check(refused, "a second store on the same directory is refused");
         store.compact({}, {});
-        // Children may be appended before their parents' records; replay orders them.
-        store.append_block(child);
         store.append_block(root);
+        store.append_block(child);
         store.append_block(orphan);
+        store.append_block(early);
+        store.append_block(early_parent);
         store.append_snapshot(tap);
+        // A block whose parent's slot was freed and rewritten does not hang below the new block.
+        store.append_block(reused_parent);
+        store.append_block(stale_child);
+        store.append_removal(reused_parent.slot, std::vector<std::uint32_t>{reused_parent.slot});
+        store.append_block(reused);
         store.flush();
     }
     {
         DiskStore store(directory, "fingerprint-a", kGeometry);
         check(store.reset_reason().empty() && !store.damaged(), "a matching store replays its journal");
         const auto& blocks = store.replayed_blocks();
-        check(blocks.size() == 2 && same(blocks[0], root) && same(blocks[1], child),
-              "blocks replay parents first, without an orphan");
+        bool parents_first = blocks.size() == 4;
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            parents_first = parents_first && (blocks[i].parent_slot == pc::kNoId ||
+                                              std::any_of(blocks.begin(), blocks.begin() + static_cast<std::ptrdiff_t>(i),
+                                                          [&](const DiskBlockRecord& b) {
+                                                              return b.slot == blocks[i].parent_slot;
+                                                          }));
+        }
+        const auto has = [&](const DiskBlockRecord& wanted) {
+            return std::any_of(blocks.begin(), blocks.end(), [&](const DiskBlockRecord& b) { return same(b, wanted); });
+        };
+        check(parents_first && has(root) && has(child) && has(early_parent), "blocks replay parents first");
+        check(std::none_of(blocks.begin(), blocks.end(),
+                           [&](const DiskBlockRecord& b) {
+                               return b.slot == orphan.slot || b.slot == early.slot || b.slot == stale_child.slot;
+                           }),
+              "a block without a live parent record when it was written is dropped");
+        check(has(reused), "a rewritten slot holds its new block");
+        std::vector<DiskBlockRecord> rewritten;
+        for (const DiskBlockRecord& b : blocks) {
+            if (b.slot == root.slot || b.slot == child.slot) { rewritten.push_back(b); }
+        }
         check(store.replayed_snapshots().size() == 1 && same(store.replayed_snapshots()[0], tap),
               "a snapshot replays with its tail and meta");
-        const std::vector<DiskBlockRecord> kept_blocks(blocks.begin(), blocks.end());
         const std::vector<DiskSnapshotRecord> kept_snapshots = store.replayed_snapshots();
-        store.compact(kept_blocks, kept_snapshots);
+        store.compact(rewritten, kept_snapshots);
         check(store.replayed_blocks().empty(), "compaction drops the replayed records");
 
         // A freed slot is writable again only once its removal is durable.

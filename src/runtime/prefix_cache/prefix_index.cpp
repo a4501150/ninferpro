@@ -663,6 +663,7 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
         }
         if (result.device_attached && node.disk == CopyState::Resident) {
             drop_node_disk_copy(existing->index);
+            backend_->disk_record_replaced(*existing);
         }
         ++node.pins;
         refresh_node(existing->index);
@@ -1179,6 +1180,25 @@ std::vector<SnapshotRef> PrefixCacheIndex::disk_spill_candidates(std::uint64_t s
         }
     }
     return out;
+}
+
+void PrefixCacheIndex::disk_records_below(NodeRef node, std::vector<NodeRef>& blocks,
+                                          std::vector<SnapshotRef>& snapshots) const {
+    (void)require(node);
+    std::vector<std::uint32_t> level{node.index};
+    while (!level.empty()) {
+        std::vector<std::uint32_t> next;
+        for (const std::uint32_t index : level) {
+            for (const std::uint32_t snapshot : nodes_[index].snapshots) {
+                if (snapshots_[snapshot].disk == CopyState::Resident) { snapshots.push_back(ref_of_snapshot(snapshot)); }
+            }
+            for (const std::uint32_t child : nodes_[index].children) {
+                if (nodes_[child].disk == CopyState::Resident) { blocks.push_back(ref_of_node(child)); }
+                next.push_back(child);
+            }
+        }
+        level.swap(next);
+    }
 }
 
 void PrefixCacheIndex::begin_disk_rebuild() {
@@ -1925,6 +1945,7 @@ SnapshotView PrefixCacheIndex::snapshot(SnapshotRef ref) const {
     view.hits             = snapshot.hits;
     view.superseded       = snapshot.superseded;
     view.head_residual    = snapshot.head_residual;
+    view.priority         = snapshot.priority;
     view.tail             = std::span<const TokenId>(snapshot.tail.data(), snapshot.tail_len);
     return view;
 }

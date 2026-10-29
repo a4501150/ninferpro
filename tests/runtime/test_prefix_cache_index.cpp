@@ -43,6 +43,8 @@ public:
         disk_released.push_back(slots.front());
     }
 
+    void disk_record_replaced(NodeRef node) noexcept override { disk_replaced.push_back(node); }
+
     std::uint32_t allocate() {
         const std::uint32_t id = next++;
         live.insert(id);
@@ -51,6 +53,7 @@ public:
 
     std::vector<std::uint32_t> released;
     std::vector<std::uint32_t> disk_released;
+    std::vector<NodeRef> disk_replaced;
     std::set<std::uint32_t> live;
     std::uint32_t next = 1;
 };
@@ -1519,6 +1522,17 @@ void test_disk_backed_blocks() {
     require(index.node(last).disk == CopyState::Absent &&
                 std::count(backend.disk_released.begin(), backend.disk_released.end(), slots[2]) == 1,
             "the displaced Disk record is released");
+    require(backend.disk_replaced.size() == 1 && backend.disk_replaced.front() == last,
+            "the backend learns which block lost its Disk record");
+    std::vector<NodeRef> below_blocks;
+    std::vector<SnapshotRef> below_snapshots;
+    index.disk_records_below(last, below_blocks, below_snapshots);
+    require(below_blocks.empty() && below_snapshots.size() == 1 && below_snapshots.front() == tap,
+            "the snapshot anchored at the block is a Disk record below it");
+    below_snapshots.clear();
+    index.disk_records_below(path[0], below_blocks, below_snapshots);
+    require(below_blocks.size() == 1 && below_blocks.front() == path[1] && below_snapshots.size() == 1,
+            "the Disk records below a block skip the ones without a Disk copy");
     index.release_path(std::span<const NodeRef>(path.data(), 3));
     index.check_invariants();
 

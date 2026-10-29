@@ -103,6 +103,11 @@ public:
     // The index stopped referencing a Disk record: a block's slot, or a snapshot's slots (image,
     // then tail); the first slot names the record. Called before the slots can be reused.
     virtual void release_disk_record(std::span<const std::uint32_t> /*slots*/) noexcept {}
+
+    // A sequence's page replaced the block's bytes, so its Disk record was released while the
+    // block stays in the tree: the Disk records below it (blocks and snapshots) lost their parent
+    // record. Called after release_disk_record.
+    virtual void disk_record_replaced(NodeRef /*node*/) noexcept {}
 };
 
 struct MatchCandidate {
@@ -198,6 +203,7 @@ struct SnapshotView {
     // The image's HeadSaved part holds the head residual of this frontier's last token — the
     // zero-token resume's state; only a prompt-end capture sets it.
     bool head_residual = false;
+    double priority    = 0.0; // GDSF value (estimate_priority's scale)
     std::span<const TokenId> tail;
 };
 
@@ -390,6 +396,9 @@ public:
     // within the first `slabs` slabs of the Host eviction order (superseded snapshots excluded),
     // coldest first: what to write to the Disk before the Host tier evicts it.
     [[nodiscard]] std::vector<SnapshotRef> disk_spill_candidates(std::uint64_t slabs) const;
+    // The Disk-resident blocks strictly below `node`, parents before children, and the
+    // Disk-resident snapshots anchored at or below it.
+    void disk_records_below(NodeRef node, std::vector<NodeRef>& blocks, std::vector<SnapshotRef>& snapshots) const;
 
     // Rebuilds a Disk tier's records into an empty index at startup, parents before children and
     // anchors before their snapshots, each at the slots it occupies; no data is read. Between
