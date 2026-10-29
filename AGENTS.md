@@ -46,6 +46,12 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
     across restarts by a journal; the RAM tier spills cold snapshots to it or, at
     `--host-context-mib 0`, captures write through; it replaces this model's whole-file save;
   - batched DFlash2 drafting at any round size with an online cost fit;
+  - prefill beside decode for Qwen3.8-Flash-Next: while another lane decodes, a prompt's calls are
+    split to `--prefill-chunk-beside-decode` and each but the last rides in the decode round's
+    Forward (mixed rounds, `ForwardBatch::prefill_part`); only the column-invariant exact route
+    (where the bits equal the separate calls') and request-coupled fast routes mix;
+  - tool-call grammar fixes: under a constrained auto contract a call opener inside Markdown code
+    is text, and the turn may end inside its thinking (non-strict calls there are recovered);
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
 
 ### Mechanism and policy
@@ -106,7 +112,8 @@ the smaller-card path working even though it is not measured here.
 
 Generation uses one GPU, one resident model, one to eight resident execution lanes fixed at startup,
 bounded FIFO ingress with finite bypass, resource-pressure preemption with Replay recovery,
-one content-addressed prefix cache, and one compact decode batch per round.
+one content-addressed prefix cache, and one compact decode batch per round (on Qwen3.8-Flash-Next the
+round's prefill call can ride in its Forward: a mixed round).
 Generation and offline CausalScoring use the same public `.infernix` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale continuous
@@ -223,8 +230,8 @@ the memory cap and the GPU lock itself.
 | Tier | Command | What it establishes | Time |
 |---|---|---|---|
 | T0 | `make t0 [R=regex]` | unit, Op and contract tests: CTest without the `real` label | minutes |
-| T1 | `make t1 [SHAPE=6x1,6x2]`, `make t1-exact`, `make t1-kernels [KSHAPE=6x2] [METRICS=1]` | one generation round of each shape on the real artifact through the production Forward and its CUDA Graph (`bench/models/qwen4_exp/round_bench.cpp`): device time, commit time, `--sections` per layer half, per-kernel table (with `METRICS=1` also the DRAM bandwidth each kernel leaves unused), and the logits and lane-state hashes against `bench/models/qwen4_exp/round_hashes.txt`; every shape also replays 2 or more times from one state and fails on differing bits (`--determinism N`) | about 10 s |
-| T2 | `make t2`, `make t2-record` | start-up and correctness smoke test (`tests/models/qwen4_exp/test_smoke_real.cpp`): the public Engine in process with production's options on the real artifacts (six concurrent requests, DFlash2 drafting, prefix-cache resume, an expert-placement switch and back), then the exact route's greedy tokens against `tests/models/qwen4_exp/smoke_golden.txt`, alone, six in flight, resumed and after the switch | about a minute |
+| T1 | `make t1 [SHAPE=6x1,6x2]`, `make t1-exact`, `make t1-kernels [KSHAPE=6x2] [METRICS=1]` | one generation round of each shape on the real artifact through the production Forward and its CUDA Graph (`bench/models/qwen4_exp/round_bench.cpp`), and a mixed shape (`6x2+1024`: the round and a prefill chunk in one call, on the exact route equal to the two calls): device time, commit time, `--sections` per layer half, per-kernel table (with `METRICS=1` also the DRAM bandwidth each kernel leaves unused), and the logits and lane-state hashes against `bench/models/qwen4_exp/round_hashes.txt`; every shape also replays 2 or more times from one state and fails on differing bits (`--determinism N`) | about 10 s |
+| T2 | `make t2`, `make t2-record` | start-up and correctness smoke test (`tests/models/qwen4_exp/test_smoke_real.cpp`): the public Engine in process with production's options on the real artifacts (six concurrent requests, DFlash2 drafting, prefix-cache resume, an expert-placement switch and back), then the exact route's greedy tokens against `tests/models/qwen4_exp/smoke_golden.txt`, alone, six in flight, beside a long prompt's mixed rounds, resumed and after the switch | about a minute |
 | T2 bench | `make t2-bench [ARGS="--repeat 5"]` | aggregate tok/s of six concurrent 256-token requests through the Engine in process (`bench/models/qwen4_exp/engine_bench.cpp`): the DFlash2 policy, host work and the Forward together, without a server boot | about a minute |
 | T3 | `make t3 ARGS=...` | promotion: `bench_infernix.py` and the quality gate against the server build; the only tier for policy behaviour that depends on live timing (the DFlash2 cost fit, placement swaps, scheduling) | many minutes |
 

@@ -570,6 +570,11 @@ struct EngineOptions {
     // Qwen3.8-Flash-Next (its exact-route prefill measured identical across chunks), 1,024
     // otherwise.
     std::uint32_t prefill_chunk        = 0;
+    // Prompt tokens per prefill call while another request decodes (Qwen3.8-Flash-Next), a multiple
+    // of 128; 0 takes the model's default. The engine runs one decode round per prefill call, so a
+    // narrower call keeps the decoding requests streaming at some cost to the prefilling one; at
+    // prefill_chunk or above it changes nothing.
+    std::uint32_t prefill_chunk_beside_decode = 0;
     // INT8 KV prefills with the fast prompt-attention kernel and rounds prefill_chunk down to whole
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
     // it requires the INT8 KV cache.
@@ -1714,6 +1719,8 @@ struct RuntimeStats {
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds             = 0;
     std::uint64_t decode_row_rounds         = 0;
+    // Decode rounds whose Forward also ran a prompt call (Qwen3.8-Flash-Next's mixed rounds).
+    std::uint64_t mixed_rounds              = 0;
     std::uint32_t running_requests          = 0;
     std::uint32_t prefilling_requests       = 0;
     std::uint32_t decode_ready_requests     = 0;

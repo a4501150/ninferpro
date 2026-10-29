@@ -5,4 +5,6 @@ Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x1 context=1024 kv=fp8 ex
 Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x1 context=1024 kv=fp8 experts=64 fast accept=1 = 5d940d6316135469 935d60d51c91cf59
 Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2 context=1024 kv=fp8 experts=64 exact accept=2 = 9995cc291206e4ea 88a6e9704d9aec8c
 Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2 context=1024 kv=fp8 experts=64 fast accept=2 = 307c1c75199f3437 70e2157c78991e82
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2+1024 context=1024 kv=fp8 experts=64 exact accept=2 = 9995cc291206e4ea 6846f8c5cf8ab284
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2+1024 context=1024 kv=fp8 experts=64 fast accept=2 = 8e134499eb91b96f ea6a7befcb99d2f3
 Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x3 context=1024 kv=fp8 experts=64 fast accept=3 = 168764f1f0e4445e 0776ee1ea858977c

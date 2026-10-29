@@ -38,9 +38,11 @@ ARTIFACT  ?= $(MODELS)/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix
 NGRAM     ?= $(MODELS)/Qwen3.8-Flash-Next-BF16.ngram
 DRAFTER   ?= $(MODELS)/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix
 MODEL_ENV  = INFERNIX_QWEN4_ARTIFACT=$(ARTIFACT) INFERNIX_QWEN4_NGRAM=$(NGRAM) INFERNIX_QWEN4_DFLASH2=$(DRAFTER)
-# The golden configurations: the fast route at decode and verification shapes, the exact route at two.
-T1_FAST   := 1x1,6x1,1x4,6x2,6x3
-T1_EXACT  := 6x1,6x2
+# The golden configurations: the fast route at decode and verification shapes, the exact route at two,
+# and on both a mixed call (a verification round beside a prefill chunk; on the exact route it must
+# equal the two calls it replaces).
+T1_FAST   := 1x1,6x1,1x4,6x2,6x3,6x2+1024
+T1_EXACT  := 6x1,6x2,6x2+1024
 SHAPE     ?= $(T1_FAST)
 KSHAPE    ?= 6x2
 METRICS   ?=

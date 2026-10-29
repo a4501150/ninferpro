@@ -139,7 +139,10 @@ capacity event tries a complete resume of the oldest paused request. It then req
 permits row by row, resumes first and original ticket order first, keeps the runnable subset, and
 uses the remaining headroom to try fresh admission.
 It executes the permitted compact Control/Decode set and one Prefill/Replay chunk; rows committed by
-Control reacquire Decode permits in the next cycle. Graphs use the actual member count and execution
+Control reacquire Decode permits in the next cycle. A Program with mixed rounds (Qwen3.8-Flash-Next)
+runs the Prefill chunk inside the Decode round's Forward when it can (`Program::can_mix`: not the
+prompt's last call, a layer walk's, a replay's or an image prompt's, and no context transaction open):
+one call, whose pending batch holds the decode rows only, then the chunk's progress. Graphs use the actual member count and execution
 profile. With the `idle-wide-prefill` fast path a Prefill permit reserved while no other lane is
 generating covers the startup-planned idle width (a multiple of the chunk) instead of one chunk,
 when its extra KV pages are free or evictable cache; a held permit keeps its width until its step
@@ -186,7 +189,8 @@ time of each execution unit separately.
 The Engine advances context transactions in a bounded way at the start of the round, after admission
 before execution selection, and after Control/Decode. Completed bindings promptly enter the existing
 permit flow; after Control/Decode executes, only Prefill/Replay permits that have not yet executed are
-refreshed, and each round is still one compact decode batch and one prefill turn. Incomplete
+refreshed, and each round is still one compact decode batch and one prefill turn (a mixed round runs
+both in one call). Incomplete
 asynchronous events are not spin-waited on.
 
 Events such as completion, cancellation, permanent shrink and a younger request pausing to release

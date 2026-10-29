@@ -27,6 +27,12 @@ The binaries keep their Infernix names (`infernix-serve`, `infernix`, `infernix-
 - **A working prefix cache** for single-chunk prompts on artifacts without free cache resume
   (system prompts, repeats, forked agents, restarts).
 - **Batched DFlash2 drafting** at any number of concurrent requests, with an online cost fit.
+- **Prefill beside decode.** While another request streams, a long prompt prefills in calls of
+  `--prefill-chunk-beside-decode` tokens (default 1,024), each but the last inside the decode
+  round's Forward (a mixed round), so the stream keeps going; on the exact route the output is bit
+  for bit the same.
+- **Tool-call grammar fixes.** A constrained auto tool turn treats a call opener inside Markdown
+  code as text, and may end inside its thinking (non-strict calls written there are recovered).
 - `--served-model-name` aliases, and a Linux fix to VRAM spill detection.
 
 ## Measured

@@ -78,8 +78,11 @@ columns: W = 1 plain decode, W >= 2 verification followed by the commit) through
 Forward and its CUDA Graph, every routed expert in its own VRAM frame, without the Engine. It
 prefills all eight lanes from `fixtures/bench_corpus.ids`, then reports per shape the forward and
 commit device times, the logits and lane-state hashes, and with `--sections` each layer half as its
-own graph. `make t1`, `make t1-exact`, `make t1-kernels` and `make t1-record` drive it (AGENTS.md
-"Iteration tiers"); the source header lists every option.
+own graph. A mixed shape `RxW+P` runs the round and a P-token prefill chunk of the eighth lane
+once as the round's graph followed by the chunk's call and once as one mixed call
+(`ForwardBatch::prefill_part`), and reports both device times; on the exact route it fails unless
+the two give the same bits. `make t1`, `make t1-exact`, `make t1-kernels` and `make t1-record`
+drive it (AGENTS.md "Iteration tiers"); the source header lists every option.
 
 `--profile` brackets the timed replays with `cudaProfilerStart`/`Stop`, so Nsight Compute can profile
 the decode kernels inside the round's graph:

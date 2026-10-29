@@ -257,7 +257,12 @@ cancellation, and on a capacity event tries a complete resume of the oldest paus
 acquires unit permits row by row for resident requests (resumes first, then original ticket order),
 uses the remaining headroom to try fresh admission, and then executes the runnable control and decode
 work and one prefill/Replay chunk. A protected resume gets the chunk first; other prefills rotate among
-resident requests, and decode batches use the actual `B`.
+resident requests, and decode batches use the actual `B`. On Qwen3.8-Flash-Next a prefill chunk
+that is not its prompt's last runs inside the decode round's Forward (a mixed round, `Program::mixed`):
+the Forward takes the chunk as a part after the round's columns (`ForwardBatch::prefill_part`),
+column-wise work runs once over both and the token mixers per part, eagerly (the chunk's width needs
+the wide arena, which no graph captures). Its exact route stays bit for bit the two calls' on
+construction-exact configurations, so only those and request-coupled fast routes mix.
 
 The Program's `reserve_units` atomically acquires the typed incremental demand of one call set; the
 Engine calls it row by row to form the runnable subset. One row lacking resources does not stop other

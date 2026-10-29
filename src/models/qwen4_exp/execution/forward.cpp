@@ -238,12 +238,21 @@ void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
                                     batch.verify->gdn.spec.record_capacity < batch.batch)) {
         throw std::invalid_argument("Qwen4Exp forward: verification records do not match the call");
     }
-    if (batch.batch <= 0 || batch.width <= 0 || batch.batch * batch.width != T ||
+    const ForwardPrefillPart* part = batch.prefill_part;
+    if (part != nullptr &&
+        (part->width <= 0 || part->rope_positions.ne[0] != part->width || part->rope_positions.ne[1] != 3 ||
+         part->block_start_rope.ne[0] != 1 || part->block_start_rope.ne[1] != 3 || part->slots.ne[0] != 1 ||
+         part->table_rows.ne[0] != 1 || part->host_slots.size() != 1 || batch.mtp_chunk != nullptr ||
+         batch.vision != nullptr || (batch.verify == nullptr && batch.width != 1))) {
+        throw std::invalid_argument("Qwen4Exp forward: the mixed call's prefill part is invalid");
+    }
+    const std::int32_t decode_columns = T - (part != nullptr ? part->width : 0);
+    if (batch.batch <= 0 || batch.width <= 0 || batch.batch * batch.width != decode_columns ||
         (logits != nullptr && (logits->dtype != DType::FP32 || logits->ne[1] != batch.logit_columns.ne[0] ||
                                logits->ne[0] != dim(config_.vocab_size)))) {
         throw std::invalid_argument("Qwen4Exp forward: batch geometry is invalid");
     }
-    if (batch.rope_positions.ne[0] != T || batch.rope_positions.ne[1] != 3 ||
+    if (batch.rope_positions.ne[0] != decode_columns || batch.rope_positions.ne[1] != 3 ||
         batch.block_start_rope.ne[0] != batch.batch || batch.block_start_rope.ne[1] != 3) {
         throw std::invalid_argument("Qwen4Exp forward: RoPE positions must be [T, 3] and block starts [batch, 3]");
     }
@@ -252,8 +261,9 @@ void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
             throw std::invalid_argument("Qwen4Exp forward: layer waits do not match the layers");
         }
     }
-    // Prefill chunks and forced tokens run eagerly; decode and verification rounds may be captured.
-    eager_chunk_ = batch.verify == nullptr && batch.width > 1;
+    // Prefill chunks, forced tokens and mixed calls run eagerly; decode and verification rounds may
+    // be captured.
+    eager_chunk_ = part != nullptr || (batch.verify == nullptr && batch.width > 1);
     work_.reset();
 }
 
@@ -317,10 +327,18 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
     } catch (const std::exception& error) {
         throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
     }
+    // A mixed call's decode rows end at its prefill part; each part's features are its last n columns.
+    const ForwardPrefillPart* part = batch.prefill_part;
+    const std::int32_t D           = residual.ne[1] - (part != nullptr ? part->width : 0);
     if (batch.draft_features.data != nullptr) {
-        const std::int32_t n = batch.draft_features.ne[1], T = residual.ne[1];
-        if (n > T) { throw std::invalid_argument("Qwen4Exp forward: DFlash2 features exceed the call"); }
-        capture_draft_features(layer, residual.slice(1, T - n, n), batch.draft_features);
+        const std::int32_t n = batch.draft_features.ne[1];
+        if (n > D) { throw std::invalid_argument("Qwen4Exp forward: DFlash2 features exceed the call"); }
+        capture_draft_features(layer, residual.slice(1, D - n, n), batch.draft_features);
+    }
+    if (part != nullptr && part->draft_features.data != nullptr) {
+        const std::int32_t n = part->draft_features.ne[1];
+        if (n > part->width) { throw std::invalid_argument("Qwen4Exp forward: DFlash2 features exceed the call"); }
+        capture_draft_features(layer, residual.slice(1, residual.ne[1] - n, n), part->draft_features);
     }
     if (tap != nullptr && tap->residuals != nullptr) {
         Tensor& copy = tap->residuals->at(layer);
@@ -351,21 +369,35 @@ Tensor Forward::mixer(std::uint32_t layer, const ForwardBatch& batch, const Tens
         return gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch);
     }
     // A verification call records the raw index keys for the tail commit.
+    const ForwardPrefillPart* part = batch.prefill_part;
+    const std::int32_t D           = part != nullptr ? T - part->width : T;
+    const Tensor positions         = part != nullptr ? batch.positions.slice(0, 0, D) : batch.positions;
     const AttentionCall call{.layer       = kv_.layers.at(compact),
                              .tails       = state_.qsa_tails.at(compact),
                              .key_records = batch.verify != nullptr
                                                 ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(compact), 1)
-                                                      .view({dim(config_.qsa.index_head_dim), T})
+                                                      .view({dim(config_.qsa.index_head_dim), D})
                                                 : Tensor{},
                              .update_tails     = batch.verify == nullptr,
-                             .positions        = batch.positions,
+                             .positions        = positions,
                              .rope_positions   = batch.rope_positions,
                              .block_start_rope = batch.block_start_rope,
                              .slots            = batch.slots,
                              .table_rows       = batch.table_rows,
                              .batch            = batch.batch,
                              .width            = batch.width};
-    return attention(std::get<AttentionParameters>(block.mixer), xa, call);
+    if (part == nullptr) { return attention(std::get<AttentionParameters>(block.mixer), xa, call); }
+    const Tensor prefill_positions = batch.positions.slice(0, D, part->width);
+    const AttentionCall prefill{.layer            = kv_.layers.at(compact),
+                                .tails            = state_.qsa_tails.at(compact),
+                                .positions        = prefill_positions,
+                                .rope_positions   = part->rope_positions,
+                                .block_start_rope = part->block_start_rope,
+                                .slots            = part->slots,
+                                .table_rows       = part->table_rows,
+                                .batch            = 1,
+                                .width            = part->width};
+    return attention(std::get<AttentionParameters>(block.mixer), xa, call, &prefill);
 }
 
 void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, Tensor& xm, Tensor& inject) {
@@ -573,12 +605,30 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
     ops::split_rows(kv, parts, s);
     Tensor gated      = work_.alloc(DType::BF16, {W, T});
     // A verification call records the convolution inputs for its commit and leaves the history.
-    Tensor normalized = batch.verify != nullptr ? batch.verify->ple_inputs.view({W, T})
-                                                : work_.alloc(DType::BF16, {W, T});
+    const ForwardPrefillPart* part = batch.prefill_part;
+    Tensor normalized = batch.verify != nullptr && part == nullptr ? batch.verify->ple_inputs.view({W, T})
+                                                                   : work_.alloc(DType::BF16, {W, T});
     ops::ple_gate(key, value, residual, p.key_norm, p.query_norm, p.conv_norm, dim(config_.hc.streams),
                   config_.rms_norm_eps, gated, normalized, s);
-    ops::ple_conv_inject(gated, normalized, p.convolution, dim(config_.ple.conv_dilation), state_.ple_conv,
-                         batch.slots, batch.verify != nullptr ? Tensor{} : batch.slots, residual, s);
+    if (part == nullptr) {
+        ops::ple_conv_inject(gated, normalized, p.convolution, dim(config_.ple.conv_dilation), state_.ple_conv,
+                             batch.slots, batch.verify != nullptr ? Tensor{} : batch.slots, residual, s);
+        return;
+    }
+    // A mixed call: the decode rows' convolution (and their verification record), then the prefill
+    // row's, each over its own columns.
+    const std::int32_t D = T - part->width;
+    if (batch.verify != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(batch.verify->ple_inputs.data, normalized.data,
+                                   static_cast<std::size_t>(W) * D * 2, cudaMemcpyDeviceToDevice, s));
+    }
+    Tensor decode_residual = residual.slice(1, 0, D), prefill_residual = residual.slice(1, D, part->width);
+    ops::ple_conv_inject(gated.slice(1, 0, D), normalized.slice(1, 0, D), p.convolution,
+                         dim(config_.ple.conv_dilation), state_.ple_conv, batch.slots,
+                         batch.verify != nullptr ? Tensor{} : batch.slots, decode_residual, s);
+    ops::ple_conv_inject(gated.slice(1, D, part->width), normalized.slice(1, D, part->width), p.convolution,
+                         dim(config_.ple.conv_dilation), state_.ple_conv, part->slots, part->slots,
+                         prefill_residual, s);
 }
 
 Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch) {
@@ -588,15 +638,20 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     const std::int32_t C = dim(g.conv_channels()), KW = dim(g.key_width()), VW = dim(g.value_width());
     const std::int32_t NV = dim(g.value_heads), NK = dim(g.key_heads), DK = dim(g.key_head_dim),
                        DV = dim(g.value_head_dim);
-    // A verification call projects its convolution inputs straight into the replay records.
+    // A verification call projects its convolution inputs straight into the replay records (a
+    // mixed call copies its decode rows' columns there).
+    const ForwardPrefillPart* part = batch.prefill_part;
     GdnReplayRecordLayer records;
     if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), batch.batch); }
     // gdn-conv-fused: a decode call's Q8 projection runs the causal convolution in its epilogue, from
-    // the FP32 projection rather than its BF16 rounding. Verification and prefill stay composed.
-    const bool decode     = batch.verify == nullptr && batch.width <= 1;
+    // the FP32 projection rather than its BF16 rounding. Verification, prefill and mixed calls stay
+    // composed.
+    const bool decode     = batch.verify == nullptr && batch.width <= 1 && part == nullptr;
     const bool fused_conv = fast_.gdn_conv_fused && decode && p.projection.weight.qtype == QType::Q8_G32_FP16;
     Tensor qkv;
-    if (!fused_conv) { qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_.alloc(DType::BF16, {C, T}); }
+    if (!fused_conv) {
+        qkv = batch.verify != nullptr && part == nullptr ? records.conv.view({C, T}) : work_.alloc(DType::BF16, {C, T});
+    }
     Tensor z  = work_.alloc(DType::BF16, {VW, T});
     Tensor ab = work_.alloc(DType::BF16, {2 * NV, T}); // the control projection: a's rows, then b's
     Tensor q, k, v;
@@ -646,9 +701,9 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     }
     // Verification and prefill chunks evaluate the gates once for their recurrence; decode evaluates
     // them inside the recurrent update, except a GGUF import's (its third input holds A itself), whose
-    // decode takes them from gdn_gating_direct too.
+    // decode takes them from gdn_gating_direct too. A mixed call's prefill part needs them.
     Tensor gate, beta;
-    if (batch.verify != nullptr || batch.width > 1 || g.a_direct) {
+    if (batch.verify != nullptr || batch.width > 1 || g.a_direct || part != nullptr) {
         gate = work_.alloc(DType::FP32, {NV, T});
         beta = work_.alloc(DType::FP32, {NV, T});
         if (g.a_direct) {
@@ -665,48 +720,72 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     }
     Tensor o = work_.alloc(DType::BF16, {DV, NV, T});
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(DK)));
-    if (batch.verify != nullptr) {
-        // Speculative verification: the convolution and recurrence run from the live states
-        // without changing them, and the recurrence's inputs are recorded for the commit fold.
-        const std::int32_t Wd = batch.width, B = batch.batch;
-        auto layer = state_.gdn->layer_view(index);
-        ops::causal_conv1d_silu_from_states_split(qkv.view({C, Wd, B}), p.convolution, layer.conv,
-                                                  batch.slots, q, k, v, s);
-        Tensor o_rows = o.view({DV, NV, Wd, B});
-        ops::gated_delta_net_replay_record(q.view({DK, NK, Wd, B}), k.view({DK, NK, Wd, B}), v.view({DV, NV, Wd, B}),
-                                           gate.view({NV, Wd, B}), beta.view({NV, Wd, B}), scale, layer.recurrent,
-                                           Tensor{}, batch.slots, records.key, records.value, records.gate,
-                                           o_rows, s);
-    } else if (batch.width > 1) {
-        // One sequence of several positions (a prefill chunk): chunked recurrence.
-        if (batch.batch != 1) { throw std::invalid_argument("Qwen4Exp GDN: multi-position calls hold one sequence"); }
-        if (batch.host_slots.empty()) { throw std::invalid_argument("Qwen4Exp GDN: missing host slot"); }
-        const std::int32_t slot = batch.host_slots[0];
-        Tensor conv_state = state_.gdn->conv_slot(index, slot);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state, conv_state, q, k, v, s);
-        Tensor state = state_.gdn->recurrent_slot(index, slot);
-        ops::gated_delta_net(q.view({DK, NK, T}), k.view({DK, NK, T}), v.view({DV, NV, T}), gate, beta, scale,
-                             /*normalize_qk=*/true, work_, state, state, o, device_.execution_view(),
-                             fast_.gdn_arithmetic);
-    } else {
-        // One position per sequence (decode): the recurrent update with device-chosen slots.
-        auto layer = state_.gdn->layer_view(index);
-        if (!fused_conv) {
-            ops::causal_conv1d_silu_snapshot_split(qkv.view({C, 1, T}), p.convolution, layer.conv, Tensor{},
-                                                   batch.slots, batch.slots, q, k, v, s);
-        }
-        Tensor o_batch = o.view({DV, NV, 1, T});
-        if (g.a_direct) {
-            ops::gated_delta_net_batch_update(q.view({DK, NK, 1, T}), k.view({DK, NK, 1, T}), v.view({DV, NV, 1, T}),
-                                              gate.view({NV, 1, T}), beta.view({NV, 1, T}), scale, /*normalize_qk=*/true,
-                                              layer.recurrent, batch.slots, batch.slots, o_batch, s);
+    // The recurrence of one part: `rows` sequences of `width` positions in columns [first, first + n).
+    const auto recur = [&](std::int32_t first, std::int32_t rows, std::int32_t width, bool verify, const Tensor& slots,
+                           std::span<const std::int32_t> host_slots) {
+        const std::int32_t n = rows * width;
+        const bool whole     = first == 0 && n == T;
+        const auto cols      = [&](const Tensor& t, int d) { return whole || t.data == nullptr ? t : t.slice(d, first, n); };
+        Tensor pq = cols(q, 1), pk = cols(k, 1), pv = cols(v, 1), pqkv = cols(qkv, 1), po = cols(o, 2);
+        Tensor pgate = cols(gate, 1), pbeta = cols(beta, 1);
+        if (verify) {
+            // Speculative verification: the convolution and recurrence run from the live states
+            // without changing them, and the recurrence's inputs are recorded for the commit fold.
+            const std::int32_t Wd = width, B = rows;
+            auto layer = state_.gdn->layer_view(index);
+            ops::causal_conv1d_silu_from_states_split(pqkv.view({C, Wd, B}), p.convolution, layer.conv, slots, pq, pk,
+                                                      pv, s);
+            Tensor o_rows = po.view({DV, NV, Wd, B});
+            ops::gated_delta_net_replay_record(pq.view({DK, NK, Wd, B}), pk.view({DK, NK, Wd, B}),
+                                               pv.view({DV, NV, Wd, B}), pgate.view({NV, Wd, B}),
+                                               pbeta.view({NV, Wd, B}), scale, layer.recurrent, Tensor{}, slots,
+                                               records.key, records.value, records.gate, o_rows, s);
+        } else if (width > 1) {
+            // One sequence of several positions (a prefill chunk): chunked recurrence.
+            if (rows != 1) { throw std::invalid_argument("Qwen4Exp GDN: multi-position calls hold one sequence"); }
+            if (host_slots.empty()) { throw std::invalid_argument("Qwen4Exp GDN: missing host slot"); }
+            const std::int32_t slot = host_slots[0];
+            Tensor conv_state = state_.gdn->conv_slot(index, slot);
+            ops::causal_conv1d_silu_split(pqkv, p.convolution, conv_state, conv_state, pq, pk, pv, s);
+            Tensor state = state_.gdn->recurrent_slot(index, slot);
+            ops::gated_delta_net(pq.view({DK, NK, n}), pk.view({DK, NK, n}), pv.view({DV, NV, n}), pgate, pbeta, scale,
+                                 /*normalize_qk=*/true, work_, state, state, po, device_.execution_view(),
+                                 fast_.gdn_arithmetic);
         } else {
-            // The gates are evaluated inside the update from the control projection (no gdn_gating kernel).
-            ops::gated_delta_net_batch_update_gating(q.view({DK, NK, 1, T}), k.view({DK, NK, 1, T}),
-                                                     v.view({DV, NV, 1, T}), ab.slice(0, 0, NV), ab.slice(0, NV, NV),
-                                                     p.a_log, p.dt_bias, scale, /*normalize_qk=*/true, layer.recurrent,
-                                                     batch.slots, batch.slots, o_batch, s);
+            // One position per sequence (decode): the recurrent update with device-chosen slots.
+            auto layer = state_.gdn->layer_view(index);
+            if (!fused_conv) {
+                ops::causal_conv1d_silu_snapshot_split(pqkv.view({C, 1, n}), p.convolution, layer.conv, Tensor{},
+                                                       slots, slots, pq, pk, pv, s);
+            }
+            Tensor o_batch = po.view({DV, NV, 1, n});
+            if (g.a_direct) {
+                ops::gated_delta_net_batch_update(pq.view({DK, NK, 1, n}), pk.view({DK, NK, 1, n}),
+                                                  pv.view({DV, NV, 1, n}), pgate.view({NV, 1, n}),
+                                                  pbeta.view({NV, 1, n}), scale, /*normalize_qk=*/true,
+                                                  layer.recurrent, slots, slots, o_batch, s);
+            } else {
+                // The gates are evaluated inside the update from the control projection (no gdn_gating kernel).
+                ops::gated_delta_net_batch_update_gating(pq.view({DK, NK, 1, n}), pk.view({DK, NK, 1, n}),
+                                                         pv.view({DV, NV, 1, n}), cols(ab.slice(0, 0, NV), 1),
+                                                         cols(ab.slice(0, NV, NV), 1), p.a_log, p.dt_bias, scale,
+                                                         /*normalize_qk=*/true, layer.recurrent, slots, slots, o_batch,
+                                                         s);
+            }
         }
+    };
+    if (part == nullptr) {
+        recur(0, batch.batch, batch.width, batch.verify != nullptr, batch.slots, batch.host_slots);
+    } else {
+        // A mixed call: the decode rows (their verification record copied from the call's inputs),
+        // then the prefill row.
+        const std::int32_t D = T - part->width;
+        if (batch.verify != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(records.conv.data, qkv.data, static_cast<std::size_t>(C) * D * 2,
+                                       cudaMemcpyDeviceToDevice, s));
+        }
+        recur(0, batch.batch, batch.width, batch.verify != nullptr, batch.slots, batch.host_slots);
+        recur(D, 1, part->width, false, part->slots, part->host_slots);
     }
     Tensor normed      = work_.alloc(DType::BF16, {DV, NV * T});
     const Tensor rows  = o.view({DV, NV * T});
@@ -719,7 +798,8 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     return y;
 }
 
-Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call) {
+Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call,
+                          const AttentionCall* prefill) {
     const cudaStream_t s = device_.stream;
     const auto& a        = config_.attention;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
@@ -731,7 +811,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     Tensor k = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
     Tensor v = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
     Tensor iq = work_.alloc(DType::BF16, {ID, IH, T});
-    Tensor ik = call.key_records.data != nullptr ? call.key_records.view({ID, T}) : work_.alloc(DType::BF16, {ID, T});
+    Tensor ik = call.key_records.data != nullptr && prefill == nullptr ? call.key_records.view({ID, T})
+                                                                       : work_.alloc(DType::BF16, {ID, T});
     const bool ggml = p.projection.is_ggml() && p.projection.input_perm == nullptr &&
                       (!p.index_projection || (p.index_projection->is_ggml() && p.index_projection->input_perm == nullptr));
     if (ggml) {
@@ -762,80 +843,95 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
             project_rows(x, p.projection, parts, work_, s, dense_routes(), fast_.column_invariant);
         }
     }
-    // The vector-quantized storages' exact window is addressed by the sequences' state slots.
-    ops::QsaKVLayer layer = call.layer;
-    if (layer.kv.window.present()) { layer.kv.window.slots = call.slots; }
-    const bool vq = layer.kv.storage == KvCacheStorage::Vq2 || layer.kv.storage == KvCacheStorage::Q4KeyVq2Value;
+    if (prefill != nullptr && call.key_records.data != nullptr) {
+        // A mixed verification call: its decode rows' raw index keys lead the call's columns.
+        CUDA_CHECK(cudaMemcpyAsync(call.key_records.data, ik.data, call.key_records.bytes(), cudaMemcpyDeviceToDevice, s));
+    }
     const std::int32_t KVH = dim(a.kv_heads);
     const ops::QsaGeometry geometry = qsa_geometry(config_);
-    const ops::QsaBatch qsa_batch{.block_tables     = kv_.block_tables,
-                                  .table_rows       = call.table_rows,
-                                  .positions        = call.positions,
-                                  .tail_slots       = call.slots,
-                                  .rope_positions   = call.rope_positions,
-                                  .block_start_rope = call.block_start_rope,
-                                  .batch            = call.batch,
-                                  .width            = call.width,
-                                  .update_tails     = call.update_tails};
-    // qsa-prepare-fused: every call (decode, verification, prefill and MTP chunks alike, so a position's
-    // stored K and pooled keys do not depend on which route wrote them, as Replay and prefix-cache
-    // equivalence require) normalizes and rotates Q, K, the index query and the pooled keys and appends
-    // K/V and the tails in one kernel, FP32 from the projection rows into the cache codec. Q and the
-    // index query are prepared in place.
-    Tensor qn = q;
-    ops::QsaAppend append{};
-    if (fast_.qsa_prepare_fused && ops::qsa_prepare_supports(layer.kv.storage)) {
-        const ops::QsaPrepareInputs inputs{.q = q, .k = k, .v = v, .index_q = iq, .index_k = ik};
-        const ops::QsaPrepareNorms norms{.query       = p.query_norm,
-                                         .key         = p.key_norm,
-                                         .index_query = p.index_query_norm,
-                                         .index_key   = p.index_key_norm};
-        Tensor q_out  = call.kv_only ? Tensor{} : q;
-        Tensor iq_out = call.kv_only ? Tensor{} : iq;
-        ops::qsa_prepare(inputs, norms, call.tails, layer, qsa_batch, geometry, q_out, iq_out, s);
-        if (call.kv_only) { return Tensor{}; }
-    } else {
-        qn        = work_.alloc(DType::BF16, {D, dim(a.heads), T});
-        Tensor kn = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
-        {
-            Tensor qn_rows = qn.view({D, dim(a.heads) * T});
-            Tensor kn_rows = kn.view({D, dim(a.kv_heads) * T});
-            ops::rmsnorm(q.view({D, dim(a.heads) * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
-            ops::rmsnorm(k.view({D, dim(a.kv_heads) * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
-        }
-        ops::rope(call.rope_positions, rope_, qn, kn, device_.execution_view().on_stream(s));
+    Tensor out = call.kv_only ? Tensor{} : work_.alloc(DType::BF16, {D, dim(a.heads), T});
+    // One part's preparation (K/V append, pooled keys, Q and index query) and attention over the
+    // call's columns [first, first + c.batch * c.width).
+    const auto attend = [&](const AttentionCall& c, std::int32_t first) -> bool {
+        auto scope           = work_.scope();
+        const std::int32_t n = c.batch * c.width;
+        const bool whole     = first == 0 && n == T;
+        const auto cols      = [&](const Tensor& t, int d) { return whole ? t : t.slice(d, first, n); };
+        Tensor pq = cols(q, 2), pk = cols(k, 2), pv = cols(v, 2), piq = cols(iq, 2), pik = cols(ik, 1);
+        // The vector-quantized storages' exact window is addressed by the sequences' state slots.
+        ops::QsaKVLayer layer = c.layer;
+        if (layer.kv.window.present()) { layer.kv.window.slots = c.slots; }
+        const bool vq = layer.kv.storage == KvCacheStorage::Vq2 || layer.kv.storage == KvCacheStorage::Q4KeyVq2Value;
+        const ops::QsaBatch qsa_batch{.block_tables     = kv_.block_tables,
+                                      .table_rows       = c.table_rows,
+                                      .positions        = c.positions,
+                                      .tail_slots       = c.slots,
+                                      .rope_positions   = c.rope_positions,
+                                      .block_start_rope = c.block_start_rope,
+                                      .batch            = c.batch,
+                                      .width            = c.width,
+                                      .update_tails     = c.update_tails};
+        // qsa-prepare-fused: every call (decode, verification, prefill and MTP chunks alike, so a
+        // position's stored K and pooled keys do not depend on which route wrote them, as Replay and
+        // prefix-cache equivalence require) normalizes and rotates Q, K, the index query and the
+        // pooled keys and appends K/V and the tails in one kernel, FP32 from the projection rows into
+        // the cache codec. Q and the index query are prepared in place.
+        Tensor qn = pq;
+        ops::QsaAppend append{};
+        if (fast_.qsa_prepare_fused && ops::qsa_prepare_supports(layer.kv.storage)) {
+            const ops::QsaPrepareInputs inputs{.q = pq, .k = pk, .v = pv, .index_q = piq, .index_k = pik};
+            const ops::QsaPrepareNorms norms{.query       = p.query_norm,
+                                             .key         = p.key_norm,
+                                             .index_query = p.index_query_norm,
+                                             .index_key   = p.index_key_norm};
+            Tensor q_out  = c.kv_only ? Tensor{} : pq;
+            Tensor iq_out = c.kv_only ? Tensor{} : piq;
+            ops::qsa_prepare(inputs, norms, c.tails, layer, qsa_batch, geometry, q_out, iq_out, s);
+            if (c.kv_only) { return false; }
+        } else {
+            qn        = work_.alloc(DType::BF16, {D, dim(a.heads), n});
+            Tensor kn = work_.alloc(DType::BF16, {D, dim(a.kv_heads), n});
+            {
+                Tensor qn_rows = qn.view({D, dim(a.heads) * n});
+                Tensor kn_rows = kn.view({D, dim(a.kv_heads) * n});
+                ops::rmsnorm(pq.view({D, dim(a.heads) * n}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
+                ops::rmsnorm(pk.view({D, dim(a.kv_heads) * n}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
+            }
+            ops::rope(c.rope_positions, rope_, qn, kn, device_.execution_view().on_stream(s));
 
-        // Append K/V of every sequence through its device-chosen table row, then the pooled index
-        // keys. qsa_attention appends the vector-quantized storages' K/V itself (a wide call stages
-        // its window rows); a K/V-only call appends here.
-        append = ops::QsaAppend{.k = kn.view({D, KVH, call.width, call.batch}),
-                                .v = v.view({D, KVH, call.width, call.batch})};
-        if (!vq || call.kv_only) {
-            const PagedKVBatchLayerView view{.k_pages       = layer.kv.k_pages,
-                                             .v_pages       = layer.kv.v_pages,
-                                             .k_scale_pages = layer.kv.k_scale_pages,
-                                             .v_scale_pages = layer.kv.v_scale_pages,
-                                             .block_tables  = kv_.block_tables,
-                                             .head_dim      = layer.kv.head_dim,
-                                             .num_kv_heads  = layer.kv.num_kv_heads,
-                                             .storage       = layer.kv.storage,
-                                             .window        = layer.kv.window};
-            ops::kv_cache_append_batch(append.k, append.v, call.positions.view({call.width, call.batch}),
-                                       call.table_rows, view, s);
+            // Append K/V of every sequence through its device-chosen table row, then the pooled index
+            // keys. qsa_attention appends the vector-quantized storages' K/V itself (a wide call stages
+            // its window rows); a K/V-only call appends here.
+            append = ops::QsaAppend{.k = kn.view({D, KVH, c.width, c.batch}), .v = pv.view({D, KVH, c.width, c.batch})};
+            if (!vq || c.kv_only) {
+                const PagedKVBatchLayerView view{.k_pages       = layer.kv.k_pages,
+                                                 .v_pages       = layer.kv.v_pages,
+                                                 .k_scale_pages = layer.kv.k_scale_pages,
+                                                 .v_scale_pages = layer.kv.v_scale_pages,
+                                                 .block_tables  = kv_.block_tables,
+                                                 .head_dim      = layer.kv.head_dim,
+                                                 .num_kv_heads  = layer.kv.num_kv_heads,
+                                                 .storage       = layer.kv.storage,
+                                                 .window        = layer.kv.window};
+                ops::kv_cache_append_batch(append.k, append.v, c.positions.view({c.width, c.batch}), c.table_rows,
+                                           view, s);
+            }
+            ops::qsa_pool_keys(pik, p.index_key_norm, c.tails, layer, qsa_batch, geometry, s);
+            if (c.kv_only) { return false; }
+            ops::qsa_index_query(piq, p.index_query_norm, c.rope_positions, geometry, s);
         }
-        ops::qsa_pool_keys(ik, p.index_key_norm, call.tails, layer, qsa_batch, geometry, s);
-        if (call.kv_only) { return Tensor{}; }
-        ops::qsa_index_query(iq, p.index_query_norm, call.rope_positions, geometry, s);
-    }
-
-    Tensor out = work_.alloc(DType::BF16, {D, dim(a.heads), T});
-    const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_, layer.kv.storage);
-    const DeviceSpan span     = work_.alloc_bytes(scratch);
-    ops::qsa_attention(qn, iq, layer, qsa_batch, geometry,
-                       static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), max_context_, span.data,
-                       span.bytes, out, s, vq ? &append : nullptr,
-                       fast_.column_invariant ? ops::QsaAttentionRoute::ColumnInvariant
-                                              : ops::QsaAttentionRoute::ByWidth);
+        Tensor pout               = cols(out, 2);
+        const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, n, max_context_, layer.kv.storage);
+        const DeviceSpan span     = work_.alloc_bytes(scratch);
+        ops::qsa_attention(qn, piq, layer, qsa_batch, geometry,
+                           static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), max_context_, span.data,
+                           span.bytes, pout, s, vq ? &append : nullptr,
+                           fast_.column_invariant ? ops::QsaAttentionRoute::ColumnInvariant
+                                                  : ops::QsaAttentionRoute::ByWidth);
+        return true;
+    };
+    if (!attend(call, 0)) { return Tensor{}; }
+    if (prefill != nullptr) { (void)attend(*prefill, call.batch * call.width); }
     // Output gate: out * sigmoid(gate), then o_proj.
     Tensor gated = out.view({QW, T});
     ops::sigmoid_mul(gate, gated, s);

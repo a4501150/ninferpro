@@ -32,6 +32,12 @@
 // drafts) without the SSD tier), the fork route of calls of at most N jobs, and the landing tables.
 // --fast-path NAME adds the path to the fast route before its registry entry (it must apply).
 //
+// A mixed shape R x W + P (e.g. 6x2+1024, R <= 7) adds a P-token prefill chunk of the last lane after
+// its --context tokens, run once as the decode round's graph followed by the chunk's own call and once
+// as one mixed call (ForwardBatch::prefill_part). It reports both device times and fails (exit 2) on
+// the exact route when the mixed call's logits or lane state differ from the separate calls'. On the
+// fast route they differ in low bits (the decode columns take the routes of the mixed call's width).
+//
 // Not included: the DFlash2 drafter's calls and catch-up, the acceptance kernels, sampling and the
 // host's round work (the server's GPU is busy about 98% of a round, the drafter included).
 
@@ -116,6 +122,7 @@ KvCacheStorage parse_kv(const std::string& name) {
 
 struct Shape {
     std::int32_t rows = 0, width = 0;
+    std::int32_t prefill = 0; // a mixed shape's prefill chunk (0: a plain round)
 };
 
 struct Options {
@@ -139,10 +146,15 @@ std::vector<Shape> parse_shapes(const std::string& text) {
     std::string item;
     while (std::getline(list, item, ',')) {
         const auto x = item.find('x');
-        if (x == std::string::npos) { throw std::invalid_argument("--shape takes RxW, e.g. 6x2"); }
-        const Shape s{std::stoi(item.substr(0, x)), std::stoi(item.substr(x + 1))};
+        if (x == std::string::npos) { throw std::invalid_argument("--shape takes RxW or RxW+P, e.g. 6x2"); }
+        const auto plus = item.find('+', x);
+        const Shape s{std::stoi(item.substr(0, x)), std::stoi(item.substr(x + 1, plus - x - 1)),
+                      plus == std::string::npos ? 0 : std::stoi(item.substr(plus + 1))};
         if (s.rows < 1 || s.rows > kLanes || s.width < 1 || s.width > 16) {
             throw std::invalid_argument("--shape " + item + ": rows 1..8, width 1..16");
+        }
+        if (plus != std::string::npos && (s.prefill < 2 || s.rows > kLanes - 1)) {
+            throw std::invalid_argument("--shape " + item + ": a mixed shape has rows 1..7 and a prefill of 2 or more");
         }
         out.push_back(s);
     }
@@ -832,10 +844,186 @@ std::string run_shape(const Options& o, const Shape& shape, Harness& h, DeviceCo
     return result;
 }
 
+// A mixed shape: the decode round's graph and the prefill chunk's call (as the engine runs them
+// today), against one mixed call over both. Returns the mixed call's hashes, or "" when they differ
+// from the separate calls' on the exact route.
+std::string run_mixed(const Options& o, const Shape& shape, Harness& h, DeviceContext& device,
+                      const q4::NgramVolume& volume, const std::vector<std::vector<std::int32_t>>& histories) {
+    const auto& c        = h.config;
+    const cudaStream_t s = device.stream;
+    const std::int32_t R = shape.rows, W = shape.width, P = shape.prefill, D = R * W, T = D + P;
+    const auto vocab     = static_cast<std::int32_t>(c.vocab_size);
+    const bool verify    = W > 1;
+    const std::int32_t accept = o.accept < 0 ? W : std::clamp(o.accept, 0, W);
+    std::vector<std::int32_t> slots(static_cast<std::size_t>(R));
+    std::iota(slots.begin(), slots.end(), 0);
+    const std::int32_t prefill_slot[] = {kLanes - 1};
+    Call decode  = make_call(c, volume, histories, slots, o.context, W, verify);
+    Call prefill = make_call(c, volume, histories, prefill_slot, o.context, P, false);
+    decode.batch.decode_round = true;
+    q4::execution::ForwardVerify view;
+    if (verify) {
+        view                = h.verify_view(R, W);
+        decode.batch.verify = &view;
+    }
+
+    // The mixed call: the decode rows' columns, then the chunk's (ids, positions, n-gram rows); the
+    // decode rows' RoPE, rows and logit columns; the chunk's as its part.
+    const std::size_t i32   = sizeof(std::int32_t);
+    const std::size_t ngram = static_cast<std::size_t>(decode.batch.ngram_rows.ne[0]) * decode.batch.ngram_rows.ne[1];
+    DeviceBuffer mixed_buffer(static_cast<std::size_t>(T) * (2 * i32 + ngram) + 512);
+    auto* base = static_cast<std::byte*>(mixed_buffer.p);
+    const auto join = [&](std::size_t offset, const Tensor& a, const Tensor& b) {
+        check(cudaMemcpyAsync(base + offset, a.data, a.bytes(), cudaMemcpyDeviceToDevice, s), "mixed copy");
+        check(cudaMemcpyAsync(base + offset + a.bytes(), b.data, b.bytes(), cudaMemcpyDeviceToDevice, s), "mixed copy");
+        return base + offset;
+    };
+    const std::size_t ids_at = 0, positions_at = (T * i32 + 255) / 256 * 256, ngram_at = 2 * positions_at;
+    q4::execution::ForwardBatch mixed = decode.batch;
+    mixed.ids        = Tensor(join(ids_at, decode.batch.ids, prefill.batch.ids), DType::I32, {T});
+    mixed.positions  = Tensor(join(positions_at, decode.batch.positions, prefill.batch.positions), DType::I32, {T});
+    mixed.ngram_rows = Tensor(join(ngram_at, decode.batch.ngram_rows, prefill.batch.ngram_rows), DType::U8,
+                              {decode.batch.ngram_rows.ne[0], decode.batch.ngram_rows.ne[1], T});
+    mixed.decode_round = false;
+    q4::execution::ForwardPrefillPart part{.width            = P,
+                                           .rope_positions   = prefill.batch.rope_positions,
+                                           .block_start_rope = prefill.batch.block_start_rope,
+                                           .slots            = prefill.batch.slots,
+                                           .table_rows       = prefill.batch.table_rows,
+                                           .host_slots       = prefill.batch.host_slots};
+    mixed.prefill_part = &part;
+    device.synchronize();
+
+    DeviceBuffer logits_buffer(static_cast<std::size_t>(vocab) * D * sizeof(float));
+    DeviceBuffer prefill_logits_buffer(static_cast<std::size_t>(vocab) * sizeof(float));
+    Tensor logits(logits_buffer.p, DType::FP32, {vocab, decode.batch.logit_columns.ne[0]});
+    Tensor prefill_logits(prefill_logits_buffer.p, DType::FP32, {vocab, 1});
+
+    std::optional<ops::GdnReplayFoldPlan> fold;
+    DeviceBuffer commit_device;
+    std::vector<ops::GdnReplayFoldRow> fold_rows;
+    if (verify) {
+        fold.emplace(h.records.narrowed(W), h.gdn->all_layers_view());
+        std::vector<std::int32_t> commit(static_cast<std::size_t>(R), accept);
+        commit_device = DeviceBuffer(commit.size() * sizeof(std::int32_t));
+        commit_device.copy_from_host(commit.data(), commit_device.bytes);
+        for (std::int32_t b = 0; b < R; ++b) { fold_rows.push_back({b, b, accept}); }
+    }
+    const auto commit = [&] {
+        if (!verify) { return; }
+        fold->execute(fold_rows, s);
+        const Tensor columns(commit_device.p, DType::I32, {R});
+        const auto layers = static_cast<std::int32_t>(c.attention_layers);
+        Tensor tails(h.tails_backing.p, DType::BF16, {h.di, h.r - 1, h.rows, layers});
+        ops::qsa_commit_tails(Tensor(h.qsa_records.p, DType::BF16, {h.di, W, R, layers}),
+                              decode.batch.positions.view({W, R}), columns, tails, decode.batch.slots,
+                              q4::execution::qsa_geometry(c), s);
+        Tensor ple_states(h.ple_backing.p, DType::BF16, {h.width, h.span, h.rows});
+        ops::ple_conv_commit(Tensor(h.ple_records.p, DType::BF16, {h.width, W, R}), columns, ple_states,
+                             decode.batch.slots, s);
+    };
+
+    DecodeGraphDefinition definition;
+    definition.capture(s, [&] { h.forward->run(decode.batch, logits); });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    graph.upload(s);
+    Timer timer(4);
+    // Separate: the round's graph and its commit, then the chunk; mixed: one call, then the commit.
+    const auto separate = [&] {
+        timer.mark(0, s);
+        graph.launch(s);
+        commit();
+        timer.mark(1, s);
+        h.forward->run(prefill.batch, prefill_logits);
+        timer.mark(2, s);
+    };
+    const auto together = [&] {
+        timer.mark(0, s);
+        h.forward->run(mixed, logits);
+        commit();
+        timer.mark(3, s);
+    };
+
+    std::vector<float> host(static_cast<std::size_t>(vocab) * logits.ne[1]);
+    std::vector<std::byte> state(h.state_backing.bytes + h.ple_backing.bytes + h.tails_backing.bytes);
+    std::vector<std::int32_t> top;
+    const auto hash_now = [&] {
+        device.synchronize();
+        logits_buffer.copy_to_host(host.data(), host.size() * sizeof(float));
+        top.clear();
+        for (std::int32_t col = 0; col < logits.ne[1]; ++col) {
+            const float* row = host.data() + static_cast<std::size_t>(col) * vocab;
+            top.push_back(static_cast<std::int32_t>(std::max_element(row, row + vocab) - row));
+        }
+        h.state_backing.copy_to_host(state.data(), h.state_backing.bytes);
+        h.ple_backing.copy_to_host(state.data() + h.state_backing.bytes, h.ple_backing.bytes);
+        h.tails_backing.copy_to_host(state.data() + h.state_backing.bytes + h.ple_backing.bytes, h.tails_backing.bytes);
+        return std::array<std::uint64_t, 2>{hash_bytes(host.data(), host.size() * sizeof(float)),
+                                            hash_bytes(state.data(), state.size())};
+    };
+    std::vector<std::array<std::uint64_t, 2>> apart, joint;
+    std::int32_t agree = 0; // logit columns whose top-1 token is the separate calls'
+    for (std::int32_t i = 0; i < o.determinism; ++i) {
+        h.restore(s);
+        separate();
+        apart.push_back(hash_now());
+        const std::vector<std::int32_t> apart_top = top;
+        h.restore(s);
+        together();
+        joint.push_back(hash_now());
+        agree = 0;
+        for (std::size_t col = 0; col < top.size(); ++col) { agree += top[col] == apart_top[col]; }
+    }
+    std::int32_t differing = 0;
+    for (std::size_t i = 0; i < joint.size(); ++i) { differing += joint[i] != joint.front() || apart[i] != apart.front(); }
+
+    // Warm-up as run_shape's, then each body timed in its own synchronized pass (they share mark 0).
+    std::vector<double> round_us, chunk_us, mixed_us;
+    const auto warm_start = std::chrono::steady_clock::now();
+    for (std::int32_t warm = 0; warm < o.warmup || seconds_since(warm_start) < kWarmSeconds; ++warm) {
+        h.restore(s);
+        separate();
+        h.restore(s);
+        together();
+        check(cudaStreamSynchronize(s), "replay");
+    }
+    for (std::int32_t i = 0; i < o.replays; ++i) {
+        h.restore(s);
+        separate();
+        check(cudaStreamSynchronize(s), "replay");
+        round_us.push_back(timer.us(0, 1));
+        chunk_us.push_back(timer.us(1, 2));
+        h.restore(s);
+        together();
+        check(cudaStreamSynchronize(s), "replay");
+        mixed_us.push_back(timer.us(0, 3));
+    }
+    const Stats r = summarize(round_us), k = summarize(chunk_us), m = summarize(mixed_us);
+    std::printf("\nshape %dx%d+%d (%d decode columns and a %d-token chunk, context %d%s)\n", R, W, P, D, P, o.context,
+                verify ? (", commit " + std::to_string(accept) + " per row").c_str() : "");
+    std::printf("  separate: round %8.1f us + chunk %8.1f us = %8.1f us\n", r.median, k.median, r.median + k.median);
+    std::printf("  mixed:    %8.1f us   (%+.1f us, %+.1f%% against separate)\n", m.median,
+                m.median - (r.median + k.median), 100.0 * (m.median / (r.median + k.median) - 1.0));
+    std::printf("  hash logits %016llx state %016llx (mixed), %016llx %016llx (separate)\n",
+                static_cast<unsigned long long>(joint[0][0]), static_cast<unsigned long long>(joint[0][1]),
+                static_cast<unsigned long long>(apart[0][0]), static_cast<unsigned long long>(apart[0][1]));
+    if (differing != 0) { throw std::runtime_error("replays from the same state gave different bits"); }
+    const bool equal = joint[0] == apart[0];
+    std::printf("  mixed %s the separate calls (top-1 equal in %d of %d logit columns)\n",
+                equal ? "equals" : "DIFFERS from", agree, static_cast<std::int32_t>(logits.ne[1]));
+    char value[40];
+    std::snprintf(value, sizeof(value), "%016llx %016llx", static_cast<unsigned long long>(joint[0][0]),
+                  static_cast<unsigned long long>(joint[0][1]));
+    return !equal && o.exact ? std::string() : std::string(value);
+}
+
 // The golden-hash file: one line per configuration, "key = logits-hash state-hash".
 std::string hash_key(const Options& o, const Shape& shape) {
     std::ostringstream key;
-    key << o.artifact.filename().string() << ' ' << shape.rows << 'x' << shape.width << " context=" << o.context
+    key << o.artifact.filename().string() << ' ' << shape.rows << 'x' << shape.width;
+    if (shape.prefill > 0) { key << '+' << shape.prefill; }
+    key << " context=" << o.context
         << " kv=" << o.kv_name << " experts=" << (o.sample_experts == 0 ? std::string("all") : std::to_string(o.sample_experts))
         << ' ' << (o.exact ? "exact" : "fast") << " accept=" << (o.accept < 0 ? shape.width : std::clamp(o.accept, 0, shape.width));
     for (const FastPath path : o.fast_path_candidates) { key << " +" << fast_path_name(path); }
@@ -870,12 +1058,13 @@ int main(int argc, char** argv) {
         // Always every lane the engine runs, prefilled, so the state hash covers the same lanes
         // whatever shapes one run selects.
         const std::int32_t rows = kLanes;
-        std::int32_t max_width = 1, max_columns = 0;
+        std::int32_t max_width = 1, max_columns = 0, max_prefill = 0;
         for (const Shape& s : o.shapes) {
             max_width   = std::max(max_width, s.width);
-            max_columns = std::max(max_columns, s.rows * s.width);
+            max_columns = std::max(max_columns, s.rows * s.width + s.prefill);
+            max_prefill = std::max(max_prefill, s.prefill);
         }
-        const std::int32_t context = o.context + max_width + 1;
+        const std::int32_t context = o.context + std::max(max_width, max_prefill) + 1;
 
         const auto t0 = std::chrono::steady_clock::now();
         DeviceContext device(0);
@@ -936,15 +1125,17 @@ int main(int argc, char** argv) {
         auto recorded     = o.record.empty() ? std::map<std::string, std::string>{} : read_hashes(o.record);
         int mismatches = 0, missing = 0;
         for (const Shape& shape : o.shapes) {
-            const std::string hashes = run_shape(o, shape, h, device, volume, histories, parameters);
+            const std::string hashes = shape.prefill > 0 ? run_mixed(o, shape, h, device, volume, histories)
+                                                         : run_shape(o, shape, h, device, volume, histories, parameters);
             const std::string key    = hash_key(o, shape);
-            if (!o.record.empty()) { recorded[key] = hashes; }
+            if (!o.record.empty() && !hashes.empty()) { recorded[key] = hashes; }
+            if (hashes.empty()) { ++mismatches; }
             if (o.check.empty()) { continue; }
             const auto it = golden.find(key);
             if (it == golden.end()) {
                 std::printf("  check: no golden hash for \"%s\"\n", key.c_str());
                 ++missing;
-            } else if (it->second != hashes) {
+            } else if (hashes.empty() || it->second != hashes) {
                 std::printf("  check: DIFFERS from the golden %s\n", it->second.c_str());
                 ++mismatches;
             } else {

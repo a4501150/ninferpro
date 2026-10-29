@@ -159,6 +159,21 @@ struct NgramRowGate {
     const std::int32_t* wait_row   = nullptr; // device: the row to add to
 };
 
+// The prefill part of a mixed call: one sequence of `width` positions in the call's last columns,
+// after the decode or verification rows the ForwardBatch's own row fields describe. Column-wise
+// work runs once over every column; the token mixers, the PLE convolution and the KV appends run
+// per part, so each part's bits are those of its own call on the column-invariant routes.
+struct ForwardPrefillPart {
+    std::int32_t width = 0;
+    Tensor rope_positions;   // I32 [width, 3] axis-major
+    Tensor block_start_rope; // I32 [1, 3] axis-major
+    Tensor slots;            // I32 [1]
+    Tensor table_rows;       // I32 [1]
+    std::span<const std::int32_t> host_slots; // [1]
+    // DFlash2 target features of the part's last n columns (ForwardBatch::draft_features' rule).
+    Tensor draft_features;
+};
+
 struct ForwardBatch {
     Tensor ids;        // I32 [T]
     Tensor positions;  // I32 [T]: KV position of each column
@@ -206,6 +221,10 @@ struct ForwardBatch {
     // With a gated stream (ExpertStream::gated): each layer's routing decides, through
     // ForwardExperts::split, which experts the stream copies and which the CPU serves.
     bool split          = false;
+    // A mixed call: its prefill part follows the batch * width decode columns. ids, positions and
+    // ngram_rows then span both parts; rope_positions, the row fields, verify and draft_features
+    // describe the decode part (draft_features its last n columns). No MTP chunk or vision input.
+    const ForwardPrefillPart* prefill_part = nullptr;
 };
 
 // One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c
@@ -344,7 +363,10 @@ private:
         const Tensor& table_rows;
         std::int32_t batch = 0, width = 0;
     };
-    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
+    // With `prefill` (a mixed call): `call` holds the decode rows' leading columns and `prefill` the
+    // prefill row's trailing ones; the projections run once, the attention per part.
+    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call,
+                     const AttentionCall* prefill = nullptr);
     // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
     // columns. With inject and residual, the output is injected into the residual streams (and not
     // returned).
