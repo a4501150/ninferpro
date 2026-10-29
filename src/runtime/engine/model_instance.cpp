@@ -214,6 +214,15 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     // and idle-wide-prefill already widens its idle steps (16,384 measured 3.5 % slower at
     // pp16384 and pp32768 on the 27B).
     if (options.prefill_chunk == 0) { options.prefill_chunk = qwen4_exp ? 16384U : 1024U; }
+    // While another request decodes, Qwen3.8-Flash-Next prefills in narrower calls: the engine
+    // runs one decode round per prefill call. Production's flags (NVFP4, FP8 KV, DFlash2, RTX PRO
+    // 6000), a 15.6k-token prompt arriving beside a stream of 137 deltas/s: 2,048-token calls left
+    // it 6.8 deltas/s with 178 ms gaps; 1,024 gave 10.7 and 107 ms for a time to first token of
+    // 1.6 s instead of 1.4 s (1.3 s alone); 512 gave 15.3 and 72 ms for 2.1 s.
+    constexpr std::uint32_t kQwen4ExpPrefillChunkBesideDecode = 1024;
+    if (options.prefill_chunk_beside_decode == 0) {
+        options.prefill_chunk_beside_decode = qwen4_exp ? kQwen4ExpPrefillChunkBesideDecode : options.prefill_chunk;
+    }
     if (options.expert_tail_skip != 0 && !qwen4_exp) {
         throw std::invalid_argument("--expert-tail-skip applies to Qwen3.8-Flash-Next (its offloaded experts) only");
     }

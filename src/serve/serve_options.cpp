@@ -49,6 +49,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--max-pending-requests"},
     ServeOptionArity{"--pending-timeout-ms"},
     ServeOptionArity{"--prefill-chunk"},
+    ServeOptionArity{"--prefill-chunk-beside-decode"},
     ServeOptionArity{"--use-original-int8-prefill-kernel", false},
     ServeOptionArity{"--prefill-split-workspace-mib"},
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
@@ -274,6 +275,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
            "                             (default 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
+           "  --prefill-chunk-beside-decode N\n"
+           "                             Qwen3.8-Flash-Next prefill call size while another\n"
+           "                             request decodes, multiple of 128 (default 1024)\n"
            "  --use-original-int8-prefill-kernel\n"
            "                             prefill INT8 KV with the original prompt kernel at\n"
            "                             the requested chunk (default: the fast kernel, chunk\n"
@@ -724,6 +728,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.prefill_chunk == 0) {
                 throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
             }
+        } else if (arg == "--prefill-chunk-beside-decode") {
+            options.prefill_chunk_beside_decode = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--prefill-chunk-beside-decode"), "prefill-chunk-beside-decode"));
+            if (options.prefill_chunk_beside_decode == 0) {
+                throw std::invalid_argument("--prefill-chunk-beside-decode must be a positive multiple of 128");
+            }
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
         } else if (arg == "--prefill-split-workspace-mib") {
@@ -1151,6 +1161,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     // 0: the model's default (EngineOptions::prefill_chunk).
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (options.prefill_chunk_beside_decode % 128 != 0) {
+        throw std::invalid_argument("--prefill-chunk-beside-decode must be a positive multiple of 128");
     }
     if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
         throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");

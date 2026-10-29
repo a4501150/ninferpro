@@ -336,6 +336,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
+    engine_options.prefill_chunk_beside_decode = options_.prefill_chunk_beside_decode;
     engine_options.original_int8_prefill_kernel = options_.original_int8_prefill_kernel;
     engine_options.prefill_split_workspace_mib  = options_.prefill_split_workspace_mib;
     engine_options.original_nvfp4_prefill_kernel = options_.original_nvfp4_prefill_kernel;

@@ -848,6 +848,7 @@ public:
         vocab_         = dim(c_.vocab_size);
         token_domain_  = plan_.token_domain;
         chunk_         = plan_.chunk;
+        beside_decode_chunk_ = options_.prefill_chunk_beside_decode;
         mtp_k_         = plan_.mtp_k;
         dflash_k_      = plan_.dflash_k;
         max_width_     = plan_.max_width;
@@ -1958,6 +1959,7 @@ public:
             walk_begin(lane, index, end);
             return walk_step(lane, index, start);
         }
+        split_beside_decode(lane, index);
         const std::int32_t width = static_cast<std::int32_t>(lane.calls[lane.next_call++] - lane.state_tokens);
         const bool last          = begin + width == static_cast<std::int32_t>(lane.prefill_end);
         // A call the CPU serves (an opener tail, a tiny suffix) promotes at the decode rate (design
@@ -2007,6 +2009,24 @@ public:
         }
 
         return prefill_progress(lane, index, begin, width, static_cast<std::uint32_t>(width), last, promotions, start);
+    }
+
+    // While another lane decodes, a planned call wider than the beside-decode chunk runs as
+    // several: the engine runs one decode round per prefill call, so the decoding lanes keep
+    // streaming between them. The split lands on the GDN grid (the exact route's bits do not
+    // depend on it). Exact taps already end calls; a flexible tap is realized at the first
+    // boundary at or past it, which a split can bring closer to its position.
+    void split_beside_decode(Lane& lane, std::uint32_t index) {
+        const std::uint32_t cap = std::min<std::uint32_t>(beside_decode_chunk_, static_cast<std::uint32_t>(chunk_));
+        if (cap == 0 || lane.calls[lane.next_call] - lane.state_tokens <= cap) { return; }
+        bool decoding = false;
+        for (std::uint32_t other = 0; other < options_.max_concurrency; ++other) {
+            decoding = decoding || (other != index && lanes_[other].phase == Phase::Decode);
+        }
+        if (!decoding) { return; }
+        const std::uint32_t split = (lane.state_tokens + cap) / kResumeGrid * kResumeGrid;
+        if (split <= lane.state_tokens) { return; }
+        lane.calls.insert(lane.calls.begin() + static_cast<std::ptrdiff_t>(lane.next_call), split);
     }
 
     // Prompt seeding (design §19.3.27): a prefill call's per-token routes, read from the route log
@@ -5914,6 +5934,7 @@ private:
     Clock::time_point vram_epoch_{};
 
     std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0, pages_per_row_ = 0;
+    std::uint32_t beside_decode_chunk_ = 0; // prompt tokens per call while another lane decodes (0: no cap)
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
     std::uint32_t kv_pages_ = 0;
 

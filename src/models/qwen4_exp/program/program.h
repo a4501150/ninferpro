@@ -365,6 +365,8 @@ struct ProgramOptions {
     // final-mixer output of a max_context window and one tile of FP32 logits.
     bool causal_scoring = false;
     std::uint32_t prefill_chunk   = 1024;
+    // Prompt tokens per call while another lane decodes; 0 or at least prefill_chunk: no cap.
+    std::uint32_t prefill_chunk_beside_decode = 0;
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
