@@ -573,6 +573,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.computed_prefill_tokens      = result.computed_prefill_tokens;
     outcome.metrics.prefix_cache_hit_tokens      = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path            = result.prefix_reuse_path;
+    outcome.metrics.prefix_from_disk             = result.prefix_from_disk;
     outcome.metrics.speculative_backend          = result.speculative.backend;
     outcome.metrics.speculative_draft_window     = result.speculative.draft_window;
     outcome.metrics.speculative_rounds           = result.speculative.rounds;

@@ -3,9 +3,11 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace infernix::models::qwen4_exp::prefix {
@@ -18,6 +20,10 @@ namespace {
 // stall under WDDM where several smaller ones succeed. A slab never crosses chunks.
 constexpr std::size_t kHostChunkBytes = std::size_t{4} << 30U;
 constexpr std::size_t kSlabAlignment  = 4096;
+// The Disk tier's VRAM staging: whole-image regions and block records. A record's copy group (it
+// lies in no Host chunk) is one id per buffer.
+constexpr std::uint32_t kDiskRegions     = 2;
+constexpr std::uint32_t kStagingRecords  = 64;
 
 std::size_t align_slab(std::size_t bytes) { return (bytes + kSlabAlignment - 1U) / kSlabAlignment * kSlabAlignment; }
 
@@ -38,25 +44,36 @@ PrefixHostLayout plan_prefix_host_layout(const KvPageGeometry& pages, const Stat
 }
 
 PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool, const KvPageGeometry& pages,
-                         const LaneStateImage& lanes, std::uint64_t host_bytes)
+                         const LaneStateImage& lanes, std::uint64_t host_bytes, std::uint64_t disk_bytes)
     : taps_(config.taps), pool_(&pool), geometry_(pages), lanes_(&lanes),
       host_(plan_prefix_host_layout(pages, lanes.layout(), host_bytes)) {
     if (pool.plane_count() != pages.geometry.planes.size()) {
         throw std::invalid_argument("Qwen4Exp prefix cache: the page geometry does not match the pool");
     }
-    if (host_.slabs == 0) {
-        // Host-born snapshots are the only snapshot source: without a Host tier there is no cache.
-        throw std::invalid_argument("Qwen4Exp prefix cache needs a Host tier (--host-context-mib)");
+    const std::uint64_t disk_slots = disk_bytes / host_.slab_bytes;
+    if (disk_slots > pc::kNoId / 4U) { throw std::invalid_argument("Qwen4Exp prefix cache: the Disk tier is too large"); }
+    disk_slots_ = static_cast<std::uint32_t>(disk_slots);
+    if (host_.slabs == 0 && disk_slots_ == 0) {
+        // Snapshots are born in the Host tier or written through to the Disk tier: without either
+        // there is no cache.
+        throw std::invalid_argument(
+            "Qwen4Exp prefix cache needs a Host tier (--host-context-mib) or a Disk tier (--prefix-cache-disk)");
     }
-    if (host_.slabs < host_.image_slabs + 2U) {
-        const std::uint64_t mib = (static_cast<std::uint64_t>(host_.image_slabs + 2U) * host_.slab_bytes + (1U << 20U) - 1U) >> 20U;
+    const std::uint64_t snapshot_mib =
+        (static_cast<std::uint64_t>(host_.image_slabs + 2U) * host_.slab_bytes + (1U << 20U) - 1U) >> 20U;
+    if (host_.slabs != 0 && host_.slabs < host_.image_slabs + 2U) {
         throw std::invalid_argument("--host-context-mib is too small for the Qwen4Exp prefix cache: one snapshot needs " +
-                                    std::to_string(mib) + " MiB");
+                                    std::to_string(snapshot_mib) + " MiB");
+    }
+    if (disk_slots_ != 0 && disk_slots_ < host_.image_slabs + 2U) {
+        throw std::invalid_argument("--prefix-cache-disk-gib is too small for the Qwen4Exp prefix cache: one snapshot needs " +
+                                    std::to_string(snapshot_mib) + " MiB");
     }
     pc::PrefixIndexConfig index = config.index;
-    index.max_nodes             = config.kv_pages + host_.slabs + 1U;
-    index.max_snapshots         = config.device_snapshot_slots + host_.slabs / host_.image_slabs + 1U;
+    index.max_nodes             = config.kv_pages + host_.slabs + disk_slots_ + 1U;
+    index.max_snapshots = config.device_snapshot_slots + host_.slabs / host_.image_slabs + disk_slots_ / host_.image_slabs + 1U;
     index.host_slabs            = host_.slabs;
+    index.disk_slots            = disk_slots_;
     index.image_slabs           = host_.image_slabs;
     index.device_snapshot_slots = config.device_snapshot_slots;
     index.block_bytes           = host_.page.page_stride;
@@ -79,6 +96,25 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
         }
         pinned += bytes;
     }
+    if (disk_slots_ != 0) {
+        const std::size_t staging_bytes = static_cast<std::size_t>(kStagingRecords) * host_.slab_bytes;
+        if (host_.slabs == 0) {
+            // Without a Host tier, two VRAM regions: a capture written through and a fetch, or a
+            // fetch read by its restore while the next one lands. With one, fetches read into Host
+            // slabs and nothing stages in VRAM.
+            for (std::uint32_t r = 0; r < kDiskRegions; ++r) {
+                regions_.push_back(Region{DeviceBuffer(static_cast<std::size_t>(host_.image_slabs + 1U) * host_.slab_bytes),
+                                          PinnedHostBuffer(CuFileQueue::kAlignment), 0});
+            }
+            block_staging_device_ = DeviceBuffer(staging_bytes);
+            block_staging_        = static_cast<std::byte*>(block_staging_device_.p);
+        } else {
+            block_staging_host_.emplace(staging_bytes);
+            block_staging_ = static_cast<std::byte*>(block_staging_host_->data());
+        }
+        for (std::uint32_t i = kStagingRecords; i-- > 0;) { free_staging_.push_back(i); }
+        slot_journaled_.assign(disk_slots_, false);
+    }
     CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
     node_mtp_next_.assign(index.max_nodes, -1);
@@ -88,6 +124,13 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
 }
 
 PrefixCache::~PrefixCache() {
+    if (store_) {
+        // Transfers in flight still move bytes of the staging buffers and Host slabs.
+        try {
+            store_->io().wait(completions_);
+        } catch (...) {}
+        store_.reset();
+    }
     // Only CUDA objects are released here; leases go back to the pool with blocks_.
     for (cudaStream_t stream : {transfer_, restore_stream_}) {
         if (stream != nullptr) {
@@ -97,6 +140,16 @@ PrefixCache::~PrefixCache() {
     }
     for (PendingCapture& c : captures_) {
         for (cudaEvent_t e : c.events) { (void)cudaEventDestroy(e); }
+        if (c.header_done != nullptr) { (void)cudaEventDestroy(c.header_done); }
+        if (c.deferred != nullptr) { (void)cudaEventDestroy(c.deferred); }
+    }
+    for (auto& [id, w] : block_writes_) {
+        if (w.copied != nullptr) { (void)cudaEventDestroy(w.copied); }
+    }
+    if (fetch_) {
+        for (Fetch::Block& b : fetch_->blocks) {
+            if (b.copied != nullptr) { (void)cudaEventDestroy(b.copied); }
+        }
     }
     for (auto& [id, s] : staged_) {
         for (cudaEvent_t e : s.events) { (void)cudaEventDestroy(e); }
@@ -213,7 +266,7 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     if (tail != capture.tail_page.has_value() || capture.tail.size() >= pc::kBlockTokens) {
         throw std::invalid_argument("Qwen4Exp prefix cache: a capture's tail does not match its page");
     }
-    auto image = index_->reserve_host_image(tail, capture.claim);
+    auto image = reserve_image(tail, capture.claim);
     if (!image) {
         ++counters_.taps_skipped;
         return false;
@@ -225,20 +278,23 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
     recycle(start);
     const std::vector<std::byte*> segments = image_segments(*image);
-    write_state_image_header(lanes_->layout(), capture.meta, segments.front());
+    write_header(*image, capture.meta, transfer_);
     const HostImage destination{segments, host_.slab_bytes};
-    std::byte* const tail_record     = tail ? slab(image->slabs.back()) : nullptr;
-    const std::uint32_t tail_group   = tail ? slab_group(image->slabs.back()) : 0U;
+    std::byte* const record          = tail ? tail_record(*image) : nullptr;
+    const std::uint32_t group        = tail ? tail_group(*image) : 0U;
     const std::optional<DeviceKVPageHandle> tail_page = capture.tail_page;
+    const bool host = !image->disk;
     PendingCapture pending{std::move(capture), std::move(*image), {}};
     for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) {
-        copy_capture_group(g, lane, destination, tail_record, tail_group, tail_page);
+        copy_capture_group(g, lane, destination, record, group, tail_page);
         cudaEvent_t event = take_event();
         CUDA_CHECK(cudaEventRecord(event, transfer_));
         pending.events.push_back(event);
     }
-    counters_.host_write_bytes += host_.image_bytes + (tail ? host_.page.page_stride : 0U);
-    ++counters_.host_image_writes;
+    if (host) {
+        counters_.host_write_bytes += host_.image_bytes + (tail ? host_.page.page_stride : 0U);
+        ++counters_.host_image_writes;
+    }
     captures_.push_back(std::move(pending));
     return true;
 }
@@ -275,10 +331,17 @@ bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cuda
         return false;
     }
     std::byte* const staging = prompt_end_slots_[slot];
-    auto image                = index_->reserve_host_image(tail, capture.claim);
-    if (!image) {
-        ++counters_.prompt_end_skipped;
-        return false;
+    // Without a Host tier, both regions may be held (an open tap, a tap being written): the image
+    // waits in its slot for one rather than being dropped, since the prompt end serves repeats.
+    const bool defer = !host_tier() && disk_writable() &&
+                       std::none_of(regions_.begin(), regions_.end(), [](const Region& r) { return r.users == 0; });
+    std::optional<ImageTarget> image;
+    if (!defer) {
+        image = reserve_image(tail, capture.claim);
+        if (!image) {
+            ++counters_.prompt_end_skipped;
+            return false;
+        }
     }
     // The anchor must outlive the copy: the capturing lane may release its path before it lands.
     if (capture.anchor.valid()) { index_->pin_node(capture.anchor); }
@@ -291,26 +354,52 @@ bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cuda
     lanes_->copy_lane_to_packed(lane, staging, producer);
     cudaEvent_t start = take_event();
     CUDA_CHECK(cudaEventRecord(start, producer));
-    CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
-    recycle(start);
-    const std::vector<std::byte*> segments = image_segments(*image);
-    lanes_->copy_packed_to_host(staging, HostImage{segments, host_.slab_bytes}, transfer_);
-    if (tail) {
-        copy_tail_page_to_record(*capture.tail_page, slab(image->slabs.back()), slab_group(image->slabs.back()),
-                                 transfer_);
+    ++counters_.prompt_end_captures;
+    PendingCapture pending{std::move(capture), {}, {}, staging};
+    if (defer) {
+        pending.deferred = start;
+        captures_.push_back(std::move(pending));
+        return true;
     }
+    pending.image = std::move(*image);
+    copy_prompt_end(pending, start);
+    recycle(start);
+    captures_.push_back(std::move(pending));
+    return true;
+}
+
+void PrefixCache::copy_prompt_end(PendingCapture& c, cudaEvent_t after) {
+    CUDA_CHECK(cudaStreamWaitEvent(transfer_, after, 0));
+    const bool tail                        = !c.capture.tail.empty();
+    const std::vector<std::byte*> segments = image_segments(c.image);
+    lanes_->copy_packed_to_host(c.staging, HostImage{segments, host_.slab_bytes}, transfer_);
+    if (tail) { copy_tail_page_to_record(*c.capture.tail_page, tail_record(c.image), tail_group(c.image), transfer_); }
     // One event per layer group, as the group-by-group captures take: the whole image is copied at
     // once, so every layer's wait is the copy's end (a lane's next call waits the full set).
-    std::vector<cudaEvent_t> events;
     for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) {
         cudaEvent_t event = take_event();
         CUDA_CHECK(cudaEventRecord(event, transfer_));
-        events.push_back(event);
+        c.events.push_back(event);
     }
-    counters_.host_write_bytes += host_.image_bytes + (tail ? host_.page.page_stride : 0U);
-    ++counters_.host_image_writes;
-    ++counters_.prompt_end_captures;
-    captures_.push_back(PendingCapture{std::move(capture), std::move(*image), std::move(events), staging});
+    if (!c.image.disk) {
+        counters_.host_write_bytes += host_.image_bytes + (tail ? host_.page.page_stride : 0U);
+        ++counters_.host_image_writes;
+    }
+}
+
+bool PrefixCache::start_deferred(PendingCapture& c, bool& dropped) {
+    dropped = false;
+    if (std::none_of(regions_.begin(), regions_.end(), [](const Region& r) { return r.users == 0; })) { return false; }
+    std::optional<ImageTarget> image = reserve_image(!c.capture.tail.empty(), c.capture.claim);
+    if (!image) {
+        dropped = true;
+        ++counters_.prompt_end_skipped;
+        return false;
+    }
+    c.image = std::move(*image);
+    copy_prompt_end(c, c.deferred);
+    recycle(c.deferred);
+    c.deferred = nullptr;
     return true;
 }
 
@@ -326,11 +415,66 @@ void PrefixCache::copy_tail_page_to_record(DeviceKVPageHandle page, std::byte* r
     }
 }
 
-std::vector<std::byte*> PrefixCache::image_segments(const pc::HostImageReservation& image) const {
+std::vector<std::byte*> PrefixCache::image_segments(const ImageTarget& image) const {
     std::vector<std::byte*> segments;
     segments.reserve(host_.image_slabs);
-    for (std::uint32_t i = 0; i < host_.image_slabs; ++i) { segments.push_back(slab(image.slabs[i])); }
+    for (std::uint32_t i = 0; i < host_.image_slabs; ++i) {
+        segments.push_back(image.disk ? region_base(image.region) + static_cast<std::size_t>(i) * host_.slab_bytes
+                                      : slab(image.host.slabs[i]));
+    }
     return segments;
+}
+
+std::byte* PrefixCache::tail_record(const ImageTarget& image) const {
+    return image.disk ? region_base(image.region) + static_cast<std::size_t>(host_.image_slabs) * host_.slab_bytes
+                      : slab(image.host.slabs.back());
+}
+
+std::uint32_t PrefixCache::tail_group(const ImageTarget& image) const {
+    return image.disk ? kNoRegion - 1U - image.region : slab_group(image.host.slabs.back());
+}
+
+std::optional<PrefixCache::ImageTarget> PrefixCache::reserve_image(bool tail, double claim) {
+    if (host_tier()) {
+        auto host = index_->reserve_host_image(tail, claim);
+        if (!host) { return std::nullopt; }
+        return ImageTarget{std::move(*host), std::nullopt, kNoRegion};
+    }
+    if (!disk_writable()) { return std::nullopt; }
+    const std::optional<std::uint32_t> region = take_region();
+    if (!region) {
+        ++counters_.disk_capture_skips;
+        return std::nullopt;
+    }
+    auto disk = index_->reserve_disk_image(tail, claim);
+    if (!disk) {
+        release_region(*region);
+        ++counters_.disk_capture_skips;
+        return std::nullopt;
+    }
+    return ImageTarget{{}, std::move(*disk), *region};
+}
+
+void PrefixCache::release_image(ImageTarget&& image) noexcept {
+    if (image.disk) {
+        index_->release_disk_image(std::move(*image.disk));
+        image.disk.reset();
+        release_region(image.region);
+        image.region = kNoRegion;
+    } else {
+        index_->release_host_image(std::move(image.host));
+    }
+}
+
+void PrefixCache::write_header(const ImageTarget& image, const StateImageHeader& meta, cudaStream_t stream) {
+    if (!image.disk) {
+        write_state_image_header(lanes_->layout(), meta, slab(image.host.slabs.front()));
+        return;
+    }
+    // The region's pinned header is its own until the region is released.
+    auto* header = static_cast<std::byte*>(regions_[image.region].header.data());
+    write_state_image_header(lanes_->layout(), meta, header);
+    CUDA_CHECK(cudaMemcpyAsync(region_base(image.region), header, kStateImageHeaderBytes, cudaMemcpyHostToDevice, stream));
 }
 
 void PrefixCache::copy_capture_group(std::uint32_t group, std::uint32_t lane, const HostImage& destination,
@@ -359,7 +503,7 @@ void PrefixCache::copy_capture_group(std::uint32_t group, std::uint32_t lane, co
 }
 
 std::optional<std::uint64_t> PrefixCache::open_staged_capture(bool tail, double claim) {
-    auto image = index_->reserve_host_image(tail, claim);
+    auto image = reserve_image(tail, claim);
     if (!image) {
         ++counters_.taps_skipped;
         return std::nullopt;
@@ -382,8 +526,8 @@ void PrefixCache::capture_group(std::uint64_t staged, std::uint32_t group, std::
     CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
     recycle(start);
     const std::vector<std::byte*> segments = image_segments(s.image);
-    copy_capture_group(group, lane, HostImage{segments, host_.slab_bytes}, s.tail ? slab(s.image.slabs.back()) : nullptr,
-                       s.tail ? slab_group(s.image.slabs.back()) : 0U, tail_page);
+    copy_capture_group(group, lane, HostImage{segments, host_.slab_bytes}, s.tail ? tail_record(s.image) : nullptr,
+                       s.tail ? tail_group(s.image) : 0U, tail_page);
     CUDA_CHECK(cudaEventRecord(s.events[group], transfer_));
     ++s.copied;
 }
@@ -401,10 +545,17 @@ void PrefixCache::commit_staged_capture(std::uint64_t staged, Capture&& capture)
     StagedCapture s = std::move(found->second);
     staged_.erase(found);
     if (capture.anchor.valid()) { index_->pin_node(capture.anchor); }
-    write_state_image_header(lanes_->layout(), capture.meta, slab(s.image.slabs[0]));
-    counters_.host_write_bytes += host_.image_bytes + (s.tail ? host_.page.page_stride : 0U);
-    ++counters_.host_image_writes;
-    captures_.push_back(PendingCapture{std::move(capture), std::move(s.image), std::move(s.events)});
+    write_header(s.image, capture.meta, transfer_);
+    PendingCapture pending{std::move(capture), std::move(s.image), std::move(s.events)};
+    if (pending.image.disk) {
+        // The header's copy follows the groups' on the transfer stream: the region has landed after it.
+        pending.header_done = take_event();
+        CUDA_CHECK(cudaEventRecord(pending.header_done, transfer_));
+    } else {
+        counters_.host_write_bytes += host_.image_bytes + (s.tail ? host_.page.page_stride : 0U);
+        ++counters_.host_image_writes;
+    }
+    captures_.push_back(std::move(pending));
 }
 
 void PrefixCache::abandon_staged_capture(std::uint64_t staged) noexcept {
@@ -415,7 +566,7 @@ void PrefixCache::abandon_staged_capture(std::uint64_t staged) noexcept {
         (void)cudaEventSynchronize(event);
         recycle(event);
     }
-    index_->release_host_image(std::move(found->second.image));
+    release_image(std::move(found->second.image));
     staged_.erase(found);
 }
 
@@ -426,7 +577,22 @@ std::span<const cudaEvent_t> PrefixCache::capture_events(std::uint64_t id) const
     return {};
 }
 
+void PrefixCache::order_page_reuse(std::span<const DeviceKVPageLease> pages) const {
+    for (const PendingCapture& c : captures_) {
+        // An endpoint owns its tail page and a prompt-end capture copies its own; only a tap
+        // reads a page someone else can free.
+        if (c.staging != nullptr || !c.capture.tail_page || c.capture.tail_lease || c.events.empty()) {
+            continue;
+        }
+        const bool reads = std::any_of(pages.begin(), pages.end(), [&](const DeviceKVPageLease& page) {
+            return page.valid() && page.handle() == *c.capture.tail_page;
+        });
+        if (reads) { CUDA_CHECK(cudaStreamWaitEvent(producer_, c.events.back(), 0)); }
+    }
+}
+
 void PrefixCache::write_blocks(std::span<const pc::NodeRef> nodes, cudaStream_t producer) {
+    if (!host_tier()) { return; }
     std::vector<pc::NodeRef> written;
     std::vector<DeviceKVPageHandle> pages;
     std::vector<std::byte*> records;
@@ -477,42 +643,112 @@ void PrefixCache::abandon_capture(std::uint64_t id) noexcept {
     const auto found = std::find_if(captures_.begin(), captures_.end(),
                                     [&](const PendingCapture& c) { return c.capture.id == id; });
     if (found == captures_.end()) { return; }
-    // The slabs and the staging slot are still read until the copy lands.
+    if (found->deferred != nullptr) {
+        // Nothing reserved yet: the slot is free once the producer's copy into it has ended.
+        (void)cudaEventSynchronize(found->deferred);
+        recycle(found->deferred);
+        if (found->capture.anchor.valid()) { index_->unpin_node(found->capture.anchor); }
+        captures_.erase(found);
+        return;
+    }
+    // The slabs and the staging slot are still read until the copy lands, a region until its
+    // Disk writes complete.
     (void)cudaEventSynchronize(found->events.back());
+    if (found->header_done != nullptr) { (void)cudaEventSynchronize(found->header_done); }
+    try {
+        while (found->writes != 0) {
+            reap_disk();
+            if (found->writes != 0) { std::this_thread::sleep_for(std::chrono::microseconds(50)); }
+        }
+    } catch (...) {
+        std::terminate(); // the region would be reused under a transfer in flight
+    }
     for (cudaEvent_t event : found->events) { recycle(event); }
+    recycle(found->header_done);
     if (found->capture.anchor.valid()) { index_->unpin_node(found->capture.anchor); }
-    index_->release_host_image(std::move(found->image));
+    release_image(std::move(found->image));
     captures_.erase(found);
 }
 
+void PrefixCache::publish_capture(PendingCapture& c) {
+    pc::PublishResult result;
+    if (c.image.disk) {
+        release_region(c.image.region);
+        c.image.region = kNoRegion;
+    }
+    if (c.image.disk && c.write_failed) {
+        // Nothing was recorded: the slots return, and the tail page with the dropped lease.
+        index_->release_disk_image(std::move(*c.image.disk));
+        c.capture.tail_lease.reset();
+    } else {
+        std::optional<std::uint32_t> tail_device;
+        if (c.capture.tail_lease) { tail_device = adopt_tail(std::move(*c.capture.tail_lease)); }
+        result = c.image.disk ? index_->publish_disk_snapshot(c.capture.anchor, c.capture.frontier, c.capture.tail,
+                                                              tail_device, std::move(*c.image.disk), c.capture.kind,
+                                                              c.capture.meta.head_residual)
+                              : index_->publish_host_snapshot(c.capture.anchor, c.capture.frontier, c.capture.tail,
+                                                              tail_device, std::move(c.image.host), c.capture.kind,
+                                                              c.capture.meta.head_residual);
+    }
+    if (result.created) {
+        snapshot_meta_[result.snapshot.index] = c.capture.meta;
+        ++(c.capture.kind == pc::SnapshotKind::Endpoint ? counters_.endpoints_created : counters_.taps_created);
+        if (c.image.disk) {
+            // Written through: its path follows it to the Disk, and its record follows theirs.
+            journal_waits_.push_back(JournalWait{{}, result.snapshot});
+            if (c.capture.anchor.valid() &&
+                !queue_path_writes(c.capture.anchor, index_->snapshot(result.snapshot).priority)) {
+                ++counters_.disk_capture_skips;
+            }
+        }
+    }
+    if (c.capture.supersedes && index_->valid(*c.capture.supersedes) &&
+        (!result.snapshot.valid() || *c.capture.supersedes != result.snapshot)) {
+        index_->supersede(*c.capture.supersedes, c.capture.continuation);
+    }
+    if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
+    published_[c.capture.id] = result;
+    for (cudaEvent_t event : c.events) { recycle(event); }
+    recycle(c.header_done);
+    c.header_done = nullptr;
+}
+
 void PrefixCache::poll() {
-    // Captures land in transfer-stream order; one still waiting for its anchor block keeps its
-    // place while the ones behind it publish.
+    if (store_) { reap_disk(); }
+    // Captures land in transfer-stream order; one still waiting for its anchor block, or for its
+    // Disk writes, keeps its place while the ones behind it publish.
     for (auto it = captures_.begin(); it != captures_.end();) {
         PendingCapture& c = *it;
-        const cudaError_t status = cudaEventQuery(c.events.back());
+        if (c.deferred != nullptr) {
+            bool dropped = false;
+            if (!start_deferred(c, dropped)) {
+                if (dropped) {
+                    (void)cudaEventSynchronize(c.deferred);
+                    recycle(c.deferred);
+                    if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
+                    it = captures_.erase(it);
+                } else {
+                    ++it;
+                }
+                continue;
+            }
+        }
+        const cudaError_t status = cudaEventQuery(c.header_done != nullptr ? c.header_done : c.events.back());
         if (status == cudaErrorNotReady) { break; }
         CUDA_CHECK(status);
+        c.staging = nullptr; // the copy has read the prompt-end slot
+        if (c.image.disk) {
+            if (!c.writes_issued) { issue_capture_writes(c); }
+            if (!c.writes_issued || c.writes != 0) {
+                ++it;
+                continue;
+            }
+        }
         if (c.capture.anchor_pending) {
             ++it;
             continue;
         }
-        std::optional<std::uint32_t> tail_device;
-        if (c.capture.tail_lease) { tail_device = adopt_tail(std::move(*c.capture.tail_lease)); }
-        const pc::PublishResult result =
-            index_->publish_host_snapshot(c.capture.anchor, c.capture.frontier, c.capture.tail, tail_device,
-                                          std::move(c.image), c.capture.kind, c.capture.meta.head_residual);
-        if (result.created) {
-            snapshot_meta_[result.snapshot.index] = c.capture.meta;
-            ++(c.capture.kind == pc::SnapshotKind::Endpoint ? counters_.endpoints_created : counters_.taps_created);
-        }
-        if (c.capture.supersedes && index_->valid(*c.capture.supersedes) &&
-            (!result.snapshot.valid() || *c.capture.supersedes != result.snapshot)) {
-            index_->supersede(*c.capture.supersedes, c.capture.continuation);
-        }
-        if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
-        published_[c.capture.id] = result;
-        for (cudaEvent_t event : c.events) { recycle(event); }
+        publish_capture(c);
         it = captures_.erase(it);
     }
     while (!writes_.empty()) {
@@ -535,12 +771,14 @@ void PrefixCache::poll() {
         finish_restore(batch);
         landing_.pop_front();
     }
+    if (store_) { poll_disk(); }
 }
 
 void PrefixCache::drain() {
     CUDA_CHECK(cudaStreamSynchronize(transfer_));
     CUDA_CHECK(cudaStreamSynchronize(restore_stream_));
     poll();
+    if (store_) { drain_disk(); }
 }
 
 bool PrefixCache::await_extended_endpoint(std::span<const pc::NodeRef> path, std::span<const TokenId> tokens) {
@@ -552,8 +790,14 @@ bool PrefixCache::await_extended_endpoint(std::span<const pc::NodeRef> path, std
                         tokens.begin() + static_cast<std::ptrdiff_t>(k) * pc::kBlockTokens)) {
             continue;
         }
+        const std::uint64_t id = c.capture.id;
         CUDA_CHECK(cudaEventSynchronize(c.events.back()));
         poll();
+        // Written through to the Disk tier, it publishes once its writes complete.
+        while (std::any_of(captures_.begin(), captures_.end(), [&](const PendingCapture& p) { return p.capture.id == id; })) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            poll();
+        }
         return true;
     }
     return false;
@@ -608,25 +852,45 @@ void PrefixCache::restore_node_page(pc::NodeRef node, DeviceKVPageHandle destina
 void PrefixCache::restore_tail_page(pc::SnapshotRef snapshot, DeviceKVPageHandle destination) {
     if (!restore_.open) { throw std::logic_error("Qwen4Exp prefix cache: no restore is open"); }
     const pc::SnapshotView view = index_->snapshot(snapshot);
-    if (view.host != pc::CopyState::Resident || view.tail_len == 0) {
+    const bool fetched          = fetch_ && fetch_->ready && !fetch_->failed && fetch_->snapshot == snapshot && fetch_->tail;
+    if (view.tail_len == 0 || (view.host != pc::CopyState::Resident && !fetched)) {
         throw std::logic_error("Qwen4Exp prefix cache: restored tail has no Host copy");
     }
     index_->pin_snapshot(snapshot);
     restore_.snapshot_pins.push_back(snapshot);
-    const std::uint32_t tail_slab = view.host_slabs.back();
-    restore_.pages.push_back(PageCopy{destination, slab(tail_slab), slab_group(tail_slab)});
-    ++counters_.host_tail_restores;
+    if (view.host == pc::CopyState::Resident) {
+        const std::uint32_t tail_slab = view.host_slabs.back();
+        restore_.pages.push_back(PageCopy{destination, slab(tail_slab), slab_group(tail_slab)});
+        ++counters_.host_tail_restores;
+        return;
+    }
+    ++regions_[fetch_->region].users;
+    restore_.regions.push_back(fetch_->region);
+    restore_.pages.push_back(PageCopy{destination,
+                                      region_base(fetch_->region) + static_cast<std::size_t>(host_.image_slabs) * host_.slab_bytes,
+                                      kNoRegion - 1U - fetch_->region});
 }
 
 void PrefixCache::restore_image(pc::SnapshotRef snapshot, std::uint32_t lane) {
     if (!restore_.open || restore_.image) { throw std::logic_error("Qwen4Exp prefix cache: image restore is not open"); }
     const pc::SnapshotView view = index_->snapshot(snapshot);
-    if (view.host != pc::CopyState::Resident) { throw std::logic_error("Qwen4Exp prefix cache: restored image is not on the Host"); }
+    const bool fetched = fetch_ && fetch_->ready && !fetch_->failed && fetch_->snapshot == snapshot &&
+                         fetch_->region != kNoRegion;
+    if (view.host != pc::CopyState::Resident && !fetched) {
+        throw std::logic_error("Qwen4Exp prefix cache: restored image is not on the Host");
+    }
     index_->pin_snapshot(snapshot);
     restore_.snapshot_pins.push_back(snapshot);
     restore_.image      = snapshot;
     restore_.image_lane = lane;
-    ++counters_.host_image_restores;
+    if (view.host == pc::CopyState::Resident) {
+        ++counters_.host_image_restores;
+        return;
+    }
+    // The fetched image, read from its region until the batch lands.
+    restore_.image_region = fetch_->region;
+    ++regions_[fetch_->region].users;
+    restore_.regions.push_back(fetch_->region);
 }
 
 void PrefixCache::copy_pages_from_host(std::span<const PageCopy> copies, std::size_t plane_begin, std::size_t plane_end,
@@ -650,7 +914,7 @@ RestoreTicket PrefixCache::submit_restore() {
     if (!restore_.open) { throw std::logic_error("Qwen4Exp prefix cache: no restore is open"); }
     const StateImageLayout& layout = lanes_->layout();
     std::vector<const std::byte*> segments;
-    if (restore_.image) {
+    if (restore_.image && restore_.image_region == kNoRegion) {
         const pc::SnapshotView view = index_->snapshot(*restore_.image);
         for (std::uint32_t i = 0; i < host_.image_slabs; ++i) { segments.push_back(slab(view.host_slabs[i])); }
     }
@@ -666,12 +930,17 @@ RestoreTicket PrefixCache::submit_restore() {
             const PlaneRange planes = kv_layer_planes(geometry_, attention++);
             copy_pages_from_host(restore_.pages, planes.begin, planes.end, restore_stream_);
         }
-        if (restore_.image) { lanes_->copy_group_from_host(g, image, restore_.image_lane, restore_stream_); }
+        if (restore_.image_region != kNoRegion) {
+            lanes_->copy_group_from_packed(g, region_base(restore_.image_region), restore_.image_lane, restore_stream_);
+        } else if (restore_.image) {
+            lanes_->copy_group_from_host(g, image, restore_.image_lane, restore_stream_);
+        }
         cudaEvent_t event = take_event();
         CUDA_CHECK(cudaEventRecord(event, restore_stream_));
         restore_.events.push_back(event);
     }
-    counters_.host_restore_bytes += restore_.pages.size() * host_.page.page_stride + (restore_.image ? host_.image_bytes : 0U);
+    counters_.host_restore_bytes += restore_.pages.size() * host_.page.page_stride +
+                                    (restore_.image && restore_.image_region == kNoRegion ? host_.image_bytes : 0U);
     restore_.open             = false;
     const RestoreTicket ticket = restore_.ticket;
     landing_.push_back(std::move(restore_));
@@ -702,6 +971,8 @@ void PrefixCache::finish_restore(RestoreBatch& batch) noexcept {
     for (const pc::NodeRef node : batch.nodes) { index_->complete_device_fill(node); }
     for (const pc::NodeRef node : batch.pins) { index_->unpin_node(node); }
     for (const pc::SnapshotRef snapshot : batch.snapshot_pins) { index_->unpin_snapshot(snapshot); }
+    for (const std::uint32_t region : batch.regions) { release_region(region); }
+    batch.regions.clear();
     for (cudaEvent_t event : batch.events) { recycle(event); }
     batch.events.clear();
 }
@@ -712,13 +983,22 @@ void PrefixCache::abort_restore() noexcept {
     for (const pc::NodeRef node : restore_.nodes) { index_->abort_device_fill(node); }
     for (const pc::NodeRef node : restore_.pins) { index_->unpin_node(node); }
     for (const pc::SnapshotRef snapshot : restore_.snapshot_pins) { index_->unpin_snapshot(snapshot); }
+    for (const std::uint32_t region : restore_.regions) { release_region(region); }
     restore_ = RestoreBatch{};
 }
 
 void PrefixCache::clear() noexcept {
     try {
         drain();
+        // A fetch in flight still reads into its pages and region.
+        while (fetch_running()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            poll();
+        }
+        CUDA_CHECK(cudaStreamSynchronize(transfer_));
+        poll();
     } catch (...) {}
+    release_fetch();
     for (RestoreBatch& batch : landing_) {
         for (cudaEvent_t event : batch.events) { recycle(event); }
     }
@@ -728,6 +1008,22 @@ void PrefixCache::clear() noexcept {
     while (!captures_.empty()) { abandon_capture(captures_.front().capture.id); }
     writes_.clear();
     published_.clear();
+    for (auto& [id, w] : block_writes_) { recycle(w.copied); }
+    block_writes_.clear();
+    spill_.reset();
+    journal_waits_.clear();
+    unreadable_.clear();
+    journaled_snapshots_.clear();
+    std::fill(slot_journaled_.begin(), slot_journaled_.end(), false);
+    for (Region& region : regions_) { region.users = 0; }
+    free_staging_.clear();
+    for (std::uint32_t i = kStagingRecords; block_staging_ != nullptr && i-- > 0;) { free_staging_.push_back(i); }
+    if (store_) {
+        // The emptied index names no record: neither does the journal.
+        try {
+            store_->compact({}, {});
+        } catch (...) { disk_broken_ = true; }
+    }
     pc::PrefixIndexConfig config = index_->config();
     index_.reset();
     blocks_.clear();
@@ -741,6 +1037,10 @@ void PrefixCache::clear() noexcept {
 
 void PrefixCache::release_device_block(std::uint32_t device_id) noexcept {
     if (device_id >= blocks_.size() || !blocks_[device_id]) { std::terminate(); }
+    // A published tail page can still be read by the tap that captured it.
+    try {
+        order_page_reuse(std::span<const DeviceKVPageLease>(&*blocks_[device_id], 1));
+    } catch (...) { std::terminate(); } // the page would be reused under a copy in flight
     blocks_[device_id].reset(); // the lease returns its page to the pool
     free_blocks_.push_back(device_id);
 }

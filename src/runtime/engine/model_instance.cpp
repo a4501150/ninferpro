@@ -259,13 +259,37 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             throw std::invalid_argument(
                 "--cache-host-state fp24 and bf16 are lossy; --disable-fast-paths requires fp32");
         }
-        if (qwen4_exp) {
-            // Qwen3.8-Flash-Next's snapshots are born in the Host tier (design §19.3.1): it needs
-            // the tier and has no Device snapshot slots.
-            if (!host_tier) {
+        if (!hybrid.disk_directory.empty()) {
+#ifdef _WIN32
+            throw std::invalid_argument("the prefix cache Disk tier (--prefix-cache-disk) needs cuFile, which has no "
+                                        "Windows build");
+#endif
+            if (!qwen4_exp) {
                 throw std::invalid_argument(
-                    "Qwen3.8-Flash-Next's prefix cache keeps its snapshots in the Host tier: "
-                    "--host-context-mib must be positive");
+                    "the prefix cache Disk tier (--prefix-cache-disk) applies to Qwen3.8-Flash-Next only");
+            }
+            hybrid.disk_capacity_bytes = hybrid.disk_capacity_bytes.value_or(kDefaultPrefixDiskCacheBytes);
+            if (*hybrid.disk_capacity_bytes == 0) {
+                throw std::invalid_argument("--prefix-cache-disk-gib must be positive");
+            }
+        } else if (hybrid.disk_capacity_bytes.value_or(0U) != 0) {
+            throw std::invalid_argument("--prefix-cache-disk-gib needs --prefix-cache-disk");
+        } else {
+            hybrid.disk_capacity_bytes = 0U;
+        }
+        if (qwen4_exp) {
+            // Qwen3.8-Flash-Next's snapshots are born in the Host tier, or without one written
+            // through to the Disk tier (design §19.3.1); it has no Device snapshot slots.
+            if (!host_tier && hybrid.disk_directory.empty()) {
+                throw std::invalid_argument(
+                    "Qwen3.8-Flash-Next's prefix cache keeps its snapshots in the Host or Disk tier: "
+                    "--host-context-mib must be positive without --prefix-cache-disk");
+            }
+            if (!hybrid.persistent_file.empty() || hybrid.persistent_save_interval.count() != 0) {
+                throw std::invalid_argument(
+                    "Qwen3.8-Flash-Next keeps its prefix cache across restarts in the Disk tier: use "
+                    "--prefix-cache-disk DIR and --prefix-cache-disk-gib N instead of --prefix-cache-file and "
+                    "--prefix-cache-save-mins");
             }
             if (hybrid.device_snapshot_slots.value_or(0U) != 0) {
                 throw std::invalid_argument(
@@ -323,7 +347,8 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         // Without a prefix cache every request starts from the root and nothing is retained:
         // the lanes' StateImages are the only Device state and there is no Host tier.
         if (cache.host_capacity_bytes.value_or(0U) != 0 ||
-            cache.hybrid.device_snapshot_slots.value_or(0U) != 0) {
+            cache.hybrid.device_snapshot_slots.value_or(0U) != 0 || !cache.hybrid.disk_directory.empty() ||
+            cache.hybrid.disk_capacity_bytes.value_or(0U) != 0) {
             throw std::invalid_argument(
                 "prefix cache capacities require the context cache to be enabled");
         }
@@ -332,6 +357,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             throw std::invalid_argument("prefix cache policies require the context cache to be enabled");
         }
         cache.host_capacity_bytes          = 0U;
+        cache.hybrid.disk_capacity_bytes   = 0U;
         cache.hybrid.device_snapshot_slots = 0U;
         cache.hybrid.tool_call_hold        = std::chrono::milliseconds{0};
     }

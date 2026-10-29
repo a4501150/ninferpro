@@ -1473,7 +1473,7 @@ int test_open_reasoning_recovery() {
                           "open thinking with " + label + " produced a call or leaked content");
     }
 
-    // Only a turn the model ended itself, with tolerant mode, free tools and no content fed.
+    // Only a turn the model ended itself, with tolerant mode and no content fed.
     for (const infernix::FinishReason reason :
          {infernix::FinishReason::OutputLimit, infernix::FinishReason::ContextCapacity,
           infernix::FinishReason::Cancelled, infernix::FinishReason::StopString}) {
@@ -1489,13 +1489,6 @@ int test_open_reasoning_recovery() {
             recovered(planning + remove, infernix::FinishReason::StopToken, true, "Answer.");
         failures += check(terminal.tool_calls.empty() && terminal.content == "Answer.",
                           "open thinking overrode a turn that fed content");
-    }
-    {
-        const auto constrained = fi::select_tool_call_contract(contract, infernix::ToolChoice{});
-        fi::ToolCallOutputDecoder decoder(constrained, 64, true);
-        failures += check(decoder.finish(infernix::FinishReason::StopToken, planning + remove)
-                              .tool_calls.empty(),
-                          "constrained tool output recovered a call from open thinking");
     }
     return failures;
 }

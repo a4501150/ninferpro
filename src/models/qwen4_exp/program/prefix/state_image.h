@@ -161,7 +161,8 @@ struct LaneStateBuffers {
     std::vector<std::byte*> ring_k, ring_v;
 };
 
-// Host placement of one packed image.
+// Host placement of one packed image. The segments may also be device memory (the Disk tier's
+// staging regions): the copies take either.
 struct HostImage {
     std::span<std::byte* const> segments;
     std::size_t segment_bytes = 0;

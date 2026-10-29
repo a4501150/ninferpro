@@ -67,6 +67,8 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--cache-tap-ladder"},
     ServeOptionArity{"--prefix-cache-file"},
     ServeOptionArity{"--prefix-cache-save-mins"},
+    ServeOptionArity{"--prefix-cache-disk"},
+    ServeOptionArity{"--prefix-cache-disk-gib"},
     ServeOptionArity{"--no-queue-holds", false},
     ServeOptionArity{"--cache-tool-hold-secs"},
     ServeOptionArity{"--cache-host-state"},
@@ -410,13 +412,27 @@ std::string serve_usage_text(const char* argv0) {
            "  (--kv-capacity defaults to auto) and every option below is optional.\n"
            "  --host-context-mib N       pinned Host pool in decimal MiB (whole bytes) that\n"
            "                             KV blocks and state snapshots share (default 8192;\n"
-           "                             0 = GPU only; Qwen3.8-Flash-Next: must be positive)\n"
-           "  --prefix-cache-file PATH   restore the host tier from PATH at startup when\n"
-           "                             present (written by this binary for the same\n"
-           "                             artifact and KV format) and save it there on clean\n"
-           "                             shutdown (Ctrl+C twice); relative paths resolve\n"
-           "                             against the launch directory (default off:\n"
-           "                             nothing is saved)\n"
+           "                             0 = GPU only; Qwen3.8-Flash-Next: 0 only with\n"
+           "                             --prefix-cache-disk)\n"
+           "  --prefix-cache-disk DIR    Qwen3.8-Flash-Next: an SSD tier in DIR (created when\n"
+           "                             missing; one server per directory) that keeps\n"
+           "                             blocks and snapshots across restarts, read and\n"
+           "                             written through cuFile (GPUDirect Storage when the\n"
+           "                             nvidia_fs module is loaded, its compatibility mode\n"
+           "                             otherwise). With a Host tier, the snapshots it would\n"
+           "                             evict next are written once, and the rest at\n"
+           "                             shutdown; with --host-context-mib 0, every snapshot\n"
+           "                             is written when captured (about 110 MiB each: more\n"
+           "                             SSD wear). A rebuilt binary, another artifact or\n"
+           "                             another size empties it. Linux only\n"
+           "  --prefix-cache-disk-gib N  size of the SSD tier in GiB, preallocated (default\n"
+           "                             64)\n"
+           "  --prefix-cache-file PATH   Qwen3.5: restore the host tier from PATH at\n"
+           "                             startup when present (written by this binary for\n"
+           "                             the same artifact and KV format) and save it there\n"
+           "                             on clean shutdown (Ctrl+C twice); relative paths\n"
+           "                             resolve against the launch directory (default\n"
+           "                             off: nothing is saved)\n"
            "  --prefix-cache-save-mins N also save the host tier to --prefix-cache-file\n"
            "                             every N minutes while serving, when it changed;\n"
            "                             requests wait while it is written (default off:\n"
@@ -796,6 +812,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--prefix-cache-file must not be empty");
             }
             cache_option_flag = "--prefix-cache-file";
+        } else if (arg == "--prefix-cache-disk") {
+            options.context_cache.hybrid.disk_directory = require_value("--prefix-cache-disk");
+            if (options.context_cache.hybrid.disk_directory.empty()) {
+                throw std::invalid_argument("--prefix-cache-disk must not be empty");
+            }
+            cache_option_flag = "--prefix-cache-disk";
+        } else if (arg == "--prefix-cache-disk-gib") {
+            const int gib = parse_nonnegative_int(require_value("--prefix-cache-disk-gib"), "prefix-cache-disk-gib");
+            if (gib == 0) { throw std::invalid_argument("--prefix-cache-disk-gib must be positive"); }
+            options.context_cache.hybrid.disk_capacity_bytes = static_cast<std::uint64_t>(gib) << 30U;
+            cache_option_flag = "--prefix-cache-disk-gib";
         } else if (arg == "--prefix-cache-save-mins") {
             const int minutes = parse_nonnegative_int(require_value("--prefix-cache-save-mins"), "prefix-cache-save-mins");
             if (minutes == 0) { throw std::invalid_argument("--prefix-cache-save-mins must be positive"); }
@@ -1060,6 +1087,22 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                         "with --no-prefix-reuse");
         }
     } else {
+        std::filesystem::path& directory = options.context_cache.hybrid.disk_directory;
+        if (directory.empty() && options.context_cache.hybrid.disk_capacity_bytes) {
+            throw std::invalid_argument("--prefix-cache-disk-gib sizes --prefix-cache-disk, which is not set");
+        }
+        if (!directory.empty()) {
+            // Resolved and checked now, as the file below is.
+            directory = std::filesystem::absolute(directory).lexically_normal();
+            std::error_code error;
+            if (std::filesystem::exists(directory, error) && !std::filesystem::is_directory(directory, error)) {
+                throw std::invalid_argument("--prefix-cache-disk " + directory.string() + " is not a directory");
+            }
+            if (!std::filesystem::is_directory(directory.parent_path(), error)) {
+                throw std::invalid_argument("--prefix-cache-disk " + directory.string() + ": the directory " +
+                                            directory.parent_path().string() + " does not exist");
+            }
+        }
         std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         if (file.empty() && options.context_cache.hybrid.persistent_save_interval.count() != 0) {
             throw std::invalid_argument("--prefix-cache-save-mins saves to --prefix-cache-file, which is not set");

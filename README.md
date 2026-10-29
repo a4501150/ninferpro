@@ -95,7 +95,7 @@ build/apps/infernix-serve Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 
   --max-context 262144 --max-concurrency 6 \
   --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix \
   --draft-tokens auto --lm-head-draft --tolerant-tool-calls \
-  --prefix-cache-file prefix-cache.bin --prefix-cache-save-mins 10 \
+  --prefix-cache-disk prefix-cache --prefix-cache-disk-gib 64 \
   --served-model-name qwen3.8-flash-next --host 0.0.0.0 --port 8000
 ```
 

@@ -18,6 +18,12 @@ infernix_add_test(infernix_direct_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_
 infernix_add_test(infernix_read_only_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_read_only_file.cpp"
   LIBRARIES infernix_core)
 
+if(NOT WIN32)
+  # cuFile batch I/O for the prefix cache's Disk tier (host and device memory).
+  infernix_add_test(infernix_cufile_io_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cufile_io.cpp"
+    LIBRARIES infernix_core)
+endif()
+
 set_tests_properties(infernix_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "INFERNIX_CUDA_SYNC=unset:")
 set(sync_modes spin blocking yield auto)

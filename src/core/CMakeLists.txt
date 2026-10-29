@@ -1,11 +1,15 @@
 if(WIN32)
   set(INFERNIX_READ_ONLY_FILE_SOURCE read_only_file_win32.cpp)
+  set(INFERNIX_CUFILE_SOURCE cufile_io_unsupported.cpp)
 else()
   set(INFERNIX_READ_ONLY_FILE_SOURCE read_only_file_posix.cpp)
+  # The prefix cache's Disk tier (cuFile has no Windows build).
+  set(INFERNIX_CUFILE_SOURCE cufile_io.cpp)
 endif()
 
 add_library(infernix_core STATIC
   ${INFERNIX_READ_ONLY_FILE_SOURCE}
+  ${INFERNIX_CUFILE_SOURCE}
   arena.cu
   block_copy.cu
   copy_batch.cpp
@@ -35,6 +39,9 @@ add_library(infernix_core STATIC
 infernix_internal_includes(infernix_core)
 infernix_cuda_archive(infernix_core)
 target_link_libraries(infernix_core PUBLIC infernix_cuda_runtime CUDA::nvtx3 CUDA::cuda_driver Threads::Threads)
+if(NOT WIN32)
+  target_link_libraries(infernix_core PRIVATE CUDA::cuFile)
+endif()
 if(WIN32)
   # DXGI: the OS video-memory budget and display outputs of the CUDA adapter (vram_budget.cpp).
   target_link_libraries(infernix_core PRIVATE dxgi)

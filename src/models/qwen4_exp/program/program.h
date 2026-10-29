@@ -106,6 +106,21 @@ struct HybridPrefixCacheStats {
     std::uint64_t held_snapshot_losses    = 0;
     std::uint64_t held_host_refusals      = 0;
     std::uint64_t tool_call_holds         = 0;
+    // The Disk tier (--prefix-cache-disk): its slots (one Host slab each), and its transfers.
+    std::uint32_t disk_slots              = 0;
+    std::uint32_t disk_free_slots         = 0;
+    std::uint64_t disk_image_writes       = 0; // snapshots spilled or written through
+    std::uint64_t disk_block_writes       = 0;
+    std::uint64_t disk_write_bytes        = 0;
+    std::uint64_t disk_fetches            = 0; // sources read before their admission
+    std::uint64_t disk_image_reads        = 0;
+    std::uint64_t disk_block_reads        = 0;
+    std::uint64_t disk_read_bytes         = 0;
+    std::uint64_t disk_failures           = 0; // failed transfers, fetched images with another header
+    std::uint64_t disk_capture_skips      = 0; // no staging region or Disk slots (no Host tier)
+    std::uint64_t disk_spill_skips        = 0;
+    std::uint64_t disk_snapshot_evictions = 0;
+    std::uint64_t disk_dead_reclaims      = 0;
 };
 
 class SequenceHandle {
@@ -129,6 +144,7 @@ struct SourceCandidate {
     std::uint32_t reused_tokens = 0;
     std::shared_ptr<const detail::QuoteImpl> hybrid;
     PrefixReusePath reuse_path = PrefixReusePath::Root;
+    bool from_disk             = false; // read from the Disk tier before the admission
 };
 
 // A binding's outcome for the Engine's admission (the shape Qwen3.5's binding returns). The prefix
@@ -318,18 +334,28 @@ struct ProgramDevicePlan {
     }
 };
 
-// The prefix cache's Host tier saved at shutdown or loaded at startup (--prefix-cache-file).
-struct PrefixCachePersistence {
+// The prefix cache's Disk tier opened at startup (--prefix-cache-disk).
+struct PrefixCacheDiskOpen {
+    std::string mode;         // the cuFile mode: "GDS" or "compat"
+    std::string reset_reason; // why it started empty; empty when its journal was trusted
+    bool damaged = false;     // its journal ended in a damaged record
+    std::uint64_t blocks            = 0; // rebuilt
+    std::uint64_t snapshots         = 0;
+    std::uint64_t dropped_blocks    = 0; // journaled but not rebuilt
+    std::uint64_t dropped_snapshots = 0;
+    std::uint64_t bytes             = 0;
+    std::uint64_t staging_bytes     = 0; // VRAM the Disk transfers stage through (taken from the expert frames)
+    double seconds                  = 0.0;
+};
+
+// The shutdown spill of the Host tier to the Disk tier.
+struct PrefixCacheDiskSpill {
     bool ok = false;
-    std::string message;
+    std::string message; // why it stopped early
     std::uint64_t blocks    = 0;
     std::uint64_t snapshots = 0;
     std::uint64_t bytes     = 0;
     double seconds          = 0.0;
-    std::uint64_t saved_blocks        = 0;
-    std::uint64_t saved_snapshots     = 0;
-    std::uint64_t required_host_bytes = 0;
-    std::uint64_t host_bytes          = 0;
 };
 
 struct ProgramOptions {
@@ -474,9 +500,11 @@ struct ProgramOptions {
     // layer's non-resident experts ahead by DMA into frames lent for the prompt.
     bool prefill_stream              = true;
     // Prefix cache (design §19.3.1): requests resume from and publish to a shared block tree with
-    // Host-born state snapshots in a pinned slab pool of prefix_host_bytes.
+    // state snapshots in a pinned slab pool of prefix_host_bytes and a Disk tier of
+    // prefix_disk_bytes (attach_prefix_cache_disk); one of them is needed.
     bool prefix_cache                = false;
     std::uint64_t prefix_host_bytes  = 0;
+    std::uint64_t prefix_disk_bytes  = 0;
     runtime::prefix_cache::TapPlannerConfig prefix_taps;
     runtime::prefix_cache::CacheCostModel prefix_cost;
     // What a cut that ends a layer walk's span costs (the next span streams the experts again), at
@@ -488,7 +516,7 @@ struct ProgramOptions {
     // The longest predicted wait for a prefilling sibling's snapshot a fresh request accepts instead
     // of prefilling the shared prefix itself (0: no coalescing).
     double prefix_coalesce_wait_seconds = 0.0;
-    // The product's control over the shutdown save of a persistent prefix cache.
+    // The product's control over the shutdown spill to the Disk tier.
     PrefixCacheSaveControl prefix_save;
     DiagnosticObserver diagnostics;
     // Internal (A/B measurement and tests): the runtime VRAM monitor that shrinks and grows the
@@ -650,20 +678,16 @@ public:
     // publishing, lets the prefix cache's transfers land and empties the cache when the failed
     // round may have published into it. False when that fails (the Engine fails everything).
     [[nodiscard]] bool recover_after_failure() noexcept;
-    // Releases every lane, saves the expert cache's state and then the prefix cache's Host tier
-    // when a file is attached.
+    // Releases every lane, saves the expert cache's state and then spills the prefix cache's Host
+    // tier to its Disk tier when one is attached.
     void shutdown_cleanup() noexcept;
-    // Loads the Host tier from `path` into the empty prefix cache and keeps `path` for the shutdown
-    // save. `fingerprint` names everything the saved bytes depend on besides their geometry.
-    [[nodiscard]] PrefixCachePersistence attach_prefix_cache_file(const std::filesystem::path& path,
-                                                                  std::string fingerprint,
-                                                                  const StartupObserver& observer);
-    // The shutdown save's result; absent before shutdown or without a file.
-    [[nodiscard]] std::optional<PrefixCachePersistence> prefix_shutdown_save() const;
-    // Between units (no unit's Device work in flight): writes the Host tier to the attached file
-    // when it has been written since the last save or load (Engine periodic save,
-    // HybridPrefixCacheOptions::persistent_save_interval). Absent without a file or a change.
-    [[nodiscard]] std::optional<PrefixCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
+    // Opens the prefix cache's Disk tier (ProgramOptions::prefix_disk_bytes) in `directory` and
+    // rebuilds its entries into the empty cache. `fingerprint` names everything the stored bytes
+    // depend on besides their geometry; a mismatch empties the tier.
+    [[nodiscard]] PrefixCacheDiskOpen attach_prefix_cache_disk(const std::filesystem::path& directory,
+                                                               std::string_view fingerprint);
+    // The shutdown spill's result; absent before shutdown or without a Disk tier.
+    [[nodiscard]] std::optional<PrefixCacheDiskSpill> prefix_shutdown_spill() const;
 
     // Teacher-forced scoring of a text prompt (ProgramOptions::causal_scoring; an idle Program): the
     // log-probability of each token from first_target on given the tokens before it, with the

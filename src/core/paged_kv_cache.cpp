@@ -716,10 +716,10 @@ std::uint32_t DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t p
             ++copies;
             if (to_host) {
                 CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, host_pitch, device_ptr, device_pitch, width,
-                                             count, cudaMemcpyDeviceToHost, stream));
+                                             count, cudaMemcpyDefault, stream));
             } else {
                 CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, host_pitch, width,
-                                             count, cudaMemcpyHostToDevice, stream));
+                                             count, cudaMemcpyDefault, stream));
             }
         };
         if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {

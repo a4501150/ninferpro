@@ -33,6 +33,8 @@ inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
 // Pinned Host slab pool of the hybrid prefix cache when --host-context-mib is not given, for every
 // architecture.
 inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
+// The Disk tier's size when HybridPrefixCacheOptions::disk_directory is set without one.
+inline constexpr std::uint64_t kDefaultPrefixDiskCacheBytes = 64ULL << 30;
 // How long the prefix cache holds a conversation's state after a reply ending in a tool call,
 // when --cache-tool-hold-secs is not given (Qwen3.5): longer than most tools take to run.
 inline constexpr std::chrono::milliseconds kDefaultToolCallHold{30'000};
@@ -387,9 +389,11 @@ struct DiagnosticObserver {
     std::function<void(const Diagnostic& diagnostic)> callback;
 };
 
-// Abandons the Host tier save of a stopping Engine (HybridPrefixCacheOptions::persistent_file)
-// from any thread, also while the Engine is being destroyed. Copies share one state: the product
-// keeps a copy from the options it passes, beyond the Engine's lifetime.
+// Abandons the shutdown save of a stopping Engine from any thread, also while the Engine is being
+// destroyed: the Host tier file (HybridPrefixCacheOptions::persistent_file, Qwen3.5) or the spill
+// of the Host tier to the Disk tier (disk_directory, Qwen3.8-Flash-Next; what is already on the
+// Disk stays). Copies share one state: the product keeps a copy from the options it passes, beyond
+// the Engine's lifetime.
 class PrefixCacheSaveControl {
 public:
     enum class Abandon : std::uint8_t {
@@ -449,6 +453,14 @@ struct HybridPrefixCacheOptions {
     std::string persistent_identity;
     // Lets the product abandon the save at shutdown (infernix-serve: Ctrl+C during the stop).
     PrefixCacheSaveControl persistent_save;
+    // Qwen3.8-Flash-Next: the Disk tier, in this directory (empty: none), of disk_capacity_bytes
+    // (default kDefaultPrefixDiskCacheBytes). It holds blocks and snapshots across restarts: with a
+    // Host tier, the snapshots the Host tier would evict next are written to it once, and every
+    // other one at shutdown; without one (host_capacity_bytes 0), every snapshot is written to it
+    // when captured. A restart rebuilds its entries from its journal without reading their data.
+    // Replaces persistent_file, which does not apply to this model. Linux only (cuFile).
+    std::filesystem::path disk_directory;
+    std::optional<std::uint64_t> disk_capacity_bytes;
     // With `persistent_file`: also save the Host tier this often while the Engine runs (zero: only
     // at shutdown). A save runs at the first worker boundary once the interval has passed, also
     // while requests run (it pauses generation for its duration), and only when the Host tier has
@@ -1565,6 +1577,8 @@ struct GenerationResult {
     // Completed initial prefill, excluding cached tokens and separately counted replay work.
     std::uint32_t computed_prefill_tokens = 0;
     PrefixReusePath prefix_reuse_path     = PrefixReusePath::Root;
+    // The reused source was read from the prefix cache's Disk tier before the admission.
+    bool prefix_from_disk = false;
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
     GenerationSchedulingStats scheduling;
@@ -1786,6 +1800,22 @@ struct RuntimeStats {
     std::uint64_t hybrid_held_host_refusals      = 0;
     // Holds placed after a reply ending in a tool call (HybridPrefixCacheOptions::tool_call_hold).
     std::uint64_t hybrid_tool_call_holds         = 0;
+    // The Disk tier (HybridPrefixCacheOptions::disk_directory; zero without one): capacity and use,
+    // snapshots and blocks written, sources read before their admission and their bytes, failed
+    // transfers, captures skipped for want of a staging region or Disk slots (no Host tier),
+    // spills skipped for want of Disk slots, and snapshots and dead blocks evicted from it.
+    std::uint64_t hybrid_disk_capacity_bytes      = 0;
+    std::uint64_t hybrid_disk_used_bytes          = 0;
+    std::uint64_t hybrid_disk_image_writes        = 0;
+    std::uint64_t hybrid_disk_block_writes        = 0;
+    std::uint64_t hybrid_disk_write_bytes         = 0;
+    std::uint64_t hybrid_disk_fetches             = 0;
+    std::uint64_t hybrid_disk_read_bytes          = 0;
+    std::uint64_t hybrid_disk_failures            = 0;
+    std::uint64_t hybrid_disk_capture_skips       = 0;
+    std::uint64_t hybrid_disk_spill_skips         = 0;
+    std::uint64_t hybrid_disk_snapshot_evictions  = 0;
+    std::uint64_t hybrid_disk_dead_reclaims       = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
@@ -1861,6 +1891,22 @@ struct LoadSummary {
     // none wider fit. Zero when idle-wide-prefill is not selected (Qwen3.5 family only).
     std::uint32_t prefill_chunk      = 0;
     std::uint32_t idle_prefill_width = 0;
+
+    // Qwen3.8-Flash-Next's prefix cache Disk tier at startup.
+    struct PrefixCacheDisk {
+        bool attached = false;
+        std::string mode;         // the cuFile mode: "GDS" or "compat"
+        std::string reset_reason; // why it started empty; empty when its journal was trusted
+        bool damaged = false;     // its journal ended in a damaged record
+        std::uint64_t capacity_bytes    = 0;
+        std::uint64_t blocks            = 0; // rebuilt
+        std::uint64_t snapshots         = 0;
+        std::uint64_t dropped_blocks    = 0; // journaled but not rebuilt
+        std::uint64_t dropped_snapshots = 0;
+        std::uint64_t bytes             = 0; // what the rebuilt entries hold
+        std::uint64_t staging_bytes     = 0; // VRAM the Disk transfers stage through
+        double seconds                  = 0.0;
+    } prefix_disk;
 
     // Hybrid prefix cache restored from its persistent file at startup.
     struct PrefixCacheRestore {

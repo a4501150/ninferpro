@@ -254,6 +254,37 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "Qwen3.8-Flash-Next normalization accepted an unservable cache");
     }
+    // The Disk tier: Qwen3.8-Flash-Next only, where it replaces the Host tier file and may stand
+    // without a Host tier; a size needs its directory.
+    {
+        EngineOptions options;
+        options.context_cache.host_capacity_bytes  = 0;
+        options.context_cache.hybrid.disk_directory = "disk-tier";
+        const infernix::ContextCacheOptions out =
+            normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp).context_cache;
+        failures += check(out.host_capacity_bytes == 0U &&
+                              out.hybrid.disk_capacity_bytes == infernix::kDefaultPrefixDiskCacheBytes,
+                          "a Disk tier without a Host tier was not accepted with its default size");
+    }
+    for (int variant = 0; variant < 4; ++variant) {
+        EngineOptions options;
+        auto architecture = infernix::models::Architecture::Qwen4Exp;
+        if (variant == 0) { options.context_cache.hybrid.persistent_file = "file.cache"; }
+        if (variant == 1) {
+            options.context_cache.hybrid.disk_directory = "disk-tier";
+            architecture                                = infernix::models::Architecture::Qwen3_5;
+        }
+        if (variant == 2) { options.context_cache.hybrid.disk_capacity_bytes = 1ULL << 30; }
+        if (variant == 3) {
+            options.context_cache.hybrid.disk_directory      = "disk-tier";
+            options.context_cache.hybrid.disk_capacity_bytes = 0;
+        }
+        bool rejected = false;
+        try {
+            (void)normalize_engine_options(options, architecture);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "normalization accepted a Disk tier or cache file it cannot serve");
+    }
     {
         EngineOptions options;
         options.context_cache.enabled = false;

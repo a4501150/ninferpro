@@ -30,6 +30,11 @@ Modifications made in this product (summary; see README.md for details):
   free-cache-resume path. Recipe C's fast route runs the compensated chunked
   GDN prefill (gdn-compensated: every chunk product of high/low operand pairs,
   the recurrent arithmetic's error order at chunked speed).
+- A Disk tier for the Qwen3.8-Flash-Next prefix cache (--prefix-cache-disk,
+  --prefix-cache-disk-gib): KV blocks and state snapshots on the SSD through
+  cuFile (GPUDirect Storage or its compatibility mode), sized apart from RAM,
+  kept across restarts by a journal, spilled from the RAM tier or, with the
+  RAM tier off, written through; it replaces this model's whole-file save.
 - Batched DFlash2 drafting at any round size with an online cost fit.
 - Linux VRAM spill detection fix (no WDDM budget).
 

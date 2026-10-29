@@ -782,6 +782,28 @@ int main() {
     failures +=
         check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--host-context-mib", "0"}),
               "--prefix-cache-file was accepted without a Host tier to save");
+    // The Disk tier: a directory resolved at launch, sized in GiB (64 by default at the Engine), and
+    // allowed without a Host tier.
+    {
+        const ServeOptions disk = parse({"infernix-serve", "model.ninfer", "--prefix-cache-disk", "disk-tier",
+                                         "--prefix-cache-disk-gib", "32", "--host-context-mib", "0"});
+        failures += check(disk.context_cache.hybrid.disk_directory ==
+                                  (std::filesystem::current_path() / "disk-tier").lexically_normal() &&
+                              disk.context_cache.hybrid.disk_capacity_bytes == (32ULL << 30U) &&
+                              disk.context_cache.host_capacity_bytes == 0U,
+                          "--prefix-cache-disk and --prefix-cache-disk-gib were not parsed");
+        failures += check(!parse({"infernix-serve", "model.ninfer", "--prefix-cache-disk", "disk-tier"})
+                               .context_cache.hybrid.disk_capacity_bytes,
+                          "--prefix-cache-disk without a size must leave the default to the Engine");
+    }
+    failures += check(rejected_cache_file({"--prefix-cache-disk-gib", "8"}),
+                      "--prefix-cache-disk-gib was accepted without --prefix-cache-disk");
+    failures += check(rejected_cache_file({"--prefix-cache-disk", "disk-tier", "--prefix-cache-disk-gib", "0"}),
+                      "--prefix-cache-disk-gib accepted zero");
+    failures += check(rejected_cache_file({"--prefix-cache-disk", (std::filesystem::temp_directory_path() /
+                                                                   "infernix-missing-directory-for-test" / "tier")
+                                                                      .string()}),
+                      "--prefix-cache-disk accepted a directory whose parent does not exist");
     // The periodic save: minutes, only with a cache file, never zero.
     {
         std::vector<std::string> arguments{"infernix-serve", "model.ninfer", "--prefix-cache-file", "file.cache",
@@ -799,6 +821,8 @@ int main() {
                       "--prefix-cache-save-mins accepted zero");
     for (const std::vector<std::string>& cache_flag :
          std::vector<std::vector<std::string>>{{"--prefix-cache-file", "file.cache"},
+                                               {"--prefix-cache-disk", "disk-tier"},
+                                               {"--prefix-cache-disk-gib", "8"},
                                                {"--device-snapshot-slots", "2"},
                                                {"--cache-taps-per-request", "2"},
                                                {"--cache-tap-ladder", "2048"},

@@ -369,6 +369,22 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     } else if (load.prefix_cache.attempted) {
         impl_->logger->info("prefix cache not restored | {}", load.prefix_cache.message);
     }
+    const LoadSummary::PrefixCacheDisk& disk = load.prefix_disk;
+    if (disk.attached && !disk.reset_reason.empty()) {
+        impl_->logger->info("prefix cache Disk tier | {} | cuFile {} | {} VRAM staging | started empty: {}",
+                            format_pretty_bytes(disk.capacity_bytes), disk.mode, format_pretty_bytes(disk.staging_bytes),
+                            disk.reset_reason);
+    } else if (disk.attached) {
+        const std::uint64_t dropped = disk.dropped_blocks + disk.dropped_snapshots;
+        impl_->logger->info("prefix cache Disk tier | {} | cuFile {} | {} VRAM staging | {} snapshots | {} blocks | {} used | "
+                            "rebuilt in {}{}{}",
+                            format_pretty_bytes(disk.capacity_bytes), disk.mode, format_pretty_bytes(disk.staging_bytes),
+                            format_pretty_count(disk.snapshots),
+                            format_pretty_count(disk.blocks), format_pretty_bytes(disk.bytes),
+                            format_pretty_duration(disk.seconds),
+                            dropped != 0 ? " | dropped " + format_pretty_count(dropped) + " unlinked records" : std::string{},
+                            disk.damaged ? " | its journal ended in a damaged record" : "");
+    }
 }
 
 } // namespace infernix::product

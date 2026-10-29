@@ -89,14 +89,15 @@ void StopControl::exit_locked() {
                                   : PrefixCacheSaveControl::Abandon::Unsaved;
         switch (result) {
         case PrefixCacheSaveControl::Abandon::Unsaved:
-            message = "Ctrl+C: exiting without saving the prefix cache | the previous file is kept";
+            message = "Ctrl+C: exiting without saving the prefix cache | what was saved before is kept";
             break;
         case PrefixCacheSaveControl::Abandon::Saved:
             message += " | the prefix cache was already saved";
             break;
         case PrefixCacheSaveControl::Abandon::StillWriting:
             message = "Ctrl+C: exiting without saving the prefix cache | the save did not stop in "
-                      "time, so its unfinished .tmp file may remain; the previous file is kept";
+                      "time, so an unfinished --prefix-cache-file .tmp file may remain; what was saved "
+                      "before is kept";
             break;
         }
     }

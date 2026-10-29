@@ -67,6 +67,7 @@ struct GenerationMetrics {
     NgramArchiveStats ngram_archive;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     infernix::PrefixReusePath prefix_reuse_path = infernix::PrefixReusePath::Root;
+    bool prefix_from_disk                       = false;
 };
 
 struct GenerationOutcome {
