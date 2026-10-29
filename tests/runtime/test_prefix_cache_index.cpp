@@ -932,6 +932,14 @@ void test_host_write_admission() {
     require(index.snapshot(valuable).host == CopyState::Resident &&
                 index.snapshot(cheap).host == CopyState::Absent,
             "the rejected snapshot stays Device-only and the valuable one keeps its Host copy");
+    // A fill for a request waiting on it (a read back from the Disk tier) passes no value gate.
+    index.pin_snapshot(cheap);
+    require(index.begin_snapshot_host_fill(cheap, std::numeric_limits<double>::infinity()),
+            "an unbounded claim displaces the snapshot worth more");
+    index.complete_snapshot_host_fill(cheap);
+    index.unpin_snapshot(cheap);
+    require(index.snapshot(cheap).host == CopyState::Resident && index.snapshot(valuable).host == CopyState::Absent,
+            "the claimed snapshot holds the slabs the valuable one gave up");
     index.release_path(path_a);
     index.release_path(path_b);
     index.check_invariants();

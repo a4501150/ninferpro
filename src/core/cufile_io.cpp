@@ -90,6 +90,7 @@ struct CuFileQueue::Impl {
     std::vector<void*> registered;
     std::vector<Batch> batches;
     std::deque<Part> queued;
+    std::deque<Part> urgent_queued; // issued first
     // Host memory moves by pread/pwrite on these threads: cuFile 1.19's compatibility mode
     // faults now and then inside cuFileBatchIOGetStatus after batch reads into host memory
     // (pinned or pageable, registered or not), and GPUDirect Storage has no direct path for host
@@ -102,7 +103,8 @@ struct CuFileQueue::Impl {
     std::vector<std::thread> host_threads;
     std::mutex host_mutex;
     std::condition_variable host_wake;
-    std::deque<Part> host_queued;      // guarded by host_mutex
+    std::deque<Part> host_queued;      // guarded by host_mutex; its first host_urgent are urgent
+    std::size_t host_urgent = 0;       // guarded by host_mutex
     std::vector<HostDone> host_done;   // guarded by host_mutex
     std::uint32_t host_outstanding = 0; // submitted to the threads, not yet reaped
     bool host_stopping             = false;
@@ -158,9 +160,14 @@ struct CuFileQueue::Impl {
     }
 
     void issue(Batch& batch) {
-        const std::size_t count = std::min<std::size_t>(options.batch_depth, queued.size());
-        batch.parts.assign(queued.begin(), queued.begin() + static_cast<std::ptrdiff_t>(count));
-        queued.erase(queued.begin(), queued.begin() + static_cast<std::ptrdiff_t>(count));
+        batch.parts.clear();
+        for (std::deque<Part>* from : {&urgent_queued, &queued}) {
+            while (!from->empty() && batch.parts.size() < options.batch_depth) {
+                batch.parts.push_back(from->front());
+                from->pop_front();
+            }
+        }
+        const std::size_t count = batch.parts.size();
         batch.params.resize(count);
         for (std::size_t i = 0; i < count; ++i) {
             const Part& part              = batch.parts[i];
@@ -195,6 +202,7 @@ struct CuFileQueue::Impl {
                 if (host_queued.empty()) { return; }
                 part = host_queued.front();
                 host_queued.pop_front();
+                if (host_urgent != 0) { --host_urgent; }
             }
             HostDone done{part, true, {}};
             auto* memory     = static_cast<std::byte*>(part.buffer) + part.buffer_offset;
@@ -234,7 +242,7 @@ struct CuFileQueue::Impl {
             if (batch.outstanding != 0) { reap(batch); }
         }
         for (Batch& batch : batches) {
-            if (queued.empty()) { break; }
+            if (queued.empty() && urgent_queued.empty()) { break; }
             if (batch.outstanding == 0) { issue(batch); }
         }
     }
@@ -364,15 +372,19 @@ void CuFileQueue::submit(const Transfer& transfer) {
             .device        = device,
         };
         if (device) {
-            impl.queued.push_back(part);
+            (transfer.urgent ? impl.urgent_queued : impl.queued).push_back(part);
         } else {
             impl.host_parts.push_back(part);
         }
     }
     if (!impl.host_parts.empty()) {
         {
+            // An urgent transfer goes behind the urgent ones already queued, before the others.
             std::lock_guard lock(impl.host_mutex);
-            impl.host_queued.insert(impl.host_queued.end(), impl.host_parts.begin(), impl.host_parts.end());
+            const auto at = transfer.urgent ? impl.host_queued.begin() + static_cast<std::ptrdiff_t>(impl.host_urgent)
+                                            : impl.host_queued.end();
+            impl.host_queued.insert(at, impl.host_parts.begin(), impl.host_parts.end());
+            if (transfer.urgent) { impl.host_urgent += impl.host_parts.size(); }
         }
         impl.host_outstanding += static_cast<std::uint32_t>(impl.host_parts.size());
         impl.host_parts.clear();

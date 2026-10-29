@@ -354,12 +354,14 @@ public:
 
     // ---- host residency (§9.3)
     // ------------------------------------------------------------------- Allocates a slab for a
-    // device-resident pinned node (write-through destination). Absent when no slab can be freed.
+    // pinned node with a Device copy (write-through destination) or a Disk copy (a read back from
+    // the Disk tier) and no Host copy. Absent when no slab can be freed.
     [[nodiscard]] std::optional<std::uint32_t> begin_host_fill(NodeRef node);
     void complete_host_fill(NodeRef node);
     void abort_host_fill(NodeRef node);
-    // Allocates image slabs (+1 tail slab) for a pinned snapshot. Absent when they cannot be freed.
-    [[nodiscard]] bool begin_snapshot_host_fill(SnapshotRef snapshot);
+    // Allocates image slabs (+1 tail slab) for a pinned snapshot. Absent when they cannot be freed:
+    // a retained snapshot valued above `claim` (default: this snapshot's priority) keeps its slabs.
+    [[nodiscard]] bool begin_snapshot_host_fill(SnapshotRef snapshot, std::optional<double> claim = std::nullopt);
     void complete_snapshot_host_fill(SnapshotRef snapshot);
     void abort_snapshot_host_fill(SnapshotRef snapshot);
     // A pinned host- or disk-backed snapshot whose tail lost its Device copy receives `device_id`

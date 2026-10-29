@@ -4268,8 +4268,12 @@ journal; hybrid-prefix-cache-spec §17), the `PrefixIndexBackend` callbacks and
   2.9-3.6 GiB/s (2026-10-29, production running), so the restore's per-layer events stay on the
   copy streams and a Disk read happens before the admission, which is deferred meanwhile. With the
   Host tier, cold retained snapshots are spilled once (the Host eviction then keeps their Disk
-  copy); without it (`--host-context-mib 0`) captures write through from two VRAM staging regions
-  (2 × 125 slots, plus 64 block records: about 290 MB, taken from the expert frames). The
+  copy) and fetches read into Host slabs; without it (`--host-context-mib 0`) captures write
+  through from two VRAM staging regions (2 × 126 slots, plus 64 block records: 354 MiB of VRAM).
+  Only that mode stages in VRAM: with every expert resident the prefill chunk is sized from the
+  VRAM left free, and the staging cut it from 4,096 to 2,048 tokens (T3 prefill of a 30k prompt
+  13,500 against 12,600 tok/s, three and two runs, with the RAM tier on as well before fetches
+  moved to Host slabs). The
   `cudaMemcpyDefault` copies of `state_image.cpp` and `DeviceKVPagePool::copy_host_run` let the
   same capture and restore code address a region instead of Host slabs. cuFile 1.19 (CUDA 13.4)
   forced two workarounds in `core/cufile_io`: its compatibility mode faults now and then inside
@@ -4280,7 +4284,11 @@ journal; hybrid-prefix-cache-spec §17), the `PrefixIndexBackend` callbacks and
   recomputes a block replaces its Disk record like its Host record (`insert_block`); the records
   below it then link to a removed record, so the binding rewrites the block and journals them
   again after it (under MTP every repeat of a prompt-end snapshot republishes its anchor block:
-  one block write each).
+  one block write each). Without the Host tier an open tap and a tap being written can hold both
+  regions when the prompt end is captured: on T3 (three 20.8k-token prompts) two of three
+  same-boot repeats then resumed at a 14,336-token tap (0.6 s TTFT) instead of with no prefill,
+  so the prompt-end capture waits in its fixed slot for a region; taps found without one are
+  still skipped.
 
 - **Pages without refcounts.** Path pins keep a pinned node's Device copy (`prefix_index.h:24-27`);
   a lane holds private leases plus its path, and `insert_block` moves its lease to a new node or an

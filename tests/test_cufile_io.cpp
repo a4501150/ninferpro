@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -211,6 +212,25 @@ void test_many_in_flight(const std::filesystem::path& path) {
     cuda(cudaFree(device), "cudaFree");
 }
 
+void test_urgent(const std::filesystem::path& path) {
+    // With one host thread, an urgent read overtakes the reads queued before it.
+    CuFileQueue::Options options;
+    options.host_threads = 1;
+    CuFileQueue queue(path, kFile, options);
+    Aligned back(9 * kTransfer);
+    for (std::uint64_t i = 0; i < 8; ++i) {
+        queue.submit({.op = CuFileQueue::Op::Read, .offset = 0, .bytes = kTransfer, .buffer = back.p,
+                      .buffer_offset = i * kTransfer, .tag = i});
+    }
+    queue.submit({.op = CuFileQueue::Op::Read, .offset = 0, .bytes = kTransfer, .buffer = back.p,
+                  .buffer_offset = 8 * kTransfer, .tag = 8, .urgent = true});
+    std::vector<CuFileQueue::Completion> done;
+    queue.wait(done);
+    check(all_ok(done, 9), "urgent and queued reads complete");
+    const auto urgent = std::find_if(done.begin(), done.end(), [](const auto& c) { return c.tag == 8; });
+    check(urgent != done.end() && urgent - done.begin() < 7, "an urgent read completes before the reads queued earlier");
+}
+
 void test_reopen(const std::filesystem::path& path) {
     // A reopened file of the same size keeps its bytes.
     CuFileQueue queue(path, kFile);
@@ -229,6 +249,7 @@ int main() {
         test_round_trips(path);
         test_reopen(path);
         test_many_in_flight(path);
+        test_urgent(path);
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         ++failures;

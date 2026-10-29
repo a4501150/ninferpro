@@ -917,8 +917,9 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
 
 std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref) {
     Node& node = require(ref);
-    if (node.device != CopyState::Resident || node.host != CopyState::Absent || node.pins == 0) {
-        invariant("prefix cache host fill requires a pinned device-only node");
+    if ((node.device != CopyState::Resident && node.disk != CopyState::Resident) || node.host != CopyState::Absent ||
+        node.pins == 0) {
+        invariant("prefix cache host fill requires a pinned node with a Device or Disk copy and no Host copy");
     }
     if (!config_.host_blocks) { return std::nullopt; }
     std::vector<std::uint32_t> slab;
@@ -946,7 +947,7 @@ void PrefixCacheIndex::abort_host_fill(NodeRef ref) {
     refresh_node(ref.index);
 }
 
-bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref) {
+bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref, std::optional<double> claim) {
     Snapshot& snapshot = require(ref);
     if (snapshot.host != CopyState::Absent || snapshot.pins == 0) {
         invariant("prefix cache snapshot host fill requires a pinned device-only snapshot");
@@ -956,7 +957,7 @@ bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref) {
     std::vector<std::uint32_t> slabs;
     // The image goes to the Host only if it is worth what it displaces; otherwise it stays
     // Device-only.
-    if (!allocate_slabs(count, slabs, ref.index, snapshot.priority)) { return false; }
+    if (!allocate_slabs(count, slabs, ref.index, claim.value_or(snapshot.priority))) { return false; }
     Snapshot& filled  = snapshots_[ref.index];
     filled.host_slabs = std::move(slabs);
     filled.host       = CopyState::Filling;

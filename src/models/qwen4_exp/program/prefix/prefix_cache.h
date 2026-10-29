@@ -249,7 +249,7 @@ public:
     void drain();
     [[nodiscard]] bool transfers_pending() const noexcept {
         return !captures_.empty() || !writes_.empty() || !landing_.empty() || !block_writes_.empty() ||
-               spill_.has_value() || !promotions_.empty();
+               spill_.has_value();
     }
     // Waits for an endpoint copy-out a prompt extends (its anchor is on the prompt's matched `path`
     // and its tail tokens continue the prompt), and publishes it. Only such a prompt waits; the
@@ -349,6 +349,10 @@ private:
         bool writes_issued       = false;
         std::uint32_t writes     = 0; // in flight
         bool write_failed        = false;
+        // A prompt-end capture waiting for a region (no Host tier): the producer's copy into its
+        // slot. Its image is reserved and copied out once a region is free; until then it has no
+        // events.
+        cudaEvent_t deferred = nullptr;
     };
     struct StagedCapture {
         ImageTarget image;
@@ -358,6 +362,11 @@ private:
     };
     // The image's segments, as HostImage takes them, and its tail record and that record's group.
     [[nodiscard]] std::vector<std::byte*> image_segments(const ImageTarget& image) const;
+    // Copies a prompt-end capture's slot into its image on the transfer stream, after `after`.
+    void copy_prompt_end(PendingCapture& c, cudaEvent_t after);
+    // A deferred prompt-end capture takes a free region: false while none is; one whose image
+    // cannot be reserved is dropped (`dropped`).
+    bool start_deferred(PendingCapture& c, bool& dropped);
     [[nodiscard]] std::byte* tail_record(const ImageTarget& image) const;
     [[nodiscard]] std::uint32_t tail_group(const ImageTarget& image) const;
     // Reserves where a capture lands (Host slabs, or a region and Disk slots); absent when none.
@@ -428,12 +437,20 @@ private:
             runtime::prefix_cache::NodeRef node;
             DeviceKVPageHandle page;
             std::uint32_t slot    = 0;
-            std::uint32_t staging = kNoRegion;
+            std::uint32_t staging = kNoRegion; // its staging record (no Host tier)
+            std::uint32_t slab    = kNoRegion; // its Host slab (a Host tier)
             cudaEvent_t copied    = nullptr;
             bool ok               = true;
         };
         runtime::prefix_cache::SnapshotRef snapshot;
         std::vector<runtime::prefix_cache::NodeRef> path; // acquired
+        // With a Host tier, the image and blocks are read into Host fills (`image_fill`; a tail
+        // without a Disk copy is copied from its Device page, `tail_copy`) and restored from the
+        // Host as usual. Without one, blocks go through staging records into new Device pages and
+        // the image into a region.
+        bool host              = false;
+        bool image_fill        = false;
+        cudaEvent_t tail_copy  = nullptr;
         std::uint32_t region = kNoRegion;
         bool tail            = false; // the tail record is in the region
         std::vector<Block> blocks;
@@ -443,11 +460,6 @@ private:
         bool failed         = false;
         bool ready          = false;
         std::chrono::steady_clock::time_point expires;
-    };
-    struct Promotion {
-        runtime::prefix_cache::SnapshotRef snapshot; // pinned, Host Filling
-        std::uint32_t region = kNoRegion;
-        cudaEvent_t done     = nullptr;
     };
     // A record appended once the record it links to (parent block, anchor) has been.
     struct JournalWait {
@@ -488,8 +500,10 @@ private:
     void service_spill();
     void service_fetch();
     void finish_fetch();
-    void service_promotions();
     void service_journal();
+    bool start_host_fetch(runtime::prefix_cache::SnapshotRef snapshot, std::span<const runtime::prefix_cache::NodeRef> path,
+                          bool image, std::span<const runtime::prefix_cache::NodeRef> blocks);
+    void finish_host_fetch();
     [[nodiscard]] bool journalable(runtime::prefix_cache::NodeRef node) const;
     void service_replaced();
     void poll_disk();
@@ -528,7 +542,11 @@ private:
     std::uint32_t disk_slots_ = 0;
     std::unique_ptr<DiskStore> store_;
     std::vector<Region> regions_;
-    DeviceBuffer block_staging_; // kStagingRecords block records
+    // kStagingRecords block records: Device memory without a Host tier, pinned memory with one (no
+    // VRAM, so the prefill workspace keeps its room).
+    DeviceBuffer block_staging_device_;
+    std::optional<PinnedHostBuffer> block_staging_host_;
+    std::byte* block_staging_ = nullptr;
     std::vector<std::uint32_t> free_staging_;
     std::unordered_map<std::uint64_t, DiskIo> disk_io_; // by transfer tag
     std::uint64_t next_disk_tag_ = 1;
@@ -539,7 +557,6 @@ private:
     std::chrono::steady_clock::time_point next_spill_scan_{};
     std::optional<Fetch> fetch_;
     std::vector<runtime::prefix_cache::SnapshotRef> unreadable_;
-    std::deque<Promotion> promotions_;
     std::vector<JournalWait> journal_waits_;
     // Blocks whose Disk record a sequence's page replaced: written again, and the records below
     // them journaled again after them.

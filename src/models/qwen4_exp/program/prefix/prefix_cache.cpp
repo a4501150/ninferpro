@@ -97,13 +97,21 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
         pinned += bytes;
     }
     if (disk_slots_ != 0) {
-        // Two regions: a capture written through and a fetch, or a fetch read by its restore while
-        // the next one lands.
-        for (std::uint32_t r = 0; r < kDiskRegions; ++r) {
-            regions_.push_back(Region{DeviceBuffer(static_cast<std::size_t>(host_.image_slabs + 1U) * host_.slab_bytes),
-                                      PinnedHostBuffer(CuFileQueue::kAlignment), 0});
+        const std::size_t staging_bytes = static_cast<std::size_t>(kStagingRecords) * host_.slab_bytes;
+        if (host_.slabs == 0) {
+            // Without a Host tier, two VRAM regions: a capture written through and a fetch, or a
+            // fetch read by its restore while the next one lands. With one, fetches read into Host
+            // slabs and nothing stages in VRAM.
+            for (std::uint32_t r = 0; r < kDiskRegions; ++r) {
+                regions_.push_back(Region{DeviceBuffer(static_cast<std::size_t>(host_.image_slabs + 1U) * host_.slab_bytes),
+                                          PinnedHostBuffer(CuFileQueue::kAlignment), 0});
+            }
+            block_staging_device_ = DeviceBuffer(staging_bytes);
+            block_staging_        = static_cast<std::byte*>(block_staging_device_.p);
+        } else {
+            block_staging_host_.emplace(staging_bytes);
+            block_staging_ = static_cast<std::byte*>(block_staging_host_->data());
         }
-        block_staging_ = DeviceBuffer(static_cast<std::size_t>(kStagingRecords) * host_.slab_bytes);
         for (std::uint32_t i = kStagingRecords; i-- > 0;) { free_staging_.push_back(i); }
         slot_journaled_.assign(disk_slots_, false);
     }
@@ -133,6 +141,7 @@ PrefixCache::~PrefixCache() {
     for (PendingCapture& c : captures_) {
         for (cudaEvent_t e : c.events) { (void)cudaEventDestroy(e); }
         if (c.header_done != nullptr) { (void)cudaEventDestroy(c.header_done); }
+        if (c.deferred != nullptr) { (void)cudaEventDestroy(c.deferred); }
     }
     for (auto& [id, w] : block_writes_) {
         if (w.copied != nullptr) { (void)cudaEventDestroy(w.copied); }
@@ -142,7 +151,6 @@ PrefixCache::~PrefixCache() {
             if (b.copied != nullptr) { (void)cudaEventDestroy(b.copied); }
         }
     }
-    for (Promotion& p : promotions_) { (void)cudaEventDestroy(p.done); }
     for (auto& [id, s] : staged_) {
         for (cudaEvent_t e : s.events) { (void)cudaEventDestroy(e); }
     }
@@ -323,10 +331,17 @@ bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cuda
         return false;
     }
     std::byte* const staging = prompt_end_slots_[slot];
-    auto image                = reserve_image(tail, capture.claim);
-    if (!image) {
-        ++counters_.prompt_end_skipped;
-        return false;
+    // Without a Host tier, both regions may be held (an open tap, a tap being written): the image
+    // waits in its slot for one rather than being dropped, since the prompt end serves repeats.
+    const bool defer = !host_tier() && disk_writable() &&
+                       std::none_of(regions_.begin(), regions_.end(), [](const Region& r) { return r.users == 0; });
+    std::optional<ImageTarget> image;
+    if (!defer) {
+        image = reserve_image(tail, capture.claim);
+        if (!image) {
+            ++counters_.prompt_end_skipped;
+            return false;
+        }
     }
     // The anchor must outlive the copy: the capturing lane may release its path before it lands.
     if (capture.anchor.valid()) { index_->pin_node(capture.anchor); }
@@ -339,25 +354,52 @@ bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cuda
     lanes_->copy_lane_to_packed(lane, staging, producer);
     cudaEvent_t start = take_event();
     CUDA_CHECK(cudaEventRecord(start, producer));
-    CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
+    ++counters_.prompt_end_captures;
+    PendingCapture pending{std::move(capture), {}, {}, staging};
+    if (defer) {
+        pending.deferred = start;
+        captures_.push_back(std::move(pending));
+        return true;
+    }
+    pending.image = std::move(*image);
+    copy_prompt_end(pending, start);
     recycle(start);
-    const std::vector<std::byte*> segments = image_segments(*image);
-    lanes_->copy_packed_to_host(staging, HostImage{segments, host_.slab_bytes}, transfer_);
-    if (tail) { copy_tail_page_to_record(*capture.tail_page, tail_record(*image), tail_group(*image), transfer_); }
+    captures_.push_back(std::move(pending));
+    return true;
+}
+
+void PrefixCache::copy_prompt_end(PendingCapture& c, cudaEvent_t after) {
+    CUDA_CHECK(cudaStreamWaitEvent(transfer_, after, 0));
+    const bool tail                        = !c.capture.tail.empty();
+    const std::vector<std::byte*> segments = image_segments(c.image);
+    lanes_->copy_packed_to_host(c.staging, HostImage{segments, host_.slab_bytes}, transfer_);
+    if (tail) { copy_tail_page_to_record(*c.capture.tail_page, tail_record(c.image), tail_group(c.image), transfer_); }
     // One event per layer group, as the group-by-group captures take: the whole image is copied at
     // once, so every layer's wait is the copy's end (a lane's next call waits the full set).
-    std::vector<cudaEvent_t> events;
     for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) {
         cudaEvent_t event = take_event();
         CUDA_CHECK(cudaEventRecord(event, transfer_));
-        events.push_back(event);
+        c.events.push_back(event);
     }
-    if (!image->disk) {
+    if (!c.image.disk) {
         counters_.host_write_bytes += host_.image_bytes + (tail ? host_.page.page_stride : 0U);
         ++counters_.host_image_writes;
     }
-    ++counters_.prompt_end_captures;
-    captures_.push_back(PendingCapture{std::move(capture), std::move(*image), std::move(events), staging});
+}
+
+bool PrefixCache::start_deferred(PendingCapture& c, bool& dropped) {
+    dropped = false;
+    if (std::none_of(regions_.begin(), regions_.end(), [](const Region& r) { return r.users == 0; })) { return false; }
+    std::optional<ImageTarget> image = reserve_image(!c.capture.tail.empty(), c.capture.claim);
+    if (!image) {
+        dropped = true;
+        ++counters_.prompt_end_skipped;
+        return false;
+    }
+    c.image = std::move(*image);
+    copy_prompt_end(c, c.deferred);
+    recycle(c.deferred);
+    c.deferred = nullptr;
     return true;
 }
 
@@ -587,6 +629,14 @@ void PrefixCache::abandon_capture(std::uint64_t id) noexcept {
     const auto found = std::find_if(captures_.begin(), captures_.end(),
                                     [&](const PendingCapture& c) { return c.capture.id == id; });
     if (found == captures_.end()) { return; }
+    if (found->deferred != nullptr) {
+        // Nothing reserved yet: the slot is free once the producer's copy into it has ended.
+        (void)cudaEventSynchronize(found->deferred);
+        recycle(found->deferred);
+        if (found->capture.anchor.valid()) { index_->unpin_node(found->capture.anchor); }
+        captures_.erase(found);
+        return;
+    }
     // The slabs and the staging slot are still read until the copy lands, a region until its
     // Disk writes complete.
     (void)cudaEventSynchronize(found->events.back());
@@ -655,6 +705,20 @@ void PrefixCache::poll() {
     // Disk writes, keeps its place while the ones behind it publish.
     for (auto it = captures_.begin(); it != captures_.end();) {
         PendingCapture& c = *it;
+        if (c.deferred != nullptr) {
+            bool dropped = false;
+            if (!start_deferred(c, dropped)) {
+                if (dropped) {
+                    (void)cudaEventSynchronize(c.deferred);
+                    recycle(c.deferred);
+                    if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
+                    it = captures_.erase(it);
+                } else {
+                    ++it;
+                }
+                continue;
+            }
+        }
         const cudaError_t status = cudaEventQuery(c.header_done != nullptr ? c.header_done : c.events.back());
         if (status == cudaErrorNotReady) { break; }
         CUDA_CHECK(status);
@@ -930,8 +994,6 @@ void PrefixCache::clear() noexcept {
     while (!captures_.empty()) { abandon_capture(captures_.front().capture.id); }
     writes_.clear();
     published_.clear();
-    for (Promotion& p : promotions_) { recycle(p.done); }
-    promotions_.clear();
     for (auto& [id, w] : block_writes_) { recycle(w.copied); }
     block_writes_.clear();
     spill_.reset();
@@ -941,7 +1003,7 @@ void PrefixCache::clear() noexcept {
     std::fill(slot_journaled_.begin(), slot_journaled_.end(), false);
     for (Region& region : regions_) { region.users = 0; }
     free_staging_.clear();
-    for (std::uint32_t i = kStagingRecords; regions_.size() != 0 && i-- > 0;) { free_staging_.push_back(i); }
+    for (std::uint32_t i = kStagingRecords; block_staging_ != nullptr && i-- > 0;) { free_staging_.push_back(i); }
     if (store_) {
         // The emptied index names no record: neither does the journal.
         try {

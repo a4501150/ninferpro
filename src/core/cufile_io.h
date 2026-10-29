@@ -52,6 +52,7 @@ public:
         void* buffer              = nullptr;
         std::size_t buffer_offset = 0;
         std::uint64_t tag         = 0; // returned with the completion
+        bool urgent               = false; // issued before every queued transfer that is not
     };
 
     struct Completion {

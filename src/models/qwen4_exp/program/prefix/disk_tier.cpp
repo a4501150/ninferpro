@@ -1,5 +1,5 @@
 // The Disk tier of Qwen4Exp's prefix cache (prefix_cache.h): spills, write-through, fetches,
-// promotions back to the Host tier, the journal and the startup rebuild. Every residency change
+// the journal and the startup rebuild. Every residency change
 // runs on the worker thread from poll(); cuFile transfers are polled, never waited on, except at
 // shutdown, clear and destruction.
 
@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -39,7 +40,7 @@ bool same_meta(const StateImageHeader& a, const StateImageHeader& b) {
 // ---- staging -------------------------------------------------------------------------------------
 
 std::uint64_t PrefixCache::disk_staging_bytes() const noexcept {
-    std::uint64_t bytes = block_staging_.bytes;
+    std::uint64_t bytes = block_staging_device_.bytes;
     for (const Region& region : regions_) { bytes += region.image.bytes; }
     return bytes;
 }
@@ -67,7 +68,7 @@ std::size_t PrefixCache::staging_offset(std::uint32_t staging) const noexcept {
 }
 
 std::byte* PrefixCache::staging_record(std::uint32_t staging) const noexcept {
-    return static_cast<std::byte*>(block_staging_.p) + staging_offset(staging);
+    return block_staging_ + staging_offset(staging);
 }
 
 bool PrefixCache::disk_writable() const noexcept { return store_ && !disk_broken_ && !store_->failed(); }
@@ -87,7 +88,12 @@ void PrefixCache::submit_disk(CuFileQueue::Op op, std::uint32_t slot, std::size_
                                               .bytes         = bytes,
                                               .buffer        = buffer,
                                               .buffer_offset = buffer_offset,
-                                              .tag           = tag});
+                                              .tag           = tag,
+                                              // A staging region and an admission wait on these;
+                                              // block writes and spills do not.
+                                              .urgent = io.kind == DiskIo::Kind::Capture ||
+                                                        io.kind == DiskIo::Kind::FetchImage ||
+                                                        io.kind == DiskIo::Kind::FetchBlock});
     disk_io_.emplace(tag, io);
 }
 
@@ -130,8 +136,14 @@ void PrefixCache::reap_disk() {
         case DiskIo::Kind::FetchBlock:
             if (fetch_ && io.owner < fetch_->blocks.size()) {
                 Fetch::Block& block = fetch_->blocks[io.owner];
-                if (done.ok) {
+                if (done.ok && fetch_->host) {
+                    block.stage = Fetch::Block::Stage::Done; // read into its Host slab
+                } else if (done.ok) {
                     block.stage = Fetch::Block::Stage::Copying; // the copy into its page is issued next
+                } else if (fetch_->host) {
+                    block.ok       = false;
+                    block.stage    = Fetch::Block::Stage::Done;
+                    fetch_->failed = true;
                 } else {
                     block.ok       = false;
                     block.stage    = Fetch::Block::Stage::Done;
@@ -244,7 +256,7 @@ void PrefixCache::service_block_writes() {
                     w.ok    = false;
                     w.stage = BlockWrite::Stage::Done;
                 } else if (store_->writable(slots)) {
-                    submit_disk(CuFileQueue::Op::Write, w.slot, host_.slab_bytes, block_staging_.p,
+                    submit_disk(CuFileQueue::Op::Write, w.slot, host_.slab_bytes, block_staging_,
                                 staging_offset(w.staging), DiskIo{DiskIo::Kind::Block, it->first});
                     w.stage = BlockWrite::Stage::Writing;
                 }
@@ -335,7 +347,9 @@ void PrefixCache::service_spill() {
 
 bool PrefixCache::disk_capture_pending(std::span<const pc::NodeRef> path, std::span<const TokenId> tokens) const {
     return std::any_of(captures_.begin(), captures_.end(), [&](const PendingCapture& c) {
-        if (!c.image.disk || c.capture.anchor_pending || c.capture.frontier > tokens.size()) { return false; }
+        if ((!c.image.disk && c.deferred == nullptr) || c.capture.anchor_pending || c.capture.frontier > tokens.size()) {
+            return false;
+        }
         const std::uint32_t k = c.capture.frontier / pc::kBlockTokens;
         if (k > 0 && (path.size() < k || path[k - 1] != c.capture.anchor)) { return false; }
         return std::equal(c.capture.tail.begin(), c.capture.tail.end(),
@@ -367,6 +381,7 @@ bool PrefixCache::start_fetch(pc::SnapshotRef snapshot, std::span<const pc::Node
         }
     }
     if (!image && blocks.empty()) { return false; }
+    if (host_tier()) { return start_host_fetch(snapshot, path, image, blocks); }
     std::uint32_t region = kNoRegion;
     if (image) {
         const std::optional<std::uint32_t> taken = take_region();
@@ -420,11 +435,135 @@ bool PrefixCache::start_fetch(pc::SnapshotRef snapshot, std::span<const pc::Node
     return true;
 }
 
+bool PrefixCache::start_host_fetch(pc::SnapshotRef snapshot, std::span<const pc::NodeRef> path, bool image,
+                                   std::span<const pc::NodeRef> blocks) {
+    if (!path.empty()) { index_->acquire_path(path); }
+    index_->pin_snapshot(snapshot);
+    Fetch& f   = fetch_.emplace();
+    f.snapshot = snapshot;
+    f.path.assign(path.begin(), path.end());
+    f.host = true;
+    // Every Host fill first, so a fetch that cannot hold all of them starts nothing: the request
+    // then resumes from a shallower source instead of waiting for one that never lands.
+    bool reserved = true;
+    for (const pc::NodeRef node : blocks) {
+        const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node);
+        if (!slab_id) {
+            reserved = false;
+            break;
+        }
+        Fetch::Block block;
+        block.node    = node;
+        block.slot    = index_->node(node).disk_slot;
+        block.slab    = *slab_id;
+        f.blocks.push_back(block);
+    }
+    const pc::SnapshotView view = index_->snapshot(snapshot);
+    const bool tail_on_disk     = view.disk_slots.size() > host_.image_slabs;
+    if (reserved && image && view.tail_len != 0 && !tail_on_disk && view.tail_device_copy != pc::CopyState::Resident) {
+        reserved = false;
+    }
+    // The read serves a request waiting now: it displaces the least valuable Host entries whatever
+    // their value, as a block's write-through does.
+    if (reserved && image) {
+        reserved = f.image_fill =
+            index_->begin_snapshot_host_fill(snapshot, std::numeric_limits<double>::infinity());
+    }
+    if (!reserved) {
+        for (const Fetch::Block& b : f.blocks) { index_->abort_host_fill(b.node); }
+        fetch_.reset();
+        index_->unpin_snapshot(snapshot);
+        if (!path.empty()) { index_->release_path(path); }
+        return false;
+    }
+    for (std::uint32_t i = 0; i < f.blocks.size(); ++i) {
+        Fetch::Block& b = f.blocks[i];
+        submit_disk(CuFileQueue::Op::Read, b.slot, host_.slab_bytes, slab(b.slab), 0, DiskIo{DiskIo::Kind::FetchBlock, i});
+        b.stage = Fetch::Block::Stage::Reading;
+    }
+    counters_.disk_block_reads += f.blocks.size();
+    counters_.disk_read_bytes += f.blocks.size() * host_.slab_bytes;
+    if (f.image_fill) {
+        const pc::SnapshotView filling = index_->snapshot(snapshot);
+        for (std::uint32_t i = 0; i < host_.image_slabs; ++i) {
+            submit_disk(CuFileQueue::Op::Read, filling.disk_slots[i], host_.slab_bytes, slab(filling.host_slabs[i]), 0,
+                        DiskIo{DiskIo::Kind::FetchImage, 0});
+            ++f.reads;
+        }
+        if (filling.tail_len != 0) {
+            const std::uint32_t tail_slab = filling.host_slabs.back();
+            if (tail_on_disk) {
+                submit_disk(CuFileQueue::Op::Read, filling.disk_slots.back(), host_.slab_bytes, slab(tail_slab), 0,
+                            DiskIo{DiskIo::Kind::FetchImage, 0});
+                ++f.reads;
+            } else {
+                // The tail's Device page was written on the compute stream.
+                cudaEvent_t start = take_event();
+                CUDA_CHECK(cudaEventRecord(start, producer_));
+                CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
+                recycle(start);
+                copy_tail_page_to_record(page(filling.tail_device), slab(tail_slab), slab_group(tail_slab), transfer_);
+                f.tail_copy = take_event();
+                CUDA_CHECK(cudaEventRecord(f.tail_copy, transfer_));
+            }
+        }
+        ++counters_.disk_image_reads;
+        counters_.disk_read_bytes += static_cast<std::uint64_t>(f.reads) * host_.slab_bytes;
+    }
+    ++counters_.disk_fetches;
+    return true;
+}
+
+void PrefixCache::finish_host_fetch() {
+    Fetch& f = *fetch_;
+    if (f.image_fill && !f.failed) {
+        const pc::SnapshotView view = index_->snapshot(f.snapshot);
+        const auto header           = read_state_image_header(lanes_->layout(), slab(view.host_slabs.front()));
+        if (!header || !same_meta(*header, snapshot_meta_[f.snapshot.index])) {
+            ++counters_.disk_failures;
+            f.failed = true;
+            unreadable_.push_back(f.snapshot);
+        }
+    }
+    if (f.image_fill) {
+        if (f.failed) {
+            index_->abort_snapshot_host_fill(f.snapshot);
+        } else {
+            index_->complete_snapshot_host_fill(f.snapshot);
+        }
+    }
+    for (const Fetch::Block& b : f.blocks) {
+        if (b.ok) {
+            index_->complete_host_fill(b.node);
+        } else {
+            index_->abort_host_fill(b.node);
+        }
+    }
+    f.ready   = true;
+    f.expires = Clock::now() + kFetchHold;
+    if (f.failed) { release_fetch(); }
+}
+
 void PrefixCache::service_fetch() {
     if (!fetch_) { return; }
     Fetch& f = *fetch_;
     if (f.ready) {
         if (Clock::now() >= f.expires) { release_fetch(); }
+        return;
+    }
+    if (f.host) {
+        if (f.reads != 0 ||
+            std::any_of(f.blocks.begin(), f.blocks.end(), [](const Fetch::Block& b) { return b.stage != Fetch::Block::Stage::Done; })) {
+            return;
+        }
+        if (f.tail_copy != nullptr) {
+            const cudaError_t status = cudaEventQuery(f.tail_copy);
+            if (status == cudaErrorNotReady) { return; }
+            CUDA_CHECK(status);
+            recycle(f.tail_copy);
+            f.tail_copy = nullptr;
+        }
+        finish_host_fetch();
         return;
     }
     bool ordered = false;
@@ -453,7 +592,7 @@ void PrefixCache::service_fetch() {
         if (b.stage == Fetch::Block::Stage::Queued && !free_staging_.empty()) {
             b.staging = free_staging_.back();
             free_staging_.pop_back();
-            submit_disk(CuFileQueue::Op::Read, b.slot, host_.slab_bytes, block_staging_.p, staging_offset(b.staging),
+            submit_disk(CuFileQueue::Op::Read, b.slot, host_.slab_bytes, block_staging_, staging_offset(b.staging),
                         DiskIo{DiskIo::Kind::FetchBlock, i});
             b.stage = Fetch::Block::Stage::Reading;
         }
@@ -507,36 +646,7 @@ void PrefixCache::finish_fetch() {
     if (f.failed) {
         unreadable_.push_back(f.snapshot);
         release_fetch();
-        return;
     }
-    // A hot entry the Host tier gave up returns to it: the region's image (and tail) to new slabs.
-    if (!host_tier() || f.region == kNoRegion) { return; }
-    const pc::SnapshotView view = index_->snapshot(f.snapshot);
-    if (view.host != pc::CopyState::Absent || (view.tail_len != 0 && !f.tail && view.tail_device_copy != pc::CopyState::Resident)) {
-        return;
-    }
-    if (!index_->begin_snapshot_host_fill(f.snapshot)) { return; }
-    const pc::SnapshotView filling = index_->snapshot(f.snapshot);
-    std::vector<std::byte*> segments;
-    for (std::uint32_t i = 0; i < host_.image_slabs; ++i) { segments.push_back(slab(filling.host_slabs[i])); }
-    lanes_->copy_packed_to_host(region_base(f.region), HostImage{segments, host_.slab_bytes}, transfer_);
-    if (filling.tail_len != 0) {
-        const std::uint32_t tail_slab = filling.host_slabs.back();
-        if (f.tail) {
-            CUDA_CHECK(cudaMemcpyAsync(slab(tail_slab),
-                                       region_base(f.region) + static_cast<std::size_t>(host_.image_slabs) * host_.slab_bytes,
-                                       host_.page.page_stride, cudaMemcpyDeviceToHost, transfer_));
-        } else {
-            copy_tail_page_to_record(page(filling.tail_device), slab(tail_slab), slab_group(tail_slab), transfer_);
-        }
-    }
-    index_->pin_snapshot(f.snapshot);
-    ++regions_[f.region].users;
-    Promotion promotion{f.snapshot, f.region, take_event()};
-    CUDA_CHECK(cudaEventRecord(promotion.done, transfer_));
-    counters_.host_write_bytes += host_.image_bytes + (filling.tail_len != 0 ? host_.page.page_stride : 0U);
-    ++counters_.host_image_writes;
-    promotions_.push_back(promotion);
 }
 
 void PrefixCache::release_fetch() noexcept {
@@ -547,20 +657,6 @@ void PrefixCache::release_fetch() noexcept {
     } catch (...) {}
     if (fetch_->region != kNoRegion) { release_region(fetch_->region); }
     fetch_.reset();
-}
-
-void PrefixCache::service_promotions() {
-    while (!promotions_.empty()) {
-        Promotion& p             = promotions_.front();
-        const cudaError_t status = cudaEventQuery(p.done);
-        if (status == cudaErrorNotReady) { return; }
-        CUDA_CHECK(status);
-        index_->complete_snapshot_host_fill(p.snapshot);
-        index_->unpin_snapshot(p.snapshot);
-        release_region(p.region);
-        recycle(p.done);
-        promotions_.pop_front();
-    }
 }
 
 // ---- journal -------------------------------------------------------------------------------------
@@ -690,7 +786,6 @@ void PrefixCache::poll_disk() {
     service_block_writes();
     service_spill();
     service_fetch();
-    service_promotions();
     service_journal();
     if (host_tier() && !spill_ && disk_writable() && Clock::now() >= next_spill_scan_) {
         next_spill_scan_ = Clock::now() + kSpillScan;
@@ -706,7 +801,9 @@ void PrefixCache::poll_disk() {
 bool PrefixCache::disk_writes_pending() const noexcept {
     return spill_.has_value() || !block_writes_.empty() ||
            std::any_of(captures_.begin(), captures_.end(),
-                       [](const PendingCapture& c) { return c.image.disk && (!c.writes_issued || c.writes != 0); });
+                       [](const PendingCapture& c) {
+                           return c.deferred != nullptr || (c.image.disk && (!c.writes_issued || c.writes != 0));
+                       });
 }
 
 void PrefixCache::drain_disk() {
@@ -733,7 +830,9 @@ DiskAttachResult PrefixCache::attach_disk(const std::filesystem::path& directory
     store_ = std::make_unique<DiskStore>(directory, fingerprint, geometry);
     // Registered staging moves without cuFile's bounce buffers where GPUDirect Storage serves it.
     for (Region& region : regions_) { (void)store_->io().register_buffer(region.image.p, region.image.bytes); }
-    (void)store_->io().register_buffer(block_staging_.p, block_staging_.bytes);
+    if (block_staging_device_.p != nullptr) {
+        (void)store_->io().register_buffer(block_staging_device_.p, block_staging_device_.bytes);
+    }
 
     DiskAttachResult out;
     out.reset_reason = store_->reset_reason();
