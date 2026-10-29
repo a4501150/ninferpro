@@ -240,6 +240,11 @@ public:
     // The capture's copy-out events in layer order (decoder layers, then MTP): each is recorded once
     // that layer's state (and its planes of the tail page) has been read. Empty once it has landed.
     [[nodiscard]] std::span<const cudaEvent_t> capture_events(std::uint64_t id) const noexcept;
+    // Orders the compute stream (every later writer of a pool page runs on it or after it) after
+    // the pending captures that read one of `pages` as their tail, before those pages return to the
+    // pool: a tap reads the lane's page on the transfer stream, and a page reused under that copy
+    // would put another request's KV into the snapshot. Free once the copies have landed.
+    void order_page_reuse(std::span<const DeviceKVPageLease> pages) const;
     // Copies every Device-only node of `nodes` to a Host slab, after `producer`'s queued work.
     // Without a Host tier nothing is written: blocks reach the Disk with the snapshots below them.
     void write_blocks(std::span<const runtime::prefix_cache::NodeRef> nodes, cudaStream_t producer);

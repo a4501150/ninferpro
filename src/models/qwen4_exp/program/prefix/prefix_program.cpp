@@ -1174,6 +1174,9 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
         // have its restore landing in its private page and state slot: whatever reuses them next runs
         // on the compute stream, so that stream waits for the restore (free once it has landed).
         if (lane.prefix.restore) { prefix_->order_after_restore(*lane.prefix.restore, device_.stream); }
+        // A tap taken just before the release (cancel, failure, pause) may still be copying the
+        // lane's partial tail page; release() returns the lane's pages to the pool next.
+        prefix_->order_page_reuse(lane.pages);
         if (lane.prefix.pending_anchor != 0) { prefix_->abandon_capture(lane.prefix.pending_anchor); }
         if (!lane.prefix.path.empty()) { prefix_->index().release_path(lane.prefix.path); }
         prefix_->poll();

@@ -577,6 +577,20 @@ std::span<const cudaEvent_t> PrefixCache::capture_events(std::uint64_t id) const
     return {};
 }
 
+void PrefixCache::order_page_reuse(std::span<const DeviceKVPageLease> pages) const {
+    for (const PendingCapture& c : captures_) {
+        // An endpoint owns its tail page and a prompt-end capture copies its own; only a tap
+        // reads a page someone else can free.
+        if (c.staging != nullptr || !c.capture.tail_page || c.capture.tail_lease || c.events.empty()) {
+            continue;
+        }
+        const bool reads = std::any_of(pages.begin(), pages.end(), [&](const DeviceKVPageLease& page) {
+            return page.valid() && page.handle() == *c.capture.tail_page;
+        });
+        if (reads) { CUDA_CHECK(cudaStreamWaitEvent(producer_, c.events.back(), 0)); }
+    }
+}
+
 void PrefixCache::write_blocks(std::span<const pc::NodeRef> nodes, cudaStream_t producer) {
     if (!host_tier()) { return; }
     std::vector<pc::NodeRef> written;
@@ -1023,6 +1037,10 @@ void PrefixCache::clear() noexcept {
 
 void PrefixCache::release_device_block(std::uint32_t device_id) noexcept {
     if (device_id >= blocks_.size() || !blocks_[device_id]) { std::terminate(); }
+    // A published tail page can still be read by the tap that captured it.
+    try {
+        order_page_reuse(std::span<const DeviceKVPageLease>(&*blocks_[device_id], 1));
+    } catch (...) { std::terminate(); } // the page would be reused under a copy in flight
     blocks_[device_id].reset(); // the lease returns its page to the pool
     free_blocks_.push_back(device_id);
 }
