@@ -865,6 +865,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"host_restore_copies", delta(&RuntimeStats::hybrid_host_restore_copies)},
                  {"evicted_blocks", delta(&RuntimeStats::hybrid_evicted_blocks)},
                  {"host_snapshot_evictions", delta(&RuntimeStats::hybrid_host_snapshot_evictions)},
+                 {"host_backed_evictions", delta(&RuntimeStats::hybrid_host_backed_evictions)},
                  {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},
                  {"unbacked_node_losses", delta(&RuntimeStats::hybrid_unbacked_node_losses)},
                  {"held_snapshots", current.hybrid_held_snapshots},

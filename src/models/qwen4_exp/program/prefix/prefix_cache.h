@@ -15,11 +15,13 @@
 //   stream in forward order, one event per decoder layer and one for the MTP group, so a lane's
 //   first call waits for each layer's state just before that layer reads it.
 // - The Disk tier (disk_tier.cpp, --prefix-cache-disk) holds slots of one Host slab each in a
-//   DiskStore. With a Host tier, retained snapshots in the coldest quarter of the Host eviction
-//   order are spilled to it once, with their path blocks; without one, every capture lands in a
-//   VRAM staging region and is written through to it, path blocks first. A Disk-only source is
-//   fetched before its admission (fetch): blocks into new cache pages, the image and tail into a
-//   staging region the restore reads. All Disk I/O is cuFile batch I/O polled from poll().
+//   DiskStore and backs the memory tiers (hybrid-prefix-cache-spec §17.1): with a Host tier, a
+//   writer copies every retained snapshot and its path to it, held and most valuable first, so the
+//   Host tier can drop those copies for nothing; without one, every capture lands in a VRAM staging
+//   region and is written through, and the writer follows with its path. A Disk-only source is
+//   fetched before its admission (fetch): into Host fills, or without a Host tier blocks into new
+//   cache pages and the image and tail into a staging region the restore reads. All Disk I/O is
+//   cuFile batch I/O polled from poll(), which the Engine also runs while idle.
 
 #include "core/arena.h"
 #include "core/cufile_io.h"
@@ -29,7 +31,7 @@
 #include "models/qwen4_exp/program/prefix/disk_store.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "infernix/types.h"
-#include "runtime/prefix_cache/prefix_index.h"
+#include "models/qwen4_exp/program/prefix/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include <cuda_runtime_api.h>
@@ -86,7 +88,7 @@ struct PrefixCacheCounters {
     std::uint64_t disk_read_bytes             = 0;
     std::uint64_t disk_failures               = 0; // failed transfers, and fetched images whose header differs
     std::uint64_t disk_capture_skips          = 0; // no staging region or Disk slots for a capture (no Host tier)
-    std::uint64_t disk_spill_skips            = 0; // no Disk slots for a spill
+    std::uint64_t disk_spill_skips            = 0; // writer jobs ended for want of Disk slots or a source copy
 };
 
 // The Disk tier at startup (attach_disk).
@@ -127,7 +129,7 @@ struct PrefixHostLayout {
                                                        std::uint64_t host_bytes);
 
 struct PrefixCacheConfig {
-    runtime::prefix_cache::PrefixIndexConfig index; // capacities filled by the cache from the layouts
+    prefix::cache_index::PrefixIndexConfig index; // capacities filled by the cache from the layouts
     runtime::prefix_cache::TapPlannerConfig taps;
     std::uint32_t kv_pages             = 0; // Device page groups of the pool
     std::uint32_t device_snapshot_slots = 0;
@@ -139,7 +141,7 @@ struct RestoreTicket {
     std::uint64_t id = 0;
 };
 
-class PrefixCache final : public runtime::prefix_cache::PrefixIndexBackend {
+class PrefixCache final : public prefix::cache_index::PrefixIndexBackend {
 public:
     // `host_bytes` sizes the Host tier and `disk_bytes` the Disk tier (0: none); one of them is
     // needed. The Disk tier is used once attached (attach_disk).
@@ -150,8 +152,8 @@ public:
     PrefixCache(const PrefixCache&)            = delete;
     PrefixCache& operator=(const PrefixCache&) = delete;
 
-    [[nodiscard]] runtime::prefix_cache::PrefixCacheIndex& index() noexcept { return *index_; }
-    [[nodiscard]] const runtime::prefix_cache::PrefixCacheIndex& index() const noexcept { return *index_; }
+    [[nodiscard]] prefix::cache_index::PrefixCacheIndex& index() noexcept { return *index_; }
+    [[nodiscard]] const prefix::cache_index::PrefixCacheIndex& index() const noexcept { return *index_; }
     [[nodiscard]] const runtime::prefix_cache::TapPlannerConfig& taps() const noexcept { return taps_; }
     [[nodiscard]] PrefixCacheCounters& counters() noexcept { return counters_; }
     [[nodiscard]] const PrefixCacheCounters& counters() const noexcept { return counters_; }
@@ -168,20 +170,20 @@ public:
     // Inserts a committed full block whose page is `lease`. When the index keeps it (a new node,
     // or a Host-only node adopting it), the lease moves into the cache and the result reports
     // device_attached; otherwise `lease` is left with the caller.
-    [[nodiscard]] runtime::prefix_cache::InsertResult insert_block(runtime::prefix_cache::NodeRef parent,
+    [[nodiscard]] prefix::cache_index::InsertResult insert_block(prefix::cache_index::NodeRef parent,
                                                                    std::uint64_t lookup_hash,
                                                                    std::span<const TokenId> tokens,
                                                                    std::uint64_t extra, DeviceKVPageLease& lease,
                                                                    bool attach, std::int32_t mtp_next);
     // The token a node's last MTP cell encodes (history[64(b+1)] of its publisher); -1 when unknown.
-    [[nodiscard]] std::int32_t mtp_next(runtime::prefix_cache::NodeRef node) const;
+    [[nodiscard]] std::int32_t mtp_next(prefix::cache_index::NodeRef node) const;
     // The Device page of a Device-resident block or snapshot tail.
     [[nodiscard]] DeviceKVPageHandle page(std::uint32_t device_id) const;
     // Adopts a lane's partial page as a snapshot's Device tail; returns its device id.
     [[nodiscard]] std::uint32_t adopt_tail(DeviceKVPageLease&& lease);
 
     // ---- snapshot meta -----------------------------------------------------------------------
-    [[nodiscard]] const StateImageHeader& meta(runtime::prefix_cache::SnapshotRef snapshot) const;
+    [[nodiscard]] const StateImageHeader& meta(prefix::cache_index::SnapshotRef snapshot) const;
 
     // ---- Host-born captures ------------------------------------------------------------------
     // Copies lane `lane`'s state image (and, with a tail, the partial page `tail_page`) to reserved
@@ -190,7 +192,7 @@ public:
     // layer's planes of `tail_page`, wait on that layer's event (capture_events).
     struct Capture {
         std::uint64_t id = 0; // the caller's name for capture_result
-        runtime::prefix_cache::NodeRef anchor;
+        prefix::cache_index::NodeRef anchor;
         // A prompt-end capture on a block boundary under MTP: the anchor block holds the pending
         // drafter cell, so the lane publishes it only after the first decode round has written that
         // cell. The copy runs now; publication waits for resolve_capture_anchor.
@@ -199,10 +201,10 @@ public:
         std::vector<TokenId> tail;
         std::optional<DeviceKVPageHandle> tail_page;
         std::optional<DeviceKVPageLease> tail_lease; // handed over as the Device tail when present
-        runtime::prefix_cache::SnapshotKind kind = runtime::prefix_cache::SnapshotKind::Tap;
+        prefix::cache_index::SnapshotKind kind = prefix::cache_index::SnapshotKind::Tap;
         double claim = 0.0; // the new snapshot's estimate_priority
         StateImageHeader meta;
-        std::optional<runtime::prefix_cache::SnapshotRef> supersedes;
+        std::optional<prefix::cache_index::SnapshotRef> supersedes;
         // When `supersedes` is the snapshot the lane resumed from: the lane's tokens from its frontier
         // on, so the endpoints the lineage went past are superseded too (PrefixCacheIndex::supersede).
         std::vector<TokenId> continuation;
@@ -219,7 +221,7 @@ public:
     [[nodiscard]] bool capture_prompt_end(std::uint32_t lane, Capture&& capture, cudaStream_t producer);
     // Names the anchor of a capture taken with `anchor_pending` (the block the capturing lane has
     // now published); the capture publishes once it has landed.
-    void resolve_capture_anchor(std::uint64_t id, runtime::prefix_cache::NodeRef anchor);
+    void resolve_capture_anchor(std::uint64_t id, prefix::cache_index::NodeRef anchor);
     // Drops a capture whose anchor will never be published (the lane ended before the block):
     // waits for its copy and returns its slabs, its staging slot and its tail page.
     void abandon_capture(std::uint64_t id) noexcept;
@@ -251,7 +253,7 @@ public:
     void order_page_reuse(std::span<const DeviceKVPageLease> pages) const;
     // Copies every Device-only node of `nodes` to a Host slab, after `producer`'s queued work.
     // Without a Host tier nothing is written: blocks reach the Disk with the snapshots below them.
-    void write_blocks(std::span<const runtime::prefix_cache::NodeRef> nodes, cudaStream_t producer);
+    void write_blocks(std::span<const prefix::cache_index::NodeRef> nodes, cudaStream_t producer);
     // Publishes landed captures and writes and retires landed restores. Non-blocking.
     void poll();
     // Waits for every capture copy, Host write and restore in flight and publishes them. Disk writes
@@ -263,23 +265,23 @@ public:
     // Waits for an endpoint copy-out a prompt extends (its anchor is on the prompt's matched `path`
     // and its tail tokens continue the prompt), and publishes it. Only such a prompt waits; the
     // copy is first in the transfer stream, at most an image's copy time. Returns whether it waited.
-    [[nodiscard]] bool await_extended_endpoint(std::span<const runtime::prefix_cache::NodeRef> path,
+    [[nodiscard]] bool await_extended_endpoint(std::span<const prefix::cache_index::NodeRef> path,
                                                std::span<const TokenId> tokens);
     // The publication of a landed capture (absent while it is in flight); forget it when done.
-    [[nodiscard]] std::optional<runtime::prefix_cache::PublishResult> capture_result(std::uint64_t id) const;
+    [[nodiscard]] std::optional<prefix::cache_index::PublishResult> capture_result(std::uint64_t id) const;
     void forget_capture(std::uint64_t id) noexcept;
 
     // ---- restores (one admission staged at a time) --------------------------------------------
     void open_restore(cudaStream_t producer);
     // A Host-only block into a new cache page (the lease moves into the cache; node Filling).
-    void restore_block(runtime::prefix_cache::NodeRef node, DeviceKVPageLease&& destination);
+    void restore_block(prefix::cache_index::NodeRef node, DeviceKVPageLease&& destination);
     // A block's Host page into a lane's private page (a copy-on-write anchor), the block pinned
     // until the batch lands.
-    void restore_node_page(runtime::prefix_cache::NodeRef node, DeviceKVPageHandle destination);
+    void restore_node_page(prefix::cache_index::NodeRef node, DeviceKVPageHandle destination);
     // A snapshot's Host tail page into a lane's private page.
-    void restore_tail_page(runtime::prefix_cache::SnapshotRef snapshot, DeviceKVPageHandle destination);
+    void restore_tail_page(prefix::cache_index::SnapshotRef snapshot, DeviceKVPageHandle destination);
     // A snapshot's Host image into a lane.
-    void restore_image(runtime::prefix_cache::SnapshotRef snapshot, std::uint32_t lane);
+    void restore_image(prefix::cache_index::SnapshotRef snapshot, std::uint32_t lane);
     // Enqueues the batch per decoder layer (that layer's page planes or state parts), then the MTP
     // group, recording one event after each. Returns the ticket the lane's calls wait with.
     [[nodiscard]] RestoreTicket submit_restore();
@@ -306,23 +308,28 @@ public:
     // Reads what `snapshot` and its matched `path` hold only on the Disk: blocks into new cache
     // pages (Device Filling until they land), the image and tail into a staging region. False when
     // no fetch can start now (one is running, no region, Disk slots unreadable, or too few pages).
-    [[nodiscard]] bool start_fetch(runtime::prefix_cache::SnapshotRef snapshot,
-                                   std::span<const runtime::prefix_cache::NodeRef> path);
+    [[nodiscard]] bool start_fetch(prefix::cache_index::SnapshotRef snapshot,
+                                   std::span<const prefix::cache_index::NodeRef> path);
     [[nodiscard]] bool fetch_running() const noexcept { return fetch_ && !fetch_->ready; }
+    // Disk tier work poll() would advance with no request running: transfers in flight, records
+    // to journal, or snapshots published since the writer last found nothing to write.
+    [[nodiscard]] bool background_pending() const noexcept;
+    // `--debug disk` lines go to `observer`.
+    void set_diagnostics(const DiagnosticObserver& observer) { diagnostics_ = observer; }
     // A capture being written through to the Disk tier (no Host tier) that `tokens` extends: its
     // anchor is on the prompt's matched `path` and its tail continues the prompt. It publishes
     // once its writes complete.
-    [[nodiscard]] bool disk_capture_pending(std::span<const runtime::prefix_cache::NodeRef> path,
+    [[nodiscard]] bool disk_capture_pending(std::span<const prefix::cache_index::NodeRef> path,
                                             std::span<const TokenId> tokens) const;
-    [[nodiscard]] bool fetch_holds(runtime::prefix_cache::SnapshotRef snapshot) const noexcept {
+    [[nodiscard]] bool fetch_holds(prefix::cache_index::SnapshotRef snapshot) const noexcept {
         return fetch_ && fetch_->ready && fetch_->snapshot == snapshot;
     }
     // The Disk bytes of `candidate` a landed fetch holds in its region (its image and tail).
-    [[nodiscard]] std::uint64_t fetched_bytes(const runtime::prefix_cache::MatchCandidate& candidate) const noexcept;
+    [[nodiscard]] std::uint64_t fetched_bytes(const prefix::cache_index::MatchCandidate& candidate) const noexcept;
     // Drops a landed fetch: its pins and, once no restore reads it, its region.
     void release_fetch() noexcept;
     // A snapshot whose fetch failed: not fetched again.
-    [[nodiscard]] bool disk_unreadable(runtime::prefix_cache::SnapshotRef snapshot) const noexcept;
+    [[nodiscard]] bool disk_unreadable(prefix::cache_index::SnapshotRef snapshot) const noexcept;
     // At shutdown, after every lane is released: spills every retained Host snapshot without a
     // Disk copy, highest value first, records every snapshot's hits and makes the journal durable.
     // `abandoned` stops it between snapshots.
@@ -330,18 +337,18 @@ public:
 
     // PrefixIndexBackend
     void release_device_block(std::uint32_t device_id) noexcept override;
-    void release_snapshot(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
-    void drop_snapshot_device_image(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
+    void release_snapshot(prefix::cache_index::SnapshotRef snapshot) noexcept override;
+    void drop_snapshot_device_image(prefix::cache_index::SnapshotRef snapshot) noexcept override;
     void release_disk_record(std::span<const std::uint32_t> slots) noexcept override;
-    void disk_record_replaced(runtime::prefix_cache::NodeRef node) noexcept override;
+    void disk_record_replaced(prefix::cache_index::NodeRef node) noexcept override;
 
 private:
     static constexpr std::uint32_t kNoRegion = UINT32_MAX;
     // Where a capture's image lands: Host slabs, or (no Host tier) a staging region whose slots are
     // then written to reserved Disk slots.
     struct ImageTarget {
-        runtime::prefix_cache::HostImageReservation host;
-        std::optional<runtime::prefix_cache::DiskImageReservation> disk;
+        prefix::cache_index::HostImageReservation host;
+        std::optional<prefix::cache_index::DiskImageReservation> disk;
         std::uint32_t region = kNoRegion;
     };
     struct PendingCapture {
@@ -390,7 +397,7 @@ private:
     void copy_capture_group(std::uint32_t group, std::uint32_t lane, const HostImage& destination,
                             std::byte* tail_record, std::uint32_t tail_group, std::optional<DeviceKVPageHandle> tail_page);
     struct PendingWrite {
-        std::vector<runtime::prefix_cache::NodeRef> nodes;
+        std::vector<prefix::cache_index::NodeRef> nodes;
         cudaEvent_t done = nullptr;
     };
     struct PageCopy {
@@ -401,11 +408,11 @@ private:
     struct RestoreBatch {
         bool open = false;
         RestoreTicket ticket;
-        std::vector<runtime::prefix_cache::NodeRef> nodes; // Filling until the batch lands
-        std::vector<runtime::prefix_cache::NodeRef> pins;
-        std::vector<runtime::prefix_cache::SnapshotRef> snapshot_pins;
+        std::vector<prefix::cache_index::NodeRef> nodes; // Filling until the batch lands
+        std::vector<prefix::cache_index::NodeRef> pins;
+        std::vector<prefix::cache_index::SnapshotRef> snapshot_pins;
         std::vector<PageCopy> pages;
-        std::optional<runtime::prefix_cache::SnapshotRef> image;
+        std::optional<prefix::cache_index::SnapshotRef> image;
         std::uint32_t image_lane = 0;
         std::uint32_t image_region = kNoRegion; // a fetched image, read from its region
         std::vector<std::uint32_t> regions;      // regions read until the batch lands
@@ -419,14 +426,14 @@ private:
         std::uint32_t users = 0;
     };
     struct DiskIo {
-        enum class Kind : std::uint8_t { Capture, Block, Spill, FetchImage, FetchBlock } kind = Kind::Capture;
+        enum class Kind : std::uint8_t { Capture, Block, Image, FetchImage, FetchBlock } kind = Kind::Capture;
         std::uint64_t owner = 0;
     };
     // One block written to its Disk slot: from its Host slab, or through a staging record from its
     // Device page. The node is pinned and its Disk copy Filling until done.
     struct BlockWrite {
         enum class Stage : std::uint8_t { Queued, Copying, Writing, Done } stage = Stage::Queued;
-        runtime::prefix_cache::NodeRef node;
+        prefix::cache_index::NodeRef node;
         std::uint32_t slot = 0;
         const std::byte* host = nullptr;
         DeviceKVPageHandle page;
@@ -434,16 +441,24 @@ private:
         cudaEvent_t copied    = nullptr;
         bool ok               = true;
     };
-    struct Spill {
-        runtime::prefix_cache::SnapshotRef snapshot; // pinned, Disk Filling
-        bool issued         = false;
+    // The Disk writer's job (§17.1 rules 3-4): a snapshot's path blocks without a Disk copy, root
+    // first, with at most kDiskWriteWindow bytes of block writes in flight, then its image. It pins
+    // nothing between writes: an entry evicted before its turn ends the job.
+    struct Writer {
+        prefix::cache_index::SnapshotRef snapshot;
+        std::vector<prefix::cache_index::NodeRef> path;
+        std::size_t next     = 0;
+        double claim         = 0.0; // the snapshot's GDSF value, claimed for every Disk slot
+        bool image           = true; // false: the image was written through (no Host tier)
+        bool image_started   = false; // the snapshot is pinned and its Disk copy Filling
+        bool image_issued    = false;
         std::uint32_t writes = 0;
         bool ok              = true;
     };
     struct Fetch {
         struct Block {
             enum class Stage : std::uint8_t { Queued, Reading, Copying, Done } stage = Stage::Queued;
-            runtime::prefix_cache::NodeRef node;
+            prefix::cache_index::NodeRef node;
             DeviceKVPageHandle page;
             std::uint32_t slot    = 0;
             std::uint32_t staging = kNoRegion; // its staging record (no Host tier)
@@ -451,8 +466,8 @@ private:
             cudaEvent_t copied    = nullptr;
             bool ok               = true;
         };
-        runtime::prefix_cache::SnapshotRef snapshot;
-        std::vector<runtime::prefix_cache::NodeRef> path; // acquired
+        prefix::cache_index::SnapshotRef snapshot;
+        std::vector<prefix::cache_index::NodeRef> path; // acquired
         // With a Host tier, the image and blocks are read into Host fills (`image_fill`; a tail
         // without a Disk copy is copied from its Device page, `tail_copy`) and restored from the
         // Host as usual. Without one, blocks go through staging records into new Device pages and
@@ -472,8 +487,8 @@ private:
     };
     // A record appended once the record it links to (parent block, anchor) has been.
     struct JournalWait {
-        runtime::prefix_cache::NodeRef node;
-        runtime::prefix_cache::SnapshotRef snapshot;
+        prefix::cache_index::NodeRef node;
+        prefix::cache_index::SnapshotRef snapshot;
     };
 
     [[nodiscard]] std::uint32_t allocate_block_id(DeviceKVPageLease&& lease);
@@ -501,24 +516,26 @@ private:
     void issue_capture_writes(PendingCapture& c);
     // Queues `node`'s Disk write (nothing when it has a Disk copy); false when it has no source copy
     // or no Disk slot could be freed for `claim`.
-    bool queue_block_write(runtime::prefix_cache::NodeRef node, double claim);
-    // Queues the Disk writes of `anchor`'s path, root first, for a snapshot valued `claim`.
-    bool queue_path_writes(runtime::prefix_cache::NodeRef anchor, double claim);
+    bool queue_block_write(prefix::cache_index::NodeRef node, double claim);
     void service_block_writes();
-    [[nodiscard]] bool start_spill(runtime::prefix_cache::SnapshotRef snapshot);
-    void service_spill();
+    // Starts the writer on `snapshot` (`image`: its image too); false when it is busy, the snapshot
+    // needs nothing, or a path block has no copy to write from.
+    [[nodiscard]] bool start_writer(prefix::cache_index::SnapshotRef snapshot, bool image);
+    void service_writer();
     void service_fetch();
     void finish_fetch();
     void service_journal();
-    bool start_host_fetch(runtime::prefix_cache::SnapshotRef snapshot, std::span<const runtime::prefix_cache::NodeRef> path,
-                          bool image, std::span<const runtime::prefix_cache::NodeRef> blocks);
+    bool start_host_fetch(prefix::cache_index::SnapshotRef snapshot, std::span<const prefix::cache_index::NodeRef> path,
+                          bool image, std::span<const prefix::cache_index::NodeRef> blocks);
     void finish_host_fetch();
-    [[nodiscard]] bool journalable(runtime::prefix_cache::NodeRef node) const;
+    [[nodiscard]] bool journalable(prefix::cache_index::NodeRef node) const;
     void service_replaced();
     void poll_disk();
-    // Waits for every Disk write in flight (captures, blocks, the spill) and journals them.
+    // Waits for every Disk write in flight (captures, blocks, the writer's job and the queued path
+    // jobs) and journals them; starts no new writer job meanwhile.
     void drain_disk();
     [[nodiscard]] bool disk_writes_pending() const noexcept;
+    void disk_trace(const char* format, ...) const noexcept __attribute__((format(printf, 2, 3)));
 
     runtime::prefix_cache::TapPlannerConfig taps_;
     DeviceKVPagePool* pool_ = nullptr;
@@ -539,7 +556,7 @@ private:
     std::unordered_map<std::uint64_t, StagedCapture> staged_;
     std::uint64_t next_staged_ = 1;
     std::deque<PendingWrite> writes_;
-    std::unordered_map<std::uint64_t, runtime::prefix_cache::PublishResult> published_;
+    std::unordered_map<std::uint64_t, prefix::cache_index::PublishResult> published_;
     RestoreBatch restore_;
     std::deque<RestoreBatch> landing_;
     std::uint64_t next_ticket_ = 1;
@@ -562,18 +579,27 @@ private:
     std::vector<CuFileQueue::Completion> completions_;
     std::map<std::uint64_t, BlockWrite> block_writes_; // in queue order
     std::uint64_t next_block_write_ = 1;
-    std::optional<Spill> spill_;
-    std::chrono::steady_clock::time_point next_spill_scan_{};
+    DiagnosticObserver diagnostics_;
+    std::optional<Writer> writer_;
+    // Written-through snapshots (no Host tier) whose paths the writer follows with.
+    std::deque<prefix::cache_index::SnapshotRef> path_jobs_;
+    // Snapshots the writer could not finish, skipped until the index's snapshots change.
+    std::vector<prefix::cache_index::SnapshotRef> writer_refused_;
+    std::uint64_t writer_refused_epoch_ = 0;
+    bool writer_scans_                  = true;
+    // The index's snapshot epoch at the last scan that found nothing to start (UINT64_MAX: scan).
+    std::uint64_t scanned_epoch_ = UINT64_MAX;
+    std::chrono::steady_clock::time_point next_writer_scan_{};
     std::optional<Fetch> fetch_;
-    std::vector<runtime::prefix_cache::SnapshotRef> unreadable_;
+    std::vector<prefix::cache_index::SnapshotRef> unreadable_;
     std::vector<JournalWait> journal_waits_;
     // Blocks whose Disk record a sequence's page replaced: written again, and the records below
     // them journaled again after them.
-    std::vector<runtime::prefix_cache::NodeRef> replaced_;
+    std::vector<prefix::cache_index::NodeRef> replaced_;
     std::vector<bool> slot_journaled_;                                          // by a record's first slot
-    std::unordered_map<std::uint32_t, runtime::prefix_cache::SnapshotRef> journaled_snapshots_; // by first slot
+    std::unordered_map<std::uint32_t, prefix::cache_index::SnapshotRef> journaled_snapshots_; // by first slot
     bool disk_broken_ = false; // a removal could not be journaled: no slot is rewritten
-    std::optional<runtime::prefix_cache::PrefixCacheIndex> index_;
+    std::optional<prefix::cache_index::PrefixCacheIndex> index_;
 };
 
 } // namespace infernix::models::qwen4_exp::prefix

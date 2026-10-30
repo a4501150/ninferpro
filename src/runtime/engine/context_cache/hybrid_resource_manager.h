@@ -101,6 +101,9 @@ public:
         out.hybrid_host_restore_bytes      = hybrid.host_restore_bytes;
         out.hybrid_evicted_blocks          = hybrid.evicted_blocks;
         out.hybrid_host_snapshot_evictions = hybrid.host_snapshot_evictions;
+        if constexpr (requires { hybrid.host_backed_evictions; }) {
+            out.hybrid_host_backed_evictions = hybrid.host_backed_evictions;
+        }
         out.hybrid_host_dead_reclaims      = hybrid.host_dead_reclaims;
         out.hybrid_unbacked_node_losses    = hybrid.unbacked_node_losses;
         out.hybrid_held_snapshots          = hybrid.held_snapshots;

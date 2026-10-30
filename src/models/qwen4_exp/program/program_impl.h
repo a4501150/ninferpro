@@ -117,8 +117,8 @@ enum class PrefixCow : std::uint8_t { None, Tail, Anchor };
 
 // A resume source chosen by the quote: a snapshot at `frontier` over `path`, or the root.
 struct PrefixSelection {
-    std::optional<runtime::prefix_cache::SnapshotRef> snapshot;
-    std::vector<runtime::prefix_cache::NodeRef> path; // matched blocks up to the snapshot's anchor
+    std::optional<prefix::cache_index::SnapshotRef> snapshot;
+    std::vector<prefix::cache_index::NodeRef> path; // matched blocks up to the snapshot's anchor
     std::uint32_t frontier = 0;
     std::uint32_t shared   = 0; // leading blocks mapped from the cache
     PrefixCow cow          = PrefixCow::None;
@@ -132,7 +132,7 @@ struct PrefixSelection {
 // One lane's prefix-cache state.
 struct LanePrefix {
     bool reuse = false;
-    std::vector<runtime::prefix_cache::NodeRef> path; // pinned once each: mapped, then published blocks
+    std::vector<prefix::cache_index::NodeRef> path; // pinned once each: mapped, then published blocks
     std::uint32_t page_base = 0;                       // logical block of lane.pages[0]
     std::uint32_t deepest   = 0;                       // frontier of the lineage's deepest snapshot
     std::uint32_t reused    = 0;
@@ -142,7 +142,7 @@ struct LanePrefix {
     // The prompt-end capture waiting for its anchor block (MTP, a block-aligned prompt end): the
     // lane resolves it when it publishes that block, or abandons it.
     std::uint64_t pending_anchor = 0;
-    std::optional<runtime::prefix_cache::SnapshotRef> resume;
+    std::optional<prefix::cache_index::SnapshotRef> resume;
     std::optional<prefix::RestoreTicket> restore;     // the first call waits on it per layer
     std::uint64_t capture          = 0;               // its copy-out gates the next call per layer
     // The current request has captured (its first capture superseded the resume snapshot). `capture`
@@ -1353,8 +1353,8 @@ public:
         return (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;
     }
 
-    static PrefixReusePath reuse_path_for(runtime::prefix_cache::SnapshotKind kind) noexcept {
-        return kind == runtime::prefix_cache::SnapshotKind::Endpoint ? PrefixReusePath::HybridEndpoint
+    static PrefixReusePath reuse_path_for(prefix::cache_index::SnapshotKind kind) noexcept {
+        return kind == prefix::cache_index::SnapshotKind::Endpoint ? PrefixReusePath::HybridEndpoint
                                                                      : PrefixReusePath::HybridSnapshot;
     }
 
@@ -1388,8 +1388,9 @@ public:
         const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
         std::vector<SourceCandidate> out;
         if (prefix_) {
-            // A source held only on the Disk tier is read first; the request waits for it.
-            if (b.reuse && maximum_frontier == UINT32_MAX && prefix_disk_fetch(data)) { return {}; }
+            // A source held only on the Disk tier is read first and the request waits for it, a
+            // paused request's restore too (spec §17.1 rule 7).
+            if (b.reuse && prefix_disk_fetch(data, maximum_frontier)) { return {}; }
             std::optional<PrefixSelection> chosen = prefix_select(data, b, kNoLane);
             const std::uint32_t reuse = chosen && chosen->snapshot ? chosen->frontier : 0U;
             // Coalescing only defers a fresh request (an empty list: the Engine asks again).
@@ -3276,6 +3277,11 @@ public:
         if (options_.expert_state.empty() || !residency_ || residency_->stats().routed == expert_state_routed_) { return; }
         if (std::chrono::steady_clock::now() - expert_state_saved_ < kExpertStateInterval) { return; }
         save_expert_state();
+    }
+    // The prefix cache's Disk tier work outside requests (Program::background_poll).
+    [[nodiscard]] bool prefix_background_pending() const noexcept { return prefix_ && prefix_->background_pending(); }
+    void prefix_background_poll() {
+        if (prefix_) { prefix_->poll(); }
     }
 
     // At the end of a run: reports the expert cache's routed uses and hits per layer (the whole
@@ -6175,12 +6181,12 @@ private:
                          DeviceKVPageReservation& reservation, std::uint32_t pages);
     [[nodiscard]] std::uint32_t prefix_frontier(const Lane& lane, bool finishing) const noexcept;
     void prefix_publish(Lane& lane, std::uint32_t frontier);
-    void prefix_capture(Lane& lane, std::uint32_t index, runtime::prefix_cache::SnapshotKind kind, bool hand_over_tail);
+    void prefix_capture(Lane& lane, std::uint32_t index, prefix::cache_index::SnapshotKind kind, bool hand_over_tail);
     // The capture of the lane's state at frontier F (the lane's published path reaches F's anchor);
     // `mtp_written`: the MTP cell F - 1 is final. `fresh_tail`: the prompt-end capture's private
     // copy of the lane's tail page, which the snapshot takes instead of the lane's.
     [[nodiscard]] prefix::PrefixCache::Capture prefix_capture_at(Lane& lane, std::uint32_t F,
-                                                                 runtime::prefix_cache::SnapshotKind kind,
+                                                                 prefix::cache_index::SnapshotKind kind,
                                                                  bool hand_over_tail, bool mtp_written,
                                                                  DeviceKVPageLease* fresh_tail = nullptr);
     // The zero-token resume's prompt-end capture: a snapshot at the prompt's own frontier whose
@@ -6200,18 +6206,19 @@ private:
     // Every Vision item's token span: no tap and no resume lies strictly inside one.
     [[nodiscard]] static std::vector<runtime::prefix_cache::TapExclusion>
     prefix_exclusions(const qwen3_5::PreparedPromptData& prompt);
-    [[nodiscard]] std::optional<runtime::prefix_cache::SnapshotRef> prefix_resident(const Lane& lane) const;
+    [[nodiscard]] std::optional<prefix::cache_index::SnapshotRef> prefix_resident(const Lane& lane) const;
     [[nodiscard]] std::array<std::span<const cudaEvent_t>, 2> prefix_waits(const Lane& lane) const noexcept;
     void mtp_flush_cell(Lane& lane, std::uint32_t index);
 
     // Starts reading a fresh request's chosen source from the Disk tier when it is held only there,
     // or finds such a read running: the request is then deferred (hybrid_sources).
-    [[nodiscard]] bool prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt);
-    [[nodiscard]] bool prefix_disk_pending(const qwen3_5::PreparedPromptData& prompt);
+    // `maximum_frontier`: a restore's paused frontier, UINT32_MAX for a fresh request.
+    [[nodiscard]] bool prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt, std::uint32_t maximum_frontier);
+    [[nodiscard]] bool prefix_disk_pending(const qwen3_5::PreparedPromptData& prompt, std::uint32_t maximum_frontier);
     // Credits a lane-resident image and a landed fetch's bytes, then drops candidates that still
     // need a Disk read.
-    void prefix_credit(std::vector<runtime::prefix_cache::MatchCandidate>& candidates,
-                       std::optional<runtime::prefix_cache::SnapshotRef> resident) const;
+    void prefix_credit(std::vector<prefix::cache_index::MatchCandidate>& candidates,
+                       std::optional<prefix::cache_index::SnapshotRef> resident) const;
 
 public:
     // The Disk tier (--prefix-cache-disk).
@@ -6431,7 +6438,7 @@ private:
     void shrink_kv(bool evict = false) {
         if (!kv_vmm_ || pool_->backed_pages() <= plan_.kv_base_pages) { return; }
         if (evict && prefix_) {
-            runtime::prefix_cache::PrefixCacheIndex& index = prefix_->index();
+            prefix::cache_index::PrefixCacheIndex& index = prefix_->index();
             for (std::uint32_t budget = pool_->backed_pages() - plan_.kv_base_pages;
                  budget != 0 && !pool_->can_back(plan_.kv_base_pages) && index.evict_backed_device_blocks(1) != 0; --budget) {}
         }
@@ -6620,7 +6627,7 @@ private:
         // committed after the span; the next chunk's layers wait on its events.
         struct Tap {
             std::uint32_t frontier = 0;
-            runtime::prefix_cache::SnapshotKind kind = runtime::prefix_cache::SnapshotKind::Tap;
+            prefix::cache_index::SnapshotKind kind = prefix::cache_index::SnapshotKind::Tap;
             std::uint64_t staged = 0;
         };
         std::vector<Tap> taps; // per chunk

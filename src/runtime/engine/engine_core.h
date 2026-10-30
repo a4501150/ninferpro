@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -136,6 +137,23 @@ public:
         }
         stop();
         if (worker_.joinable()) { worker_.join(); }
+    }
+
+    // A Program with cache-tier work that advances outside requests (Qwen4Exp's prefix-cache Disk
+    // tier, hybrid-prefix-cache-spec §17.1 rule 6): polled at the start of every worker step and,
+    // while it reports work, every kBackgroundTick from the idle wait.
+    static constexpr bool kProgramPollsBackground = requires(typename Instance::ModelContract::Program& program) {
+        program.background_poll();
+        { program.background_pending() } -> std::convertible_to<bool>;
+    };
+    static constexpr auto kBackgroundTick = std::chrono::milliseconds(2);
+
+    // Under the execution lock, on the worker.
+    void poll_background_locked() {
+        if constexpr (kProgramPollsBackground) {
+            instance_.program->background_poll();
+            background_pending_ = instance_.program->background_pending();
+        }
     }
 
     // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7)
@@ -1713,6 +1731,9 @@ private:
             auto& decision = *admission_decision_;
             ContextResourceUsage shortage;
             bool deferred = false;
+            // No source at all: the Program defers the request (a Disk fetch, a sibling's tap) and
+            // asks to be asked again; a restore then retries at the next step, not the next event.
+            const bool asked_again = decision.sources.empty();
             while (decision.current < decision.sources.size()) {
                 const SourceCandidate& source = decision.sources[decision.current];
                 if (!lane) {
@@ -1836,7 +1857,7 @@ private:
                 return true;
             }
             if (restoring) {
-                scheduler_.restoration_blocked();
+                if (!asked_again) { scheduler_.restoration_blocked(); }
                 return false;
             }
         }
@@ -2303,14 +2324,18 @@ private:
         }
     }
 
-    // One worker step holds every request, so a step this long stalls all of them: it is reported
-    // at any log level, at most once per kLongStepQuiet.
-    static constexpr auto kLongStep      = std::chrono::seconds(1);
-    static constexpr auto kLongStepQuiet = std::chrono::seconds(10);
+    // One worker step holds every request, so a step whose work outside its prefill call takes
+    // kLongStep, or that takes kLongPrefillStep in all, stalls all of them: it is reported at any
+    // log level, at most once per kLongStepQuiet. A prefill call alone runs one chunk, which takes
+    // over a second at production chunk sizes by design.
+    static constexpr auto kLongStep        = std::chrono::seconds(1);
+    static constexpr auto kLongPrefillStep = std::chrono::seconds(10);
+    static constexpr auto kLongStepQuiet   = std::chrono::seconds(10);
     void warn_long_step(Clock::time_point started, Clock::time_point admitted, Clock::time_point rounds) noexcept {
         const Clock::time_point ended = Clock::now();
         if (ended - started < kLongStep) [[likely]] { return; }
         if (rounds < admitted) { rounds = admitted; } // a step that threw before its rounds
+        if (rounds - started < kLongStep && ended - started < kLongPrefillStep) { return; }
         ++long_steps_unreported_;
         if (ended < next_long_step_report_) { return; }
         next_long_step_report_ = ended + kLongStepQuiet;
@@ -2333,7 +2358,20 @@ private:
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
                     !instance_.program->has_context_transaction()) {
                     const auto woken = [&] { return stopping_ || !pending_.empty() || maintenance_requested_; };
-                    if (prefix_save_interval_.count() == 0) {
+                    if (background_pending_) {
+                        if (!queue_cv_.wait_for(lock, kBackgroundTick, woken)) {
+                            lock.unlock();
+                            std::scoped_lock execution_lock(execution_mutex_);
+                            try {
+                                save_prefix_cache_if_due();
+                                poll_background_locked();
+                            } catch (...) {
+                                fail_all_locked(std::current_exception());
+                                return;
+                            }
+                            continue;
+                        }
+                    } else if (prefix_save_interval_.count() == 0) {
                         queue_cv_.wait(lock, woken);
                     } else if (!queue_cv_.wait_until(lock, next_prefix_save_, woken)) {
                         // The periodic save falls due while the Engine is idle.
@@ -2382,6 +2420,7 @@ private:
             Clock::time_point admitted = step_started, rounds = step_started;
             try {
                 save_prefix_cache_if_due();
+                poll_background_locked();
                 set_host_work_class(HostWorkClass::Control);
                 auto boundary = begin_host_phase();
                 (void)expire_pending_requests();
@@ -2550,6 +2589,7 @@ private:
                 fail_all_locked(error);
                 return;
             }
+            if constexpr (kProgramPollsBackground) { background_pending_ = instance_.program->background_pending(); }
             execution_lock.unlock();
             warn_long_step(step_started, admitted, rounds);
             if (!executed) {
@@ -2601,6 +2641,7 @@ private:
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool maintenance_requested_ = false; // guarded by queue_mutex_
+    bool background_pending_    = false; // the worker's own: set by poll_background_locked
     bool failed_   = false;
     std::thread worker_;
 };

@@ -225,6 +225,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     COUNTER(hybrid_evicted_blocks, "prefix_cache_device_evictions_total", "Device tree blocks evicted.");
     COUNTER(hybrid_host_snapshot_evictions, "prefix_cache_host_snapshot_evictions_total",
             "Snapshots evicted from Host.");
+    COUNTER(hybrid_host_backed_evictions, "prefix_cache_host_backed_evictions_total",
+            "Host copies dropped because the Disk tier holds them.");
     COUNTER(hybrid_host_dead_reclaims, "prefix_cache_host_dead_reclaims_total",
             "Host block copies reclaimed with no snapshot above them.");
     COUNTER(hybrid_held_host_refusals, "prefix_cache_held_host_refusals_total",

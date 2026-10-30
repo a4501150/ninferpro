@@ -1818,17 +1818,18 @@ Functional checks of the trial builds (Qwen3.8-27B official NVFP4, RTX 5090, gre
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 
 `Qwen4ExpForCausalLM` keeps every routed expert in pinned Host RAM and streams them into a Device
-expert cache, so VRAM and pinned RAM are budgeted against the experts. Its prefix cache reuses this
-design's index (`runtime/prefix_cache`: tree, snapshots, GDSF, superseding, `plan_taps`) and the
-frontend's keys and hints (`block_hashes`, `block_extras`, `tap_hints`) unchanged; the physical
-binding and its orchestration are its own (`src/models/qwen4_exp/program/prefix/`). The model-level
+expert cache, so VRAM and pinned RAM are budgeted against the experts. Its prefix cache runs this
+design's index (tree, snapshots, GDSF, superseding) in its own copy with its own residency rules
+(§17.1), and `plan_taps` and the frontend's keys and hints (`block_hashes`, `block_extras`,
+`tap_hints`) unchanged; the physical binding and its orchestration are its own
+(`src/models/qwen4_exp/program/prefix/`). The model-level
 rules, measurements and the build record are in the
 [Flash-Next design](qwen3_8-flash-next-design.md) §19.3.1; this section states the contract.
 
 | area | Qwen4Exp |
 |---|---|
 | Configuration | `normalize_engine_options` resolves the Host tier per architecture (default the common 8 GiB, `kDefaultHybridHostCacheBytes`; 0 only with a Disk tier), the Disk tier (`disk_directory`, `disk_capacity_bytes`, default 64 GiB; refused for Qwen3.5 and on Windows), no Device snapshot slots (`--device-snapshot-slots` is refused), no `persistent_file`, the common tap budget (8 with a Host tier, else 2; ladder max(4096, 2 x chunk), gap max(1024, chunk)). A Qwen4Exp Engine runs with the cache or with the context cache disabled |
-| Disk tier | A third residency of the shared index: Disk slots of one Host slab each (`PrefixIndexConfig::disk_slots`; Qwen3.5 sets none). A Disk copy backs a block, image and tail like a Host copy, so losing a Device or Host copy keeps the entry; Disk eviction takes dead blocks, then superseded snapshots, then the GDSF minimum, never a retained snapshot valued above the claim, and an entry with another copy only gives up its Disk copy. The binding (`prefix/disk_tier.cpp`) moves page records and packed images through `core/cufile_io.h`, polled from `poll()`: device memory by cuFile batch I/O (GPUDirect Storage where `nvidia_fs` serves the file, the compatibility mode otherwise), host memory by `pread`/`pwrite` on the queue's threads. With a Host tier, a retained snapshot in the coldest quarter of the Host eviction order is spilled once with its path blocks (one at a time, scanned every 100 ms); the shutdown spills every other one, most valuable first, under `persistent_save`. Without one, every capture lands in one of two VRAM staging regions (the packed image and its tail record) instead of Host slabs, is written to reserved Disk slots and publishes when the writes complete; its path blocks follow it from their Device pages through 64 staging records. A tap that finds both regions held (an open tap, one being written) is skipped; a prompt-end capture waits in its fixed Device slot for one instead, since it serves exact repeats. Region writes and fetch reads go ahead of block writes and spills in the queue. A fresh request whose chosen source holds Disk-only bytes is deferred while they are read, and so is one whose prompt a written-through capture still covers; an idle Engine waits instead (at most 5 s), since an empty source list with nothing running fails the request. With a Host tier the bytes are read into Host fills (`begin_host_fill` accepts a Disk source; a tail with only a Device copy is copied from its page), and the restore reads the Host as for any Host-resident source; a fetch that cannot reserve every fill starts nothing, so the request takes a shallower source. Without one, blocks are read through staging records into new cache pages and the image and tail into a region, which the restore then reads. A fetched image whose header differs from its record counts as a failure and is not fetched again. Only the RAM-off mode allocates VRAM staging (two regions and the 64 block records, 354 MiB); with a Host tier the block records are pinned memory, since with every expert resident the prefill chunk is sized from the VRAM left free (the staging dropped it from 4,096 to 2,048 tokens and prefill by 7 %). `DiskStore` (`prefix/disk_store.h`) keeps `slots.bin`, a CRC-framed journal written only after the slots it names are durable (and a freed slot rewritten only after its removal is durable), a manifest of the fingerprint and geometry (a mismatch empties the tier) and a `flock`ed lock. A block record follows its parent's, a snapshot's its anchor's, and replay links each to the record live at that slot when it was read; a block whose Disk record a recomputing sequence replaced (`disk_record_replaced`) is written again and the records below it journaled again after it; startup rebuilds Disk-only entries (`restore_disk_block`, `restore_disk_snapshot`) without reading data and compacts the journal. `clear()` (a failed round) empties the tier too. Block bytes carry no checksum |
+| Disk tier | A third residency (§17.1): Disk slots of one Host slab each. The binding moves page records and packed images through `core/cufile_io.h`: device memory by cuFile batch I/O (GPUDirect Storage where `nvidia_fs` serves the file, the compatibility mode otherwise), host memory by `pread`/`pwrite` on the queue's threads; urgent reads and region writes go ahead of the writer's. Without a Host tier (`--host-context-mib 0`) every capture lands in one of two VRAM staging regions (the packed image and its tail record), is written to reserved Disk slots and publishes when the writes complete; its path blocks follow from their Device pages through 64 staging records; a tap that finds both regions held is skipped, a prompt-end capture waits in its fixed Device slot. Only that mode allocates VRAM staging (354 MiB); with a Host tier the block records are pinned memory, since with every expert resident the prefill chunk is sized from the VRAM left free. A fetched image whose header differs from its record counts as a failure and is not fetched again. `DiskStore` (`prefix/disk_store.h`) keeps `slots.bin`, a CRC-framed journal written only after the slots it names are durable (and a freed slot rewritten only after its removal is durable), a manifest of the fingerprint and geometry (a mismatch empties the tier) and a `flock`ed lock. A block record follows its parent's, a snapshot's its anchor's, and replay links each to the record live at that slot when it was read; a block whose Disk record a recomputing sequence replaced is written again and the records below it journaled again after it; startup rebuilds Disk-only entries without reading data and compacts the journal. The shutdown writes every retained snapshot still without a Disk copy, most valuable first, under `persistent_save`. `clear()` (a failed round) empties the tier too. Block bytes carry no checksum |
 | Snapshots | Host-born, or with no Host tier written through to the Disk tier: a capture reserves Host slabs and copies the lane's state image (GDN recurrent and conv state, PLE state, QSA tails, the MTP drafter's saved residual, and on a non-MTP prompt-end capture the pre-LM-head residual — the HeadSaved part; under MTP the drafter's saved residual is that same column, so the image keeps it once) and its partial page, one decoder layer at a time on the transfer stream; the next call of the lane waits per layer. Restores are one batch per admission on the restore stream, waited on per layer by the first call |
 | MTP drafter | Cells and anchors follow rules MR1-MR6 (design §19.3.1): blocks record `mtp_next`, snapshots `mtp_written`/`mtp_next`; a resume whose continuation differs rewrites the anchor's last cell in a private copy. The MR6 guard reads `history[F]`: at F == n (a zero-token resume) that token is the one the resume regenerates, unknown at admission, so a block-aligned prompt end always copies its anchor |
 | Admission | Two sources per request: the affordable snapshot chosen without a lane, then the root. `start_binding` re-selects for the actual lane (crediting a lane-resident snapshot) and returns no reservation when the choice changed, so the Engine falls back to the root; otherwise it reserves the prompt's pages plus one round, and later rounds grow the lane (design §19.3.13). A prefetch landing over the prompt's path is waited for before matching, and pending Host writes are drained before a cached source is given up (as §6.6). A blocked FIFO head's Host-only blocks are prefetched into free and Host-backed Device pages, never growing the pool into the expert frames (`RuntimeStats::hybrid_prefetched_blocks`). A fresh request whose prompt shares a prefix (media agreeing, as §12.2) with a lane still prefilling waits for that lane's snapshot at the divergence when the predicted wait is within half the queue timeout: an exact tap is planned there (splitting the lane's pending call) and published as a Boundary. Shortages are reclaimed by evicting unpinned cached Device blocks |
@@ -1838,5 +1839,78 @@ rules, measurements and the build record are in the
 | Vision | A resume frontier strictly inside an item is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
 | Statistics | `RuntimeStats::hybrid_*` and the request log's `cached_prefix_tokens` / `restored_host_bytes` as in Qwen3.5, plus `hybrid_prompt_end_captures`, `hybrid_prompt_end_gated` (skipped by design) and `hybrid_prompt_end_failed` (refused for capacity) and the Disk tier's `hybrid_disk_*` (capacity, use, image and block writes, fetches, read bytes, failures, capture and spill skips, evictions); a request resumed from a fetched source reports `prefix_from_disk` (`, from disk` on its `req#N done` line) |
 | Persistence | The Disk tier (above): its journal records each block's `mtp_next` and each snapshot's meta (`StateImageHeader`), and its manifest the slot geometry and the state-image layout fingerprint. The whole-file save (`--prefix-cache-file`) is Qwen3.5's only |
-| Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier |
+| Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the snapshot is held, written to the Disk first, and fetched before the resume (§17.1 rule 7), which binds from it without replay |
 | Not built | Device snapshot slots, prefill CPU assist and C > 1 extras (design P7, P8) |
+
+### 17.1 Tiers: VRAM, RAM and Disk
+
+Qwen4Exp owns its index (`src/models/qwen4_exp/program/prefix/prefix_index.*`, forked from
+`runtime/prefix_cache`): the tree, matching, choice, supersession and GDSF valuation are this
+design's (§5-§9.3), the residency rules below replace §9.3's allocation steps and §9.4 for it. They
+exist because the first Disk tier broke them: a spilled snapshot kept its path's Host block copies
+forever (only snapshots were Host victims), release write-back bypassed the value gate, queued
+writes pinned whole paths, and Disk I/O advanced only when a request polled. A full Host tier then
+refused every new tap (a repeat after a fill reused nothing, against 99.9 % without the Disk), and a
+worker drain of the Disk backlog stalled every request for 15-35 s.
+
+**Copies.** A block (one 64-token page record) or a snapshot (its packed image, plus a tail record
+when its frontier is not block aligned) has up to three copies: Device (a pool page; an image only
+while its lane holds it), Host (slabs) and Disk (slots of one slab each), each Absent, Filling or
+Resident. A copy is *backed* when a lower tier holds a Resident copy of the same bytes (Device by
+Host or Disk, Host by Disk); otherwise it is *sole*. An entry is usable while its image and every
+block of its path have a Resident copy somewhere.
+
+**Rule 1 — backed copies go first, ungated.** A tier frees space in this order, never touching a
+pinned copy: (1) dead copies, block copies with no live snapshot at or below them; (2) backed
+copies, least recently used first (a copy rejoins the order when its last pin goes) and queue-held
+ones last, with no value gate, since dropping one loses nothing; (3) superseded snapshots' copies;
+(4) the retained snapshot with the minimum GDSF value H, whose sole copies go and whose exclusive
+path then becomes dead — refused when H(victim) exceeds the allocation's claim. The Device tier
+evicts Host- or Disk-backed pages first (§9.1); the Host tier's step 2 covers block slabs and
+snapshot images with a Disk copy (`host_backed_evictions`); the Disk tier has no step 2.
+
+**Rule 2 — every allocation carries a claim.** A capture claims its own H; the release write-back of
+a lane's Device-only blocks claims the highest H of a retained snapshot on their path, or of the
+lane's capture still landing there; a fetch claims the H of the source it reads; the Disk writer
+claims the H of the snapshot it writes. Nothing bypasses step 4: a refused write-back leaves the
+block Device-only, a refused fetch leaves the request a shallower source, a refused capture is
+counted (`taps_skipped`, `prompt_end_failed`).
+
+**Rule 3 — write-back down to the Disk.** With a Disk tier the Disk backs the memory tiers: a writer
+copies every retained snapshot's image, tail and path blocks that lack a Disk copy, highest H first,
+a paused request's snapshot before everything else. Host copies become backed as their writes land,
+so a full Host tier frees space by step 2. When the writer falls behind, step 4 decides as it would
+without a Disk: the cache loses its least valuable entries; it never refuses everything.
+
+**Rule 4 — pins only for transfers in flight.** A copy is pinned while a transfer reads or writes it,
+or while a lane maps it. The writer works on one snapshot at a time with a cursor over its path, not
+a queue: it issues the next block write while the block writes in flight stay under
+`kDiskWriteWindow` (64 MiB), pinning only those, then the image; an entry evicted before its turn
+ends the job, and a snapshot whose job failed waits until the cache's snapshots change. Without a
+Host tier, a written-through capture's path follows as the writer's next job.
+
+**Rule 5 — who waits.** The worker never waits for the Disk backlog. It waits for the copy streams
+only (`drain`: captures, Host write-back and restores in flight, each bounded by one batch's copy
+time) and, for a prompt extending an endpoint still being copied, for that copy (without a Host
+tier, its region's Disk writes). An admission whose source holds Disk-only bytes is deferred while a
+fetch reads them into Host fills, fresh and restoring admissions alike (a deferred restore retries
+at the next step); an idle Engine waits up to 5 s instead, since nothing else runs and an empty
+source list would fail the request. `clear()` and the shutdown drain the Disk; the shutdown also
+writes every retained snapshot the writer has not reached, most valuable first.
+
+**Rule 6 — Disk progress without requests.** Disk completions, the writer, fetches and the journal
+advance in `PrefixCache::poll`, which the Engine runs at the start of every worker step
+(`Program::background_poll`) and, while the Program reports tier work (`background_pending`: transfers
+in flight, records to journal, or snapshots published since the writer last found nothing), every
+2 ms from the idle worker.
+
+**Rule 7 — pause snapshots.** A pause publishes the lane's blocks and an Endpoint at its frontier.
+Queue holds (§9.6, paused requests ranked first) keep that snapshot out of steps 3-4 while it waits
+and put its copies last in step 2; the writer takes held snapshots first, by rank; when its bytes
+have left VRAM and RAM, the restoring admission defers while the fetch runs and binds from it
+without replay.
+
+**Observability.** `/metrics` exports the tier gauges and counters (`prefix_cache_*`); `--debug
+prefix-cache` traces refused captures and prompt ends, `--debug disk` the writer's jobs, and
+`--debug scheduler` deferrals, admissions with their reuse, and pauses; an engine step spending over 1 s
+outside its prefill call is a warning at any log level.

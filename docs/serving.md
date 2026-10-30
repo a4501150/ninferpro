@@ -1357,7 +1357,8 @@ internal startup and resource-planning detail. Engine runtime diagnostics are or
 prefixed `engine |`: a Device KV lease extended by releasing retained cache is `debug`; a lease
 that cannot grow, recovery from out of memory or a failed request, and a failed prefix-cache save
 are warnings or errors; the prefix-cache save at shutdown is `info`. An engine step that holds every
-request for more than a second is a warning, at most one per 10 s with the count of others. `--debug`
+request for more than a second outside its prefill call (whose length follows the chunk size), or
+for more than 10 s in all, is a warning, at most one per 10 s with the count of others. `--debug`
 trace lines are prefixed with their category (`prefix-cache |`, `disk |`, `scheduler |`) and show at any `--log-level`. FFmpeg's media-decoding
 messages are records prefixed `media |`, so they never write inside the statistics panel: FFmpeg
 errors are warnings, and its warnings and notices, such as swscaler's `deprecated pixel format`
@@ -1474,7 +1475,7 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_{root,prefix}_selections_total` | Initial bindings from the root and from a prefix-cache snapshot |
 | `infernix_prefix_cache_{snapshots,blocks,device_blocks,device_evictable_blocks,held_snapshots}`, `infernix_prefix_cache_host_{capacity,used}_bytes` | The prefix cache's contents and the Host tier's size and use |
 | `infernix_prefix_cache_{snapshot_hits,taps,taps_skipped,endpoints}_total`, `infernix_prefix_cache_prompt_end_{captures,gated,failed}_total` | Snapshot reuse and publication; a prompt end is gated by design when a snapshot lies within one tap separation of it, and failed when a staging slot, Host slabs or a free page were missing |
-| `infernix_prefix_cache_host_{image_writes,block_writes,image_restores,block_restores,snapshot_evictions,dead_reclaims}_total`, `infernix_prefix_cache_device_evictions_total`, `infernix_prefix_cache_held_host_refusals_total` | Host tier traffic and evictions |
+| `infernix_prefix_cache_host_{image_writes,block_writes,image_restores,block_restores,snapshot_evictions,backed_evictions,dead_reclaims}_total`, `infernix_prefix_cache_device_evictions_total`, `infernix_prefix_cache_held_host_refusals_total` | Host tier traffic and evictions; `backed_evictions` counts Host copies dropped because the Disk tier also holds them |
 | `infernix_prefix_cache_disk_{capacity,used}_bytes`, `infernix_prefix_cache_disk_{image_writes,block_writes,write_bytes,fetches,read_bytes,failures}_total` | The prefix cache's Disk tier (`--prefix-cache-disk`; zero without one): its size and use, what was written to it and read back, and failed transfers or images that no longer match their record |
 | `infernix_device_kv_{used,capacity}_pages`, `infernix_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; cached blocks and snapshots also occupy these pools |
 | `infernix_host_work_seconds_total{phase}`, `infernix_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
@@ -1700,7 +1701,8 @@ Host-tier write-through and restores, and `host_write_copies` and `host_restore_
 calls that moved those bytes (many small copies queue behind other work on the copy engine; the
 Qwen3.8-Flash-Next prefix cache reports 0); `prefetched_blocks` counts the restored blocks copied for a
 waiting FIFO head before its admission. `evicted_blocks` counts Device block evictions,
-`host_snapshot_evictions` snapshots evicted from the Host tier, `host_dead_reclaims` Host slabs
+`host_snapshot_evictions` snapshots evicted from the Host tier, `host_backed_evictions` Host
+copies (blocks and snapshot images) dropped because the Disk tier also holds them, `host_dead_reclaims` Host slabs
 reclaimed from KV that no snapshot can reach, and `unbacked_node_losses` Device evictions of blocks
 with no Host copy, which remove them and the blocks after them from the cache. With queue holds
 (the default; `--no-queue-holds` turns them off), `held_snapshots` is the end-of-interval number of

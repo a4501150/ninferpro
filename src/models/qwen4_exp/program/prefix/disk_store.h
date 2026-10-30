@@ -20,7 +20,7 @@
 #include "core/cufile_io.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "runtime/prefix_cache/block_hash.h"
-#include "runtime/prefix_cache/prefix_index.h"
+#include "models/qwen4_exp/program/prefix/prefix_index.h"
 
 #include <array>
 #include <atomic>
@@ -50,8 +50,8 @@ struct DiskGeometry {
 };
 
 struct DiskBlockRecord {
-    std::uint32_t slot        = runtime::prefix_cache::kNoId;
-    std::uint32_t parent_slot = runtime::prefix_cache::kNoId; // the parent block's record; kNoId: root
+    std::uint32_t slot        = prefix::cache_index::kNoId;
+    std::uint32_t parent_slot = prefix::cache_index::kNoId; // the parent block's record; kNoId: root
     std::uint64_t lookup_hash = 0;
     std::uint64_t extra       = 0;
     std::int32_t mtp_next     = -1;
@@ -60,10 +60,10 @@ struct DiskBlockRecord {
 
 struct DiskSnapshotRecord {
     std::vector<std::uint32_t> slots; // image, then the tail's
-    std::uint32_t anchor_slot = runtime::prefix_cache::kNoId; // the anchor block's record; kNoId: root
+    std::uint32_t anchor_slot = prefix::cache_index::kNoId; // the anchor block's record; kNoId: root
     std::uint32_t frontier    = 0;
     std::vector<TokenId> tail;
-    runtime::prefix_cache::SnapshotKind kind = runtime::prefix_cache::SnapshotKind::Tap;
+    prefix::cache_index::SnapshotKind kind = prefix::cache_index::SnapshotKind::Tap;
     std::uint32_t hits = 0;
     StateImageHeader meta;
 };

@@ -100,6 +100,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t host_restore_bytes      = 0;
     std::uint64_t evicted_blocks          = 0;
     std::uint64_t host_snapshot_evictions = 0;
+    std::uint64_t host_backed_evictions   = 0; // Host copies dropped because the Disk holds them
     std::uint64_t host_dead_reclaims      = 0;
     std::uint64_t unbacked_node_losses    = 0;
     std::uint32_t held_snapshots          = 0;
@@ -610,6 +611,11 @@ public:
     // worker, between rounds and under its execution lock. An empty waker detaches the engine.
     void set_maintenance_waker(std::function<void()> waker);
     void maintain();
+    // Prefix-cache tier work outside requests (hybrid-prefix-cache-spec §17.1 rule 6): the Engine
+    // calls background_poll() at every worker step and, while background_pending(), from its idle
+    // wait every 2 ms.
+    [[nodiscard]] bool background_pending() const noexcept;
+    void background_poll();
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
 

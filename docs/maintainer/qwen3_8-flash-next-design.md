@@ -4242,7 +4242,11 @@ Optional Device slots use the same packed layout, allocated before the frames. P
 plane range (`copy_to_host_records` / `copy_from_host_records`) into any page, cache-owned or
 lane-private.
 
-#### Generic extensions (`src/runtime/prefix_cache/`, ~170 lines; Qwen3.5 behaviour unchanged)
+#### Index extensions (`prefix/prefix_index.*`, forked from `src/runtime/prefix_cache/`)
+
+The family owns its index since 2026-10-29: the runtime one serves Qwen3.5 alone, without the
+Host-born snapshots, the zero-token resume's head residual and the Disk residency below, and the
+fork adds the tier rules of hybrid-prefix-cache-spec §17.1. Extensions 2-4 stay in both.
 
 | # | Extension |
 |---|---|
@@ -4253,10 +4257,10 @@ lane-private.
 
 #### Binding `Qwen4ExpPrefixCache` (`src/models/qwen4_exp/program/prefix/`)
 
-Files `prefix_cache.{h,cpp}`, `prefix_program.cpp`, `state_image.{h,cpp}`, `call_plan.{h,cpp}`,
-`disk_tier.cpp`, `disk_store.{h,cpp}`. The binding owns `block id → DeviceKVPageLease`, `node →
+Files `prefix_index.{h,cpp}`, `prefix_cache.{h,cpp}`, `prefix_program.cpp`, `state_image.{h,cpp}`,
+`call_plan.{h,cpp}`, `disk_tier.cpp`, `disk_store.{h,cpp}`. The binding owns `block id → DeviceKVPageLease`, `node →
 mtp_next` (4 B), the slab pool, the write-through queue, restore batches with per-layer events,
-copy-outs, capture records, the Disk tier (its store, VRAM staging regions, spills, fetches and
+copy-outs, capture records, the Disk tier (its store, VRAM staging regions, writer, fetches and
 journal; hybrid-prefix-cache-spec §17), the `PrefixIndexBackend` callbacks and
 `poll`/`drain`/`clear`.
 
@@ -4270,12 +4274,18 @@ journal; hybrid-prefix-cache-spec §17), the `PrefixIndexBackend` callbacks and
   on the worker covers Disk writes: `drain` waits for the copy streams only, and `clear` and the
   shutdown spill drain the Disk. A `drain` that also waited for the Disk blocked every admission
   under memory pressure for the whole write backlog (production: steps of 15-35 s beside a
-  waiting request; a test: 2.6 s for 22,121 queued blocks). The next spill starts once the
-  previous one's path blocks are written, since each queued block write pins its block's page or
-  slab (spills every 100 ms queued ~21,000 blocks and pinned the whole cache). With the
-  Host tier, cold retained snapshots are spilled once (the Host eviction then keeps their Disk
-  copy) and fetches read into Host slabs; without it (`--host-context-mib 0`) captures write
-  through from two VRAM staging regions (2 × 126 slots, plus 64 block records: 354 MiB of VRAM).
+  waiting request; a test: 2.6 s for 22,121 queued blocks). Each queued block write pins its
+  block's page or slab (spills every 100 ms once queued ~21,000 blocks and pinned the whole cache),
+  so the writer keeps at most 64 MiB of block writes in flight (hybrid-prefix-cache-spec §17.1
+  rule 4). The first tier spilled only the coldest quarter of the Host eviction order, and the Host
+  tier evicted snapshots only: a spilled snapshot's path kept its Host block copies for good, so a
+  full Host tier had nothing left to give but the newest snapshot, whose value refused every new
+  capture (test servers, 2026-10-29: after filling the tier with 37 prompts of 30k tokens, repeats
+  reused 0 % with the Disk tier against 99.9 % without it). Now every retained snapshot is written
+  down, held and most valuable first, and the Host tier drops Disk-backed copies before valuing
+  sole ones (rules 1 and 3); fetches read into Host slabs. Without the Host tier
+  (`--host-context-mib 0`) captures write through from two VRAM staging regions (2 × 126 slots,
+  plus 64 block records: 354 MiB of VRAM) and the writer follows with their paths.
   Only that mode stages in VRAM: with every expert resident the prefill chunk is sized from the
   VRAM left free, and the staging cut it from 4,096 to 2,048 tokens (T3 prefill of a 30k prompt
   13,500 against 12,600 tok/s, three and two runs, with the RAM tier on as well before fetches

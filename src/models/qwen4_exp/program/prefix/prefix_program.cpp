@@ -12,7 +12,7 @@
 
 namespace infernix::models::qwen4_exp::detail {
 
-namespace pc = runtime::prefix_cache;
+namespace pc = infernix::models::qwen4_exp::prefix::cache_index;
 
 namespace {
 
@@ -61,6 +61,7 @@ void ProgramImpl::create_prefix_cache() {
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
                                                             options_.prefix_host_bytes, options_.prefix_disk_bytes);
     prefix_->set_compute_stream(device_.stream);
+    prefix_->set_diagnostics(options_.diagnostics);
     if (options_.free_cache_resume) {
         // The zero-token resume's prompt-end captures stage their image through fixed Device slots
         // (a lane's replayed decode graphs cannot wait on capture events): two cover a burst of
@@ -384,17 +385,18 @@ void ProgramImpl::prefix_credit(std::vector<pc::MatchCandidate>& candidates,
     std::erase_if(candidates, [](const pc::MatchCandidate& c) { return c.disk_bytes != 0; });
 }
 
-// The Disk tier (design §19.3.1): the source a fresh request would choose with every candidate
-// restorable is read before its admission when it lies (partly) only on the Disk, and a snapshot
-// of the prompt still being written through to the Disk is awaited. While other requests run, the
-// request is deferred (the Engine asks again), so their rounds never wait on the Disk; an idle
-// Engine has nothing else to run and waits here, at most kDiskWaitSeconds.
-bool ProgramImpl::prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt) {
+// The Disk tier (hybrid-prefix-cache-spec §17.1 rules 5, 7): the source a request would choose with
+// every candidate restorable (a restore's at or below its paused frontier) is read before its
+// admission when it lies (partly) only on the Disk, and a snapshot of the prompt still being
+// written through to the Disk is awaited. While other requests run, the request is deferred (the
+// Engine asks again), so their rounds never wait on the Disk; an idle Engine has nothing else to
+// run and waits here, at most kDiskWaitSeconds.
+bool ProgramImpl::prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt, std::uint32_t maximum_frontier) {
     if (!prefix_->disk_attached()) { return false; }
     constexpr double kDiskWaitSeconds = 5.0;
     const auto start                  = std::chrono::steady_clock::now();
     const bool idle = std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& lane) { return lane.phase == Phase::Free; });
-    while (prefix_disk_pending(prompt)) {
+    while (prefix_disk_pending(prompt, maximum_frontier)) {
         if (!idle) { return true; }
         if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() > kDiskWaitSeconds) {
             return false;
@@ -407,7 +409,7 @@ bool ProgramImpl::prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt) {
 // Whether the prompt's admission must wait for the Disk tier: a fetch is running (the head's choice
 // may need it), a snapshot on the prompt's path is still being written through, or a fetch of the
 // source it would choose has just started.
-bool ProgramImpl::prefix_disk_pending(const qwen3_5::PreparedPromptData& prompt) {
+bool ProgramImpl::prefix_disk_pending(const qwen3_5::PreparedPromptData& prompt, std::uint32_t maximum_frontier) {
     prefix_->poll();
     if (prefix_->fetch_running()) { return true; }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -421,7 +423,7 @@ bool ProgramImpl::prefix_disk_pending(const qwen3_5::PreparedPromptData& prompt)
         return c.filling_blocks != 0 || prefix::inside_exclusion(c.frontier, spans) ||
                prefix_->disk_unreadable(c.snapshot) ||
                (grid && (c.frontier % kResumeGrid != 0 || index.snapshot(c.snapshot).kind == pc::SnapshotKind::Endpoint)) ||
-               (c.frontier == n && !c.head_residual);
+               (c.frontier == n && !c.head_residual) || c.frontier > maximum_frontier;
     });
     for (pc::MatchCandidate& c : match.candidates) { c.disk_bytes -= std::min(c.disk_bytes, prefix_->fetched_bytes(c)); }
     const pc::AdmissionChoice choice = index.choose(match, n);
@@ -824,6 +826,7 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     out.host_restore_bytes      = count.host_restore_bytes;
     out.evicted_blocks          = index.device_block_evictions;
     out.host_snapshot_evictions = index.host_snapshot_evictions;
+    out.host_backed_evictions   = index.host_backed_evictions;
     out.host_dead_reclaims      = index.host_dead_reclaims;
     out.unbacked_node_losses    = index.unbacked_node_losses;
     out.held_snapshots          = index.held_snapshots;

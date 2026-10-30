@@ -1826,6 +1826,8 @@ struct RuntimeStats {
     std::uint64_t hybrid_host_restore_copies     = 0;
     std::uint64_t hybrid_evicted_blocks          = 0;
     std::uint64_t hybrid_host_snapshot_evictions = 0;
+    // Host copies dropped because the Disk tier also holds them (blocks and snapshot images).
+    std::uint64_t hybrid_host_backed_evictions = 0;
     std::uint64_t hybrid_host_dead_reclaims      = 0;
     std::uint64_t hybrid_unbacked_node_losses    = 0;
     // Queue holds (HybridPrefixCacheOptions::queue_holds): the snapshots held for queued

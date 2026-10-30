@@ -601,9 +601,10 @@ int run_zero_token_disk(const char* artifact, const char* ngram, bool mtp, bool 
     return failures;
 }
 
-// The RAM tier under pressure (room for three snapshot images): each new prompt's snapshots evict
-// the coldest Host entries, which were spilled to the Disk tier while the requests ran, so a
-// repeat of the first prompt still resumes with no prefill, reading its snapshot back from the Disk.
+// The RAM tier under pressure (room for three snapshot images): the writer copies every snapshot
+// and its path to the Disk tier while the requests run, so each new prompt's snapshots take the
+// Host slabs of Disk-backed copies (hybrid-prefix-cache-spec §17.1 rule 1) and a repeat of the
+// first prompt still resumes with no prefill, reading its snapshot back from the Disk.
 int run_disk_pressure(const char* artifact, const char* ngram, bool mtp) {
     std::printf("== the RAM tier spilling to the Disk tier under pressure (%s)\n", mode_name(mtp));
     const std::filesystem::path directory = disk_directory("qwen4_exp_disk_pressure");
@@ -620,12 +621,13 @@ int run_disk_pressure(const char* artifact, const char* ngram, bool mtp) {
         std::vector<Run> first;
         for (std::uint32_t i = 0; i < 4; ++i) { first.push_back(generate(engine, synthetic_tokens(1500, 50 + i), 48, true)); }
         const infernix::RuntimeStats spilled = engine.runtime_stats();
-        std::printf("        Disk writes %llu images, %llu blocks; Host evictions %llu\n",
+        std::printf("        Disk writes %llu images, %llu blocks; Host evictions: %llu Disk-backed copies, %llu snapshots\n",
                     static_cast<unsigned long long>(spilled.hybrid_disk_image_writes),
                     static_cast<unsigned long long>(spilled.hybrid_disk_block_writes),
+                    static_cast<unsigned long long>(spilled.hybrid_host_backed_evictions),
                     static_cast<unsigned long long>(spilled.hybrid_host_snapshot_evictions));
-        failures += check(spilled.hybrid_disk_image_writes > 0 && spilled.hybrid_host_snapshot_evictions > 0,
-                          "the RAM tier spilled snapshots before evicting them");
+        failures += check(spilled.hybrid_disk_image_writes > 0 && spilled.hybrid_host_backed_evictions > 0,
+                          "the RAM tier gave up Disk-backed copies under pressure");
         const Run repeat = generate(engine, synthetic_tokens(1500, 50), 48, true);
         const infernix::RuntimeStats read = engine.runtime_stats();
         std::printf("        repeat of the first prompt: reused %u; fetches %llu\n", repeat.reused,

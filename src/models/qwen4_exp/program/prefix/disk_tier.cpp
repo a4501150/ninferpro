@@ -6,8 +6,10 @@
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
 
 #include "core/device.h"
+#include "runtime/diagnostics.h"
 
 #include <algorithm>
+#include <cstdarg>
 #include <chrono>
 #include <limits>
 #include <stdexcept>
@@ -16,7 +18,7 @@
 
 namespace infernix::models::qwen4_exp::prefix {
 
-namespace pc = runtime::prefix_cache;
+namespace pc = infernix::models::qwen4_exp::prefix::cache_index;
 
 namespace {
 
@@ -25,7 +27,11 @@ using Clock = std::chrono::steady_clock;
 // A landed fetch keeps its pins and region this long for the admission that asked for it.
 constexpr auto kFetchHold = std::chrono::seconds(2);
 // How often the Host eviction order is scanned for a snapshot to spill.
-constexpr auto kSpillScan = std::chrono::milliseconds(100);
+// Block writes the writer keeps in flight, each pinning its block's slab or page (§17.1 rule 4).
+constexpr std::uint64_t kDiskWriteWindow = 64ULL << 20;
+// Candidates the writer tries per scan, and how often it retries ones that could not start.
+constexpr std::size_t kWriterCandidates = 8;
+constexpr auto kWriterRetry             = std::chrono::seconds(1);
 // The copy group of a block staging record (it lies in no Host chunk).
 constexpr std::uint32_t kStagingGroup = UINT32_MAX;
 
@@ -121,10 +127,10 @@ void PrefixCache::reap_disk() {
                 write->second.stage = BlockWrite::Stage::Done;
             }
             break;
-        case DiskIo::Kind::Spill:
-            if (spill_) {
-                --spill_->writes;
-                spill_->ok = spill_->ok && done.ok;
+        case DiskIo::Kind::Image:
+            if (writer_) {
+                --writer_->writes;
+                writer_->ok = writer_->ok && done.ok;
             }
             break;
         case DiskIo::Kind::FetchImage:
@@ -204,15 +210,6 @@ bool PrefixCache::queue_block_write(pc::NodeRef node, double claim) {
     return true;
 }
 
-bool PrefixCache::queue_path_writes(pc::NodeRef anchor, double claim) {
-    std::vector<pc::NodeRef> path;
-    for (pc::NodeRef node = anchor; node.valid(); node = index_->node(node).parent) { path.push_back(node); }
-    for (auto it = path.rbegin(); it != path.rend(); ++it) {
-        if (!queue_block_write(*it, claim)) { return false; }
-    }
-    return true;
-}
-
 void PrefixCache::service_block_writes() {
     bool ordered = false; // the transfer stream waits for the compute stream's queued work
     for (auto it = block_writes_.begin(); it != block_writes_.end();) {
@@ -281,66 +278,130 @@ void PrefixCache::service_block_writes() {
     }
 }
 
-// ---- spills (Host tier) --------------------------------------------------------------------------
+void PrefixCache::disk_trace(const char* format, ...) const noexcept {
+    if (!diagnostics_.tracing(DebugCategory::Disk)) { return; }
+    va_list arguments;
+    va_start(arguments, format);
+    runtime::publish_diagnostic_v(diagnostics_, DiagnosticLevel::Info, DebugCategory::Disk, format, arguments);
+    va_end(arguments);
+}
 
-bool PrefixCache::start_spill(pc::SnapshotRef snapshot) {
-    if (spill_ || !disk_writable() || !index_->valid(snapshot)) { return false; }
+// ---- the writer (§17.1 rules 3-4) ---------------------------------------------------------------
+
+bool PrefixCache::start_writer(pc::SnapshotRef snapshot, bool image) {
+    if (writer_ || !disk_writable() || !index_->valid(snapshot)) { return false; }
     const pc::SnapshotView view = index_->snapshot(snapshot);
-    if (view.host != pc::CopyState::Resident || view.disk != pc::CopyState::Absent || view.pins != 0) { return false; }
-    // Every path block without a Disk copy needs a copy to write it from.
+    if (image && (view.host != pc::CopyState::Resident || view.disk != pc::CopyState::Absent)) { return false; }
+    Writer w;
+    w.snapshot = snapshot;
+    w.image    = image;
+    w.claim    = view.priority;
     for (pc::NodeRef node = view.anchor; node.valid();) {
         const pc::NodeView n = index_->node(node);
-        if (n.disk == pc::CopyState::Absent && n.host != pc::CopyState::Resident && n.device != pc::CopyState::Resident) {
-            return false;
+        if (n.disk == pc::CopyState::Absent) {
+            if (n.host != pc::CopyState::Resident && n.device != pc::CopyState::Resident) { return false; }
+            w.path.push_back(node);
         }
         node = n.parent;
     }
-    index_->pin_snapshot(snapshot);
-    if (!index_->begin_snapshot_disk_fill(snapshot)) {
-        index_->unpin_snapshot(snapshot);
-        ++counters_.disk_spill_skips;
-        return false;
-    }
-    if (view.anchor.valid() && !queue_path_writes(view.anchor, view.priority)) {
-        // The blocks queued so far are written anyway; the snapshot is not.
-        index_->abort_snapshot_disk_fill(snapshot);
-        index_->unpin_snapshot(snapshot);
-        ++counters_.disk_spill_skips;
-        return false;
-    }
-    spill_ = Spill{.snapshot = snapshot};
+    if (w.path.empty() && !image) { return false; }
+    std::reverse(w.path.begin(), w.path.end());
+    disk_trace("writer: snapshot at %u, %zu path blocks%s, value %.3g", view.frontier, w.path.size(),
+               image ? " and its image" : "", w.claim);
+    writer_ = std::move(w);
     return true;
 }
 
-void PrefixCache::service_spill() {
-    if (!spill_) { return; }
-    Spill& s = *spill_;
-    if (!s.issued) {
-        if (!disk_writable()) {
-            s.ok     = false;
-            s.issued = true;
-        } else {
-            const pc::SnapshotView view = index_->snapshot(s.snapshot);
-            if (!store_->writable(view.disk_slots)) { return; }
-            for (std::size_t i = 0; i < view.disk_slots.size(); ++i) {
-                submit_disk(CuFileQueue::Op::Write, view.disk_slots[i], host_.slab_bytes, slab(view.host_slabs[i]), 0,
-                            DiskIo{DiskIo::Kind::Spill, 0});
+void PrefixCache::service_writer() {
+    if (!writer_) {
+        while (!path_jobs_.empty() && !writer_) {
+            const pc::SnapshotRef job = path_jobs_.front();
+            path_jobs_.pop_front();
+            (void)start_writer(job, false);
+        }
+        const std::uint64_t epoch = index_->snapshot_epoch();
+        if (writer_refused_epoch_ != epoch) {
+            writer_refused_.clear();
+            writer_refused_epoch_ = epoch;
+        }
+        if (!writer_ && writer_scans_ && host_tier() && disk_writable() &&
+            (epoch != scanned_epoch_ || Clock::now() >= next_writer_scan_)) {
+            for (const pc::SnapshotRef candidate : index_->disk_write_candidates(kWriterCandidates)) {
+                if (std::find(writer_refused_.begin(), writer_refused_.end(), candidate) != writer_refused_.end()) {
+                    continue;
+                }
+                if (start_writer(candidate, true)) { break; }
+                writer_refused_.push_back(candidate);
             }
-            s.writes = static_cast<std::uint32_t>(view.disk_slots.size());
-            s.issued = true;
-            ++counters_.disk_image_writes;
-            counters_.disk_write_bytes += view.disk_slots.size() * host_.slab_bytes;
+            if (!writer_) {
+                scanned_epoch_    = epoch;
+                next_writer_scan_ = Clock::now() + kWriterRetry;
+            }
+        }
+        if (!writer_) { return; }
+    }
+    Writer& w = *writer_;
+    const std::size_t window = static_cast<std::size_t>(std::max<std::uint64_t>(1, kDiskWriteWindow / host_.slab_bytes));
+    while (w.ok && w.next < w.path.size() && block_writes_.size() < window) {
+        const pc::NodeRef node = w.path[w.next];
+        if (!index_->valid(node) || !queue_block_write(node, w.claim)) {
+            w.ok = false;
+            break;
+        }
+        ++w.next;
+    }
+    if (w.ok && w.image && !w.image_started && w.next == w.path.size()) {
+        const bool needed = index_->valid(w.snapshot) &&
+                            index_->snapshot(w.snapshot).host == pc::CopyState::Resident &&
+                            index_->snapshot(w.snapshot).disk == pc::CopyState::Absent;
+        if (needed) {
+            index_->pin_snapshot(w.snapshot);
+            if (index_->begin_snapshot_disk_fill(w.snapshot)) {
+                w.image_started = true;
+            } else {
+                index_->unpin_snapshot(w.snapshot);
+                w.ok = false;
+            }
+        } else {
+            w.ok = false;
         }
     }
-    if (s.writes != 0) { return; }
-    if (s.ok) {
-        index_->complete_snapshot_disk_fill(s.snapshot);
-        journal_waits_.push_back(JournalWait{{}, s.snapshot});
-    } else {
-        index_->abort_snapshot_disk_fill(s.snapshot);
+    if (w.image_started) {
+        if (!w.image_issued) {
+            if (!disk_writable()) {
+                w.ok           = false;
+                w.image_issued = true;
+            } else {
+                const pc::SnapshotView view = index_->snapshot(w.snapshot);
+                if (!store_->writable(view.disk_slots)) { return; }
+                for (std::size_t i = 0; i < view.disk_slots.size(); ++i) {
+                    submit_disk(CuFileQueue::Op::Write, view.disk_slots[i], host_.slab_bytes, slab(view.host_slabs[i]), 0,
+                                DiskIo{DiskIo::Kind::Image, 0});
+                }
+                w.writes       = static_cast<std::uint32_t>(view.disk_slots.size());
+                w.image_issued = true;
+                ++counters_.disk_image_writes;
+                counters_.disk_write_bytes += view.disk_slots.size() * host_.slab_bytes;
+            }
+        }
+        if (w.writes != 0) { return; }
+        if (w.ok) {
+            index_->complete_snapshot_disk_fill(w.snapshot);
+            journal_waits_.push_back(JournalWait{{}, w.snapshot});
+        } else {
+            index_->abort_snapshot_disk_fill(w.snapshot);
+        }
+        index_->unpin_snapshot(w.snapshot);
+    } else if (w.ok && w.next < w.path.size()) {
+        return; // the window is full
     }
-    index_->unpin_snapshot(s.snapshot);
-    spill_.reset();
+    if (!w.ok) {
+        ++(w.image ? counters_.disk_spill_skips : counters_.disk_capture_skips);
+        if (index_->valid(w.snapshot)) { writer_refused_.push_back(w.snapshot); }
+        disk_trace("writer: job ended after %zu of %zu path blocks", w.next, w.path.size());
+    }
+    writer_.reset();
+    scanned_epoch_ = UINT64_MAX; // the next candidate starts at once
 }
 
 // ---- fetches -------------------------------------------------------------------------------------
@@ -445,9 +506,10 @@ bool PrefixCache::start_host_fetch(pc::SnapshotRef snapshot, std::span<const pc:
     f.host = true;
     // Every Host fill first, so a fetch that cannot hold all of them starts nothing: the request
     // then resumes from a shallower source instead of waiting for one that never lands.
-    bool reserved = true;
+    bool reserved      = true;
+    const double claim = index_->snapshot(snapshot).priority;
     for (const pc::NodeRef node : blocks) {
-        const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node);
+        const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node, claim);
         if (!slab_id) {
             reserved = false;
             break;
@@ -784,36 +846,33 @@ void PrefixCache::service_replaced() {
 void PrefixCache::poll_disk() {
     service_replaced();
     service_block_writes();
-    service_spill();
+    service_writer();
     service_fetch();
     service_journal();
-    // The next spill waits for the previous one's path: each queued block write pins its block's
-    // Device page or Host slab, and spills queued faster than the Disk absorbs them would pin the
-    // whole cache.
-    if (host_tier() && !spill_ && block_writes_.empty() && disk_writable() && Clock::now() >= next_spill_scan_) {
-        next_spill_scan_ = Clock::now() + kSpillScan;
-        for (const pc::SnapshotRef snapshot : index_->disk_spill_candidates(host_.slabs / 4U)) {
-            if (start_spill(snapshot)) {
-                service_spill();
-                break;
-            }
-        }
-    }
 }
 
 bool PrefixCache::disk_writes_pending() const noexcept {
-    return spill_.has_value() || !block_writes_.empty() ||
+    return writer_.has_value() || !path_jobs_.empty() || !block_writes_.empty() ||
            std::any_of(captures_.begin(), captures_.end(),
                        [](const PendingCapture& c) {
                            return c.deferred != nullptr || (c.image.disk && (!c.writes_issued || c.writes != 0));
                        });
 }
 
+bool PrefixCache::background_pending() const noexcept {
+    if (!store_ || disk_broken_) { return false; }
+    return disk_writes_pending() || fetch_.has_value() || !journal_waits_.empty() || !replaced_.empty() ||
+           (host_tier() && index_->snapshot_epoch() != scanned_epoch_);
+}
+
 void PrefixCache::drain_disk() {
+    const bool scans = writer_scans_;
+    writer_scans_    = false;
     while (disk_writes_pending()) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
         poll();
     }
+    writer_scans_ = scans;
 }
 
 // ---- startup and shutdown ------------------------------------------------------------------------
@@ -907,18 +966,24 @@ DiskSpillResult PrefixCache::spill_for_shutdown(const CancellationView& abandone
     const auto start                   = Clock::now();
     const PrefixCacheCounters before   = counters_;
     drain();
+    drain_disk();
     if (host_tier()) {
-        std::vector<pc::SnapshotRef> order = index_->disk_spill_candidates(UINT64_MAX);
-        std::reverse(order.begin(), order.end()); // the most valuable first
-        for (const pc::SnapshotRef snapshot : order) {
-            if (abandoned.requested()) {
-                out.message = "abandoned";
-                break;
+        // Every retained snapshot the writer has not reached yet, the most valuable first; one it
+        // cannot finish is passed over.
+        std::vector<pc::SnapshotRef> passed;
+        while (!abandoned.requested() && disk_writable()) {
+            const std::vector<pc::SnapshotRef> order = index_->disk_write_candidates(passed.size() + 1);
+            const auto next = std::find_if(order.begin(), order.end(), [&](pc::SnapshotRef s) {
+                return std::find(passed.begin(), passed.end(), s) == passed.end();
+            });
+            if (next == order.end()) { break; }
+            const pc::SnapshotRef snapshot = *next;
+            if (start_writer(snapshot, true)) { drain_disk(); }
+            if (index_->valid(snapshot) && index_->snapshot(snapshot).disk != pc::CopyState::Resident) {
+                passed.push_back(snapshot);
             }
-            if (!disk_writable()) { break; }
-            if (!start_spill(snapshot)) { continue; }
-            drain_disk();
         }
+        if (abandoned.requested()) { out.message = "abandoned"; }
     }
     drain_disk();
     service_journal();
