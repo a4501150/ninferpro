@@ -9,7 +9,7 @@
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
-#include "runtime/engine/diagnostics.h"
+#include "runtime/diagnostics.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
 
@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -136,6 +137,23 @@ public:
         }
         stop();
         if (worker_.joinable()) { worker_.join(); }
+    }
+
+    // A Program with cache-tier work that advances outside requests (Qwen4Exp's prefix-cache Disk
+    // tier, hybrid-prefix-cache-spec §17.1 rule 6): polled at the start of every worker step and,
+    // while it reports work, every kBackgroundTick from the idle wait.
+    static constexpr bool kProgramPollsBackground = requires(typename Instance::ModelContract::Program& program) {
+        program.background_poll();
+        { program.background_pending() } -> std::convertible_to<bool>;
+    };
+    static constexpr auto kBackgroundTick = std::chrono::milliseconds(2);
+
+    // Under the execution lock, on the worker.
+    void poll_background_locked() {
+        if constexpr (kProgramPollsBackground) {
+            instance_.program->background_poll();
+            background_pending_ = instance_.program->background_pending();
+        }
     }
 
     // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7)
@@ -1590,6 +1608,9 @@ private:
         ++cumulative_stats_.preemptions;
         request->recovery_route = GenerationRecoveryRoute::None;
         observe_scheduling(request, GenerationSchedulingTransition::PauseStarted, pause_started);
+        publish_trace(diagnostics_, DebugCategory::Scheduler, "req#%llu paused on lane %u for capacity (pause %llu)",
+                      static_cast<unsigned long long>(request->id), lane,
+                      static_cast<unsigned long long>(request->preemption_count));
         context_owner_ = request;
         scheduler_.preempted();
         return true;
@@ -1601,6 +1622,18 @@ private:
         request->admission.source_wait_seconds +=
             static_cast<double>(elapsed_ns(*request->source_wait_started, now)) * 1.0e-9;
         request->source_wait_started.reset();
+    }
+
+    // --debug scheduler: an admission deferral, once per reason until the request binds.
+    void trace_deferral(const std::shared_ptr<Request>& request, bool restoring, std::uint8_t reason, const char* why,
+                        const SourceCandidate& source, const ContextResourceUsage* shortage = nullptr) {
+        if (!diagnostics_.tracing(DebugCategory::Scheduler) || request->traced_deferral == reason) { return; }
+        request->traced_deferral = reason;
+        publish_trace(diagnostics_, DebugCategory::Scheduler,
+                      "req#%llu %s waits: %s (source reuses %u tokens; short main_kv=%u state=%u backend_kv=%u)",
+                      static_cast<unsigned long long>(request->id), restoring ? "restore" : "admission", why,
+                      static_cast<unsigned>(source.reused_tokens), shortage ? shortage->main_kv_pages : 0U,
+                      shortage ? shortage->state_slots : 0U, shortage ? shortage->backend_kv_pages : 0U);
     }
 
     // A fresh request waiting with a useful source accrues source-wait time until it binds.
@@ -1698,10 +1731,14 @@ private:
             auto& decision = *admission_decision_;
             ContextResourceUsage shortage;
             bool deferred = false;
+            // No source at all: the Program defers the request (a Disk fetch, a sibling's tap) and
+            // asks to be asked again; a restore then retries at the next step, not the next event.
+            const bool asked_again = decision.sources.empty();
             while (decision.current < decision.sources.size()) {
                 const SourceCandidate& source = decision.sources[decision.current];
                 if (!lane) {
                     note_source_wait(request, source, restoring);
+                    trace_deferral(request, restoring, 1, "no free lane", source);
                     deferred = true;
                     break;
                 }
@@ -1737,6 +1774,8 @@ private:
                     // initial allocation is not a reason to discard this source.
                     if (reservation.capacity_possible &&
                         (!resident_empty() || (!restoring && !paused_.empty()))) {
+                        trace_deferral(request, restoring, 2, "short of capacity until a resident request frees it",
+                                       source, &shortage);
                         deferred = true;
                         break;
                     }
@@ -1768,6 +1807,12 @@ private:
                 request->model_state = EngineRequestState::Materializing;
                 materializing_.emplace(MaterializingRequest{request, LaneId{*lane}, begin, restoring});
                 admission_decision_.reset();
+                request->traced_deferral = 0;
+                publish_trace(diagnostics_, DebugCategory::Scheduler,
+                              "req#%llu %s on lane %u: %u of %u prompt tokens reused%s",
+                              static_cast<unsigned long long>(request->id), restoring ? "restores" : "admitted",
+                              *lane, begin.reused_prompt_tokens, begin.prompt_tokens,
+                              begin.prefix_from_disk ? " (from disk)" : "");
                 if (!restoring) {
                     finish_source_wait(request, binding_started);
                     request->admitted_at = binding_started;
@@ -1812,7 +1857,7 @@ private:
                 return true;
             }
             if (restoring) {
-                scheduler_.restoration_blocked();
+                if (!asked_again) { scheduler_.restoration_blocked(); }
                 return false;
             }
         }
@@ -2279,6 +2324,33 @@ private:
         }
     }
 
+    // One worker step holds every request, so a step whose work outside its prefill call takes
+    // kLongStep, or that takes kLongPrefillStep in all, stalls all of them: it is reported at any
+    // log level, at most once per kLongStepQuiet. A prefill call alone runs one chunk, which takes
+    // over a second at production chunk sizes by design.
+    static constexpr auto kLongStep        = std::chrono::seconds(1);
+    static constexpr auto kLongPrefillStep = std::chrono::seconds(10);
+    static constexpr auto kLongStepQuiet   = std::chrono::seconds(10);
+    void warn_long_step(Clock::time_point started, Clock::time_point admitted, Clock::time_point rounds) noexcept {
+        const Clock::time_point ended = Clock::now();
+        if (ended - started < kLongStep) [[likely]] { return; }
+        if (rounds < admitted) { rounds = admitted; } // a step that threw before its rounds
+        if (rounds - started < kLongStep && ended - started < kLongPrefillStep) { return; }
+        ++long_steps_unreported_;
+        if (ended < next_long_step_report_) { return; }
+        next_long_step_report_ = ended + kLongStepQuiet;
+        const auto seconds     = [](Clock::time_point a, Clock::time_point b) {
+            return std::chrono::duration<double>(b - a).count();
+        };
+        publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                           "an engine step took %.2f s, holding every request (admission and cache work %.2f s, "
+                           "rounds %.2f s, prefill %.2f s); %llu such steps since the last report",
+                           seconds(started, ended), seconds(started, std::max(admitted, started)),
+                           seconds(std::max(admitted, started), rounds), seconds(rounds, ended),
+                           static_cast<unsigned long long>(long_steps_unreported_));
+        long_steps_unreported_ = 0;
+    }
+
     void worker_loop() noexcept {
         for (;;) {
             {
@@ -2286,7 +2358,20 @@ private:
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
                     !instance_.program->has_context_transaction()) {
                     const auto woken = [&] { return stopping_ || !pending_.empty() || maintenance_requested_; };
-                    if (prefix_save_interval_.count() == 0) {
+                    if (background_pending_) {
+                        if (!queue_cv_.wait_for(lock, kBackgroundTick, woken)) {
+                            lock.unlock();
+                            std::scoped_lock execution_lock(execution_mutex_);
+                            try {
+                                save_prefix_cache_if_due();
+                                poll_background_locked();
+                            } catch (...) {
+                                fail_all_locked(std::current_exception());
+                                return;
+                            }
+                            continue;
+                        }
+                    } else if (prefix_save_interval_.count() == 0) {
                         queue_cv_.wait(lock, woken);
                     } else if (!queue_cv_.wait_until(lock, next_prefix_save_, woken)) {
                         // The periodic save falls due while the Engine is idle.
@@ -2330,8 +2415,12 @@ private:
             }
             std::unique_lock execution_lock(execution_mutex_);
             bool executed = false;
+            // The step's phase boundaries, for the long-step warning.
+            const Clock::time_point step_started = Clock::now();
+            Clock::time_point admitted = step_started, rounds = step_started;
             try {
                 save_prefix_cache_if_due();
+                poll_background_locked();
                 set_host_work_class(HostWorkClass::Control);
                 auto boundary = begin_host_phase();
                 (void)expire_pending_requests();
@@ -2380,6 +2469,7 @@ private:
                     executed |= progress_context_transaction(boundary);
                     if (!instance_.program->has_context_transaction()) { reserve_resident_units(); }
                 }
+                admitted = Clock::now();
                 const auto cancelled = snapshot_cancellations();
                 auto controls = scheduler_.build_control_membership(slots_, max_concurrency_);
                 ControlMembership selected_control;
@@ -2448,6 +2538,7 @@ private:
                     }
                     finish_engine_phase(progress_boundary, EngineHostPhase::Boundary);
                 }
+                rounds = Clock::now();
                 auto prefill_slots = slots_;
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                     if (!runnable_units_[lane] ||
@@ -2498,7 +2589,9 @@ private:
                 fail_all_locked(error);
                 return;
             }
+            if constexpr (kProgramPollsBackground) { background_pending_ = instance_.program->background_pending(); }
             execution_lock.unlock();
+            warn_long_step(step_started, admitted, rounds);
             if (!executed) {
                 std::unique_lock lock(queue_mutex_);
                 queue_cv_.wait_for(lock, std::chrono::milliseconds(1));
@@ -2525,6 +2618,8 @@ private:
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
+    Clock::time_point next_long_step_report_{};
+    std::uint64_t long_steps_unreported_ = 0;
     std::deque<std::shared_ptr<Request>> pending_;
     std::size_t outstanding_              = 0;
     std::uint64_t next_request_id_        = 1;
@@ -2546,6 +2641,7 @@ private:
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool maintenance_requested_ = false; // guarded by queue_mutex_
+    bool background_pending_    = false; // the worker's own: set by poll_background_locked
     bool failed_   = false;
     std::thread worker_;
 };

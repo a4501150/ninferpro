@@ -34,6 +34,9 @@ int main() {
     running.prefix_selections           = 2;
     running.hybrid_disk_capacity_bytes  = 64;
     running.hybrid_disk_write_bytes     = 7;
+    running.hybrid_host_used_bytes      = 9;
+    running.hybrid_prompt_end_gated     = 4;
+    running.hybrid_prompt_end_failed    = 1;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
     check(live.find("infernix_generation_tokens_total 5\n") != std::string::npos,
@@ -55,6 +58,10 @@ int main() {
     check(live.find("infernix_prefix_cache_disk_capacity_bytes 64\n") != std::string::npos &&
               live.find("infernix_prefix_cache_disk_write_bytes_total 7\n") != std::string::npos,
           "the prefix cache's Disk tier size and writes must be observable");
+    check(live.find("infernix_prefix_cache_host_used_bytes 9\n") != std::string::npos &&
+              live.find("infernix_prefix_cache_prompt_end_gated_total 4\n") != std::string::npos &&
+              live.find("infernix_prefix_cache_prompt_end_failed_total 1\n") != std::string::npos,
+          "the Host tier's use and the prompt-end gate and failures must be observable apart");
 
     GenerationOutcome outcome;
     outcome.finish_reason                            = FinishReason::OutputLimit;

@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
             logger->info("{}", infernix::product::describe_config(*options.config_path, options.config_arguments));
         }
         infernix::serve::GenerationService service(
-            options, startup_log.observer(), infernix::product::engine_diagnostic_observer(logger));
+            options, startup_log.observer(), infernix::product::engine_diagnostic_observer(logger, options.debug_categories));
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);
 

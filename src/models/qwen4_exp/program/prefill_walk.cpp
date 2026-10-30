@@ -31,7 +31,7 @@
 
 namespace infernix::models::qwen4_exp::detail {
 
-namespace pc = runtime::prefix_cache;
+namespace pc = infernix::models::qwen4_exp::prefix::cache_index;
 
 namespace {
 

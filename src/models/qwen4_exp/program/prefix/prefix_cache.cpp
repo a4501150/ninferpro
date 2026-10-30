@@ -12,7 +12,7 @@
 
 namespace infernix::models::qwen4_exp::prefix {
 
-namespace pc = runtime::prefix_cache;
+namespace pc = infernix::models::qwen4_exp::prefix::cache_index;
 
 namespace {
 
@@ -327,7 +327,7 @@ bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cuda
         }
     }
     if (slot == prompt_end_slots_.size()) {
-        ++counters_.prompt_end_skipped;
+        ++counters_.prompt_end_failed;
         return false;
     }
     std::byte* const staging = prompt_end_slots_[slot];
@@ -339,7 +339,7 @@ bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cuda
     if (!defer) {
         image = reserve_image(tail, capture.claim);
         if (!image) {
-            ++counters_.prompt_end_skipped;
+            ++counters_.prompt_end_failed;
             return false;
         }
     }
@@ -393,7 +393,7 @@ bool PrefixCache::start_deferred(PendingCapture& c, bool& dropped) {
     std::optional<ImageTarget> image = reserve_image(!c.capture.tail.empty(), c.capture.claim);
     if (!image) {
         dropped = true;
-        ++counters_.prompt_end_skipped;
+        ++counters_.prompt_end_failed;
         return false;
     }
     c.image = std::move(*image);
@@ -592,7 +592,13 @@ void PrefixCache::order_page_reuse(std::span<const DeviceKVPageLease> pages) con
 }
 
 void PrefixCache::write_blocks(std::span<const pc::NodeRef> nodes, cudaStream_t producer) {
-    if (!host_tier()) { return; }
+    if (!host_tier() || nodes.empty() || !index_->valid(nodes.back())) { return; }
+    // What the blocks are worth (§17.1 rule 2): the most valuable retained snapshot over them, or
+    // the lane's capture still landing at their end.
+    double claim = index_->path_claim(nodes.back());
+    for (const PendingCapture& c : captures_) {
+        if (std::find(nodes.begin(), nodes.end(), c.capture.anchor) != nodes.end()) { claim = std::max(claim, c.capture.claim); }
+    }
     std::vector<pc::NodeRef> written;
     std::vector<DeviceKVPageHandle> pages;
     std::vector<std::byte*> records;
@@ -602,7 +608,7 @@ void PrefixCache::write_blocks(std::span<const pc::NodeRef> nodes, cudaStream_t 
         const pc::NodeView view = index_->node(node);
         if (view.device != pc::CopyState::Resident || view.host != pc::CopyState::Absent) { continue; }
         index_->pin_node(node);
-        const auto slab_id = index_->begin_host_fill(node);
+        const auto slab_id = index_->begin_host_fill(node, claim);
         if (!slab_id) {
             index_->unpin_node(node);
             break; // the Host tier cannot free a slab for anything worth less
@@ -696,10 +702,7 @@ void PrefixCache::publish_capture(PendingCapture& c) {
         if (c.image.disk) {
             // Written through: its path follows it to the Disk, and its record follows theirs.
             journal_waits_.push_back(JournalWait{{}, result.snapshot});
-            if (c.capture.anchor.valid() &&
-                !queue_path_writes(c.capture.anchor, index_->snapshot(result.snapshot).priority)) {
-                ++counters_.disk_capture_skips;
-            }
+            if (c.capture.anchor.valid()) { path_jobs_.push_back(result.snapshot); }
         }
     }
     if (c.capture.supersedes && index_->valid(*c.capture.supersedes) &&
@@ -778,7 +781,6 @@ void PrefixCache::drain() {
     CUDA_CHECK(cudaStreamSynchronize(transfer_));
     CUDA_CHECK(cudaStreamSynchronize(restore_stream_));
     poll();
-    if (store_) { drain_disk(); }
 }
 
 bool PrefixCache::await_extended_endpoint(std::span<const pc::NodeRef> path, std::span<const TokenId> tokens) {
@@ -990,6 +992,8 @@ void PrefixCache::abort_restore() noexcept {
 void PrefixCache::clear() noexcept {
     try {
         drain();
+        // The Disk writes in flight still read the slabs, pages and staging records dropped below.
+        if (store_) { drain_disk(); }
         // A fetch in flight still reads into its pages and region.
         while (fetch_running()) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -1010,7 +1014,10 @@ void PrefixCache::clear() noexcept {
     published_.clear();
     for (auto& [id, w] : block_writes_) { recycle(w.copied); }
     block_writes_.clear();
-    spill_.reset();
+    writer_.reset(); // drain_disk finished its job: nothing it holds is pinned
+    path_jobs_.clear();
+    writer_refused_.clear();
+    scanned_epoch_ = UINT64_MAX;
     journal_waits_.clear();
     unreadable_.clear();
     journaled_snapshots_.clear();

@@ -1,0 +1,795 @@
+#pragma once
+
+#include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/cost.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <span>
+#include <unordered_map>
+#include <vector>
+
+namespace infernix::models::qwen4_exp::prefix::cache_index {
+
+// Qwen4Exp's own copy of the runtime prefix index: the tree, matching, choice, supersession and GDSF
+// valuation as runtime/prefix_cache, the residency per hybrid-prefix-cache-spec §17.1. The shared
+// primitives (block hashes, tap planning, the cost model) stay the runtime's; this namespace's own
+// declarations take precedence over them.
+using namespace runtime::prefix_cache;
+
+// Hybrid prefix cache index (docs/maintainer/hybrid-prefix-cache-spec.md §5, §6, §9).
+//
+// The index is host-only bookkeeping. It owns exact identity (the block tree and snapshot tails),
+// residency state, pins, host slab ids, device snapshot slot ids and every eviction decision.
+// Device page bundles are opaque ids supplied by the caller and returned through
+// PrefixIndexBackend when the index stops referencing them. The index performs no transfers; the
+// caller moves bytes and reports completion.
+//
+// Pins are path-wide: pinning a node pins it and every ancestor, so an unpinned node always has an
+// unpinned subtree. Every active sequence pins its whole mapped path, every in-flight transfer
+// pins the path of the node it touches.
+
+inline constexpr std::uint32_t kNoId = std::numeric_limits<std::uint32_t>::max();
+// Queued requests whose resume snapshots set_queue_holds holds at most (§9.6).
+inline constexpr std::uint32_t kMaxQueueHolds = 32;
+
+struct NodeRef {
+    std::uint32_t index      = kNoId;
+    std::uint32_t generation = 0;
+
+    [[nodiscard]] bool valid() const noexcept { return index != kNoId; }
+
+    [[nodiscard]] friend bool operator==(NodeRef, NodeRef) noexcept = default;
+};
+
+struct SnapshotRef {
+    std::uint32_t index      = kNoId;
+    std::uint32_t generation = 0;
+
+    [[nodiscard]] bool valid() const noexcept { return index != kNoId; }
+
+    [[nodiscard]] friend bool operator==(SnapshotRef, SnapshotRef) noexcept = default;
+};
+
+enum class CopyState : std::uint8_t {
+    Absent,
+    Filling,
+    Resident,
+};
+
+enum class SnapshotKind : std::uint8_t {
+    Tap,
+    Endpoint,
+    OutputBoundary,
+    // A tap at a boundary that later prompts may share across conversations: a client-named
+    // breakpoint, the end of the tools or leading System/Developer block, or the divergence of
+    // concurrent requests. A lineage continuing past it supersedes it only while no other
+    // conversation has continued from it.
+    Boundary,
+};
+
+struct PrefixIndexConfig {
+    // Upper bound of simultaneously indexed nodes. Every indexed node holds a device page bundle
+    // or a host slab, so device pages + host slabs is sufficient.
+    std::uint32_t max_nodes     = 0;
+    std::uint32_t max_snapshots = 0;
+    std::uint32_t host_slabs    = 0;
+    // Slabs per snapshot image; a snapshot with a tail needs one more slab for the tail bundle.
+    std::uint32_t image_slabs           = 0;
+    std::uint32_t device_snapshot_slots = 0;
+    std::uint64_t block_bytes           = 0; // one block bundle (all enabled pools)
+    std::uint64_t image_bytes           = 0; // one state image
+    // Whether the host tier backs KV block bundles and snapshot tails. Without it the host tier
+    // holds state images only: tails and blocks are unbacked and their loss removes dependants.
+    bool host_blocks = true;
+    // Disk tier slots (0: no disk tier), each the size of one host slab: a block takes one, a
+    // snapshot image_slabs plus one for a tail. A Disk copy backs a block, image and tail like a
+    // Host copy does.
+    std::uint32_t disk_slots = 0;
+    CacheCostModel cost;
+};
+
+// Physical resources the index references but does not own.
+class PrefixIndexBackend {
+public:
+    virtual ~PrefixIndexBackend() = default;
+    // The index dropped its last reference to this device page bundle (block or snapshot tail).
+    virtual void release_device_block(std::uint32_t device_id) noexcept = 0;
+
+    // The snapshot is being removed: every copy of its image is released. Called before the
+    // snapshot reference becomes stale.
+    virtual void release_snapshot(SnapshotRef /*snapshot*/) noexcept {}
+
+    // The snapshot keeps its host image but loses its device image copy.
+    virtual void drop_snapshot_device_image(SnapshotRef /*snapshot*/) noexcept {}
+
+    // The index stopped referencing a Disk record: a block's slot, or a snapshot's slots (image,
+    // then tail); the first slot names the record. Called before the slots can be reused.
+    virtual void release_disk_record(std::span<const std::uint32_t> /*slots*/) noexcept {}
+
+    // A sequence's page replaced the block's bytes, so its Disk record was released while the
+    // block stays in the tree: the Disk records below it (blocks and snapshots) lost their parent
+    // record. Called after release_disk_record.
+    virtual void disk_record_replaced(NodeRef /*node*/) noexcept {}
+};
+
+struct MatchCandidate {
+    SnapshotRef snapshot;
+    std::uint32_t frontier         = 0;
+    std::uint32_t path_blocks      = 0; // full blocks up to and including the anchor
+    std::uint32_t host_only_blocks = 0; // path blocks without a device copy (restored from Host or Disk)
+    std::uint32_t disk_only_blocks = 0; // of host_only_blocks, those with only a Disk copy
+    std::uint32_t filling_blocks   = 0; // path blocks another admission is already restoring
+    bool tail                      = false;
+    bool tail_on_device            = false;
+    bool image_on_device           = false;
+    // The image (and the tail, when not on the Device) is read from the Disk: no Host copy.
+    bool image_on_disk_only        = false;
+    bool tail_on_disk_only         = false;
+    // The snapshot carries its frontier's pre-LM-head residual: at frontier == prompt_tokens it
+    // resumes the exact repeat with no prefill at all (the zero-token resume).
+    bool head_residual             = false;
+    std::uint64_t restore_bytes    = 0; // copied Host to Device
+    std::uint64_t disk_bytes       = 0; // read from the Disk
+};
+
+struct MatchResult {
+    std::vector<NodeRef> path;              // matched full blocks in prompt order
+    std::vector<MatchCandidate> candidates; // valid snapshots, deepest first
+};
+
+struct AdmissionChoice {
+    std::optional<std::size_t> candidate; // absent: root
+    double predicted_seconds = 0.0;
+};
+
+struct InsertResult {
+    NodeRef node;
+    bool inserted = false;
+    // The supplied device id now belongs to the index: a new node, an existing host-only node
+    // whose Device copy is re-established from the inserting sequence's page, or an existing node
+    // whose unpinned Device copy the sequence's page replaces.
+    bool device_attached = false;
+    // The replaced Device copy (kNoId otherwise). No sequence maps it and no transfer reads it;
+    // the caller releases it.
+    std::uint32_t replaced_device_id = kNoId;
+};
+
+struct PublishResult {
+    SnapshotRef snapshot;
+    bool created = false;
+};
+
+// Free-list slabs a caller holds for a snapshot image it is copying to the Host before the
+// snapshot exists: owned by no node or snapshot until publish_host_snapshot or release_host_image.
+// The slabs are the image's, then one tail slab when `tail`.
+struct HostImageReservation {
+    std::vector<std::uint32_t> slabs;
+    bool tail = false;
+};
+
+// The Disk counterpart: slots held for a snapshot image written straight to the Disk (no Host
+// tier) until publish_disk_snapshot or release_disk_image.
+struct DiskImageReservation {
+    std::vector<std::uint32_t> slots;
+    bool tail = false;
+};
+
+struct NodeView {
+    std::uint32_t depth = 0;
+    NodeRef parent;
+    std::uint32_t device_id            = kNoId;
+    CopyState device                   = CopyState::Absent;
+    std::uint32_t host_slab            = kNoId;
+    CopyState host                     = CopyState::Absent;
+    std::uint32_t disk_slot            = kNoId;
+    CopyState disk                     = CopyState::Absent;
+    std::uint32_t pins                 = 0;
+    std::uint32_t live_snapshots_below = 0;
+};
+
+struct SnapshotView {
+    NodeRef anchor;
+    std::uint32_t frontier     = 0;
+    std::uint32_t tail_len     = 0;
+    std::uint32_t tail_device  = kNoId;
+    CopyState tail_device_copy = CopyState::Absent;
+    std::uint32_t device_slot  = kNoId;
+    CopyState host             = CopyState::Absent;
+    std::span<const std::uint32_t> host_slabs; // image slabs, then the tail slab when tail_len>0
+    CopyState disk             = CopyState::Absent;
+    std::span<const std::uint32_t> disk_slots; // image slots, then the tail slot when tail_len>0
+    std::uint32_t pins = 0;
+    SnapshotKind kind  = SnapshotKind::Tap;
+    std::uint32_t hits = 0;
+    bool superseded    = false;
+    // The image's HeadSaved part holds the head residual of this frontier's last token — the
+    // zero-token resume's state; only a prompt-end capture sets it.
+    bool head_residual = false;
+    double priority    = 0.0; // GDSF value (estimate_priority's scale)
+    std::span<const TokenId> tail;
+};
+
+// Exact identity of one block, for saving the Host tier.
+struct BlockIdentity {
+    NodeRef parent;
+    std::uint64_t lookup_hash = 0;
+    std::uint64_t extra       = 0;
+    std::span<const TokenId> tokens;
+};
+
+struct RestoredBlock {
+    NodeRef node;
+    std::uint32_t slab = kNoId;
+};
+
+struct PrefixIndexStats {
+    std::uint32_t nodes                   = 0;
+    std::uint32_t snapshots               = 0;
+    std::uint32_t device_resident_blocks  = 0;
+    std::uint32_t device_evictable_blocks = 0;
+    std::uint32_t host_free_slabs         = 0;
+    std::uint32_t free_device_slots       = 0;
+    std::uint64_t device_block_evictions  = 0;
+    std::uint64_t unbacked_node_losses    = 0;
+    std::uint64_t host_dead_reclaims      = 0;
+    std::uint64_t host_snapshot_evictions = 0;
+    std::uint64_t superseded_evictions    = 0; // of host_snapshot_evictions
+    // Host copies dropped because the Disk holds them (rule 1 step 2): blocks and snapshot images.
+    std::uint64_t host_backed_evictions   = 0;
+    std::uint32_t host_backed_slabs       = 0; // slabs such copies hold now
+    std::uint64_t device_slot_evictions   = 0;
+    std::uint64_t device_slot_refusals    = 0; // acquire_device_slot found no slot
+    std::uint32_t disk_free_slots         = 0;
+    std::uint64_t disk_dead_reclaims      = 0;
+    std::uint64_t disk_snapshot_evictions = 0;
+    std::uint64_t snapshot_hits           = 0;
+    double gdsf_inflation                 = 0.0;
+    // Queue holds (§9.6): held snapshots now, held entries whose Device copy was evicted, held
+    // snapshots lost, and Host allocations refused because only held snapshots were left.
+    std::uint32_t held_snapshots          = 0;
+    std::uint64_t held_device_evictions   = 0;
+    std::uint64_t held_snapshot_losses    = 0;
+    std::uint64_t held_host_refusals      = 0;
+};
+
+class PrefixCacheIndex {
+public:
+    PrefixCacheIndex(const PrefixIndexConfig& config, PrefixIndexBackend& backend);
+
+    PrefixCacheIndex(const PrefixCacheIndex&)            = delete;
+    PrefixCacheIndex& operator=(const PrefixCacheIndex&) = delete;
+
+    [[nodiscard]] const PrefixIndexConfig& config() const noexcept { return config_; }
+
+    // Replaces the machine model used by choose() and snapshot valuation. Existing priorities
+    // are refreshed.
+    void set_cost(const CacheCostModel& cost);
+
+    // ---- lookup and choice (§6.1, §6.2) -------------------------------------------------------
+    // `block_hashes[b]` is block_lookup_hashes(tokens)[b]; `block_extras` is empty or one extra key
+    // per full block. Snapshots with frontier <= prompt_tokens - 1 are returned, and a snapshot
+    // with its head residual at frontier == prompt_tokens (the zero-token resume of an exact
+    // repeat); a snapshot at the prompt's own length without one stays unexposed.
+    [[nodiscard]] MatchResult match(std::span<const TokenId> tokens,
+                                    std::span<const std::uint64_t> block_hashes,
+                                    std::span<const std::uint64_t> block_extras,
+                                    std::uint32_t prompt_tokens) const;
+    [[nodiscard]] AdmissionChoice choose(const MatchResult& match,
+                                         std::uint32_t prompt_tokens) const;
+    // Records a hit on the snapshot selected for an admission. A hit on a superseded snapshot
+    // shows it still serves requests: it is retained again until its new lineage moves on.
+    void note_hit(SnapshotRef snapshot);
+    // A lineage that resumed from `snapshot`, or captured it as a tap, has published a deeper
+    // snapshot on the same path, so its next request resumes from that one: `snapshot` now serves
+    // only requests that diverge before it. Superseded snapshots are evicted before every retained
+    // one, oldest supersession first, and retained snapshots are valued against their nearest
+    // retained ancestor. A Boundary snapshot is superseded only while no other conversation has
+    // continued from it (the tree below it is a single chain).
+    // `continuation` is the lineage's tokens from `snapshot`'s frontier on, when it resumed from
+    // `snapshot`. Unless `snapshot` is a Boundary (whose endpoints below may be other
+    // conversations'), an Endpoint whose nearest snapshot above it is `snapshot`, never resumed
+    // from, that the continuation leaves before reaching it, is then superseded first: it serves
+    // only an exact replay of its reply, and the conversation that went past `snapshot` did not
+    // send one (a client re-rendering the reply, a retry, or a branch). Left retained, such
+    // endpoints held Device-only slots for good while the lineage's own resume point gave up its
+    // slot.
+    // Returns whether `snapshot` itself became superseded (not already superseded, not a shared
+    // Boundary).
+    bool supersede(SnapshotRef snapshot, std::span<const TokenId> continuation = {});
+    // Undoes a supersede() that returned true when the deeper snapshot was not published after
+    // all (no Device slot, or the publication failed): `snapshot` is its lineage's resume point
+    // again. Endpoints that supersede() superseded as passed stay superseded.
+    void unsupersede(SnapshotRef snapshot);
+
+    // ---- queue holds (§9.6) --------------------------------------------------------------------
+    // The snapshots queued requests will resume from, in admission order (rank 0 is admitted
+    // next). Replaces the previous holds; invalid references are skipped, a repeated snapshot
+    // keeps its first rank, and at most kMaxQueueHolds are held. A held snapshot is never a
+    // Host-allocation or snapshot-table victim, so new snapshots and block writes that would need
+    // its slabs are refused instead. Its anchor path's Device copies are evicted after every
+    // unheld entry of the same kind (host-backed copies before unbacked ones), the highest rank
+    // first, so the request furthest back in the queue gives way first. Pins still take
+    // precedence: a hold never blocks an active sequence's growth.
+    void set_queue_holds(std::span<const SnapshotRef> holds);
+    // Changes whenever a snapshot is published or removed, so the queue's holds are recomputed
+    // only when a queued request's choice of snapshot may have changed.
+    [[nodiscard]] std::uint64_t snapshot_epoch() const noexcept { return snapshot_epoch_; }
+
+    // ---- pins -----------------------------------------------------------------------------
+    // `path` is a root path (path[i] is the parent of path[i+1], path[0] a root child).
+    void acquire_path(std::span<const NodeRef> path);
+    // Releases pins taken by acquire_path/insert_block; nodes that become unpinned join the device
+    // LRU deepest first, so deeper blocks are evicted before shallower ones.
+    void release_path(std::span<const NodeRef> path);
+    // Pins one node and its ancestors (in-flight transfer of that node).
+    void pin_node(NodeRef node);
+    void unpin_node(NodeRef node);
+    void pin_snapshot(SnapshotRef snapshot);
+    void unpin_snapshot(SnapshotRef snapshot);
+
+    // ---- tree mutation (§7.6) ------------------------------------------------------------------
+    [[nodiscard]] std::optional<NodeRef> find_child(NodeRef parent, std::uint64_t lookup_hash,
+                                                    std::span<const TokenId> block_tokens,
+                                                    std::uint64_t extra) const;
+    // Inserts a committed full block owning `device_id`, device Resident, pinned once for the
+    // inserting sequence. When an identical child already exists `inserted` is false and the child
+    // is pinned; with `attach` a host-only existing child adopts `device_id` as its Device copy, and
+    // an unpinned Device-resident one adopts it in place of its copy, returned in
+    // `replaced_device_id` (device_attached in both cases). Otherwise the caller keeps its page
+    // private: a pinned copy is mapped by another sequence or read by a transfer.
+    [[nodiscard]] InsertResult insert_block(NodeRef parent, std::uint64_t lookup_hash,
+                                            std::span<const TokenId> block_tokens,
+                                            std::uint64_t extra, std::uint32_t device_id,
+                                            bool attach);
+
+    // ---- device residency of blocks (§6.4, §9.1)
+    // ------------------------------------------------- A pinned node without a Device copy
+    // receives a device page being filled from its host slab, or from its Disk slot.
+    void begin_device_fill(NodeRef node, std::uint32_t device_id);
+    void complete_device_fill(NodeRef node);
+    // Returns the device id to the backend.
+    void abort_device_fill(NodeRef node);
+    // Releases up to `blocks` unpinned device copies, host-backed ones first. Returns the number
+    // released. An unbacked release loses the node and its subtree (§9.4).
+    std::uint32_t evict_device_blocks(std::uint32_t blocks);
+    // The same, releasing only host-backed copies: nothing loses its last copy.
+    std::uint32_t evict_backed_device_blocks(std::uint32_t blocks);
+    [[nodiscard]] std::uint32_t device_evictable_blocks() const noexcept;
+    [[nodiscard]] std::uint32_t device_backed_evictable_blocks() const noexcept;
+
+    // ---- host residency (§17.1) ------------------------------------------------------------------
+    // The Host tier frees slabs in the order of §17.1 rule 1: dead block copies, Disk-backed copies
+    // (blocks and snapshot images, least recently used first, held ones last, with no value gate),
+    // superseded snapshots, then retained snapshots in GDSF order but none valued above the claim.
+    // Allocates a slab for a pinned node with a Device copy (write-back destination) or a Disk copy
+    // (a read back from the Disk tier) and no Host copy, claiming `claim` (rule 2). Absent when no
+    // slab can be freed.
+    [[nodiscard]] std::optional<std::uint32_t> begin_host_fill(NodeRef node, double claim);
+    void complete_host_fill(NodeRef node);
+    void abort_host_fill(NodeRef node);
+    // Allocates image slabs (+1 tail slab) for a pinned snapshot. Absent when they cannot be freed:
+    // a retained snapshot valued above `claim` (default: this snapshot's priority) keeps its slabs.
+    [[nodiscard]] bool begin_snapshot_host_fill(SnapshotRef snapshot, std::optional<double> claim = std::nullopt);
+    void complete_snapshot_host_fill(SnapshotRef snapshot);
+    void abort_snapshot_host_fill(SnapshotRef snapshot);
+    // A pinned host- or disk-backed snapshot whose tail lost its Device copy receives `device_id`
+    // being filled from its tail slab or slot.
+    void begin_tail_device_fill(SnapshotRef snapshot, std::uint32_t device_id);
+
+    // ---- disk residency -------------------------------------------------------------------------
+    // Disk slots are evicted like Host slabs: dead blocks, superseded snapshots, then retained
+    // snapshots in GDSF order, but no retained snapshot valued above the claim. An entry with
+    // another copy only gives up its Disk copy.
+    // Allocates a Disk slot for a pinned node with a Device or Host copy (write destination).
+    // Absent when no slot can be freed.
+    [[nodiscard]] std::optional<std::uint32_t> begin_node_disk_fill(NodeRef node, double claim);
+    void complete_node_disk_fill(NodeRef node);
+    void abort_node_disk_fill(NodeRef node);
+    // Allocates the image's slots (+1 tail slot) for a pinned valid snapshot without a Disk copy,
+    // claiming its own priority. False when they cannot be freed.
+    [[nodiscard]] bool begin_snapshot_disk_fill(SnapshotRef snapshot);
+    void complete_snapshot_disk_fill(SnapshotRef snapshot);
+    void abort_snapshot_disk_fill(SnapshotRef snapshot);
+    // Disk-born snapshots (no Host tier): the image (and tail) is written straight to Disk slots.
+    // Reserves the image's slots, plus one tail slot when `tail`, evicting no retained snapshot
+    // valued above `claim`. Absent when they cannot be freed.
+    [[nodiscard]] std::optional<DiskImageReservation> reserve_disk_image(bool tail, double claim);
+    void release_disk_image(DiskImageReservation&& reservation) noexcept;
+    // Publishes a snapshot whose image and tail were written to `image`'s slots: Disk Resident, no
+    // Host copy or Device slot; the tail's Device copy is optional. Rules as publish_host_snapshot.
+    [[nodiscard]] PublishResult publish_disk_snapshot(NodeRef anchor, std::uint32_t frontier,
+                                                      std::span<const TokenId> tail,
+                                                      std::optional<std::uint32_t> tail_device_id,
+                                                      DiskImageReservation&& image,
+                                                      SnapshotKind kind, bool head_residual = false);
+    // The Disk writer's order (§17.1 rule 3): retained Host-resident snapshots without a Disk copy,
+    // held ones first by queue rank, then the most valuable first; at most `count`.
+    [[nodiscard]] std::vector<SnapshotRef> disk_write_candidates(std::size_t count) const;
+    // The highest GDSF value of a retained snapshot anchored on `node`'s path, at or above it:
+    // what the path's blocks are worth to keep (0 when none).
+    [[nodiscard]] double path_claim(NodeRef node) const;
+    // The Disk-resident blocks strictly below `node`, parents before children, and the
+    // Disk-resident snapshots anchored at or below it.
+    void disk_records_below(NodeRef node, std::vector<NodeRef>& blocks, std::vector<SnapshotRef>& snapshots) const;
+
+    // Rebuilds a Disk tier's records into an empty index at startup, parents before children and
+    // anchors before their snapshots, each at the slots it occupies; no data is read. Between
+    // begin and end only these calls are allowed. Absent: the record conflicts with one already
+    // rebuilt (the caller drops it) or no node or snapshot entry is free.
+    void begin_disk_rebuild();
+    [[nodiscard]] std::optional<NodeRef> restore_disk_block(NodeRef parent, std::uint64_t lookup_hash,
+                                                            std::span<const TokenId> tokens,
+                                                            std::uint64_t extra, std::uint32_t slot);
+    [[nodiscard]] std::optional<SnapshotRef>
+    restore_disk_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
+                          SnapshotKind kind, std::uint32_t hits, bool head_residual,
+                          std::span<const std::uint32_t> slots);
+    void end_disk_rebuild();
+    void complete_tail_device_fill(SnapshotRef snapshot);
+    // Returns the device id to the backend.
+    void abort_tail_device_fill(SnapshotRef snapshot);
+
+    // ---- snapshots (§5.3, §7.4, §7.7, §9.2)
+    // ------------------------------------------------------- Returns a device snapshot slot for a
+    // tap/endpoint destination (staging): a free one, else a superseded owner's, else the least
+    // valuable Device-only owner's when the new snapshot's `claim` priority is at least its GDSF
+    // priority, or when Device-only owners hold every one of two or more slots and another of them
+    // is worth at least as much (that snapshot is lost), else the least
+    // recently hit Host-backed owner's (which keeps its Host copy). Absent with no Device slots
+    // configured, or when every owner is pinned, held or worth more (counted as a refusal).
+    [[nodiscard]] std::optional<std::uint32_t>
+    acquire_device_slot(double claim = std::numeric_limits<double>::infinity());
+    // GDSF priority of a new snapshot at `frontier` whose nearest retained snapshot on its path
+    // is at `base_frontier` and which alone keeps the blocks between them (§9.3).
+    [[nodiscard]] double estimate_priority(std::uint32_t base_frontier, std::uint32_t frontier,
+                                           bool tail) const noexcept;
+    void release_device_slot(std::uint32_t slot);
+    // Publishes a snapshot whose image is in staging slot `device_slot`. frontier must equal
+    // 64 * (anchor depth + 1) + tail.size() (tail.size() for the root anchor). A tail requires
+    // `tail_device_id`. For a duplicate (same anchor and tail) the staging slot is freed, the tail
+    // device id is released and the existing snapshot is returned with created=false.
+    // `head_residual`: the image carries its frontier's head residual (a prompt-end capture).
+    [[nodiscard]] PublishResult publish_snapshot(NodeRef anchor, std::uint32_t frontier,
+                                                 std::span<const TokenId> tail,
+                                                 std::optional<std::uint32_t> tail_device_id,
+                                                 std::uint32_t device_slot, SnapshotKind kind,
+                                                 bool head_residual = false);
+    // Host-born snapshots: the image (and tail) is copied straight to Host slabs, with no Device
+    // slot. Reserves the image's slabs, plus one tail slab when `tail` (which needs host_blocks),
+    // evicting like begin_snapshot_host_fill but no retained snapshot valued above `claim` (the
+    // new snapshot's estimate_priority). Absent when they cannot be freed.
+    [[nodiscard]] std::optional<HostImageReservation> reserve_host_image(bool tail, double claim);
+    // Returns a reservation's slabs to the free list; the reservation is left empty.
+    void release_host_image(HostImageReservation&& reservation) noexcept;
+    // Publishes a snapshot whose image and tail already landed in `image`'s slabs: Host Resident,
+    // no Device slot. A tail requires a reservation made with `tail`; its Device copy
+    // (`tail_device_id`) is optional. Frontier rules as publish_snapshot. A duplicate (same anchor
+    // and tail), or no snapshot entry to be had, releases the slabs and the tail device id; a
+    // duplicate returns the existing snapshot with created=false. `image` is consumed either way.
+    [[nodiscard]] PublishResult publish_host_snapshot(NodeRef anchor, std::uint32_t frontier,
+                                                      std::span<const TokenId> tail,
+                                                      std::optional<std::uint32_t> tail_device_id,
+                                                      HostImageReservation&& image,
+                                                      SnapshotKind kind, bool head_residual = false);
+
+    // ---- persistence ---------------------------------------------------------------------------
+    // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is Host-resident
+    // throughout, and exactly those paths, parents before children. Other Host content is dead
+    // (no snapshot can resume through it) or unreachable after a restart.
+    void collect_persistable(std::vector<NodeRef>& nodes,
+                             std::vector<SnapshotRef>& snapshots) const;
+    [[nodiscard]] BlockIdentity block_identity(NodeRef node) const;
+    // Rebuild a saved Host tier into a fresh index, parents before children and anchors before
+    // their snapshots, in the selection plan_host_restore made. Nothing is evicted to make room;
+    // absent means no slab, node or snapshot entry was free, or the entry already exists.
+    [[nodiscard]] std::optional<RestoredBlock> restore_host_block(NodeRef parent,
+                                                                  std::uint64_t lookup_hash,
+                                                                  std::span<const TokenId> tokens,
+                                                                  std::uint64_t extra);
+    [[nodiscard]] std::optional<SnapshotRef>
+    restore_host_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
+                          SnapshotKind kind, std::uint32_t hits, bool head_residual = false);
+
+    // ---- views
+    // ------------------------------------------------------------------------------------
+    [[nodiscard]] bool valid(NodeRef node) const noexcept;
+    [[nodiscard]] bool valid(SnapshotRef snapshot) const noexcept;
+    [[nodiscard]] NodeView node(NodeRef node) const;
+    [[nodiscard]] SnapshotView snapshot(SnapshotRef snapshot) const;
+    [[nodiscard]] std::optional<SnapshotRef> slot_owner(std::uint32_t slot) const;
+    [[nodiscard]] PrefixIndexStats stats() const noexcept;
+    // Structural self-check for tests: throws std::logic_error on any invariant violation.
+    void check_invariants() const;
+
+private:
+    static constexpr std::size_t kHostTier = 0;
+    static constexpr std::size_t kDiskTier = 1;
+
+    struct DeadLink {
+        std::uint32_t prev = kNoId;
+        std::uint32_t next = kNoId;
+        bool linked        = false;
+    };
+
+    struct DeadList {
+        std::uint32_t head = kNoId;
+        std::uint32_t tail = kNoId;
+    };
+
+    struct Node {
+        std::uint32_t generation = 0;
+        bool occupied            = false;
+        std::uint32_t parent     = kNoId;
+        std::uint32_t depth      = 0;
+        std::uint64_t hash       = 0;
+        std::uint64_t extra      = 0;
+        std::array<TokenId, kBlockTokens> tokens{};
+        std::vector<std::uint32_t> children;
+        std::vector<std::uint32_t> snapshots;
+        std::uint32_t device_id  = kNoId;
+        CopyState device         = CopyState::Absent;
+        std::uint32_t host_slab  = kNoId;
+        CopyState host           = CopyState::Absent;
+        std::uint32_t disk_slot  = kNoId;
+        CopyState disk           = CopyState::Absent;
+        std::uint32_t pins       = 0;
+        std::uint32_t live_below = 0;
+        // Retained (not superseded) snapshots anchored at or below this node.
+        std::uint32_t retained_below = 0;
+        // Membership of the dead lists of the Host (kHostTier) and Disk (kDiskTier) tiers.
+        std::array<DeadLink, 2> dead{};
+        // Lowest queue rank of a held snapshot whose anchor path holds this node (kNoHold: none).
+        std::uint8_t hold = kNoHold;
+    };
+
+    struct Snapshot {
+        std::uint32_t generation = 0;
+        bool occupied            = false;
+        std::uint32_t anchor     = kNoId; // node index, kNoId for the root
+        std::uint32_t frontier   = 0;
+        std::uint32_t tail_len   = 0;
+        std::array<TokenId, kBlockTokens - 1> tail{};
+        std::uint32_t tail_device  = kNoId;
+        CopyState tail_device_copy = CopyState::Absent;
+        std::uint32_t device_slot  = kNoId;
+        std::vector<std::uint32_t> host_slabs;
+        CopyState host                = CopyState::Absent;
+        std::vector<std::uint32_t> disk_slots;
+        CopyState disk                = CopyState::Absent;
+        std::uint32_t pins            = 0;
+        SnapshotKind kind             = SnapshotKind::Tap;
+        std::uint32_t hits            = 0;
+        // The image's HeadSaved part holds the head residual of this frontier's last token — the
+        // zero-token resume's state; only a prompt-end capture sets it.
+        bool head_residual            = false;
+        double priority               = 0.0; // GDSF H = priority_base + F * C / Z
+        double priority_base          = 0.0; // GDSF inflation at the last publication or hit
+        std::uint64_t last_hit_tick   = 0;
+        bool superseded               = false;
+        std::uint64_t superseded_tick = 0;
+        // Nearest snapshot above this one on its path (kNoId: none), whatever its state, and the
+        // snapshots whose nearest one this is.
+        std::uint32_t ancestor = kNoId;
+        std::vector<std::uint32_t> dependents;
+        std::uint8_t hold = kNoHold; // queue rank while held (§9.6)
+    };
+
+    enum class SlotState : std::uint8_t { Free, Staging, Owned };
+
+    static constexpr std::uint8_t kNoHold = 0xff;
+    // Device LRU lists: 0 backed, 1 unbacked, then for each queue rank r a backed (2 + 2r) and an
+    // unbacked (3 + 2r) list of held entries. Even lists are backed.
+    static constexpr std::size_t kLruLists = 2 + 2 * static_cast<std::size_t>(kMaxQueueHolds);
+
+    // Device LRU entries: node i is entry i, snapshot tail j is entry max_nodes + j.
+    struct LruLink {
+        std::uint32_t prev = kNoId;
+        std::uint32_t next = kNoId;
+        std::uint8_t list  = 0xff; // see kLruLists; 0xff absent
+    };
+
+    struct LruList {
+        std::uint32_t head  = kNoId;
+        std::uint32_t tail  = kNoId;
+        std::uint32_t count = 0;
+    };
+
+    [[nodiscard]] Node& require(NodeRef node);
+    [[nodiscard]] const Node& require(NodeRef node) const;
+    [[nodiscard]] Snapshot& require(SnapshotRef snapshot);
+    [[nodiscard]] const Snapshot& require(SnapshotRef snapshot) const;
+    [[nodiscard]] NodeRef ref_of_node(std::uint32_t index) const noexcept;
+    [[nodiscard]] SnapshotRef ref_of_snapshot(std::uint32_t index) const noexcept;
+    [[nodiscard]] static std::uint64_t child_key(std::uint32_t parent,
+                                                 std::uint64_t lookup_hash) noexcept;
+
+    [[nodiscard]] bool snapshot_valid(const Snapshot& snapshot) const noexcept;
+    [[nodiscard]] bool tail_matches(const Snapshot& snapshot,
+                                    std::span<const TokenId> prompt) const noexcept;
+
+    void pin_path_from(std::uint32_t node);
+    void unpin_path_from(std::uint32_t node, bool deepest_first_order);
+    void refresh_node(std::uint32_t node);
+    void refresh_tail(std::uint32_t snapshot);
+
+    std::uint32_t evict_device_entries(std::uint32_t blocks, bool unbacked);
+    void lru_remove(std::uint32_t entry);
+    void lru_append(std::uint32_t entry, std::uint8_t list);
+    // The Host tier's Disk-backed copies, by entry as the Device LRU: list 0 unheld, 1 held.
+    void host_lru_update(std::uint32_t entry, bool backed, bool held);
+    void host_lru_remove(std::uint32_t entry);
+    // Drops the Host copy of the next Disk-backed entry. False when there is none.
+    bool evict_host_backed();
+    [[nodiscard]] std::uint32_t lru_pop(std::uint8_t list);
+    // The list of an evictable entry: its residency kind and queue hold.
+    [[nodiscard]] static std::uint8_t lru_list(bool backed, std::uint8_t hold) noexcept;
+    // The next Device entry to evict: unheld backed, held backed (highest rank first), then with
+    // `unbacked` unheld unbacked and held unbacked. kNoId when none.
+    [[nodiscard]] std::uint32_t lru_pop_victim(bool unbacked);
+    // Recomputes every node's hold from holds_ and moves the affected LRU entries.
+    void refresh_holds();
+
+    void dead_remove(std::uint32_t node, std::size_t tier);
+    void dead_append(std::uint32_t node, std::size_t tier);
+
+    // A block or snapshot whose Device copy can go without losing it: a Host or Disk copy holds it.
+    [[nodiscard]] bool node_backed(const Node& node) const noexcept;
+    [[nodiscard]] bool image_backed(const Snapshot& snapshot) const noexcept;
+    [[nodiscard]] bool tail_backed(const Snapshot& snapshot) const noexcept;
+
+    [[nodiscard]] bool take_free_slabs(std::uint32_t count, std::vector<std::uint32_t>& out);
+    // Evicts dead KV, superseded snapshots, then retained snapshots in GDSF order until `count`
+    // slabs are free, but no retained snapshot with a priority above `claim`.
+    [[nodiscard]] bool allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
+                                      std::uint32_t protect_snapshot,
+                                      double claim = std::numeric_limits<double>::infinity());
+    void free_slab(std::uint32_t slab);
+    // The Disk counterpart of allocate_slabs.
+    [[nodiscard]] bool allocate_disk_slots(std::uint32_t count, std::vector<std::uint32_t>& out,
+                                           std::uint32_t protect_snapshot, double claim);
+    void free_disk_slot(std::uint32_t slot);
+    // The next snapshot to give up its Disk copy: the oldest superseded one, otherwise the GDSF
+    // minimum. kNoId when every candidate is protected.
+    [[nodiscard]] std::uint32_t pick_disk_victim(std::uint32_t protect) const;
+    void drop_snapshot_disk_copy(std::uint32_t snapshot);
+
+    // The publication shared by publish_snapshot, publish_host_snapshot and
+    // publish_disk_snapshot: exactly one of `device_slot` (a staging slot), `host_slabs` and
+    // `disk_slots` (reserved, already unmarked) holds the image. A duplicate or a full snapshot
+    // table releases the image and the tail device id.
+    [[nodiscard]] PublishResult publish_image(NodeRef anchor, std::uint32_t frontier,
+                                              std::span<const TokenId> tail,
+                                              std::optional<std::uint32_t> tail_device_id,
+                                              std::uint32_t device_slot,
+                                              std::vector<std::uint32_t>&& host_slabs,
+                                              std::vector<std::uint32_t>&& disk_slots,
+                                              SnapshotKind kind, bool head_residual);
+    // A new snapshot entry at `anchor` (validated by the caller), linked and valued.
+    [[nodiscard]] std::uint32_t emplace_snapshot(std::uint32_t anchor, std::uint32_t frontier,
+                                                 std::span<const TokenId> tail, SnapshotKind kind,
+                                                 std::uint32_t hits, bool head_residual);
+    void remove_snapshot(std::uint32_t snapshot);
+    // Snapshot ancestry: `above` lies on `below`'s path at a smaller frontier.
+    [[nodiscard]] bool on_path(const Snapshot& above, const Snapshot& below) const noexcept;
+    // Whether the tree branches below the snapshot's frontier (another conversation continued
+    // from its prefix).
+    [[nodiscard]] bool shared_below(const Snapshot& snapshot) const noexcept;
+    // Whether `continuation` (path tokens from position `from` on) differs from the snapshot's
+    // path before the snapshot's frontier; false when it ends first without differing.
+    [[nodiscard]] bool leaves_path(const Snapshot& snapshot, std::uint32_t from,
+                                   std::span<const TokenId> continuation) const noexcept;
+    [[nodiscard]] std::uint32_t find_ancestor(std::uint32_t snapshot) const noexcept;
+    void link_snapshot(std::uint32_t snapshot);
+    void unlink_snapshot(std::uint32_t snapshot);
+    [[nodiscard]] std::vector<std::uint32_t>& dependents_of(std::uint32_t snapshot) noexcept;
+    [[nodiscard]] std::uint32_t retained_ancestor(std::uint32_t snapshot) const noexcept;
+    // Retained snapshots whose nearest retained ancestor is `snapshot` (through superseded ones).
+    void collect_retained_dependents(std::uint32_t snapshot, std::vector<std::uint32_t>& out) const;
+    void adjust_retained(std::uint32_t anchor, int delta);
+    // Revalues the snapshots whose value depends on `snapshot` being retained.
+    void revalue_around(std::uint32_t snapshot, std::span<const std::uint32_t> dependents);
+    // Next snapshot to give up its Host slabs (host_only) or its index entry: the oldest
+    // superseded one, otherwise the GDSF minimum. kNoId when every candidate is protected.
+    [[nodiscard]] std::uint32_t pick_victim(bool host_resident, std::uint32_t protect) const;
+    void remove_subtree(std::uint32_t node);
+    void release_node_storage(std::uint32_t node);
+    void drop_node_device_copy(std::uint32_t node);
+    void drop_node_host_copy(std::uint32_t node);
+    void drop_node_disk_copy(std::uint32_t node);
+    // A new node below `parent` (validated by the caller) with no copy and no pin.
+    [[nodiscard]] std::uint32_t emplace_node(std::uint32_t parent, std::uint64_t lookup_hash,
+                                             std::span<const TokenId> tokens, std::uint64_t extra);
+    void adjust_live(std::uint32_t anchor, int delta);
+    // Every Device residency and slot-state change goes through these so the gauges stats()
+    // reports stay O(1): the Engine publishes statistics after every decode round.
+    void set_device(Node& node, CopyState state) noexcept;
+    void set_slot(std::uint32_t slot, SlotState state) noexcept;
+    void update_priority(std::uint32_t snapshot);
+
+    PrefixIndexConfig config_;
+    PrefixIndexBackend* backend_ = nullptr;
+
+    std::vector<Node> nodes_;
+    std::vector<std::uint32_t> free_nodes_;
+    std::unordered_multimap<std::uint64_t, std::uint32_t> children_;
+    std::vector<std::uint32_t> root_children_;
+    std::vector<std::uint32_t> root_snapshots_;
+    // Snapshots with no snapshot above them.
+    std::vector<std::uint32_t> top_snapshots_;
+
+    std::vector<Snapshot> snapshots_;
+    std::vector<std::uint32_t> free_snapshots_;
+
+    std::vector<LruLink> lru_links_;
+    std::array<LruList, kLruLists> lru_{};
+    std::uint32_t lru_backed_   = 0; // entries on even lists
+    std::uint32_t lru_unbacked_ = 0; // entries on odd lists
+    std::vector<LruLink> host_lru_links_;
+    std::array<LruList, 2> host_lru_{};
+    std::vector<std::uint32_t> host_lru_slabs_; // slabs of each listed entry
+    std::uint32_t host_backed_slabs_ = 0;
+
+    // Held snapshot indices by queue rank (§9.6), and the nodes refresh_holds marked.
+    std::vector<std::uint32_t> holds_;
+    std::vector<std::uint32_t> held_nodes_;
+    std::uint64_t snapshot_epoch_ = 0;
+
+    // Dead lists by tier: nodes with a copy in that tier no live snapshot resumes through.
+    std::array<DeadList, 2> dead_{};
+
+    std::vector<std::uint32_t> free_slabs_;
+    // Slabs held by an outstanding HostImageReservation (owned by no node or snapshot).
+    std::vector<bool> slab_reserved_;
+    // The Disk counterparts: a min-heap of free slots and slots held by a DiskImageReservation.
+    std::vector<std::uint32_t> free_disk_slots_;
+    std::vector<bool> disk_reserved_;
+    // Slots taken by restored records between begin_disk_rebuild and end_disk_rebuild.
+    std::vector<bool> disk_rebuilt_;
+    bool rebuilding_ = false;
+    std::vector<SlotState> slot_state_;
+    std::vector<std::uint32_t> slot_owner_;
+
+    std::uint32_t node_count_      = 0;
+    std::uint32_t snapshot_count_  = 0;
+    std::uint32_t device_resident_ = 0;
+    std::uint32_t free_slots_      = 0;
+    std::uint64_t tick_            = 0;
+    double inflation_              = 0.0;
+    PrefixIndexStats counters_;
+};
+
+// ---- restore planning (§5.5) -------------------------------------------------------------------
+// A saved snapshot as the restore plan sees it.
+struct SavedSnapshotShape {
+    // Index of its anchor among the saved blocks; -1 for the root.
+    std::int32_t anchor    = -1;
+    std::uint32_t frontier = 0;
+    // Host slabs it takes: the image's, plus one for a tail.
+    std::uint32_t slabs = 0;
+    std::uint32_t hits  = 0;
+};
+
+struct HostRestorePlan {
+    std::vector<bool> blocks;
+    std::vector<bool> snapshots;
+    // Host slabs the chosen entries take.
+    std::uint64_t slabs = 0;
+};
+
+// Chooses what an empty Host tier of `host_slabs` restores from a saved one: everything when it
+// fits. Otherwise snapshots are taken greedily by the GDSF density of §9.3 without its
+// time-dependent base — (1 + hits) times the prefill a restore saves from the root, per byte of
+// image, tail and anchor path. Each takes its own slabs and the path blocks not yet chosen; one
+// that does not fit is passed over for later ones that may. Blocks are chosen only on a chosen
+// snapshot's path, so no restored block is dead. `block_parents` lists every saved block's parent
+// index (-1 for the root), parents first.
+[[nodiscard]] HostRestorePlan plan_host_restore(std::span<const std::int32_t> block_parents,
+                                                std::span<const SavedSnapshotShape> snapshots,
+                                                std::uint64_t host_slabs,
+                                                const PrefixIndexConfig& config);
+
+} // namespace infernix::models::qwen4_exp::prefix::cache_index

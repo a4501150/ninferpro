@@ -211,7 +211,10 @@ history (often its own prefix), then recomputes to the pause frontier and resume
 Replay splits prefill at every split the ledger recorded, so its GDN decomposition and therefore its
 state match the original execution exactly. A Qwen3.8-Flash-Next pause also publishes the lane's
 state at its frontier to the cache, so its resume normally finds a snapshot at the paused frontier
-itself and continues without recomputation (counted as a snapshot restore).
+itself and continues without recomputation (counted as a snapshot restore). The cache holds that
+snapshot while the request waits and writes it to the Disk tier first; when its bytes are no longer
+in VRAM or RAM, the restoring admission defers while they are fetched instead of binding a shallower
+source ([prefix-cache spec](hybrid-prefix-cache-spec.md) §17.1 rule 7).
 
 Replay does not republish old output, does not charge the budget again and does not resample historical
 tokens. Penalty counts are restored from committed output and actually counted forced control; the RNG

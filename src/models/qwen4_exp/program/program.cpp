@@ -33,6 +33,10 @@ const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_siz
 
 void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
 
+bool Program::background_pending() const noexcept { return impl_->prefix_background_pending(); }
+
+void Program::background_poll() { impl_->prefix_background_poll(); }
+
 void Program::maintain() {
     impl_->apply_vram_target(true);
     impl_->maintain_expert_state();

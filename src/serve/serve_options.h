@@ -119,6 +119,8 @@ struct ServeOptions {
     SamplingOverrides sampling_overrides;
     bool greedy                 = false; // --greedy: force temperature 0 (exact argmax)
     product::LogLevel log_level = product::LogLevel::Info;
+    // --debug CATEGORIES: the DebugCategory bits whose Engine trace lines are logged.
+    std::uint32_t debug_categories = 0;
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.

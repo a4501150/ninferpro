@@ -21,7 +21,7 @@ namespace {
 
 using namespace infernix::models::qwen4_exp::prefix;
 using infernix::TokenId;
-namespace pc = infernix::runtime::prefix_cache;
+namespace pc = infernix::models::qwen4_exp::prefix::cache_index;
 
 int failures = 0;
 

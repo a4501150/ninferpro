@@ -77,7 +77,8 @@ public:
         // The zero-token resume's prompt-end captures (Qwen4Exp).
         if constexpr (requires { hybrid.prompt_end_captures; }) {
             out.hybrid_prompt_end_captures = hybrid.prompt_end_captures;
-            out.hybrid_prompt_end_skipped  = hybrid.prompt_end_skipped;
+            out.hybrid_prompt_end_gated    = hybrid.prompt_end_gated;
+            out.hybrid_prompt_end_failed   = hybrid.prompt_end_failed;
         }
         // Publication refusals (Qwen3.5's Device snapshot slots; other caches have none).
         if constexpr (requires { hybrid.device_slot_refusals; }) {
@@ -100,6 +101,9 @@ public:
         out.hybrid_host_restore_bytes      = hybrid.host_restore_bytes;
         out.hybrid_evicted_blocks          = hybrid.evicted_blocks;
         out.hybrid_host_snapshot_evictions = hybrid.host_snapshot_evictions;
+        if constexpr (requires { hybrid.host_backed_evictions; }) {
+            out.hybrid_host_backed_evictions = hybrid.host_backed_evictions;
+        }
         out.hybrid_host_dead_reclaims      = hybrid.host_dead_reclaims;
         out.hybrid_unbacked_node_losses    = hybrid.unbacked_node_losses;
         out.hybrid_held_snapshots          = hybrid.held_snapshots;
