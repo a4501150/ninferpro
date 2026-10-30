@@ -787,7 +787,10 @@ void PrefixCache::poll_disk() {
     service_spill();
     service_fetch();
     service_journal();
-    if (host_tier() && !spill_ && disk_writable() && Clock::now() >= next_spill_scan_) {
+    // The next spill waits for the previous one's path: each queued block write pins its block's
+    // Device page or Host slab, and spills queued faster than the Disk absorbs them would pin the
+    // whole cache.
+    if (host_tier() && !spill_ && block_writes_.empty() && disk_writable() && Clock::now() >= next_spill_scan_) {
         next_spill_scan_ = Clock::now() + kSpillScan;
         for (const pc::SnapshotRef snapshot : index_->disk_spill_candidates(host_.slabs / 4U)) {
             if (start_spill(snapshot)) {

@@ -250,11 +250,11 @@ public:
     void write_blocks(std::span<const runtime::prefix_cache::NodeRef> nodes, cudaStream_t producer);
     // Publishes landed captures and writes and retires landed restores. Non-blocking.
     void poll();
-    // Waits for every capture, write and restore in flight and publishes them.
+    // Waits for every capture copy, Host write and restore in flight and publishes them. Disk writes
+    // are not waited for: they stay polled (a capture written through publishes once they land).
     void drain();
     [[nodiscard]] bool transfers_pending() const noexcept {
-        return !captures_.empty() || !writes_.empty() || !landing_.empty() || !block_writes_.empty() ||
-               spill_.has_value();
+        return !captures_.empty() || !writes_.empty() || !landing_.empty();
     }
     // Waits for an endpoint copy-out a prompt extends (its anchor is on the prompt's matched `path`
     // and its tail tokens continue the prompt), and publishes it. Only such a prompt waits; the

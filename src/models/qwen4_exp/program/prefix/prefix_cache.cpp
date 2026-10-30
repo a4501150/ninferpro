@@ -778,7 +778,6 @@ void PrefixCache::drain() {
     CUDA_CHECK(cudaStreamSynchronize(transfer_));
     CUDA_CHECK(cudaStreamSynchronize(restore_stream_));
     poll();
-    if (store_) { drain_disk(); }
 }
 
 bool PrefixCache::await_extended_endpoint(std::span<const pc::NodeRef> path, std::span<const TokenId> tokens) {
@@ -990,6 +989,8 @@ void PrefixCache::abort_restore() noexcept {
 void PrefixCache::clear() noexcept {
     try {
         drain();
+        // The Disk writes in flight still read the slabs, pages and staging records dropped below.
+        if (store_) { drain_disk(); }
         // A fetch in flight still reads into its pages and region.
         while (fetch_running()) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));

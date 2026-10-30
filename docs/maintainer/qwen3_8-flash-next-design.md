@@ -4266,7 +4266,13 @@ journal; hybrid-prefix-cache-spec §17), the `PrefixIndexBackend` callbacks and
   Transfers are cuFile batch I/O polled from `poll()`: on the T710 in compatibility mode, batch
   reads reached 10.5 GiB/s from one thread where the stream-ordered `cuFileReadAsync` reached
   2.9-3.6 GiB/s (2026-10-29, production running), so the restore's per-layer events stay on the
-  copy streams and a Disk read happens before the admission, which is deferred meanwhile. With the
+  copy streams and a Disk read happens before the admission, which is deferred meanwhile. No wait
+  on the worker covers Disk writes: `drain` waits for the copy streams only, and `clear` and the
+  shutdown spill drain the Disk. A `drain` that also waited for the Disk blocked every admission
+  under memory pressure for the whole write backlog (production: steps of 15-35 s beside a
+  waiting request; a test: 2.6 s for 22,121 queued blocks). The next spill starts once the
+  previous one's path blocks are written, since each queued block write pins its block's page or
+  slab (spills every 100 ms queued ~21,000 blocks and pinned the whole cache). With the
   Host tier, cold retained snapshots are spilled once (the Host eviction then keeps their Disk
   copy) and fetches read into Host slabs; without it (`--host-context-mib 0`) captures write
   through from two VRAM staging regions (2 × 126 slots, plus 64 block records: 354 MiB of VRAM).
