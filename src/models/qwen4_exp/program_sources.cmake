@@ -2,6 +2,7 @@
 # §7). Config, binding and loading join infernix_model_loading; execution and the Program join
 # infernix_model_runtime.
 target_sources(infernix_model_loading PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/options.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_placement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load.cpp"
@@ -11,6 +12,7 @@ target_sources(infernix_model_loading PRIVATE
 )
 
 target_sources(infernix_model_runtime PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/instance.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/dflash2.cpp"

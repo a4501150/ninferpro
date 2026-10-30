@@ -51,9 +51,6 @@ struct ConstructedQwen4Exp {
     EngineOptions options;
 };
 
-// True when the artifact's text component is Qwen4ExpForCausalLM.
-[[nodiscard]] bool artifact_is_qwen4_exp(const std::filesystem::path& artifact);
-
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device);
 
 } // namespace infernix::runtime

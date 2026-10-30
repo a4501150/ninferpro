@@ -10,8 +10,9 @@
 #include "runtime/engine/engine_core.h"
 #include "runtime/diagnostics.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
-#include "runtime/engine/model_instance.h"
-#include "runtime/engine/qwen4_exp_instance.h"
+#include "models/qwen3_5/instance.h"
+#include "models/qwen4_exp/instance.h"
+#include "runtime/engine/engine_options.h"
 
 #include <algorithm>
 #include <atomic>
@@ -275,9 +276,7 @@ public:
     // artifact is reported by the (Qwen3.5) model construction, after option validation.
     EngineOptions normalize(EngineOptions engine_options) {
         try {
-            if (runtime::artifact_is_qwen4_exp(engine_options.artifact_path)) {
-                architecture = models::Architecture::Qwen4Exp;
-            }
+            architecture = models::detect_artifact_architecture(engine_options.artifact_path);
         } catch (const std::exception&) {}
         runtime::validate_engine_options(engine_options, architecture);
         return runtime::normalize_engine_options(std::move(engine_options), architecture);

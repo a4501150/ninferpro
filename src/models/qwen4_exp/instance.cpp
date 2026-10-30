@@ -1,4 +1,4 @@
-#include "runtime/engine/qwen4_exp_instance.h"
+#include "models/qwen4_exp/instance.h"
 
 #include "artifact/reader.h"
 #include "core/device.h"
@@ -16,7 +16,7 @@
 #include "models/qwen4_exp/program/route_trace.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "models/registry.h"
-#include "runtime/engine/model_instance.h"
+#include "runtime/engine/engine_options.h"
 
 #include <algorithm>
 #include <array>
@@ -119,11 +119,6 @@ void validate(const EngineOptions& options) {
 }
 
 } // namespace
-
-bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) {
-    const artifact::Reader reader(artifact);
-    return models::qwen4_exp::is_qwen4_exp(reader);
-}
 
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
     : model(std::move(source)), parameters(*model),

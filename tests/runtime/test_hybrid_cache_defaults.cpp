@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
-#include "runtime/engine/model_instance.h"
+#include "runtime/engine/engine_options.h"
 
 #include <chrono>
 #include <iostream>

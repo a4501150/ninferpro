@@ -1,24 +1,22 @@
 #pragma once
 
+// The Qwen3.5 model instance behind the public Engine: its resident model, native parameters, the
+// frontend it shares with the Qwen4Exp family, and its Program. The Engine drives it with the
+// common EngineCore; its family's option rules live in models/qwen3_5/options.h and the shared,
+// artifact-free checks in runtime/engine/engine_options.h.
+
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/runtime_types.h"
-#include "models/registry.h"
-#include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <memory>
 
+namespace infernix {
+struct DeviceContext;
+}
+
 namespace infernix::runtime {
-
-// Validates the options and resolves every default; the hybrid prefix cache's Host tier, Device
-// snapshot slots and tap budget depend on the model architecture.
-// Everything the bytes of a persisted hybrid Host tier depend on besides its geometry (which the
-// file records itself); a different value makes a saved file meaningless.
-[[nodiscard]] std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature);
-
-[[nodiscard]] EngineOptions normalize_engine_options(
-    EngineOptions options, models::Architecture architecture = models::Architecture::Qwen3_5);
 
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
@@ -41,11 +39,6 @@ struct ConstructedModel {
     LoadSummary load;
     ModelMetadata model_metadata;
 };
-
-// The option checks that need no artifact (shared by every architecture, and the Qwen3.5-only
-// pairing of --vram-headroom-mib with automatic KV capacity); the Engine runs them before it opens
-// the artifact.
-void validate_engine_options(const EngineOptions& options, models::Architecture architecture);
 
 [[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device);
 
