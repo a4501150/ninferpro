@@ -322,13 +322,13 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     // saves), so the opener serves the repeat; the capture's counters print as evidence.
     const infernix::GenerationResult again = chat({system, user("Summarise rule 12 in one sentence.")}, 32);
     const infernix::RuntimeStats after_again = engine.runtime_stats();
-    std::printf("        X3: prompt-end captures %llu -> %llu -> %llu, skipped %llu -> %llu -> %llu\n",
+    std::printf("        X3: prompt-end captures %llu -> %llu -> %llu, failed %llu -> %llu -> %llu\n",
                 static_cast<unsigned long long>(before_s2.hybrid_prompt_end_captures),
                 static_cast<unsigned long long>(after_s2.hybrid_prompt_end_captures),
                 static_cast<unsigned long long>(after_again.hybrid_prompt_end_captures),
-                static_cast<unsigned long long>(before_s2.hybrid_prompt_end_skipped),
-                static_cast<unsigned long long>(after_s2.hybrid_prompt_end_skipped),
-                static_cast<unsigned long long>(after_again.hybrid_prompt_end_skipped));
+                static_cast<unsigned long long>(before_s2.hybrid_prompt_end_failed),
+                static_cast<unsigned long long>(after_s2.hybrid_prompt_end_failed),
+                static_cast<unsigned long long>(after_again.hybrid_prompt_end_failed));
     failures += check(again.reused_prompt_tokens + 16U >= s2.prompt.prompt_tokens &&
                           again.reused_prompt_tokens < s2.prompt.prompt_tokens,
                       "X3 the repeat resumes at the opener (reused " +
@@ -354,9 +354,9 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
         const std::vector<infernix::TokenId> p = synthetic_tokens(400, 26);
         const Run first  = generate(engine, p, 32, true);
         const infernix::RuntimeStats stats = engine.runtime_stats();
-        std::printf("        prompt-end captures %llu, skipped %llu (Host free %llu of %llu bytes)\n",
+        std::printf("        prompt-end captures %llu, failed %llu (Host free %llu of %llu bytes)\n",
                     static_cast<unsigned long long>(stats.hybrid_prompt_end_captures),
-                    static_cast<unsigned long long>(stats.hybrid_prompt_end_skipped),
+                    static_cast<unsigned long long>(stats.hybrid_prompt_end_failed),
                     static_cast<unsigned long long>(stats.hybrid_host_capacity_bytes - stats.hybrid_host_used_bytes),
                     static_cast<unsigned long long>(stats.hybrid_host_capacity_bytes));
         const Run repeat = generate(engine, p, 32, true);
@@ -444,10 +444,10 @@ int run_zero_token(const char* artifact, const char* ngram, bool mtp) {
         const infernix::GenerationResult first  = run();
         const infernix::GenerationResult repeat = run();
         const infernix::RuntimeStats seeded_stats = engine.runtime_stats();
-        std::printf("        seeded: reused %u (prompt-end captures %llu, skipped %llu)\n",
+        std::printf("        seeded: reused %u (prompt-end captures %llu, failed %llu)\n",
                     repeat.reused_prompt_tokens,
                     static_cast<unsigned long long>(seeded_stats.hybrid_prompt_end_captures),
-                    static_cast<unsigned long long>(seeded_stats.hybrid_prompt_end_skipped));
+                    static_cast<unsigned long long>(seeded_stats.hybrid_prompt_end_failed));
         failures += check(repeat.reused_prompt_tokens == 900, "the seeded repeat reuses the whole prompt (got " +
                                                                  std::to_string(repeat.reused_prompt_tokens) + ")");
         failures += check(repeat.generated_token_ids == first.generated_token_ids,
@@ -664,10 +664,10 @@ int run_zero_token_constrained(const char* artifact, const char* ngram, bool mtp
     };
     const infernix::GenerationResult first  = run();
     const infernix::RuntimeStats between = engine.runtime_stats();
-    std::printf("        first: %zu tokens, %zu draws, reused %u (prompt-end captures %llu, skipped %llu)\n",
+    std::printf("        first: %zu tokens, %zu draws, reused %u (prompt-end captures %llu, failed %llu)\n",
                 first.generated_token_ids.size(), first.constrained_draws.size(), first.reused_prompt_tokens,
                 static_cast<unsigned long long>(between.hybrid_prompt_end_captures),
-                static_cast<unsigned long long>(between.hybrid_prompt_end_skipped));
+                static_cast<unsigned long long>(between.hybrid_prompt_end_failed));
     const infernix::GenerationResult repeat = run();
     std::printf("        repeat: %zu tokens, %zu draws, reused %u\n", repeat.generated_token_ids.size(),
                 repeat.constrained_draws.size(), repeat.reused_prompt_tokens);

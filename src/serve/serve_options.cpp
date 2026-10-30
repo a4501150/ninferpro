@@ -124,6 +124,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--seed"},
     ServeOptionArity{"--greedy", false},
     ServeOptionArity{"--log-level"},
+    ServeOptionArity{"--debug"},
 };
 
 const ServeOptionArity* find_option(std::string_view name) noexcept {
@@ -151,6 +152,28 @@ int parse_nonnegative_int(const char* text, const char* label) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<int>(value);
+}
+
+// --debug: comma-separated DebugCategory names, or "all".
+std::uint32_t parse_debug_categories(const char* text) {
+    std::uint32_t mask = 0;
+    std::string_view rest(text);
+    for (;;) {
+        const std::size_t comma     = rest.find(',');
+        const std::string_view name = rest.substr(0, comma);
+        const auto* found           = std::find_if(std::begin(kDebugCategories), std::end(kDebugCategories),
+                                                   [&](DebugCategory category) { return name == debug_category_name(category); });
+        if (name == "all") {
+            for (const DebugCategory category : kDebugCategories) { mask |= static_cast<std::uint32_t>(category); }
+        } else if (found != std::end(kDebugCategories)) {
+            mask |= static_cast<std::uint32_t>(*found);
+        } else {
+            throw std::invalid_argument("invalid --debug category '" + std::string(name) +
+                                        "' (prefix-cache, disk, scheduler, all)");
+        }
+        if (comma == std::string_view::npos) { return mask; }
+        rest = rest.substr(comma + 1);
+    }
 }
 
 float parse_float_in(const char* text, const char* label, float lo, float hi) {
@@ -572,6 +595,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             terminals only)\n"
            "  --log-level L              pretty stderr verbosity (trace|debug|info|warning|\n"
            "                             error|critical|off; default info)\n"
+           "  --debug LIST               log the Engine's trace lines for these subsystems,\n"
+           "                             comma-separated: prefix-cache, disk, scheduler,\n"
+           "                             all (off by default; shown at any --log-level)\n"
            "  --cors                     send permissive CORS headers for browser UIs\n"
            "  --usage-chunk-choice       give the streamed usage chunk a zero-delta choice so\n"
            "                             strict parsers that reject choices:[] accept it\n"
@@ -1078,6 +1104,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.greedy = true;
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(require_value("--log-level"));
+        } else if (arg == "--debug") {
+            options.debug_categories = parse_debug_categories(require_value("--debug"));
         } else {
             throw std::logic_error("serve option " + arg + " has no parser");
         }

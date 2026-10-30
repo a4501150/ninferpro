@@ -6,7 +6,7 @@
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 #include "models/qwen3_5/program/planning/fast_paths.h"
-#include "runtime/engine/diagnostics.h"
+#include "runtime/diagnostics.h"
 
 #include <algorithm>
 #include <system_error>

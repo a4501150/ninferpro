@@ -198,6 +198,37 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             "Draft tokens accepted by native verification.");
     COUNTER(speculative_fallback_steps, "spec_decode_fallback_steps_total",
             "Speculative fallback steps without drafts.");
+    GAUGE(hybrid_snapshots, "prefix_cache_snapshots", "Snapshots in the prefix cache.");
+    GAUGE(hybrid_tree_blocks, "prefix_cache_blocks", "KV blocks in the prefix cache's tree.");
+    GAUGE(hybrid_cached_blocks, "prefix_cache_device_blocks", "Tree blocks with a Device copy.");
+    GAUGE(hybrid_evictable_blocks, "prefix_cache_device_evictable_blocks",
+          "Device tree blocks nothing pins (evictable).");
+    GAUGE(hybrid_host_capacity_bytes, "prefix_cache_host_capacity_bytes", "Size of the prefix cache's Host tier.");
+    GAUGE(hybrid_host_used_bytes, "prefix_cache_host_used_bytes", "Host tier bytes holding entries.");
+    GAUGE(hybrid_held_snapshots, "prefix_cache_held_snapshots", "Snapshots held for queued requests.");
+    COUNTER(hybrid_snapshot_hits, "prefix_cache_snapshot_hits_total", "Admissions resumed from a snapshot.");
+    COUNTER(hybrid_taps_created, "prefix_cache_taps_total", "Tap snapshots published.");
+    COUNTER(hybrid_taps_skipped, "prefix_cache_taps_skipped_total",
+            "Planned taps not captured (no Host image or slot).");
+    COUNTER(hybrid_endpoints_created, "prefix_cache_endpoints_total", "Endpoint snapshots published.");
+    COUNTER(hybrid_prompt_end_captures, "prefix_cache_prompt_end_captures_total",
+            "Prompt-end snapshots taken for the zero-token resume.");
+    COUNTER(hybrid_prompt_end_gated, "prefix_cache_prompt_end_gated_total",
+            "Prompt ends skipped by design (a snapshot within one tap separation, an exclusion).");
+    COUNTER(hybrid_prompt_end_failed, "prefix_cache_prompt_end_failed_total",
+            "Prompt ends refused for want of a staging slot, Host slabs or a free page.");
+    COUNTER(hybrid_host_image_writes, "prefix_cache_host_image_writes_total", "Snapshot images written to Host.");
+    COUNTER(hybrid_host_block_writes, "prefix_cache_host_block_writes_total", "KV blocks written to Host.");
+    COUNTER(hybrid_host_image_restores, "prefix_cache_host_image_restores_total",
+            "Snapshot images restored from Host.");
+    COUNTER(hybrid_host_block_restores, "prefix_cache_host_block_restores_total", "KV blocks restored from Host.");
+    COUNTER(hybrid_evicted_blocks, "prefix_cache_device_evictions_total", "Device tree blocks evicted.");
+    COUNTER(hybrid_host_snapshot_evictions, "prefix_cache_host_snapshot_evictions_total",
+            "Snapshots evicted from Host.");
+    COUNTER(hybrid_host_dead_reclaims, "prefix_cache_host_dead_reclaims_total",
+            "Host block copies reclaimed with no snapshot above them.");
+    COUNTER(hybrid_held_host_refusals, "prefix_cache_held_host_refusals_total",
+            "Host allocations refused because only held snapshots were left.");
     GAUGE(hybrid_disk_capacity_bytes, "prefix_cache_disk_capacity_bytes",
           "Size of the prefix cache's Disk tier (0: none).");
     GAUGE(hybrid_disk_used_bytes, "prefix_cache_disk_used_bytes", "Disk tier bytes holding entries.");

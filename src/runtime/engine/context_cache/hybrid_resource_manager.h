@@ -77,7 +77,8 @@ public:
         // The zero-token resume's prompt-end captures (Qwen4Exp).
         if constexpr (requires { hybrid.prompt_end_captures; }) {
             out.hybrid_prompt_end_captures = hybrid.prompt_end_captures;
-            out.hybrid_prompt_end_skipped  = hybrid.prompt_end_skipped;
+            out.hybrid_prompt_end_gated    = hybrid.prompt_end_gated;
+            out.hybrid_prompt_end_failed   = hybrid.prompt_end_failed;
         }
         // Publication refusals (Qwen3.5's Device snapshot slots; other caches have none).
         if constexpr (requires { hybrid.device_slot_refusals; }) {

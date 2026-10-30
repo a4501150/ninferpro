@@ -8,10 +8,15 @@
 
 namespace infernix::product {
 
-DiagnosticObserver engine_diagnostic_observer(std::shared_ptr<spdlog::logger> logger) {
+DiagnosticObserver engine_diagnostic_observer(std::shared_ptr<spdlog::logger> logger, std::uint32_t debug) {
     return DiagnosticObserver{
         .callback = [logger = std::move(logger)](const Diagnostic& diagnostic) {
             const std::string message = format_pretty_text(diagnostic.message);
+            if (diagnostic.category != DebugCategory::None) {
+                // A --debug trace line: asked for by its category, so shown at any log level.
+                logger->info("{} | {}", debug_category_name(diagnostic.category), message);
+                return;
+            }
             switch (diagnostic.level) {
             case DiagnosticLevel::Debug:
                 logger->debug("engine | {}", message);
@@ -26,7 +31,8 @@ DiagnosticObserver engine_diagnostic_observer(std::shared_ptr<spdlog::logger> lo
                 logger->error("engine | {}", message);
                 break;
             }
-        }};
+        },
+        .debug = debug};
 }
 
 } // namespace infernix::product

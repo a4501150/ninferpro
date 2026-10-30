@@ -544,6 +544,21 @@ int main() {
     const ServeOptions logging = parse({"infernix-serve", "model.ninfer", "--log-level", "debug"});
     failures += check(logging.log_level == infernix::product::LogLevel::Debug,
                       "log level did not reach serving options");
+    failures += check(logging.debug_categories == 0, "trace categories are on without --debug");
+    const ServeOptions tracing =
+        parse({"infernix-serve", "model.ninfer", "--debug", "prefix-cache,scheduler"});
+    failures += check(tracing.debug_categories == (static_cast<std::uint32_t>(infernix::DebugCategory::PrefixCache) |
+                                                   static_cast<std::uint32_t>(infernix::DebugCategory::Scheduler)),
+                      "--debug prefix-cache,scheduler did not select exactly those categories");
+    const ServeOptions tracing_all = parse({"infernix-serve", "model.ninfer", "--debug", "all"});
+    failures += check(tracing_all.debug_categories == 0x7U, "--debug all did not select every category");
+    for (const char* bad : {"prefix", "disk,", ""}) {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--debug", bad});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, (std::string("--debug accepted '") + bad + "'").c_str());
+    }
 
     const ServeOptions zero_host_context =
         parse({"infernix-serve", "model.ninfer", "--host-context-mib", "0"});

@@ -59,7 +59,11 @@ struct PrefixCacheCounters {
     std::uint64_t taps_created                = 0;
     std::uint64_t taps_skipped                = 0;
     std::uint64_t prompt_end_captures         = 0; // the zero-token resume's prompt-end snapshots
-    std::uint64_t prompt_end_skipped          = 0; // no staging slot, Host slabs or free page
+    // Prompt ends not captured: gated by design (within one tap separation of the deepest
+    // published frontier, an excluded frontier, drafter cells not written, unpublished blocks), or
+    // failed for want of a staging slot, Host slabs or a free page.
+    std::uint64_t prompt_end_gated            = 0;
+    std::uint64_t prompt_end_failed           = 0;
     std::uint64_t endpoints_created           = 0;
     std::uint64_t endpoint_skipped_mtp        = 0;
     std::uint64_t endpoint_mismatch_fallbacks = 0;

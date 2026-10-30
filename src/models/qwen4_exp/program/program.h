@@ -85,10 +85,11 @@ struct HybridPrefixCacheStats {
     std::uint64_t blocks_duplicate        = 0;
     std::uint64_t taps_created            = 0;
     std::uint64_t taps_skipped            = 0;
-    // The zero-token resume: prompt-end snapshots taken, and skips (no staging slot, Host slabs
-    // or free page, an excluded frontier, unpublished blocks).
+    // The zero-token resume: prompt-end snapshots taken, skipped by design (PrefixCacheCounters),
+    // and refused for want of a staging slot, Host slabs or a free page.
     std::uint64_t prompt_end_captures     = 0;
-    std::uint64_t prompt_end_skipped      = 0;
+    std::uint64_t prompt_end_gated        = 0;
+    std::uint64_t prompt_end_failed       = 0;
     std::uint64_t endpoints_created       = 0;
     std::uint64_t host_image_writes       = 0;
     std::uint64_t host_block_writes       = 0;

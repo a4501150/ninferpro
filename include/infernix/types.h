@@ -376,9 +376,32 @@ enum class DiagnosticLevel : std::uint8_t {
     Error,
 };
 
+// The subsystems --debug can trace (bits of DiagnosticObserver::debug). A trace line is a Debug
+// diagnostic carrying its category; it is formatted only when its bit is set.
+enum class DebugCategory : std::uint32_t {
+    None        = 0,
+    PrefixCache = 1U << 0, // captures, publications, evictions, selections and their refusals
+    Disk        = 1U << 1, // the prefix cache's Disk tier: spills, block writes, fetches, journal
+    Scheduler   = 1U << 2, // admissions, deferrals, pauses, restores
+};
+inline constexpr DebugCategory kDebugCategories[] = {DebugCategory::PrefixCache, DebugCategory::Disk,
+                                                     DebugCategory::Scheduler};
+
+// The category's --debug name, printed before its trace lines.
+[[nodiscard]] constexpr const char* debug_category_name(DebugCategory category) noexcept {
+    switch (category) {
+    case DebugCategory::PrefixCache: return "prefix-cache";
+    case DebugCategory::Disk: return "disk";
+    case DebugCategory::Scheduler: return "scheduler";
+    case DebugCategory::None: break;
+    }
+    return "engine";
+}
+
 // One runtime diagnostic from the Engine worker or its shutdown.
 struct Diagnostic {
     DiagnosticLevel level = DiagnosticLevel::Info;
+    DebugCategory category = DebugCategory::None;
     std::string message;
 };
 
@@ -387,6 +410,11 @@ struct DiagnosticObserver {
     // which levels to show. Without a callback, Info and above go to stderr. Callback exceptions
     // are ignored so a logging failure cannot disturb execution.
     std::function<void(const Diagnostic& diagnostic)> callback;
+    // DebugCategory bits whose trace lines are published (--debug); 0 publishes none.
+    std::uint32_t debug = 0;
+    [[nodiscard]] bool tracing(DebugCategory category) const noexcept {
+        return (debug & static_cast<std::uint32_t>(category)) != 0;
+    }
 };
 
 // Abandons the shutdown save of a stopping Engine from any thread, also while the Engine is being
@@ -1768,10 +1796,12 @@ struct RuntimeStats {
     std::uint64_t hybrid_taps_skipped            = 0;
     std::uint64_t hybrid_endpoints_created       = 0;
     // The zero-token resume (Qwen4Exp): prompt-end snapshots taken at the prompt's own frontier,
-    // and skips (no staging slot, Host slabs or free page, an excluded frontier, unpublished
-    // blocks). Zero for other caches.
+    // skipped by design (within one tap separation of the deepest published frontier, an
+    // excluded frontier, unpublished blocks), and refused for want of a staging slot, Host slabs
+    // or a free page. Zero for other caches.
     std::uint64_t hybrid_prompt_end_captures     = 0;
-    std::uint64_t hybrid_prompt_end_skipped      = 0;
+    std::uint64_t hybrid_prompt_end_gated        = 0;
+    std::uint64_t hybrid_prompt_end_failed       = 0;
     // Publication refusals: taps skipped for want of a Device snapshot slot (of taps_skipped),
     // endpoints that passed their gates but were not published, snapshot images and blocks
     // refused Host slabs (they stay Device-only), Device snapshot slots taken from an owner, slot

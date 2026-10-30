@@ -7,6 +7,7 @@
 #endif
 
 #include "core/arena.h"
+#include "runtime/diagnostics.h"
 #include "core/cuda_vmm.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/vmm_arena.h"
@@ -64,6 +65,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cerrno>
 #include <cstdlib>
@@ -4301,6 +4303,17 @@ private:
         } catch (...) {}
     }
 
+    // A --debug trace line of `category`; nothing is formatted while the category is off.
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 3, 4)))
+#endif
+    void trace(DebugCategory category, const char* format, ...) const noexcept {
+        if (!options_.diagnostics.tracing(category)) [[likely]] { return; }
+        std::va_list args;
+        va_start(args, format);
+        runtime::publish_diagnostic_v(options_.diagnostics, DiagnosticLevel::Debug, category, format, args);
+        va_end(args);
+    }
 
     // The io bytes a decode or verification round of `columns` columns reads: everything before
     // the n-gram rows (ids, positions, slots, table rows, logit columns) and its columns' rows.

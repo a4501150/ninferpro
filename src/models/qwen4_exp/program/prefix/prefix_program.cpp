@@ -812,7 +812,8 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     out.taps_created            = count.taps_created;
     out.taps_skipped            = count.taps_skipped;
     out.prompt_end_captures     = count.prompt_end_captures;
-    out.prompt_end_skipped      = count.prompt_end_skipped;
+    out.prompt_end_gated        = count.prompt_end_gated;
+    out.prompt_end_failed       = count.prompt_end_failed;
     out.endpoints_created       = count.endpoints_created;
     out.host_image_writes       = count.host_image_writes;
     out.host_block_writes       = count.host_block_writes;
@@ -1072,7 +1073,7 @@ void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
     if (n == 0 || !drafter || (lane.prefix.path.size() < k && !anchor_pending) ||
         prefix::inside_exclusion(n, lane.prefix.exclusions) ||
         n - lane.prefix.deepest < pc::kMinimumTapSeparation) {
-        ++prefix_->counters().prompt_end_skipped;
+        ++prefix_->counters().prompt_end_gated;
         return;
     }
     // The fresh tail page: the snapshot's own copy of the lane's last partial block, taken before
@@ -1084,7 +1085,8 @@ void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
     if (n % kBlock != 0) {
         reservation = pool_->reserve(1);
         if (!reservation) {
-            ++prefix_->counters().prompt_end_skipped;
+            ++prefix_->counters().prompt_end_failed;
+            trace(DebugCategory::PrefixCache, "prompt end %u: no free page for its tail copy", n);
             return;
         }
         fresh = pool_->materialize_one(*reservation);
@@ -1109,6 +1111,7 @@ void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
         prefix_captured(lane, id, n);
         lane.prefix.deepest = deepest;
     } else {
+        trace(DebugCategory::PrefixCache, "prompt end %u: capture refused (no staging slot or Host slabs)", n);
         fresh.reset();       // the capture was refused: no staging slot or Host slabs (counted)
         reservation.reset();
     }

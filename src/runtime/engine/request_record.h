@@ -197,6 +197,8 @@ struct RequestRecord {
     bool admission_observed            = false;
     GenerationAdmissionStats admission;
     std::optional<Clock::time_point> source_wait_started;
+    // The last admission deferral traced (--debug scheduler), so a retry each cycle logs once.
+    std::uint8_t traced_deferral           = 0;
     bool recovery_pending                  = false;
     std::uint64_t committed_decode_tokens  = 0;
     GenerationRecoveryRoute recovery_route = GenerationRecoveryRoute::None;

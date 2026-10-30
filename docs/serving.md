@@ -1259,6 +1259,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
+| `--debug LIST` | log the Engine's trace lines for these subsystems at any log level, comma-separated: `prefix-cache` (captures, refusals, evictions, selections), `disk` (the prefix cache's Disk tier), `scheduler` (admissions, deferrals, pauses, restores), or `all` | off |
 | `--device N` | CUDA device index | `0` |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
@@ -1355,7 +1356,9 @@ readiness, request lifecycle, fixed-interval throughput, and shutdown; `--log-le
 internal startup and resource-planning detail. Engine runtime diagnostics are ordinary records
 prefixed `engine |`: a Device KV lease extended by releasing retained cache is `debug`; a lease
 that cannot grow, recovery from out of memory or a failed request, and a failed prefix-cache save
-are warnings or errors; the prefix-cache save at shutdown is `info`. FFmpeg's media-decoding
+are warnings or errors; the prefix-cache save at shutdown is `info`. An engine step that holds every
+request for more than a second is a warning, at most one per 10 s with the count of others. `--debug`
+trace lines are prefixed with their category (`prefix-cache |`, `disk |`, `scheduler |`) and show at any `--log-level`. FFmpeg's media-decoding
 messages are records prefixed `media |`, so they never write inside the statistics panel: FFmpeg
 errors are warnings, and its warnings and notices, such as swscaler's `deprecated pixel format`
 notice for each JPEG, are `debug`. A terminal may use one
@@ -1469,6 +1472,9 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
 | `infernix_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes; a snapshot restore resumed from a cache snapshot at the paused frontier |
 | `infernix_{root,prefix}_selections_total` | Initial bindings from the root and from a prefix-cache snapshot |
+| `infernix_prefix_cache_{snapshots,blocks,device_blocks,device_evictable_blocks,held_snapshots}`, `infernix_prefix_cache_host_{capacity,used}_bytes` | The prefix cache's contents and the Host tier's size and use |
+| `infernix_prefix_cache_{snapshot_hits,taps,taps_skipped,endpoints}_total`, `infernix_prefix_cache_prompt_end_{captures,gated,failed}_total` | Snapshot reuse and publication; a prompt end is gated by design when a snapshot lies within one tap separation of it, and failed when a staging slot, Host slabs or a free page were missing |
+| `infernix_prefix_cache_host_{image_writes,block_writes,image_restores,block_restores,snapshot_evictions,dead_reclaims}_total`, `infernix_prefix_cache_device_evictions_total`, `infernix_prefix_cache_held_host_refusals_total` | Host tier traffic and evictions |
 | `infernix_prefix_cache_disk_{capacity,used}_bytes`, `infernix_prefix_cache_disk_{image_writes,block_writes,write_bytes,fetches,read_bytes,failures}_total` | The prefix cache's Disk tier (`--prefix-cache-disk`; zero without one): its size and use, what was written to it and read back, and failed transfers or images that no longer match their record |
 | `infernix_device_kv_{used,capacity}_pages`, `infernix_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; cached blocks and snapshots also occupy these pools |
 | `infernix_host_work_seconds_total{phase}`, `infernix_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |

@@ -8,7 +8,7 @@
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
-#include "runtime/engine/diagnostics.h"
+#include "runtime/diagnostics.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/qwen4_exp_instance.h"

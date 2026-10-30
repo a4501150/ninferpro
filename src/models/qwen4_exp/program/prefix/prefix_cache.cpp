@@ -327,7 +327,7 @@ bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cuda
         }
     }
     if (slot == prompt_end_slots_.size()) {
-        ++counters_.prompt_end_skipped;
+        ++counters_.prompt_end_failed;
         return false;
     }
     std::byte* const staging = prompt_end_slots_[slot];
@@ -339,7 +339,7 @@ bool PrefixCache::capture_prompt_end(std::uint32_t lane, Capture&& capture, cuda
     if (!defer) {
         image = reserve_image(tail, capture.claim);
         if (!image) {
-            ++counters_.prompt_end_skipped;
+            ++counters_.prompt_end_failed;
             return false;
         }
     }
@@ -393,7 +393,7 @@ bool PrefixCache::start_deferred(PendingCapture& c, bool& dropped) {
     std::optional<ImageTarget> image = reserve_image(!c.capture.tail.empty(), c.capture.claim);
     if (!image) {
         dropped = true;
-        ++counters_.prompt_end_skipped;
+        ++counters_.prompt_end_failed;
         return false;
     }
     c.image = std::move(*image);

@@ -2,7 +2,7 @@
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
-#include "runtime/engine/diagnostics.h"
+#include "runtime/diagnostics.h"
 
 #include <spdlog/logger.h>
 
@@ -341,6 +341,33 @@ int main() {
         failures += check(output.find("engine | Device KV lease of lane 1 cannot grow") !=
                               std::string::npos,
                           "a warning Engine diagnostic must show at the default level");
+    }
+
+    // --debug trace lines: a selected category shows at the default level under its name, and an
+    // unselected one is never published.
+    {
+        std::string output;
+        {
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix",
+                     .level        = infernix::product::LogLevel::Info,
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Tool});
+                const infernix::DiagnosticObserver observer = infernix::product::engine_diagnostic_observer(
+                    logging.logger(), static_cast<std::uint32_t>(infernix::DebugCategory::PrefixCache));
+                infernix::runtime::publish_trace(observer, infernix::DebugCategory::PrefixCache,
+                                                 "tap at %u refused", 4096U);
+                infernix::runtime::publish_trace(observer, infernix::DebugCategory::Disk, "spill of %u blocks", 7U);
+                logging.flush();
+            }
+            output = capture.finish();
+        }
+        failures += check(output.find("prefix-cache | tap at 4096 refused") != std::string::npos,
+                          "a selected trace category must show at the default level");
+        failures += check(output.find("spill of 7 blocks") == std::string::npos,
+                          "an unselected trace category must not be published");
     }
 
     // FFmpeg's media-decoding lines are records of the runtime's logger rather than direct stderr
