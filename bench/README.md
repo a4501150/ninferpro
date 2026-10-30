@@ -15,8 +15,8 @@ The closed-loop agentic A/B suite under [`agentic_ab/`](agentic_ab/README.md) (N
 port vs Infernix, black-box OpenAI API) replays interleaved agent sessions, subagent fan-outs,
 compaction, retries and aborts shaped from the production request logs, and reports cache hits,
 TTFT, cold prefill and output rates. It and the decode-saturation suite of
-`tools/bench/run_serve_concurrency.py` produce the numbers in the
-[README](../README.md#benchmarks). The older serve A/B rig
+`tools/bench/run_serve_concurrency.py` produced the numbers in Infernix's README. ninferpro's
+README table comes from `make t3` instead ([Performance](../docs/performance.md)). The older serve A/B rig
 under [`ab/`](ab/README.md) predates the `e31bc99b` merge.
 
 ## Benchmark inputs
