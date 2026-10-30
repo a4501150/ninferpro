@@ -43,8 +43,10 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
   - a Disk tier for the Qwen3.8-Flash-Next prefix cache (`--prefix-cache-disk DIR`,
     `--prefix-cache-disk-gib N`): a third residency of the shared index on the SSD, moved through
     cuFile (GPUDirect Storage with `nvidia_fs` loaded, its compatibility mode otherwise), kept
-    across restarts by a journal; the RAM tier spills cold snapshots to it or, at
-    `--host-context-mib 0`, captures write through; it replaces this model's whole-file save;
+    across restarts by a journal; a background writer copies every retained snapshot and its path
+    to it and the RAM tier drops Disk-backed copies before valuing others (or, at
+    `--host-context-mib 0`, captures write through); the family owns its prefix index for this
+    (hybrid-prefix-cache-spec §17.1); it replaces this model's whole-file save;
   - batched DFlash2 drafting at any round size with an online cost fit;
   - prefill beside decode for Qwen3.8-Flash-Next: while another lane decodes, a prompt's calls are
     split to `--prefill-chunk-beside-decode` and each but the last rides in the decode round's
