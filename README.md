@@ -38,20 +38,28 @@ The binaries keep their Infernix names (`infernix-serve`, `infernix`, `infernix-
 ## Measured
 
 RTX PRO 6000 Blackwell, orcarouter Qwen3.8-Flash-Next-Uncensored-NVFP4 (recipe C conversion), BF16
-n-gram volume, DFlash2 drafter, FP8 KV, 6 lanes, 262,144-token context. One server boot, placements
-switched at runtime; speeds are tok/s from the server's own request log (2026-10-21).
+n-gram volume, DFlash2 drafter, FP8 KV, 6 lanes, 262,144-token context, no Disk prefix cache. One
+server boot, placements switched at runtime in the order shown; speeds are tok/s from the server's
+own request log (commit `fc8826e`, 2026-10-30, `make t3`). [Performance](docs/performance.md)
+defines each column's workload.
 
 | Placement | VRAM / RAM / SSD experts | Process VRAM, GiB (experts / KV / other) | Process RAM | Decode, 1 request | Decode at 30K context | Prefill, 30K | 6 requests, total |
 |---|---|---|---|---|---|---|---|
-| `vram=100%` | 24,576 / 0 / 0 | 90.0 (63.3 / 19.3 / 7.4) | 12.7 GiB | 265 | 212 | 11,400 | 339 |
-| `vram=65%,ram=15%,ssd=20%` | 15,974 / 3,619 / 4,983 | 67.9 (41.2 / 19.3 / 7.4) | 23.6 GiB | 196 | 166 | 8,660 | 304 |
-| `vram=50%,ram=50%` | 12,288 / 12,225 / 63 | 58.4 (31.7 / 19.3 / 7.4) | 45.7 GiB | 207 | 179 | 7,310 | 304 |
-| `vram=50%,ssd=50%` | 12,288 / 0 / 12,288 | 58.4 (31.7 / 19.3 / 7.4) | 14.1 GiB | 57 | 45 | 3,680 | 186 |
+| `vram=100%` | 24,576 / 0 / 0 | 90.3 (63.3 / 19.3 / 7.7) | 12.8 GiB | 380 | 333 | 13,700 | 541 |
+| `vram=65%,ram=15%,ssd=20%` | 15,974 / 3,658 / 4,944 | 68.2 (41.2 / 19.3 / 7.7) | 23.6 GiB | 232 | 220 | 9,750 | 380 |
+| `vram=50%,ram=50%` | 12,288 / 12,288 / 0 | 58.7 (31.7 / 19.3 / 7.8) | 45.8 GiB | 263 | 208 | 8,160 | 388 |
+| `vram=50%,ssd=50%` | 12,288 / 0 / 12,288 | 58.7 (31.7 / 19.3 / 7.8) | 14.2 GiB | 68 | 51 | 3,990 | 193 |
 
-Switches take 0.7-6.8 s; growing back to `vram=100%` refills 12,288 experts in about 3 s. Process
-RAM at `vram=100%` is the 8 GiB prefix-cache host tier (`--host-context-mib`) plus about 4.4 GiB of
-engine heap. RAM is worth far more than SSD for experts that leave VRAM: half the experts in RAM
-decode at 207 tok/s, half on SSD at 57.
+Switching back to `vram=100%` at the end of the same boot measured 379 / 287 / 13,600 / 525. The
+30K-context decode moves with DFlash2 acceptance (69.5 % in the first row, 64.2 % in the last), and
+a second boot's `vram=100%` row measured 289 there. The benchmark flags the
+`vram=65%,ram=15%,ssd=20%` row as disturbed (its measured pass decoded slower than its warm pass)
+in two boots; the second measured 242 / 196 / 9,750 / 400.
+
+Switches take 1.7-8.6 s; growing back to `vram=100%` took 4.2 s. Process RAM at `vram=100%` is the
+8 GiB prefix-cache host tier (`--host-context-mib`) plus about 4.8 GiB of engine heap. RAM is worth
+far more than SSD for experts that leave VRAM: half the experts in RAM decode at 263 tok/s, half on
+SSD at 68.
 
 ## Build
 
