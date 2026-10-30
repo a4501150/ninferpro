@@ -55,7 +55,7 @@
 #include "infernix/ops/qsa.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
-#include "models/qwen4_exp/expert_store.h"
+#include "models/offload/expert_store.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/program/fast_paths.h"
@@ -249,7 +249,7 @@ struct ExpertFrames {
     // misses its frame, so nothing reads them (the MoE requires a host source).
     DeviceBuffer host_tables;
 
-    ExpertFrames(const q4::execution::Parameters& parameters, const q4::ExpertStore& store, std::int32_t sample,
+    ExpertFrames(const q4::execution::Parameters& parameters, const infernix::models::offload::ExpertStore& store, std::int32_t sample,
                  DeviceContext& device) {
         const auto& c = parameters.model.config().text;
         const auto E  = static_cast<std::int32_t>(c.moe.experts);

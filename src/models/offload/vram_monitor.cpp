@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/program/vram_monitor.h"
+#include "models/offload/vram_monitor.h"
 
 #include <cuda_runtime.h>
 
@@ -11,7 +11,7 @@
 #include <windows.h>
 #endif
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::models::offload {
 
 namespace testing {
 namespace {
@@ -93,4 +93,4 @@ void VramMonitor::run() {
     }
 }
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::models::offload

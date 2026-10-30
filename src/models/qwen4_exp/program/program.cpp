@@ -46,7 +46,7 @@ Program::ExpertPlacementStatus Program::expert_placement_status() const {
     return impl_->placement_status();
 }
 
-bool Program::request_expert_placement(const ExpertPlacementRequest& request, std::string* error) {
+bool Program::request_expert_placement(const offload::ExpertPlacementRequest& request, std::string* error) {
     return impl_->request_placement(request, error);
 }
 

@@ -15,7 +15,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen4_exp/config.h"
-#include "models/qwen4_exp/expert_placement.h"
+#include "models/offload/expert_placement.h"
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/types.h"
@@ -541,7 +541,7 @@ struct ProgramOptions {
     double vram_grow_delay_seconds = 30.0;
     // Internal (measurement tools and tests): when set, every round's routed experts and every CUDA
     // graph executable's device memory are appended to this file for the expert-cache replay and
-    // the graph-memory measurement (program/route_trace.h). Changes no result.
+    // the graph-memory measurement (models/offload/route_trace.h). Changes no result.
     std::filesystem::path route_trace;
 };
 
@@ -596,7 +596,7 @@ public:
     // keys do not fit, is refused with `error` and changes nothing. Requests keep running; a
     // shrink's survivors demote through the RAM tier or drop to the artifact, and freed VMM
     // chunks release their VRAM.
-    [[nodiscard]] bool request_expert_placement(const ExpertPlacementRequest& request, std::string* error = nullptr);
+    [[nodiscard]] bool request_expert_placement(const offload::ExpertPlacementRequest& request, std::string* error = nullptr);
     // The counts form (/admin/expert-placement {"vram": N, "ram": M}): hold N frames for the
     // best-ranked keys (adaptive within the count, not pinned) and M RAM-tier resident slots;
     // M 0 releases the tier once every expert is back in VRAM. The session's ranking seeds both.

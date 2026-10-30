@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::models::offload {
 
 // A resolved placement over the model's keys (layer * experts + expert).
 struct ExpertPlacementSpec {
@@ -112,4 +112,4 @@ struct ExpertsSpec {
 [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> experts_spec_counts(const ExpertsSpec& spec,
                                                                           std::uint64_t total);
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::models::offload

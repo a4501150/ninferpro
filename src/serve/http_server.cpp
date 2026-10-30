@@ -1,6 +1,6 @@
 #include "serve/http_server.h"
 
-#include "models/qwen4_exp/expert_placement.h"
+#include "models/offload/expert_placement.h"
 
 #include "product/logging/logging.h"
 #include "serve/anthropic_messages.h"
@@ -631,9 +631,9 @@ void HttpServer::handle_expert_placement_post(const httplib::Request& req, httpl
             for (std::size_t i = 0; i < terms.size(); ++i) {
                 spec_text += (i == 0 ? "" : ",") + terms[i];
             }
-            const auto spec = infernix::models::qwen4_exp::parse_experts_spec(spec_text);
+            const auto spec = infernix::models::offload::parse_experts_spec(spec_text);
             const auto [vram_count, ram_count] =
-                infernix::models::qwen4_exp::experts_spec_counts(spec, now.total_experts);
+                infernix::models::offload::experts_spec_counts(spec, now.total_experts);
             if (dry_run) {
                 // The preview: the placement's own numbers, applied to nothing.
                 const std::uint64_t frames_bytes = vram_count * now.frame_bytes;

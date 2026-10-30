@@ -607,7 +607,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
 Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
              std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
              std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
-             std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing)
+             std::optional<offload::ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing)
     : backing_(std::move(backing)), draft_backing_(std::move(draft_backing)), expert_store_(std::move(expert_store)),
       config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
@@ -695,7 +695,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         }
         banks.push_back(std::move(bank));
     }
-    std::optional<ExpertStore> store;
+    std::optional<offload::ExpertStore> store;
     if (streamed) {
         const auto& c = data->config.text;
         store.emplace(backing.stream_source(), bank_objects, std::move(bank_strides), c.moe.experts,

@@ -4,11 +4,11 @@
 // exists (design §19.3.5 S4b). Every artifact of the architecture's shape uses it (FP8, NVFP4,
 // Dense8, IQ3_S and their derivatives route through the same experts); the program checks the shape.
 
-#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
+#include "models/offload/expert_cache.h"
 
 #include <cstdint>
 
-namespace infernix::models::qwen4_exp::expert_cache {
+namespace infernix::models::offload::expert_cache {
 
 inline constexpr std::uint32_t kCalibratedLayers  = 48;
 inline constexpr std::uint32_t kCalibratedExperts = 512;
@@ -18,4 +18,4 @@ inline constexpr std::uint32_t kCalibratedExperts = 512;
 // every layer's second, and so on.
 [[nodiscard]] SavedState calibrated_expert_order();
 
-} // namespace infernix::models::qwen4_exp::expert_cache
+} // namespace infernix::models::offload::expert_cache

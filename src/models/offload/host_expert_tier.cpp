@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/program/host_expert_tier.h"
+#include "models/offload/host_expert_tier.h"
 
 #include <cuda_runtime.h>
 
@@ -13,7 +13,7 @@
 #    include <immintrin.h>
 #endif
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::models::offload {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -1018,4 +1018,4 @@ void HostExpertTier::agent_loop() {
     }
 }
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::models::offload

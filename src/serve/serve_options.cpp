@@ -1,6 +1,6 @@
 #include "serve/serve_options.h"
 
-#include "models/qwen4_exp/expert_placement.h"
+#include "models/offload/expert_placement.h"
 #include "product/config/config_file.h"
 #include "product/speculative_options.h"
 
@@ -964,7 +964,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (text == "auto") {
                 options.experts.clear();
             } else {
-                models::qwen4_exp::parse_experts_spec(text); // grammar checked up front
+                models::offload::parse_experts_spec(text); // grammar checked up front
                 options.experts = text;
             }
         } else if (arg == "--expert-placement") {

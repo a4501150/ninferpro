@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/expert_placement.h"
+#include "models/offload/expert_placement.h"
 
 #include <algorithm>
 #include <cctype>
@@ -9,7 +9,7 @@
 #include <stdexcept>
 
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::models::offload {
 namespace {
 
 // ---- the --experts spec ----
@@ -383,4 +383,4 @@ std::vector<std::uint32_t> placement_refill_batch(std::span<const std::uint32_t>
     return want;
 }
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::models::offload

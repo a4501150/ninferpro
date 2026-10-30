@@ -43,7 +43,7 @@
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "models/qwen4_exp/config.h"
-#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
+#include "models/offload/expert_cache.h"
 
 #include <cuda_runtime.h>
 
@@ -54,7 +54,7 @@
 #include <span>
 #include <vector>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::models::offload {
 
 class HostExpertTier;
 
@@ -95,16 +95,16 @@ public:
     // record stride, each at most record_stride (empty: every layer's is record_stride). The layers
     // of one stride share a pool of frames of that pitch. max_columns: the most columns one round
     // routes. The cache starts with no frames: resize() backs them.
-    ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks, std::uint64_t record_stride,
+    ExpertResidency(const qwen4_exp::TextConfig& config, std::vector<const std::uint8_t*> banks, std::uint64_t record_stride,
                     std::int32_t max_columns, int device, std::vector<std::uint64_t> host_strides = {});
     ~ExpertResidency();
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
 
     // Device bytes besides the frames: the frame tables and the route log.
-    [[nodiscard]] static std::uint64_t table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept;
+    [[nodiscard]] static std::uint64_t table_bytes(const qwen4_exp::TextConfig& config, std::int32_t max_columns) noexcept;
     // Frames the cache uses at most: every routed expert (a resident placement holds them all).
-    [[nodiscard]] static std::uint32_t max_frames(const TextConfig& config) noexcept;
+    [[nodiscard]] static std::uint32_t max_frames(const qwen4_exp::TextConfig& config) noexcept;
     // The average frame's bytes for these strides (the sizing unit of frames(), resize() and the
     // device plan): the mean record stride, rounded up.
     [[nodiscard]] static std::uint64_t average_frame_bytes(std::span<const std::uint64_t> strides) noexcept;
@@ -324,7 +324,7 @@ private:
     // publishes their slots (T7), frees their frames and loads queued experts into them.
     void finish_demotions(cudaStream_t compute, bool wait);
 
-    const TextConfig& c_;
+    const qwen4_exp::TextConfig& c_;
     std::vector<const std::uint8_t*> banks_;
     std::vector<std::uint64_t> host_strides_; // per layer: its bank's record stride
     std::uint64_t stride_      = 0;           // the largest record stride (the tier's slot pitch)
@@ -402,4 +402,4 @@ private:
     std::uint32_t bounce_half_ = 0;
 };
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::models::offload

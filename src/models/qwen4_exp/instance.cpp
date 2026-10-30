@@ -6,15 +6,15 @@
 #include "core/startup.h"
 #include "core/vram_budget.h"
 #include "models/load_options.h"
-#include "models/qwen4_exp/expert_placement.h"
+#include "models/offload/expert_placement.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/memory_plan.h"
-#include "models/qwen4_exp/program/expert_cache/calibrated_order.h"
-#include "models/qwen4_exp/program/expert_cache/expert_state.h"
+#include "models/offload/calibrated_order.h"
+#include "models/offload/expert_state.h"
 #include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
-#include "models/qwen4_exp/program/route_trace.h"
-#include "models/qwen4_exp/program/vram_monitor.h"
+#include "models/offload/route_trace.h"
+#include "models/offload/vram_monitor.h"
 #include "models/registry.h"
 #include "runtime/engine/engine_options.h"
 
@@ -250,9 +250,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefix_coalesce_wait_seconds = static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0;
     }
     program_options.route_trace   = options.route_trace_path.empty()
-                                        ? models::qwen4_exp::testing::route_trace()
+                                        ? models::offload::testing::route_trace()
                                         : options.route_trace_path;
-    program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();
+    program_options.vram_grow_delay_seconds = models::offload::testing::vram_grow_delay();
     program_options.vram_headroom = options.vram_headroom_bytes;
     program_options.vram_past_budget = options.vram_past_budget;
     program_options.expert_tail_skip = options.expert_tail_skip;
@@ -299,7 +299,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // warm start reads), else the calibrated order, else spread across the layers.
     const auto load_ranking = [&](std::vector<std::uint32_t>& counts, std::vector<std::uint32_t>& ranked) {
         if (!program_options.expert_state.empty()) {
-            const auto load = models::qwen4_exp::expert_cache::load_expert_state(
+            const auto load = models::offload::expert_cache::load_expert_state(
                 program_options.expert_state, program_options.expert_state_identity,
                 static_cast<std::uint32_t>(placement_keys));
             if (load.state) {
@@ -308,9 +308,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             }
         }
         if (counts.empty() && ranked.empty() && text_config.hidden_size == 2560 &&
-            placement_layers == models::qwen4_exp::expert_cache::kCalibratedLayers &&
-            placement_experts == models::qwen4_exp::expert_cache::kCalibratedExperts) {
-            const auto calibrated = models::qwen4_exp::expert_cache::calibrated_expert_order();
+            placement_layers == models::offload::expert_cache::kCalibratedLayers &&
+            placement_experts == models::offload::expert_cache::kCalibratedExperts) {
+            const auto calibrated = models::offload::expert_cache::calibrated_expert_order();
             counts = calibrated.counts;
             ranked = calibrated.ranked;
             return true;
@@ -318,28 +318,28 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         return false;
     };
 
-    models::qwen4_exp::ExpertPlacementSpec spec;
+    models::offload::ExpertPlacementSpec spec;
     bool placed = false;
     bool all_in_vram = false; // the spec names vram=all: resident, or a startup error
     std::string placement_origin;
     if (!options.expert_placement_path.empty()) {
-        spec = models::qwen4_exp::parse_expert_placement_file(options.expert_placement_path, placement_layers,
+        spec = models::offload::parse_expert_placement_file(options.expert_placement_path, placement_layers,
                                                               placement_experts);
         placed          = true;
         placement_origin = options.expert_placement_path.string();
     } else if (!options.experts_spec.empty()) {
         // The exclusive three-tier spec: shares or counts by usage rank. vram=all (or 100%) is
         // the resident placement; the probe below holds it or fails the start.
-        const models::qwen4_exp::ExpertsSpec experts = models::qwen4_exp::parse_experts_spec(options.experts_spec);
+        const models::offload::ExpertsSpec experts = models::offload::parse_experts_spec(options.experts_spec);
         const auto [vram_count, ram_count] =
-            models::qwen4_exp::experts_spec_counts(experts, placement_keys);
+            models::offload::experts_spec_counts(experts, placement_keys);
         if (vram_count >= placement_keys) {
             all_in_vram = true;
             placement_origin = options.experts_spec;
         } else {
             std::vector<std::uint32_t> counts, ranked;
             const bool calibrated = load_ranking(counts, ranked);
-            spec = models::qwen4_exp::placement_from_counts(
+            spec = models::offload::placement_from_counts(
                 static_cast<std::uint32_t>(vram_count), static_cast<std::uint32_t>(ram_count), placement_layers,
                 placement_experts, counts, ranked);
             placed = true;
@@ -737,10 +737,10 @@ bool Qwen4ExpInstance::request_expert_placement(const ExpertPlacementSwitch& req
         return false;
     }
     if (!request.placement_file.empty()) {
-        models::qwen4_exp::ExpertPlacementRequest model_request;
+        models::offload::ExpertPlacementRequest model_request;
         try {
             const auto& text   = text_config_();
-            const auto spec   = models::qwen4_exp::parse_expert_placement_file(
+            const auto spec   = models::offload::parse_expert_placement_file(
                 request.placement_file, text.num_hidden_layers, text.moe.experts);
             model_request.frame_target = static_cast<std::uint32_t>(spec.vram.size());
             model_request.pinned       = spec.vram;

@@ -1,6 +1,6 @@
-#include "models/qwen4_exp/program/expert_residency.h"
+#include "models/offload/expert_residency.h"
 
-#include "models/qwen4_exp/program/host_expert_tier.h"
+#include "models/offload/host_expert_tier.h"
 
 #include "core/block_copy.h"
 #include "core/copy_batch.h"
@@ -12,7 +12,7 @@
 #include <map>
 #include <stdexcept>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::models::offload {
 namespace {
 
 using expert_cache::CacheController;
@@ -36,7 +36,7 @@ std::uint8_t* ExpertResidency::Pool::base() const noexcept {
     return static_cast<std::uint8_t*>(arena ? arena->base() : memory.p);
 }
 
-std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept {
+std::uint64_t ExpertResidency::table_bytes(const qwen4_exp::TextConfig& config, std::int32_t max_columns) noexcept {
     const std::uint64_t keys = static_cast<std::uint64_t>(config.num_hidden_layers) * config.moe.experts;
     const std::uint64_t route =
         static_cast<std::uint64_t>(config.moe.top_k) * static_cast<std::uint64_t>(max_columns) * config.num_hidden_layers;
@@ -44,7 +44,7 @@ std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_
     return (keys + route + landing) * sizeof(std::int32_t);
 }
 
-std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
+std::uint32_t ExpertResidency::max_frames(const qwen4_exp::TextConfig& config) noexcept {
     return config.num_hidden_layers * config.moe.experts;
 }
 
@@ -55,7 +55,7 @@ std::uint64_t ExpertResidency::average_frame_bytes(std::span<const std::uint64_t
     return (sum + strides.size() - 1) / strides.size();
 }
 
-ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks,
+ExpertResidency::ExpertResidency(const qwen4_exp::TextConfig& config, std::vector<const std::uint8_t*> banks,
                                  std::uint64_t record_stride, std::int32_t max_columns, int device,
                                  std::vector<std::uint64_t> host_strides)
     : c_(config), banks_(std::move(banks)), host_strides_(std::move(host_strides)), stride_(record_stride) {
@@ -1049,4 +1049,4 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
     }
 }
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::models::offload

@@ -32,10 +32,10 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/memory_plan.h"
-#include "models/qwen4_exp/program/expert_residency.h"
-#include "models/qwen4_exp/program/host_expert_tier.h"
-#include "models/qwen4_exp/program/expert_cache/calibrated_order.h"
-#include "models/qwen4_exp/program/expert_cache/expert_state.h"
+#include "models/offload/expert_residency.h"
+#include "models/offload/host_expert_tier.h"
+#include "models/offload/calibrated_order.h"
+#include "models/offload/expert_state.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/call_plan.h"
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
@@ -45,8 +45,8 @@
 #include "models/qwen3_5/execution/vision_tower.h"
 #include "models/qwen3_5/execution/vision_weight_stream.h"
 #include "models/qwen3_5/program/vision_control.h"
-#include "models/qwen4_exp/program/route_trace.h"
-#include "models/qwen4_exp/program/vram_monitor.h"
+#include "models/offload/route_trace.h"
+#include "models/offload/vram_monitor.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "infernix/ops/argmax.h"
@@ -179,7 +179,7 @@ struct LaneVision {
     qwen3_5::VisionControl control;            // the encoded items' controls
     std::vector<std::shared_ptr<const qwen3_5::PreparedMediaPayload>> payloads; // per encoded item
     std::vector<std::uint32_t> visual;         // the encoded visual tokens' positions, ascending
-    ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
+    offload::ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
     DeviceBuffer fallback;                     // the same bytes when the residency lends no frame
     Tensor handoff;                            // BF16 [out, V_encoded]
     std::unique_ptr<qwen3_5::execution::VisionWeightStream> stream;
@@ -395,7 +395,7 @@ struct ResumeStateImpl {
     SelectorCalibration dflash_calibration; // DFlash2: acceptance by selector-probability decile
     std::array<double, 4> ngram_accept{}; // the n-gram copies' acceptance per match-length bucket
     std::vector<ConstrainedDraw> constraint_trace;
-    ExpertResidency::Stats cache_at_admission;
+    offload::ExpertResidency::Stats cache_at_admission;
     std::uint64_t cpu_served_at_admission = 0;
     NgramVolume::Counters ngram;
     GateTraffic gate;
@@ -439,9 +439,9 @@ public:
         std::uint64_t prefill_ns      = 0;
         std::uint64_t decode_ns       = 0;
         std::uint64_t decode_share_ns = 0;
-        ExpertResidency::Stats cache_at_admission;
+        offload::ExpertResidency::Stats cache_at_admission;
         std::uint64_t cpu_served_at_admission = 0;
-        HostExpertTier::Stats tier_at_admission{}; // SSD tier mode
+        offload::HostExpertTier::Stats tier_at_admission{}; // SSD tier mode
         // The Program's verification-round counters (rounds, columns, padded columns) at
         // admission, for the request's share of the rounds' padding.
         std::array<std::uint64_t, 3> verify_at_admission{};
@@ -738,10 +738,10 @@ public:
                4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words + kGateStatsBytes * lanes +
                (o.ngram_table && o.ngram_table->fp8_scale ? sizeof(std::uint16_t) : 0) + constraint_bytes(lanes, W) +
                grammar_mask_bytes(d.token_domain, lanes, W) + d.score_residuals + d.score_logits + d.score_io;
-        b.residency            = ExpertResidency::table_bytes(c, d.columns);
+        b.residency            = offload::ExpertResidency::table_bytes(c, d.columns);
         b.expert_record_stride = d.record_stride;
         b.expert_frame_bytes   = d.frame_bytes;
-        b.max_frames           = ExpertResidency::max_frames(c);
+        b.max_frames           = offload::ExpertResidency::max_frames(c);
         b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
                                              static_cast<std::uint32_t>(d.mtp_k), o.sampled_mtp_drafts && d.mtp,
                                              static_cast<std::uint32_t>(d.dflash_k));
@@ -1011,7 +1011,7 @@ public:
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = plan_.staging_slots;
         // The expert cache's tables and route log; its frames come last (below).
-        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), record_stride, columns_, device_.device,
+        residency_ = std::make_unique<offload::ExpertResidency>(c_, std::move(banks), record_stride, columns_, device_.device,
                                                        host_strides);
         // An explicit placement pins its vram set; a resident placement also stops every frame
         // lender (the wide workspace falls back to a temporary allocation).
@@ -1058,7 +1058,7 @@ public:
                     ? std::min<std::uint32_t>(std::max(options_.cpu_expert_jobs, options_.cpu_assist_jobs),
                                               static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuJobs))
                     : 0U;
-            HostExpertTier::Options tier;
+            offload::HostExpertTier::Options tier;
             tier.ring = std::max<std::uint32_t>(128, cpu_cap + 2U * static_cast<std::uint32_t>(plan_.staging_slots));
             const std::uint32_t lists = tier.ring + tier.prefetch + tier.demotion;
             const std::uint64_t keys  = static_cast<std::uint64_t>(store->layers()) * store->experts();
@@ -1099,9 +1099,9 @@ public:
             tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(chunk_, 1)) + 1U;
             // An expert stripe on a second drive: each record's tail is read from it while its head
             // is read from the artifact, at the same depth per drive.
-            const ExpertStore* records = &*store;
+            const offload::ExpertStore* records = &*store;
             if (!options_.expert_stripe.empty()) {
-                striped_store_.emplace(with_stripe(*store, read_expert_stripe(options_.expert_stripe),
+                striped_store_.emplace(offload::with_stripe(*store, offload::read_expert_stripe(options_.expert_stripe),
                                                    parameters_.model.info().artifact_id));
                 records = &*striped_store_;
                 tier.io.demand_depth *= 2;
@@ -1109,7 +1109,7 @@ public:
                 diagnostic("SSD tier: expert record tails from " + options_.expert_stripe.string(),
                            DiagnosticLevel::Info);
             }
-            tier_ = std::make_unique<HostExpertTier>(*records, std::move(tier));
+            tier_ = std::make_unique<offload::HostExpertTier>(*records, std::move(tier));
             residency_->attach_tier(tier_.get());
             // A placement switch rebuilds the tier from the boot options (the rebuild's clone):
             // the store (with its stripe), the queue depths, the ring sizing.
@@ -1205,7 +1205,7 @@ public:
             const VramDemand demand = expert_frame_demand(residency_->frame_bytes());
             sizing_                 = size_expert_frames(vram_->query(), demand);
             // Each pool maps whole chunks: one chunk of slack per pool beyond the first.
-            const auto slack = static_cast<std::uint32_t>((residency_->pools() - 1) * ExpertResidency::kChunkBytes /
+            const auto slack = static_cast<std::uint32_t>((residency_->pools() - 1) * offload::ExpertResidency::kChunkBytes /
                                                           residency_->frame_bytes());
             sizing_.frames   = sizing_.frames > slack ? sizing_.frames - slack : 0U;
             // An explicit placement names the pool's exact size; the startup resolution validated
@@ -1251,7 +1251,7 @@ public:
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames[l] = residency_->table(l); }
         experts.landing       = residency_->landing_table();
         experts.landed        = residency_->landed_log();
-        experts.landing_slots = static_cast<std::int32_t>(ExpertResidency::kLandingSlots);
+        experts.landing_slots = static_cast<std::int32_t>(offload::ExpertResidency::kLandingSlots);
         experts.tail_skip_rank = static_cast<std::int32_t>(options_.expert_tail_skip);
         if (tier_) {
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
@@ -1267,9 +1267,9 @@ public:
             for (auto& channel : experts.cpu) { channel.pcie_divisor = pcie_divisor(); }
         }
         if (!options_.route_trace.empty()) {
-            trace_ = std::make_unique<RouteTrace>(
+            trace_ = std::make_unique<offload::RouteTrace>(
                 options_.route_trace,
-                RouteTraceSetup{.layers             = c_.num_hidden_layers,
+                offload::RouteTraceSetup{.layers             = c_.num_hidden_layers,
                                 .experts            = c_.moe.experts,
                                 .top_k              = c_.moe.top_k,
                                 .frames             = residency_->frames(),
@@ -2004,7 +2004,7 @@ public:
             check_expert_error();
             const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                     static_cast<std::uint64_t>(width));
-            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
+            trace_round(offload::RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
                         static_cast<std::uint32_t>(begin));
             note_prompt_routes(lane, width);
             residency_->after_round(device_.stream, width, promotions);
@@ -2283,7 +2283,7 @@ public:
                 const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
                 device_.synchronize();
             }
-            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
+            trace_round(offload::RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
                         static_cast<std::uint32_t>(begin));
             note_prompt_routes(lane, width);
             residency_->after_round(device_.stream, width, promotions);
@@ -2303,7 +2303,7 @@ public:
             {
                 const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                         static_cast<std::uint64_t>(width));
-                trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
+                trace_round(offload::RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
                             static_cast<std::uint32_t>(begin));
                 note_prompt_routes(lane, width);
                 residency_->after_round(device_.stream, width, promotions);
@@ -2581,7 +2581,7 @@ public:
             run(1, static_cast<std::int32_t>(stride), 1, chunk ? &*chunk : nullptr);
             device_.synchronize();
             check_expert_error();
-            trace_round(RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride,
+            trace_round(offload::RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride,
                         kDecodePromotionsPerLayer, static_cast<std::uint32_t>(begin));
             residency_->after_round(device_.stream, static_cast<std::int32_t>(stride), kDecodePromotionsPerLayer);
             apply_vram_target(false);
@@ -2853,7 +2853,7 @@ private:
         // Seeded frames (a warm start) do not end it: promotions only follow misses, so a workload
         // the saved state matches promotes little anyway, while one it does not match replaces the
         // seeded experts at the fill rate instead of the steady-state rate.
-        const ExpertResidency::Stats& stats = residency_->stats();
+        const offload::ExpertResidency::Stats& stats = residency_->stats();
         if (stats.promotions + stats.landed < residency_->frames()) {
             return kDecodePromotionsPerLayer * tokens;
         }
@@ -2899,8 +2899,8 @@ private:
         const std::size_t budget = decode_budget(deferred_.tokens);
         if (trace_) {
             const std::int32_t width = deferred_.live ? round_width_ : 1;
-            trace_round(deferred_.live ? RouteTraceKind::Verify : RouteTraceKind::Decode, deferred_.columns / width,
-                        width, deferred_.tokens, budget, RouteTrace::kUnknownPosition,
+            trace_round(deferred_.live ? offload::RouteTraceKind::Verify : offload::RouteTraceKind::Decode, deferred_.columns / width,
+                        width, deferred_.tokens, budget, offload::RouteTrace::kUnknownPosition,
                         deferred_.live ? std::span<const std::uint8_t>(live_.data(),
                                                                        static_cast<std::size_t>(deferred_.columns))
                                        : std::span<const std::uint8_t>{});
@@ -2922,7 +2922,7 @@ private:
         if (!options_.vram_monitor || options_.expert_frame_ceiling != 0) { return; }
         const VramSnapshot now = vram_->query();
         if (residency_->elastic()) {
-            control_.emplace(demand, ExpertResidency::kChunkBytes, now.local_usage, residency_->pool_bytes(),
+            control_.emplace(demand, offload::ExpertResidency::kChunkBytes, now.local_usage, residency_->pool_bytes(),
                              options_.vram_grow_delay_seconds);
         }
         frames_now_     = residency_->frames();
@@ -2930,7 +2930,7 @@ private:
         startup_frames_ = frames_now_;
         placement_ceiling_ = options_.expert_frame_ceiling;
         vram_epoch_     = Clock::now();
-        monitor_ = std::make_unique<VramMonitor>(device_.device, *vram_,
+        monitor_ = std::make_unique<offload::VramMonitor>(device_.device, *vram_,
                                                  [this](const VramSnapshot& snapshot) { on_vram_snapshot(snapshot); });
     }
 
@@ -2976,24 +2976,24 @@ public:
     // hold different experts.
     void warm_start_experts() {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
-        expert_cache::ExpertStateLoad load;
+        offload::expert_cache::ExpertStateLoad load;
         SeedSource source = SeedSource::None;
         if (!options_.expert_state.empty() && options_.expert_cache) {
-            load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+            load = offload::expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
             if (load.state) {
                 source = SeedSource::Saved;
             } else if (has_calibrated_order()) {
                 diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
-                load.state = expert_cache::calibrated_expert_order();
+                load.state = offload::expert_cache::calibrated_expert_order();
                 source     = SeedSource::Calibrated;
             }
         }
         // An explicit placement's order (its vram set first, then its ram set) overrides the
         // saved ranking for the seed and the tier fill; the counts stay the session's.
         if (load.state && !options_.expert_tier_order.empty()) {
-            load.state = expert_cache::SavedState{load.state->counts, options_.expert_tier_order};
+            load.state = offload::expert_cache::SavedState{load.state->counts, options_.expert_tier_order};
         }
-        const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
+        const offload::expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
         TierFill fill;
         if (tier_) { fill = prefill_tier(state, source); }
         if (options_.resident_experts && tier_ && residency_->frames() > 0) {
@@ -3004,7 +3004,7 @@ public:
             // resident before the first request.
             const auto begin    = std::chrono::steady_clock::now();
             const std::uint32_t keys = tier_->keys();
-            expert_cache::SavedState window;
+            offload::expert_cache::SavedState window;
             if (state != nullptr && state->counts.size() == keys) { window.counts = state->counts; }
             std::uint32_t seeded = 0;
             // The cursor's first un-read key: prefill_tier already read the order's top
@@ -3063,11 +3063,11 @@ private:
     // Where the warm start's ranking and counts came from.
     enum class SeedSource { None, Saved, Calibrated };
 
-    // The calibrated order (expert_cache/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
+    // The calibrated order (offload/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
     // applies to every model of that shape (NInfer's guard), whatever the artifact's formats.
     [[nodiscard]] bool has_calibrated_order() const noexcept {
-        return c_.hidden_size == 2560 && c_.num_hidden_layers == expert_cache::kCalibratedLayers &&
-               c_.moe.experts == expert_cache::kCalibratedExperts && c_.moe.top_k == 10 &&
+        return c_.hidden_size == 2560 && c_.num_hidden_layers == offload::expert_cache::kCalibratedLayers &&
+               c_.moe.experts == offload::expert_cache::kCalibratedExperts && c_.moe.top_k == 10 &&
                c_.moe.intermediate == 640 && c_.moe.shared_intermediate == 640;
     }
 
@@ -3083,7 +3083,7 @@ private:
     // session's VRAM residents, best first), then every other key that session used, most used
     // first, then the keys it never used one expert of every layer in turn, so that no layer is left
     // wholly on the SSD (file order filled the first layers and left the last ones on disk).
-    [[nodiscard]] std::vector<std::uint32_t> tier_fill_order(const expert_cache::SavedState* state) const {
+    [[nodiscard]] std::vector<std::uint32_t> tier_fill_order(const offload::expert_cache::SavedState* state) const {
         const std::uint32_t layers = c_.num_hidden_layers, experts = c_.moe.experts, keys = layers * experts;
         if (tier_->keys() != keys) { throw std::logic_error("Qwen3.8-Flash-Next: the SSD tier has another key count"); }
         // An explicit placement names the fill order itself (its vram set first, then its ram set).
@@ -3132,7 +3132,7 @@ private:
     }
 
     // The SSD tier's first RAM pass, before the frames' warm start reads from it.
-    TierFill prefill_tier(const expert_cache::SavedState* state, SeedSource source) {
+    TierFill prefill_tier(const offload::expert_cache::SavedState* state, SeedSource source) {
         const auto start = std::chrono::steady_clock::now();
         TierFill fill;
         fill.source = source;
@@ -3187,7 +3187,7 @@ private:
 
     // The frames' warm start from the saved state or the calibrated order; returns how many experts
     // it loaded.
-    std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load, SeedSource source) {
+    std::uint32_t warm_start_frames(const offload::expert_cache::ExpertStateLoad& load, SeedSource source) {
         if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
         if (source == SeedSource::None) {
             diagnostic("expert cache: no saved state yet, so it starts empty and fills as requests arrive");
@@ -3264,7 +3264,7 @@ public:
         if (options_.expert_state.empty() || !residency_ || residency_->frames() == 0) { return; }
         try {
             const std::string error =
-                expert_cache::save_expert_state(options_.expert_state, options_.expert_state_identity, residency_->saved_state());
+                offload::expert_cache::save_expert_state(options_.expert_state, options_.expert_state_identity, residency_->saved_state());
             if (!error.empty()) { diagnostic("expert state not saved: " + error, DiagnosticLevel::Warning); }
             expert_state_saved_  = std::chrono::steady_clock::now();
             expert_state_routed_ = residency_->stats().routed;
@@ -3330,7 +3330,7 @@ public:
     // A switch requested from any thread (the HTTP handler), applied by the engine thread at the
     // next maintenance boundary, where no round's kernels are in flight.
     mutable std::mutex placement_mutex_;
-    ExpertPlacementRequest placement_pending_;
+    offload::ExpertPlacementRequest placement_pending_;
     bool placement_pending_set_ = false;
 
     // A placement grow's resident refill (design §19.3.7): the switch backs new frames but does
@@ -3342,7 +3342,7 @@ public:
     struct PlacementFill {
         std::vector<std::uint32_t> order;   // keys in fill order (usage rank)
         std::size_t at = 0;                 // cursor into `order`
-        expert_cache::SavedState window{};  // counts for seeding; `ranked` holds the tier's keys
+        offload::expert_cache::SavedState window{};  // counts for seeding; `ranked` holds the tier's keys
         std::uint32_t seeded = 0;           // keys seeded so far
         std::uint32_t total  = 0;           // keys the walk covers (progress reporting)
         std::uint32_t stall  = 0;           // consecutive ticks without a seed or a read
@@ -3369,8 +3369,8 @@ public:
     // The boot tier's store (with its stripe) and options: a rebuild clones them with a new
     // resident-slot count. `placement_wants_no_tier_`: a pending switch grows to every key
     // resident in VRAM naming no RAM tier; the tier releases once that grow's refill completes.
-    const ExpertStore* tier_store_   = nullptr;
-    HostExpertTier::Options tier_options_{};
+    const offload::ExpertStore* tier_store_   = nullptr;
+    offload::HostExpertTier::Options tier_options_{};
     bool placement_wants_no_tier_     = false;
 
     // Freed pageable tier memory stays in the allocator's arenas unless handed back.
@@ -3410,7 +3410,7 @@ public:
             b.one_allocation = true;
             return b;
         }
-        HostExpertTier* tier = tier_.get();
+        offload::HostExpertTier* tier = tier_.get();
         b.record_of = [tier](std::uint32_t layer, std::uint32_t expert) { return tier->record(tier->key(layer, expert)); };
         b.hold      = [tier](std::uint32_t layer, std::uint32_t expert) { tier->stream_pin(tier->key(layer, expert)); };
         b.ssd.read    = [tier](std::uint32_t layer, std::uint32_t expert) {
@@ -3450,7 +3450,7 @@ public:
         if (tier_ != nullptr && tier_->resident_capacity() == residents) { return; }
         // The old tier's records seed the new one: no demotion may still be landing in its slots.
         residency_->quiesce_tier(device_.stream);
-        HostExpertTier::Options options = tier_options_;
+        offload::HostExpertTier::Options options = tier_options_;
         const std::uint32_t lists       = options.ring + options.prefetch + options.demotion;
         // ram=0 below full VRAM still stages SSD reads through the tier's lists; the tier needs
         // one resident slot beyond them.
@@ -3460,7 +3460,7 @@ public:
         options.bounce                   = 0; // nothing to stage without them
         options.stream_bounce            = 0;
         options.min_slots                = lists + 1;
-        auto next                        = std::make_unique<HostExpertTier>(*tier_store_, std::move(options));
+        auto next                        = std::make_unique<offload::HostExpertTier>(*tier_store_, std::move(options));
         std::size_t kept                 = 0;
         if (tier_ != nullptr) {
             // The keys the old tier holds, best first: its own decayed usage, else identity.
@@ -3548,7 +3548,7 @@ public:
     void start_tier_fill() {
         if (tier_ == nullptr || residency_ == nullptr || tier_->resident_capacity() == 0) { return; }
         const std::uint32_t keys = c_.num_hidden_layers * c_.moe.experts;
-        const expert_cache::SavedState state = residency_->saved_state();
+        const offload::expert_cache::SavedState state = residency_->saved_state();
         tier_backfill_          = TierBackfill{};
         // Every key by usage: the residents (skipped, they hold frames), then the rest by count.
         tier_backfill_.order  = tier_fill_order(&state);
@@ -3587,7 +3587,7 @@ public:
         wake_maintenance();
     }
 
-    [[nodiscard]] bool request_placement(const ExpertPlacementRequest& request, std::string* error) {
+    [[nodiscard]] bool request_placement(const offload::ExpertPlacementRequest& request, std::string* error) {
         std::unique_lock<std::mutex> lock(placement_mutex_);
         if (!residency_ || residency_->frames() == 0 && request.frame_target == 0) {
             if (error != nullptr) { *error = "this engine runs without the expert cache"; }
@@ -3646,7 +3646,7 @@ public:
             if (error != nullptr) { *error = "this engine runs without the expert cache"; }
             return false;
         }
-        ExpertPlacementRequest request;
+        offload::ExpertPlacementRequest request;
         request.frame_target  = std::min(vram_experts, residency_->frame_limit());
         request.has_ram_target = true;
         request.ram_target    = ram_experts;
@@ -3662,7 +3662,7 @@ public:
     // VRAM. A switch that names no RAM tier while holding every key in VRAM releases it once
     // the grow's refill completes.
     void apply_pending_placement() {
-        ExpertPlacementRequest request;
+        offload::ExpertPlacementRequest request;
         {
             const std::lock_guard<std::mutex> lock(placement_mutex_);
             if (!placement_pending_set_) { return; }
@@ -3785,7 +3785,7 @@ public:
     // the engine idles.
     void start_placement_fill(const std::vector<std::uint32_t>& request_order) {
         if (tier_ == nullptr || residency_ == nullptr || residency_->frames() == 0) { return; }
-        const expert_cache::SavedState state = residency_->saved_state();
+        const offload::expert_cache::SavedState state = residency_->saved_state();
         placement_fill_                      = PlacementFill{};
         const std::uint32_t keys = c_.num_hidden_layers * c_.moe.experts;
         if (state.counts.size() == keys) { placement_fill_.window.counts = state.counts; }
@@ -3839,7 +3839,7 @@ public:
         const std::int32_t* table = residency_->host_table();
         const std::uint32_t keys  = c_.num_hidden_layers * c_.moe.experts;
         const std::uint32_t landed =
-            tier_->prefill(placement_refill_batch(placement_fill_.order, placement_fill_.at, kRefillBatch,
+            tier_->prefill(offload::placement_refill_batch(placement_fill_.order, placement_fill_.at, kRefillBatch,
                                                   std::span<const std::int32_t>(table, keys)));
         const bool filled = residency_->resident_count() >= residency_->frames();
         if (seeded > 0 || landed > 0) {
@@ -3923,7 +3923,7 @@ public:
         status.total_experts = c_.num_hidden_layers * c_.moe.experts;
         status.frame_bytes    = residency_->frame_bytes();
         status.pool_bytes     = residency_->pool_bytes();
-        status.landing_slots  = status.resident ? 0 : ExpertResidency::kLandingSlots * c_.num_hidden_layers;
+        status.landing_slots  = status.resident ? 0 : offload::ExpertResidency::kLandingSlots * c_.num_hidden_layers;
         {
             const VramSnapshot vram = vram_->query();
             status.vram_free  = vram.device_free;
@@ -3969,7 +3969,7 @@ public:
             if (error != nullptr) { *error = "this engine runs without the expert cache"; }
             return false;
         }
-        const expert_cache::SavedState state = residency_->saved_state();
+        const offload::expert_cache::SavedState state = residency_->saved_state();
         std::vector<std::uint32_t> ram;
         const std::uint32_t keys = c_.num_hidden_layers * c_.moe.experts;
         if (tier_ != nullptr) {
@@ -3977,7 +3977,7 @@ public:
                 if (tier_->record(key) != nullptr) { ram.push_back(key); }
             }
         }
-        return write_expert_placement_file(
+        return offload::write_expert_placement_file(
             path, c_.num_hidden_layers, c_.moe.experts,
             std::span<const std::int32_t>(residency_->host_table(), keys), ram, state.counts, error);
     }
@@ -4083,7 +4083,7 @@ private:
 
     // Appends the round whose routes after_round is about to apply to the internal route trace
     // (ProgramOptions::route_trace); rows' lanes are host_lanes_ as staged for the round.
-    void trace_round(RouteTraceKind kind, std::int32_t rows, std::int32_t width, std::uint32_t tokens,
+    void trace_round(offload::RouteTraceKind kind, std::int32_t rows, std::int32_t width, std::uint32_t tokens,
                      std::size_t budget, std::uint32_t position, std::span<const std::uint8_t> live = {}) {
         if (!trace_) { return; }
         trace_->append({.kind     = kind,
@@ -4407,7 +4407,7 @@ private:
         const std::uint64_t page_bytes =
             std::max<std::uint64_t>(1, kv_span_.bytes / std::max<std::uint32_t>(1, pool_->capacity_pages()));
         const std::uint64_t frame_room = static_cast<std::uint64_t>(residency_->frames()) * residency_->frame_bytes();
-        const std::uint64_t slack      = residency_->pools() * ExpertResidency::kChunkBytes + 2 * kKvChunkBytes * plan_.pool.planes.size();
+        const std::uint64_t slack      = residency_->pools() * offload::ExpertResidency::kChunkBytes + 2 * kKvChunkBytes * plan_.pool.planes.size();
         const std::uint64_t usable     = frame_room > slack ? frame_room - slack : 0;
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(room, usable / page_bytes));
     }
@@ -4725,11 +4725,11 @@ private:
             // widens by the most any lease takes per layer of its pool.
             const std::uint64_t slot     = plan_.record_stride;
             const cudaStream_t writers[] = {expert_stream_->stream()};
-            const auto per_layer         = [&](const ExpertResidency::FrameLease& lease) {
+            const auto per_layer         = [&](const offload::ExpertResidency::FrameLease& lease) {
                 const std::uint32_t layers = std::max(1U, residency_->lease_layers(lease));
                 return (lease.count + layers - 1) / layers;
             };
-            ExpertResidency::FrameLease wide, walk;
+            offload::ExpertResidency::FrameLease wide, walk;
             if (wide_work_ > 0) {
                 if (wide_work_ + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
                 wide = residency_->lend(wide_work_, device_.stream, writers);
@@ -4805,7 +4805,7 @@ private:
     // Prefill then runs at the widest halving of the chunk that can be lent (or the static arena's
     // width): its exact route is chunk-invariant, so only speed changes. The buffers planned for the
     // wider chunk stay as they are. `lendable` counts frames of `stride` bytes the cache can lend (a
-    // cache of several frame pools lends from one: ExpertResidency::lend_capacity_bytes).
+    // cache of several frame pools lends from one: offload::ExpertResidency::lend_capacity_bytes).
     // A resident placement lends no frames: the wide workspace comes from free device memory, so
     // the chunk halves until it fits what startup left (the output is the same).
     void fit_wide_work_to_free(std::uint64_t free_bytes) {
@@ -5034,24 +5034,24 @@ private:
         return free_bytes;
     }
     void trace_graph(const DecodeGraph& graph, std::size_t free_before) {
-        RouteTraceGraph family = RouteTraceGraph::Decode;
-        std::ptrdiff_t at      = route_trace_index(graphs_, &graph);
+        offload::RouteTraceGraph family = offload::RouteTraceGraph::Decode;
+        std::ptrdiff_t at      = offload::route_trace_index(graphs_, &graph);
         std::ptrdiff_t stride  = 1;
-        if (at < 0 && (at = route_trace_index(verify_graphs_, &graph)) >= 0) {
-            family = RouteTraceGraph::Verify;
+        if (at < 0 && (at = offload::route_trace_index(verify_graphs_, &graph)) >= 0) {
+            family = offload::RouteTraceGraph::Verify;
             stride = max_width_;
-        } else if (at < 0 && ((at = route_trace_index(mtp_draft_graphs_, &graph)) >= 0 ||
-                              (at = route_trace_index(mtp_sampled_graphs_, &graph)) >= 0 ||
-                              (at = route_trace_index(mtp_gated_graphs_, &graph)) >= 0)) {
-            family = RouteTraceGraph::MtpDraft;
+        } else if (at < 0 && ((at = offload::route_trace_index(mtp_draft_graphs_, &graph)) >= 0 ||
+                              (at = offload::route_trace_index(mtp_sampled_graphs_, &graph)) >= 0 ||
+                              (at = offload::route_trace_index(mtp_gated_graphs_, &graph)) >= 0)) {
+            family = offload::RouteTraceGraph::MtpDraft;
             stride = mtp_k_;
-        } else if (at < 0 && (at = route_trace_index(mtp_catch_graphs_, &graph)) >= 0) {
-            family = RouteTraceGraph::MtpCatchUp;
+        } else if (at < 0 && (at = offload::route_trace_index(mtp_catch_graphs_, &graph)) >= 0) {
+            family = offload::RouteTraceGraph::MtpCatchUp;
             stride = max_width_;
-        } else if (at < 0 && (at = route_trace_index(dflash_propose_graphs_, &graph)) >= 0) {
-            family = RouteTraceGraph::DFlashPropose;
-        } else if (at < 0 && (at = route_trace_index(dflash_context_graphs_, &graph)) >= 0) {
-            family = RouteTraceGraph::DFlashCatchUp;
+        } else if (at < 0 && (at = offload::route_trace_index(dflash_propose_graphs_, &graph)) >= 0) {
+            family = offload::RouteTraceGraph::DFlashPropose;
+        } else if (at < 0 && (at = offload::route_trace_index(dflash_context_graphs_, &graph)) >= 0) {
+            family = offload::RouteTraceGraph::DFlashCatchUp;
             stride = max_width_;
         }
         if (at < 0) { return; }
@@ -6406,7 +6406,7 @@ private:
         const std::uint64_t spare_bytes = static_cast<std::uint64_t>(spare) * stride;
         std::uint32_t give              = 0;
         if (added > spare_bytes) {
-            give = static_cast<std::uint32_t>((added - spare_bytes + residency_->pools() * ExpertResidency::kChunkBytes + stride - 1) / stride);
+            give = static_cast<std::uint32_t>((added - spare_bytes + residency_->pools() * offload::ExpertResidency::kChunkBytes + stride - 1) / stride);
         }
         if (give > frames) { return false; }
         device_.synchronize();
@@ -6581,19 +6581,19 @@ private:
     // their memory (the residency's promotion copies, the stream, the CPU service), declared later.
     // With an expert stripe the tier reads through this store, the Model's with each record's tail
     // in the stripe file.
-    std::optional<ExpertStore> striped_store_;
+    std::optional<offload::ExpertStore> striped_store_;
     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
-    std::unique_ptr<HostExpertTier> tier_;
+    std::unique_ptr<offload::HostExpertTier> tier_;
     PinnedHostBuffer expert_error_{1}; // mapped u32: ops::MoeExpertSource::error of every call
     bool clear_prefix_on_release_ = false;
-    std::unique_ptr<ExpertResidency> residency_;
+    std::unique_ptr<offload::ExpertResidency> residency_;
     std::unique_ptr<execution::ExpertStream> expert_stream_;
     std::vector<std::uint64_t> host_strides_; // each bank's own record stride (a GGUF import's vary)
     // The stream's leases: the ring, the wide arena and a walk's area (each a run of one pool).
-    ExpertResidency::FrameLease stream_lease_, stream_wide_lease_, stream_walk_lease_;
+    offload::ExpertResidency::FrameLease stream_lease_, stream_wide_lease_, stream_walk_lease_;
     std::size_t stream_ring_bytes_ = 0, stream_wide_bytes_ = 0, stream_walk_bytes_ = 0;
     std::size_t wide_work_ = 0;              // the plan's wide arena bytes (0: none)
-    ExpertResidency::FrameLease work_lease_; // the wide arena lent alone (no stream lease)
+    offload::ExpertResidency::FrameLease work_lease_; // the wide arena lent alone (no stream lease)
     DeviceBuffer wide_fallback_;             // the wide arena when nothing could be lent
     std::unique_ptr<WorkspaceArena> wide_arena_; // the arena swapped with *work_ around a wide call
     execution::ExpertStream::Stats stream_at_lease_;
@@ -6672,7 +6672,7 @@ private:
     void walk_commit_taps(Lane& lane);
     void walk_enqueue(std::uint32_t to_layer);
     void walk_abandon() noexcept;
-    std::unique_ptr<RouteTrace> trace_;
+    std::unique_ptr<offload::RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
 
     // ---- prefill CPU split (design §19.3.12) ----
@@ -6994,7 +6994,7 @@ private:
     cudaEvent_t flush_uploaded_ = nullptr;
 
     // Last: its thread reads the source, the control law and the residency, so it stops first.
-    std::unique_ptr<VramMonitor> monitor_;
+    std::unique_ptr<offload::VramMonitor> monitor_;
 };
 
 } // namespace detail
