@@ -41,7 +41,7 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
     free-cache-resume path, and its fast route runs the compensated chunked GDN prefill
     (`gdn-compensated`); other configurations keep their own routes bit for bit;
   - a Disk tier for the Qwen3.8-Flash-Next prefix cache (`--prefix-cache-disk DIR`,
-    `--prefix-cache-disk-gib N`): a third residency of the shared index on the SSD, moved through
+    `--prefix-cache-disk-gib N`): a third residency of its prefix index on the SSD, moved through
     cuFile (GPUDirect Storage with `nvidia_fs` loaded, its compatibility mode otherwise), kept
     across restarts by a journal; a background writer copies every retained snapshot and its path
     to it and the RAM tier drops Disk-backed copies before valuing others (or, at
