@@ -248,7 +248,7 @@ int run_fp8_a8() {
 // the epilogue's single BF16 rounding of the FP32 sum of both terms (at most 2^-9 relative, RMS
 // about 1.1e-3) is the A16 route's own error, so the route sits at the A16 route's error against
 // the 3.9e-3 budget, not above it.
-// Each problem's pair admission (its ops/linear/fp8/shapes kPairMinTokens: the width from which
+// Each problem's pair admission (its the fp8 shape file kPairMinTokens: the width from which
 // the pair route is faster than the exact route).
 struct PairProblem {
     std::int32_t n, k, min_tokens;

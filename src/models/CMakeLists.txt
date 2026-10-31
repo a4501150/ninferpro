@@ -13,6 +13,11 @@ target_include_directories(infernix_model_runtime PRIVATE
 target_include_directories(infernix_model_runtime SYSTEM PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
 
+# The families' tuned linear shapes compile into infernix_ops (the launch templates and RDC
+# live there); each family owns and lists its own shape files.
+include(qwen3_5/shapes/sources.cmake)
+include(qwen4_exp/shapes/sources.cmake)
+
 include(qwen3_5/loading_sources.cmake)
 include(qwen3_5/execution_sources.cmake)
 include(qwen3_5/program_sources.cmake)

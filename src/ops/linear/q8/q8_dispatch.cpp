@@ -2,59 +2,22 @@
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/q8/q8_shapes.h"
 
-#include <algorithm>
-#include <array>
 #include <stdexcept>
 
 namespace infernix::ops::detail {
 namespace {
-using ShapeSelector = Q8Launch (*)(std::int32_t);
-
-struct ShapeEntry {
-    std::int32_t n;
-    std::int32_t k;
-    ShapeSelector select;
-    // The shape's fast-path routes (LinearRoutes::Q8SlicedK), or null where it has none.
-    ShapeSelector fast = nullptr;
-    // The shape's A16ColumnInvariant routes, or null where it registers none.
-    ShapeSelector invariant = nullptr;
-    // The shape's LinearRoutes::Q8HcSlicedK routes, or null where it has none.
-    ShapeSelector hc_fast = nullptr;
-};
-
-template <class Geometry>
-constexpr ShapeEntry shape(ShapeSelector select) {
-    return {Geometry::kOutputRows, Geometry::kInputRows, select};
+// Scans each owning family's table in turn; the first (n, k) row wins.
+const Q8ShapeEntry* find_shape(std::int32_t n, std::int32_t k) {
+    for (std::size_t i = 0; i < qwen3_5_q8_shapes_count; ++i) {
+        const Q8ShapeEntry& entry = qwen3_5_q8_shapes[i];
+        if (entry.n == n && entry.k == k) return &entry;
+    }
+    for (std::size_t i = 0; i < qwen4_exp_q8_shapes_count; ++i) {
+        const Q8ShapeEntry& entry = qwen4_exp_q8_shapes[i];
+        if (entry.n == n && entry.k == k) return &entry;
+    }
+    return nullptr;
 }
-
-constexpr std::array kShapes{
-    shape<Q8N1024K2048>(select_q8_n1024_k2048),     shape<Q8N1024K5120>(select_q8_n1024_k5120),
-    shape<Q8N2048K4096>(select_q8_n2048_k4096),     shape<Q8N2048K4608>(select_q8_n2048_k4608),
-    shape<Q8N2048K16384>(select_q8_n2048_k16384),   shape<Q8N4608K4608>(select_q8_n4608_k4608),
-    shape<Q8N5120K4608>(select_q8_n5120_k4608),     shape<Q8N5120K6144>(select_q8_n5120_k6144),
-    shape<Q8N5120K10240>(select_q8_n5120_k10240),   shape<Q8N5120K17408>(select_q8_n5120_k17408),
-    shape<Q8N5120K25600>(select_q8_n5120_k25600),   shape<Q8N6144K5120>(select_q8_n6144_k5120),
-    shape<Q8N9216K2048>(select_q8_n9216_k2048),     shape<Q8N12288K2048>(select_q8_n12288_k2048),
-    shape<Q8N14336K5120>(select_q8_n14336_k5120),   shape<Q8N17408K5120>(select_q8_n17408_k5120),
-    shape<Q8N34816K5120>(select_q8_n34816_k5120),
-    ShapeEntry{248320, 5120, select_q8_n248320_k5120, nullptr, select_q8_n248320_k5120_invariant},
-    // Qwen3.8-Flash-Next (N 324 and 320 are not 16-row multiples, so they bypass the geometry type).
-    ShapeEntry{16384, 2560, select_q8_n16384_k2560, select_q8_n16384_k2560_fast},
-    ShapeEntry{12800, 2560, select_q8_n12800_k2560, nullptr, select_q8_n12800_k2560_invariant},
-    ShapeEntry{13952, 2560, select_q8_n13952_k2560, nullptr, select_q8_n13952_k2560_invariant},
-    ShapeEntry{2560, 2560, select_q8_n2560_k2560, nullptr, select_q8_n2560_k2560_invariant},
-    ShapeEntry{1280, 2560, select_q8_n1280_k2560, nullptr, select_q8_n1280_k2560_invariant},
-    ShapeEntry{2560, 6144, select_q8_n2560_k6144, select_q8_n2560_k6144_fast, select_q8_n2560_k6144_invariant},
-    ShapeEntry{324, 10240, select_q8_n324_k10240, nullptr, select_q8_n324_k10240_invariant,
-               select_q8_n324_k10240_fast},
-    ShapeEntry{320, 10240, select_q8_n320_k10240, nullptr, select_q8_n320_k10240_invariant,
-               select_q8_n320_k10240_fast},
-    ShapeEntry{10240, 320, select_q8_n10240_k320, nullptr, select_q8_n10240_k320_invariant},
-    ShapeEntry{2560, 640, select_q8_n2560_k640, nullptr, select_q8_n2560_k640_invariant},
-    // NInfer's tunings for its own 2560-wide groupings.
-    shape<Q8N6144K2560>(select_q8_n6144_k2560),   shape<Q8N10240K2560>(select_q8_n10240_k2560),
-    shape<Q8N12288K2560>(select_q8_n12288_k2560),
-};
 
 // Shapes without a tuned entry use the runtime-shape templates: predicated SIMT for decode and
 // verification widths, MMA tiles beyond, each covering any row count and any K padded to 128.
@@ -74,11 +37,11 @@ Q8Launch select_q8_generic(std::int32_t n, std::int32_t k, std::int32_t t) {
 Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearRoutes routes) {
     if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
     if (n <= 0 || k <= 0) throw std::invalid_argument("q8 linear: unsupported shape");
-    for (const auto& entry : kShapes) {
-        if (entry.n != n || entry.k != k) continue;
-        if (has_route(routes, LinearRoutes::Q8SlicedK) && entry.fast != nullptr) return entry.fast(t);
-        if (has_route(routes, LinearRoutes::Q8HcSlicedK) && entry.hc_fast != nullptr) return entry.hc_fast(t);
-        return entry.select(t);
+    const Q8ShapeEntry* entry = find_shape(n, k);
+    if (entry != nullptr) {
+        if (has_route(routes, LinearRoutes::Q8SlicedK) && entry->fast != nullptr) return entry->fast(t);
+        if (has_route(routes, LinearRoutes::Q8HcSlicedK) && entry->hc_fast != nullptr) return entry->hc_fast(t);
+        return entry->select(t);
     }
     return select_q8_generic(n, k, t);
 }
@@ -88,21 +51,21 @@ Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     if (!valid_linear_policy(policy)) throw std::invalid_argument("q8 linear: unsupported policy");
     if (column_invariant(policy)) {
         if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
-        for (const auto& entry : kShapes) {
-            if (entry.n == n && entry.k == k && entry.invariant != nullptr) return entry.invariant(t);
-        }
-        throw std::invalid_argument("q8 linear: no column-invariant route for this problem");
+        const Q8ShapeEntry* entry = find_shape(n, k);
+        if (entry == nullptr || entry->invariant == nullptr)
+            throw std::invalid_argument("q8 linear: no column-invariant route for this problem");
+        return entry->invariant(t);
     }
     return select_q8_a16_launch(n, k, t, routes);
 }
 
 bool q8_column_invariant_supported(std::int32_t n, std::int32_t k) noexcept {
-    return std::any_of(kShapes.begin(), kShapes.end(),
-                       [&](const ShapeEntry& entry) { return entry.n == n && entry.k == k && entry.invariant != nullptr; });
+    const Q8ShapeEntry* entry = find_shape(n, k);
+    return entry != nullptr && entry->invariant != nullptr;
 }
 
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 LinearRoutes routes, cudaStream_t stream) {
+                  LinearRoutes routes, cudaStream_t stream) {
     select_q8_launch(w.n, w.k, x.ne[1], policy, routes)(x, w, out, stream);
 }
 

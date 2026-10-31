@@ -96,5 +96,32 @@ void launch_q8_n16384_k2560_conv_snapshot(const Tensor& x, const Weight& weight,
 [[nodiscard]] Q8Launch select_q8_n320_k10240(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n10240_k320(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k640(std::int32_t tokens);
+// The final mixer down shares the hyper-connection down's K and its tables (n320_k10240.cu
+// defines the selectors; n324_k10240.cu defines the shared fast table for both shapes).
+
+// Family shape tables: the model families own their tuned shapes (src/models/<family>/shapes/),
+// and each family's table lists its whole set in one visible place. The tables have external
+// linkage — the dispatch declares them extern, which forces the linker to extract the table
+// translation unit and, through its rows, every shape file it references from the archive.
+struct Q8ShapeEntry {
+    std::int32_t n;
+    std::int32_t k;
+    Q8Launch (*select)(std::int32_t);
+    // The shape's fast-path routes (LinearRoutes::Q8SlicedK), or null where it has none.
+    Q8Launch (*fast)(std::int32_t) = nullptr;
+    // The shape's A16ColumnInvariant routes, or null where it registers none.
+    Q8Launch (*invariant)(std::int32_t) = nullptr;
+    // The shape's LinearRoutes::Q8HcSlicedK routes, or null where it has none.
+    Q8Launch (*hc_fast)(std::int32_t) = nullptr;
+};
+
+// The Qwen3.5 family's tuned shapes (src/models/qwen3_5/shapes/q8/q8_shapes.cpp).
+extern const Q8ShapeEntry qwen3_5_q8_shapes[];
+extern const std::size_t qwen3_5_q8_shapes_count;
+
+// The Qwen4Exp (Qwen3.8-Flash-Next) family's tuned shapes
+// (src/models/qwen4_exp/shapes/q8/q8_shapes.cpp).
+extern const Q8ShapeEntry qwen4_exp_q8_shapes[];
+extern const std::size_t qwen4_exp_q8_shapes_count;
 
 } // namespace infernix::ops::detail

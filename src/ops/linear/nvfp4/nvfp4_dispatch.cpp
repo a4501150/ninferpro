@@ -1,19 +1,17 @@
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
-#include <array>
 #include <stdexcept>
 
 namespace infernix::ops::detail {
 namespace {
-const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
-                         &kNvfp4N5120K6144, &kNvfp4N5120K17408};
-
 const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
     if (!valid_linear_policy(policy) || column_invariant(policy))
         throw std::invalid_argument("nvfp4 linear: unsupported policy");
-    for (const auto* shape : kShapes)
+    for (std::size_t i = 0; i < qwen3_5_nvfp4_shapes_count; ++i) {
+        const Nvfp4LinearShape* shape = qwen3_5_nvfp4_shapes[i];
         if (shape->n == n && shape->k == k) return *shape;
+    }
     throw std::invalid_argument("nvfp4 linear: unsupported shape");
 }
 } // namespace

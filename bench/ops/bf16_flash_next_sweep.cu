@@ -11,7 +11,7 @@
 //   candidates  private launchers of the existing BF16 kernel templates (runtime K).
 // Every candidate is first screened against the fallback at T = 77 and 1000 (partial token tiles,
 // and the 4304 row/K tails); a candidate that fails the screen is never selected.
-// It then proposes, per problem, a selector body for src/ops/linear/bf16/shapes/n<N>_k<K>.cu: the
+// It then proposes, per problem, a selector body for src/models/qwen4_exp/shapes/bf16/n<N>_k<K>.cu: the
 // fastest candidate at each measured T, merged into intervals while the kept candidate stays
 // within --tolerance-pct of the fastest. A boundary sits on the last measured T of its interval;
 // refine a seam with --t-list. T <= 8 stays on the fallback's skinny GEMV and is not swept.

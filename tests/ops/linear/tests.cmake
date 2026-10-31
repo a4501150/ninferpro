@@ -46,6 +46,13 @@ infernix_add_op_test(infernix_linear_bf16_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_a16.cpp"
   LIBRARIES infernix_linear_test_support)
 
+# The two families' tuned (n, k) sets per dtype stay disjoint, so the dispatch's ordered family
+# table scan cannot shadow one family's tuning with the other's (the former single closed table
+# made an overlap impossible).
+infernix_add_op_test(infernix_linear_shape_tables_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_shape_tables.cpp"
+  LIBRARIES infernix_ops)
+
 # FP32 projections (router and lm_head logits), BF16 and q8_g32_fp16 weights, against FP64.
 infernix_add_op_test(infernix_projection_fp32_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_projection_fp32.cpp"
