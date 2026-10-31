@@ -10,16 +10,16 @@
 
 namespace infernix::models::qwen4_exp::detail {
 
-namespace vx = qwen3_5::execution;
+namespace vx = qwen_common::execution;
 
-std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen3_5::PreparedPromptData& prompt,
+std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen_common::PreparedPromptData& prompt,
                                                                 std::uint32_t reused) const {
     if (!parameters_.vision || !parameters_.model.config().vision) {
         throw std::invalid_argument("Qwen4Exp: images and video need an engine started with --vision");
     }
-    const qwen3_5::VisionConfig& config = *parameters_.model.config().vision;
+    const qwen_common::VisionConfig& config = *parameters_.model.config().vision;
     auto out     = std::make_shared<VisionAdmission>();
-    out->control = qwen3_5::plan_vision_control(prompt, config);
+    out->control = qwen_common::plan_vision_control(prompt, config);
     std::vector<VisionWindowItem> items;
     items.reserve(out->control.items.size());
     for (std::size_t i = 0; i < out->control.items.size(); ++i) {
@@ -44,7 +44,7 @@ std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen3_5::P
 }
 
 void ProgramImpl::vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmission> admission,
-                                 const qwen3_5::PreparedPromptData& prompt) {
+                                 const qwen_common::PreparedPromptData& prompt) {
     auto vision        = std::make_unique<LaneVision>();
     const auto& window = admission->window;
     if (window.items.empty()) {
@@ -52,7 +52,7 @@ void ProgramImpl::vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmissi
     } else {
         // The encoded items are a suffix of the prompt's items (those ending past the reused prefix).
         const std::uint32_t first = window.items.front();
-        vision->control           = qwen3_5::build_vision_control(prompt, admission->control, first);
+        vision->control           = qwen_common::build_vision_control(prompt, admission->control, first);
         for (std::size_t k = 0; k < vision->control.items.size(); ++k) {
             const auto& payload = prompt.media_payloads.at(first + k);
             const auto& control = vision->control.items[k];
@@ -77,7 +77,7 @@ void ProgramImpl::vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmissi
 void ProgramImpl::vision_step(Lane& lane) {
     LaneVision& v                        = *lane.vision;
     const VisionWindowPlan& window       = v.admission->window;
-    const qwen3_5::VisionConfig& config  = *parameters_.model.config().vision;
+    const qwen_common::VisionConfig& config  = *parameters_.model.config().vision;
     const cudaStream_t s                 = device_.stream;
     const auto out                       = parameters_.vision->merger_fc2.weight.n;
     if (!v.pass) {

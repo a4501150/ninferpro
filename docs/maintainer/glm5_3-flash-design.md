@@ -958,7 +958,7 @@ This is an **explicit product change**: a new mathematical architecture
 |---|---|---|
 | Config interpretation (exact key set, refusals), mathematics, binding, block order, MTP alignment | Model | `src/models/glm5_next/` (`config`, `weights`, `load`, `execution/forward`, `execution/parameters`) |
 | Program: lanes, KDA state pool, MLA latent KV and index keys, prefix-cache binding, MTP drafter, graphs, expert-offload composition | Program | `src/models/glm5_next/program/` |
-| Engine instance | Runtime | `src/runtime/engine/glm5_next_instance.{h,cpp}`; a third `Architecture` value in `src/models/registry.cpp`; a third `EngineCore` arm in `engine.cpp` |
+| Engine instance | Model | `src/models/glm5_next/instance.{h,cpp}`; a third `Architecture` value in `src/models/registry.cpp`; a third `EngineCore` arm in `engine.cpp` |
 | EXL3 codec: tile decode, codebook, 128-point Hadamard, E3A16 block quantization | Ops (common) | `src/ops/common/exl3/`, shared by the Linear and MoE Ops and the CPU kernels; the scalar form is the exact oracle |
 | Tokenizer pre-tokenizer, chat template, tool-call and reasoning parsing | Frontend | §21 |
 | Recipe, EXL3 import, supplement fetch, expert-volume writer, restripe, verification, reference forwards | Converter / tools | `tools/convert/glm5_next.py`, `tools/convert/formats/exl3.py`, `official_recipes.py`, `tools/artifact/expert_volume.py`, `tools/artifact/restripe.py`, `tools/glm5_next/` |
@@ -970,7 +970,8 @@ ExLlamaV3 is MIT-licensed; any kernel code ported from it keeps its copyright no
 Flash-Next built the expert cache, residency controller, RAM tier, expert store, state file, RAM
 ledger terms, route trace and VRAM monitor inside `src/models/qwen4_exp/program/` (~3.3k lines), as
 its design required while it was the only consumer (FN §1.4). A second explicit family now needs
-the same mechanisms, so they move to **`src/models/offload/`**: concrete components parameterized by
+the same mechanisms, so they are extracted to **`src/models/offload/`** (the host-only library
+`infernix_offload`, already done): concrete components parameterized by
 an `ExpertBankGeometry` (banks, experts per bank, expert format and bits, record bytes, side-entry
 bytes, H, I) and composed by each Program.
 
@@ -2066,7 +2067,7 @@ a8_dense,a8_experts` (records the gated permissions in the artifact); `--proposa
 |---|---|---|---|
 | **M0** | Facts | Both artifacts' config, tokenizer, template, generation config and safetensors headers (not gated; the weights are not needed yet); ExLlamaV3 at 1.4.4 and 1.4.6: tile weight order, stream bit order, Hadamard scale, `out_scales` semantics, MTP trellis shapes; vLLM/SGLang `glm5_next` MTP mathematics; C++ probes: pinning ceiling, striped 0.75 MiB reads with IOCP (`tools/glm5_next_probe/`), **CPU E3A16 at 9 MiB on P- and E-cores**, link | §2, §3, §9.5 and §19 confirmed or revised; open questions of §25.2 closed; §5.3 re-run with the measured CPU cost |
 | **M1** | Traces and policy | Route traces recorded by M4's engine on NRS and a broad corpus (code, chat, CJK, tool use, long context); two-level replay of the §10.2 and §10.4 candidates; lookahead recall by depth and width for SSD-tier experts | Policies chosen by the fixed rules; §5.2 replaced by measured hit rates |
-| **M2** | Shared offload components | `src/models/offload/` extracted from Qwen4Exp, with frame side entries; expert volumes for Qwen4Exp too | Qwen4Exp's unit and real tests pass unchanged; greedy ids identical; tg512 within noise |
+| **M2** | Shared offload components | Frame side entries in `src/models/offload/` (the tier itself is already extracted from Qwen4Exp); expert volumes for Qwen4Exp too | Qwen4Exp's unit and real tests pass unchanged; greedy ids identical; tg512 within noise |
 | **M3** | Ops | EXL3 codec; `exl3` Linear (decode, prompt and transposed routes); `offloaded_sparse_moe` `exl3_mul1` on the GPU and the CPU (AVX-VNNI); GLM routing; `mhc`; `kda_input_prep` and replay; `dsa_indexer`; `mla_sparse_attention`; striped reader | Every §20.1 qualification passes |
 | **M4** | Artifacts and functional model | The recipe and both official entries, the supplement fetch, volumes, restripe, `verify_artifact`; Engine, CLI, bench, CausalScoring with one volume and the existing tiers; the two reference forwards | Every tensor round-trips bit-exactly; §20.2 checks; execution gate (§20.3); the quantization-quality report for both artifacts; first end-to-end numbers |
 | **M5** | Tiers at GLM scale | Striped reading on two volumes, landing ring, partial-record consumption, lookahead, M1's policies, promotion sweep, CPU worker and core-type sweep, warm start, prompt seeding, pageable fallback if needed | §20.4 invariance and fault tests; decode with two volumes ≥ 1.15× one; Must decode target |

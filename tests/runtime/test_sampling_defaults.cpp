@@ -1,6 +1,6 @@
 #include "runtime/contract/sampling.h"
 
-#include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen_common/frontend/frontend.h"
 
 #include <cmath>
 #include <iostream>
@@ -34,7 +34,7 @@ bool throws_invalid(const auto& operation) {
 
 int main() {
     using infernix::models::Architecture;
-    using infernix::models::qwen3_5::default_sampling;
+    using infernix::models::qwen_common::default_sampling;
     int failures     = 0;
     const auto dense = default_sampling(Architecture::Qwen3_5);
     const auto moe   = default_sampling(Architecture::Qwen3_5Moe);

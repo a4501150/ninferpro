@@ -14,11 +14,11 @@
 namespace infernix::models::qwen3_5::detail {
 namespace {
 
-PreparedPromptData replay_prompt(const RequestBasePlanImpl& base, const SequenceState& sequence) {
+qwen_common::PreparedPromptData replay_prompt(const RequestBasePlanImpl& base, const SequenceState& sequence) {
     if (!base.prompt || sequence.ledger.size() < base.prompt->token_ids.size()) {
         throw std::logic_error("replay ledger does not retain its prepared prompt");
     }
-    const PreparedPromptData& source = *base.prompt;
+    const qwen_common::PreparedPromptData& source = *base.prompt;
     const std::size_t prompt_tokens  = source.token_ids.size();
     const std::size_t ledger_tokens  = sequence.ledger.size();
     if (source.token_types.size() != prompt_tokens ||
@@ -27,7 +27,7 @@ PreparedPromptData replay_prompt(const RequestBasePlanImpl& base, const Sequence
         throw std::logic_error("replay input does not match the retained prompt");
     }
 
-    PreparedPromptData out = source;
+    qwen_common::PreparedPromptData out = source;
     out.token_ids          = sequence.ledger;
     out.token_types.resize(ledger_tokens, 0);
     out.positions.resize(3ULL * ledger_tokens);
@@ -220,8 +220,8 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             auto& replay  = *request.replay;
             replay.prompt = replay_prompt(*request.base, sequence);
             VisionPrefillPlan plan;
-            plan.control = std::make_shared<VisionControl>(
-                build_vision_control(replay.prompt, *request.base->vision_control_plan, 0));
+            plan.control = std::make_shared<qwen_common::VisionControl>(
+                qwen_common::build_vision_control(replay.prompt, *request.base->vision_control_plan, 0));
             const auto& items = request.base->vision_control_plan->items;
             for (std::size_t index = 0; index < items.size(); ++index) {
                 const auto& item = items[index];

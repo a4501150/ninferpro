@@ -7,7 +7,7 @@
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/speculative_tree.h"
 #include "core/decode_graph.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
@@ -19,7 +19,7 @@
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
-#include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen_common/program/ngram_proposer.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "runtime/prefix_cache/cost.h"
 #include "runtime/prefix_cache/prefix_index.h"
@@ -42,7 +42,7 @@
 
 namespace infernix::models::qwen3_5::detail {
 using execution::dimension;
-using PreparedPromptData = qwen3_5::PreparedPromptData;
+using PreparedPromptData = qwen_common::PreparedPromptData;
 
 enum class MtpBridgeMode : std::uint8_t {
     None,
@@ -51,7 +51,7 @@ enum class MtpBridgeMode : std::uint8_t {
 };
 
 struct PreparedNgramIndex {
-    std::unique_ptr<NgramProposer> index;
+    std::unique_ptr<qwen_common::detail::NgramProposer> index;
 };
 
 // A TokenConstraint compiled for ops::constrain_logits: its distinct multi-token sets (written
@@ -70,13 +70,13 @@ struct RequestConstraintPlan {
 };
 
 struct RequestBasePlanImpl {
-    std::shared_ptr<const PreparedPromptData> prompt;
+    std::shared_ptr<const qwen_common::PreparedPromptData> prompt;
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
     // Tokens whose prompt-frontier log-probabilities complete the request's prefill.
     std::vector<TokenId> readout_tokens;
     RequestConstraintPlan constraint;
-    std::shared_ptr<const VisionControlPlan> vision_control_plan;
+    std::shared_ptr<const qwen_common::VisionControlPlan> vision_control_plan;
     bool allow_prefix_reuse = false;
     // The prepared ngram index moves out of the immutable prompt into this one-shot slot; the
     // request's single fresh binding takes it (a resumed binding keeps its saved proposer).
@@ -206,8 +206,8 @@ struct SequenceState {
 };
 
 struct RequestControl {
-    std::unique_ptr<NgramProposer> ngram;
-    std::shared_ptr<const NgramSnapshot> ngram_snapshot;
+    std::unique_ptr<qwen_common::detail::NgramProposer> ngram;
+    std::shared_ptr<const qwen_common::NgramSnapshot> ngram_snapshot;
     std::uint64_t ngram_copy_source = 0;
     std::uint32_t ngram_copy_offset = 0;
     std::size_t ngram_copy_ledger   = 0;
@@ -233,7 +233,7 @@ struct RequestControl {
     std::vector<ConstrainedDraw> constraint_trace;
 
     struct Prefill {
-        PreparedPromptData prompt;
+        qwen_common::PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
         std::unique_ptr<execution::VisionPrefillSession> vision;
         std::uint32_t base               = 0;
@@ -343,9 +343,9 @@ public:
     ProgramImpl(const execution::Parameters&, const SequencePlanImpl&, DeviceContext&,
                 const StartupObserver&);
     ~ProgramImpl() noexcept;
-    [[nodiscard]] RequestBasePlan plan_request(PreparedPromptData&&,
+    [[nodiscard]] RequestBasePlan plan_request(qwen_common::PreparedPromptData&&,
                                                const runtime::ResolvedExecutionOptions&);
-    [[nodiscard]] ScoreResult causal_score(PreparedPromptData&&, std::uint32_t first_target,
+    [[nodiscard]] ScoreResult causal_score(qwen_common::PreparedPromptData&&, std::uint32_t first_target,
                                            const ScoreOptions& options);
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit>);
     void release_units(std::span<const SequenceHandle>) noexcept;
@@ -601,7 +601,7 @@ public:
     [[nodiscard]] ResumeState complete_pause(ContextTransaction&);
     void install_resume_sampling(SequenceState&, RequestControl&);
     void initialize_prefill(std::uint32_t lane, std::uint32_t base);
-    void preencode_overlay_vision(execution::VisionPrefillSession&, const PreparedPromptData&,
+    void preencode_overlay_vision(execution::VisionPrefillSession&, const qwen_common::PreparedPromptData&,
                                   const VisionPrefillPlan&, std::uint32_t base);
     [[nodiscard]] SequenceHandle sequence_handle(std::uint32_t lane) const noexcept;
     void invalidate_lane(std::uint32_t lane) noexcept;
@@ -697,10 +697,10 @@ public:
     // The narrowest family of `kind` that verifies at least `drafts` proposals per row.
     [[nodiscard]] SpeculativeRoundFamily& round_family(SpeculativeRoundKind kind,
                                                        std::uint32_t drafts = 0);
-    [[nodiscard]] std::vector<NgramProposer::Match>
+    [[nodiscard]] std::vector<qwen_common::detail::NgramProposer::Match>
     propose_ngram(std::span<const std::uint32_t> lanes,
                   std::span<const runtime::RoundBudget> budgets);
-    [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
+    [[nodiscard]] qwen_common::detail::NgramProposer::Match propose_ngram_one(std::uint32_t lane,
                                                          const runtime::RoundBudget& budget);
     // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
     static void take_ngram_index(RequestControl& request, const RequestBasePlanImpl& base);
@@ -760,7 +760,7 @@ public:
     // True when a sibling lane still prefilling a prompt that shares more with this one than the
     // cache offers will publish a snapshot where they diverge soon enough to wait for. Plans that
     // snapshot as an exact tap of the sibling when none is planned near the divergence.
-    [[nodiscard]] bool hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse);
+    [[nodiscard]] bool hybrid_await_sibling(const qwen_common::PreparedPromptData& prompt, std::uint32_t reuse);
     // Writes the Host tier to the attached file once every Host write has landed. Called by the
     // shutdown cleanup after the lanes wrote their blocks through.
     void save_hybrid_cache_for_shutdown() noexcept;

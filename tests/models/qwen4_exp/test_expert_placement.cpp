@@ -3,9 +3,9 @@
 // pinning that keeps a placed set resident (a pinned key is never a victim; admissions stop while
 // only they remain; a shrink they block is refused).
 
-#include "models/qwen4_exp/expert_placement.h"
-#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
-#include "models/qwen4_exp/program/expert_cache/host_tier.h"
+#include "models/offload/expert_placement.h"
+#include "models/offload/expert_cache.h"
+#include "models/offload/host_tier.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -17,7 +17,7 @@
 #include <vector>
 
 using namespace infernix;
-using namespace infernix::models::qwen4_exp;
+using namespace infernix::models::offload;
 
 namespace {
 

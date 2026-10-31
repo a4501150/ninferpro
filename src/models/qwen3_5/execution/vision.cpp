@@ -1,12 +1,12 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
-#include "models/qwen3_5/execution/vision_tower.h"
+#include "models/qwen_common/execution/vision_tower.h"
 
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/nvtx.h"
-#include "models/qwen3_5/program/vision_control.h"
+#include "models/qwen_common/program/vision_control.h"
 #include "infernix/ops/linear.h"
 
 #include <algorithm>
@@ -76,8 +76,8 @@ TensorRegion alias_tensor(const TensorRegion& storage, DType dtype,
     return out;
 }
 
-VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
-                                             const VisionParameters& parameters,
+VisionWorkspaceLayout build_workspace_layout(const qwen_common::VisionConfig& config,
+                                             const qwen_common::execution::VisionParameters& parameters,
                                              std::size_t patches64, std::size_t tokens64,
                                              std::size_t handoff_offset_bytes,
                                              std::size_t* encode_extent = nullptr) {
@@ -193,7 +193,7 @@ std::size_t output_handoff_bytes(std::int32_t output_hidden, std::size_t merged_
     return layout.finish(kWorkspaceAlignment, "Vision item output handoff layout");
 }
 
-std::size_t merger_hidden_bytes(const VisionConfig& config, std::size_t merged_tokens) {
+std::size_t merger_hidden_bytes(const qwen_common::VisionConfig& config, std::size_t merged_tokens) {
     if (merged_tokens == 0 ||
         merged_tokens > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("Vision merger hidden extent must fit positive int32");
@@ -209,12 +209,12 @@ VisionContext::VisionContext(DeviceContext& ctx, const Parameters& parameters)
     : ctx_(ctx), config_(parameters.model.config().vision.value()),
       parameters_(parameters.vision.value()) {}
 
-VisionContext::VisionContext(DeviceContext& ctx, const VisionConfig& config,
-                             const VisionParameters& parameters)
+VisionContext::VisionContext(DeviceContext& ctx, const qwen_common::VisionConfig& config,
+                             const qwen_common::execution::VisionParameters& parameters)
     : ctx_(ctx), config_(config), parameters_(parameters) {}
 
-std::size_t VisionContext::workspace_bytes(const VisionConfig& config,
-                                           const VisionParameters& parameters, std::size_t patches,
+std::size_t VisionContext::workspace_bytes(const qwen_common::VisionConfig& config,
+                                           const qwen_common::execution::VisionParameters& parameters, std::size_t patches,
                                            std::size_t merged_tokens,
                                            const VisionWorkspacePlan& plan) {
     return build_workspace_layout(config, parameters, patches, merged_tokens,
@@ -222,8 +222,8 @@ std::size_t VisionContext::workspace_bytes(const VisionConfig& config,
         .bytes;
 }
 
-VisionWorkspacePlan VisionContext::plan_workspace(const VisionConfig& config,
-                                                  const VisionParameters& parameters,
+VisionWorkspacePlan VisionContext::plan_workspace(const qwen_common::VisionConfig& config,
+                                                  const qwen_common::execution::VisionParameters& parameters,
                                                   std::uint32_t max_merged_tokens,
                                                   std::size_t general_capacity_bytes) {
     if (max_merged_tokens == 0 || general_capacity_bytes == 0) {
@@ -251,8 +251,8 @@ VisionWorkspacePlan VisionContext::plan_workspace(const VisionConfig& config,
     return out;
 }
 
-VisionWorkspacePlan VisionContext::plan_overlay_window(const VisionConfig& config,
-                                                       const VisionParameters& parameters,
+VisionWorkspacePlan VisionContext::plan_overlay_window(const qwen_common::VisionConfig& config,
+                                                       const qwen_common::execution::VisionParameters& parameters,
                                                        std::size_t max_patches,
                                                        std::uint32_t max_merged_tokens) {
     if (max_merged_tokens == 0 || max_patches == 0) {
@@ -300,9 +300,9 @@ Tensor VisionContext::bind_output(DeviceSpan backing, const VisionWorkspacePlan&
 }
 
 void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
-                           const VisionWorkspacePlan& plan, VisionWeightStream* weight_stream) const {
+                           const VisionWorkspacePlan& plan, qwen_common::execution::VisionWeightStream* weight_stream) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
-    const qwen3_5::VisionItemControl& control = *item.control;
+    const qwen_common::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;
     const auto tokens64                       = control.merged_count;
     nvtx::ScopedRange encode_range(nvtx::Name::VisionEncode, nvtx::Category::Vision,
@@ -328,13 +328,13 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
     cudaStream_t stream = ctx_.stream;
     // The shared tower stages (vision_tower.h) over this plan's buffers.
     Tensor x = layout.x.bind(backing);
-    const VisionEmbedBuffers embed{.position_ids  = layout.position_ids.bind(backing),
+    const qwen_common::execution::VisionEmbedBuffers embed{.position_ids  = layout.position_ids.bind(backing),
                                    .patches       = layout.patch_bf16.bind(backing),
                                    .pos_indices   = layout.pos_indices.bind(backing),
                                    .pos_weights   = layout.pos_weights.bind(backing),
                                    .patch_scratch = layout.patch_scratch.bind(backing)};
-    vision_embed(stream, config_, parameters_, control, item.patches, embed, x, weight_stream);
-    const VisionLayerBuffers buffers{.qkv                = layout.qkv.bind(backing),
+    qwen_common::execution::vision_embed(stream, config_, parameters_, control, item.patches, embed, x, weight_stream);
+    const qwen_common::execution::VisionLayerBuffers buffers{.qkv                = layout.qkv.bind(backing),
                                      .attention_norm     = layout.attention_norm.bind(backing),
                                      .mlp_up             = layout.mlp_up.bind(backing),
                                      .mlp_norm           = layout.mlp_norm.bind(backing),
@@ -348,20 +348,20 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         if (weight_stream != nullptr) {
             weight_stream->arrive(static_cast<std::uint32_t>(layer), stream);
         }
-        vision_layer(ctx_.execution_view().on_stream(stream), config_, parameters_.layers[layer], embed.position_ids,
+        qwen_common::execution::vision_layer(ctx_.execution_view().on_stream(stream), config_, parameters_.layers[layer], embed.position_ids,
                      control.segment_length, buffers, x);
     }
     if (weight_stream != nullptr) { weight_stream->merger_ready(stream); }
-    const VisionMergerBuffers merger{.normalized     = layout.normalized.bind(backing),
+    const qwen_common::execution::VisionMergerBuffers merger{.normalized     = layout.normalized.bind(backing),
                                      .hidden         = layout.merger_hidden.bind(backing),
                                      .first_scratch  = layout.merger_first_scratch.bind(backing),
                                      .second_scratch = layout.merger_second_scratch.bind(backing)};
-    vision_merge(stream, config_, parameters_, x, merger, output);
+    qwen_common::execution::vision_merge(stream, config_, parameters_, x, merger, output);
 }
 
 VisionPrefillSession::VisionPrefillSession(
     DeviceContext& device, const execution::Parameters& parameters, DeviceSpan workspace,
-    const VisionWorkspacePlan& workspace_plan, const qwen3_5::PreparedPromptData& prompt,
+    const VisionWorkspacePlan& workspace_plan, const qwen_common::PreparedPromptData& prompt,
     const VisionPrefillPlan& plan, VisionHandoffState& handoff, std::size_t& handoff_peak_bytes)
     : device_(device), workspace_(workspace), workspace_plan_(workspace_plan), prompt_(prompt),
       plan_(plan), handoff_(handoff), handoff_peak_bytes_(handoff_peak_bytes),
@@ -387,8 +387,8 @@ VisionPrefillSession::VisionPrefillSession(
             (previous_item && use.prepared_item_index <= *previous_item)) {
             throw std::invalid_argument("Vision suffix item indices are invalid or unordered");
         }
-        const qwen3_5::VisionItemControl& control = plan_.control->items[use.control_index];
-        const qwen3_5::VisionItem& source         = prompt_.vision_items[use.prepared_item_index];
+        const qwen_common::VisionItemControl& control = plan_.control->items[use.control_index];
+        const qwen_common::VisionItem& source         = prompt_.vision_items[use.prepared_item_index];
         if (control.scatter_indices.empty() ||
             use.end != static_cast<std::uint32_t>(control.scatter_indices.back()) + 1U ||
             (use.begin != static_cast<std::uint32_t>(control.scatter_indices.front()) &&
@@ -417,7 +417,7 @@ VisionPrefillSession::VisionPrefillSession(
     }
     if (plan_.max_merged_count != 0 &&
         std::none_of(plan_.control->items.begin(), plan_.control->items.end(),
-                     [&](const qwen3_5::VisionItemControl& item) {
+                     [&](const qwen_common::VisionItemControl& item) {
                          return item.merged_count == plan_.max_merged_count;
                      })) {
         throw std::invalid_argument("Vision request workspace extent has no matching suffix item");
@@ -449,7 +449,7 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     if (active == nullptr) {
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }
-    const qwen3_5::VisionItemControl& control = plan_.control->items[active->control_index];
+    const qwen_common::VisionItemControl& control = plan_.control->items[active->control_index];
     Tensor output = VisionContext::bind_output(workspace_, workspace_plan_, control.merged_count);
 
     if (!owns_handoff() || !active_item_ || *active_item_ != active->prepared_item_index) {

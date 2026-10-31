@@ -1,4 +1,5 @@
-#include "runtime/engine/model_instance.h"
+#include "models/qwen3_5/instance.h"
+#include "runtime/engine/engine_options.h"
 
 #include "core/device.h"
 #include "runtime/engine/context_cache/context_cost.h"

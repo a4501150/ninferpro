@@ -114,7 +114,7 @@ not become Infernix's public contract.
 | Sampling / speculative Ops | legal-candidate filtering, probability normalization, p/q acceptance, residuals and sampling results |
 | Gateway / CLI | file acquisition, protocol field translation, protocol errors and response encoding |
 
-The generic adapter lives in `src/text/`; Qwen output semantics in `src/models/qwen3_5/frontend/`. The
+The generic adapter lives in `src/text/`; Qwen output semantics in `src/models/qwen_common/frontend/`. The
 execution data contract belongs to `src/runtime/contract/`; the physical consumers are owned by the
 Programs and Ops.
 

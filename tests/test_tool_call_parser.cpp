@@ -1,5 +1,5 @@
-#include "models/qwen3_5/frontend/tool_call_parser.h"
-#include "models/qwen3_5/frontend/tool_contract.h"
+#include "models/qwen_common/frontend/tool_call_parser.h"
+#include "models/qwen_common/frontend/tool_contract.h"
 
 #include <nlohmann/json.hpp>
 
@@ -15,7 +15,7 @@
 namespace {
 
 using Json   = nlohmann::json;
-namespace fi = infernix::models::qwen3_5::frontend;
+namespace fi = infernix::models::qwen_common::frontend;
 
 // An empty contract: no declared tools, the parser's untyped legacy policy.
 const fi::ToolCallOutputContract kLegacyContract;

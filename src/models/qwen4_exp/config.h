@@ -6,7 +6,8 @@
 // (docs/maintainer/qwen3_8-flash-next-design.md §2, §12).
 
 #include "models/load_options.h"
-#include "models/qwen3_5/config.h"
+#include "models/qwen_common/vision_config.h"
+#include "models/offload/geometry.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 
 #include <algorithm>
@@ -208,7 +209,7 @@ struct Config {
     std::uint32_t proposal_rows = 0; // rows of the bound proposal head (--lm-head-draft), else 0
     // The Vision tower (--vision): Qwen3.5's tower except its output width, which the merger's
     // bound fc2 gives (design §19.3.2).
-    std::optional<qwen3_5::VisionConfig> vision;
+    std::optional<qwen_common::VisionConfig> vision;
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
@@ -217,5 +218,12 @@ struct Config {
 // records the target identity it was converted for, tools/convert/qwen4_exp.py), checked against
 // the target's text config.
 [[nodiscard]] DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const TextConfig& target);
+
+// The offload tier's view of this family's expert banks (models/offload/geometry.h): 48 routed
+// layers of 512 NVFP4 experts, 8 routed per token per layer.
+[[nodiscard]] inline offload::ExpertBankGeometry bank_geometry(const TextConfig& config) noexcept {
+    return {.banks = config.num_hidden_layers, .experts_per_bank = config.moe.experts,
+            .top_k = config.moe.top_k};
+}
 
 } // namespace infernix::models::qwen4_exp

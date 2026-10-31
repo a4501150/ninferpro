@@ -6,7 +6,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen_common/execution/parameters.h"
 #include "models/qwen4_exp/model.h"
 #include "infernix/ops/ggml_linear.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
@@ -138,7 +138,7 @@ public:
     std::optional<MtpParameters> mtp;
     std::optional<DFlash2Parameters> dflash2;
     DraftHeadParameters draft_head;
-    std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
+    std::optional<qwen_common::execution::VisionParameters> vision; // --vision (shared tower types)
 
 private:
     // Device copy of every layer's ExpertScales, [layers][E].

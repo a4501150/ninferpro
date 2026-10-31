@@ -169,12 +169,12 @@ public:
         return out;
     }
 
-    // The Vision tower's parameters in the shared tower's types (qwen3_5/execution/vision_tower.h),
+    // The Vision tower's parameters in the shared tower's types (qwen_common/execution/vision_tower.h),
     // prepared as Qwen3.5 prepares them: fused QKV over one input and its joined bias.
-    qwen3_5::execution::VisionParameters vision(const VisionWeights& w) const {
-        using qwen3_5::execution::NormParameters;
+    qwen_common::execution::VisionParameters vision(const VisionWeights& w) const {
+        using qwen_common::execution::NormParameters;
         const auto norm = [&](const VisionNormWeights& n) { return NormParameters{tensor(n.weight), tensor(n.bias)}; };
-        qwen3_5::execution::VisionParameters out;
+        qwen_common::execution::VisionParameters out;
         out.patch_embedding      = native({w.patch_embedding});
         out.patch_embedding_bias = tensor(w.patch_embedding_bias);
         out.position_embedding   = tensor(w.position_embedding);
@@ -183,7 +183,7 @@ public:
             out.layers.push_back(with_context("vision/layers/" + std::to_string(i), [&] {
                 const auto& layer = w.layers[i];
                 const std::array qkv{input(layer.query), input(layer.key), input(layer.value)};
-                return qwen3_5::execution::VisionBlockParameters{norm(layer.norm1),
+                return qwen_common::execution::VisionBlockParameters{norm(layer.norm1),
                                                                  norm(layer.norm2),
                                                                  ops::prepare_linear_weight(qkv),
                                                                  joined_bias({layer.query_bias, layer.key_bias, layer.value_bias}),

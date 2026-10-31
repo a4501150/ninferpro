@@ -14,7 +14,7 @@
 #include "infernix/ops/sparse_moe.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/state/state_image.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
 
 #include <array>
@@ -143,9 +143,9 @@ public:
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     [[nodiscard]] PrefillChunkResult
-    prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
+    prefill_chunk(const qwen_common::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
-    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen3_5::PreparedPromptData& input,
+    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen_common::PreparedPromptData& input,
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    VisionPrefillSession& vision,

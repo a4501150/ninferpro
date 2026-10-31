@@ -404,10 +404,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
     }
 }
 
-std::vector<NgramProposer::Match>
+std::vector<qwen_common::detail::NgramProposer::Match>
 ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
                            std::span<const runtime::RoundBudget> budgets) {
-    std::vector<NgramProposer::Match> matches(lanes.size());
+    std::vector<qwen_common::detail::NgramProposer::Match> matches(lanes.size());
     if (ngram_draft_window == 0) { return matches; }
     if (budgets.size() != lanes.size()) {
         throw std::invalid_argument("ngram budget count does not match lane count");
@@ -430,7 +430,7 @@ void ProgramImpl::take_ngram_index(RequestControl& request, const RequestBasePla
     request.ngram_snapshot = base.prompt->ngram_snapshot;
 }
 
-NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
+qwen_common::detail::NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
                                                     const runtime::RoundBudget& budget) {
     auto& request        = requests[lane];
     const auto& sequence = active_sequence(lane);
@@ -450,8 +450,8 @@ NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
         request.ngram->append(ledger[request.ngram_indexed++]);
     }
     const auto history =
-        std::span<const TokenId>(ledger).last(std::min(kNgramMatchHistoryTokens, ledger.size()));
-    NgramProposer::Match match;
+        std::span<const TokenId>(ledger).last(std::min(qwen_common::kNgramMatchHistoryTokens, ledger.size()));
+    qwen_common::detail::NgramProposer::Match match;
     if (request.ngram_snapshot && request.ngram_copy_source != 0 &&
         ledger.size() >= request.ngram_copy_ledger) {
         const auto offset = request.ngram_copy_offset + ledger.size() - request.ngram_copy_ledger;
@@ -465,7 +465,7 @@ NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
         match = request.ngram->propose(history, maximum + 2U, ngram_min_match);
         // Equal candidates keep the live source; a maximal match cannot be improved.
         if (request.ngram_snapshot &&
-            !NgramProposer::maximal(match, history.size(), maximum + 2U)) {
+            !qwen_common::detail::NgramProposer::maximal(match, history.size(), maximum + 2U)) {
             auto retained = request.ngram_snapshot->propose(history, maximum + 2U, ngram_min_match);
             if (retained.matched > match.matched ||
                 (retained.matched == match.matched &&
@@ -474,7 +474,7 @@ NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
             }
         }
     }
-    match = NgramProposer::finish_round(std::move(match), maximum, neural_draft_window);
+    match = qwen_common::detail::NgramProposer::finish_round(std::move(match), maximum, neural_draft_window);
     // A cursor is only a candidate. Next round rechecks it against committed ledger
     // tokens, including correction/bonus/control tokens, before skipping lookup.
     request.ngram_copy_source = !match.tokens.empty() && match.archived ? match.source : 0;

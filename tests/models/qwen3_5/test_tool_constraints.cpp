@@ -1,7 +1,7 @@
-#include "models/qwen3_5/frontend/chat_template.h"
-#include "models/qwen3_5/frontend/tool_contract.h"
-#include "models/qwen3_5/frontend/tool_grammar.h"
-#include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen_common/frontend/chat_template.h"
+#include "models/qwen_common/frontend/tool_contract.h"
+#include "models/qwen_common/frontend/tool_grammar.h"
+#include "models/qwen_common/frontend/tool_call_parser.h"
 #include "text/grammar.h"
 
 #include <nlohmann/json.hpp>
@@ -9,7 +9,7 @@
 #include <stdexcept>
 
 namespace {
-namespace frontend = infernix::models::qwen3_5::frontend;
+namespace frontend = infernix::models::qwen_common::frontend;
 using Json         = nlohmann::ordered_json;
 
 void require(bool value, const char* message) {

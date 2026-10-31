@@ -10,7 +10,7 @@
 #include "core/device.h"
 #include "core/direct_read_queue.h"
 #include "core/ggml_format.h"
-#include "models/qwen4_exp/expert_store.h"
+#include "models/offload/expert_store.h"
 
 #include <algorithm>
 #include <chrono>
@@ -27,7 +27,7 @@
 namespace {
 
 using namespace infernix;
-using models::qwen4_exp::ExpertStore;
+using models::offload::ExpertStore;
 
 int failures = 0;
 

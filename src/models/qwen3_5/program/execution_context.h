@@ -13,7 +13,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 #include "models/qwen3_5/state/decoder_state.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
 
 #include <array>
 #include <cstddef>
@@ -24,9 +24,9 @@
 
 namespace infernix::models::qwen3_5::execution {
 
-using qwen3_5::PreparedPromptData;
+using qwen_common::PreparedPromptData;
 using detail::DFlashPersistentState;
-using qwen3_5::PromptModality;
+using qwen_common::PromptModality;
 
 struct ExecutionCore {
     DeviceContext& device;
@@ -170,7 +170,7 @@ void target_accept(ExecutionCore&, Tensor& continuation_hidden_store, TextContex
                                                     bool finalize_at_end);
 
 [[nodiscard]] PrefillChunkResult
-prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
+prefill_multimodal_chunk(PrefillContext& state, const qwen_common::PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,
                          std::optional<std::uint32_t> split_frontier, bool finalize_at_end);
 
@@ -186,7 +186,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,
                             const Tensor* next_embedding = nullptr);
-void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
+void mtp_bridge_multimodal(PrefillContext& state, const qwen_common::PreparedPromptData& prompt,
                            VisionPrefillSession& vision, const MtpBridgeInput& bridge);
 
 // Executes one exact-B ordinary decode traversal. All request rows enter through the stable

@@ -10,8 +10,9 @@
 #include "runtime/engine/engine_core.h"
 #include "runtime/diagnostics.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
-#include "runtime/engine/model_instance.h"
-#include "runtime/engine/qwen4_exp_instance.h"
+#include "models/qwen3_5/instance.h"
+#include "models/qwen4_exp/instance.h"
+#include "runtime/engine/engine_options.h"
 
 #include <algorithm>
 #include <atomic>
@@ -123,14 +124,14 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 class PreparedPrompt::Impl {
 public:
     Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         models::qwen3_5::PreparedPrompt prepared)
+         models::qwen_common::PreparedPrompt prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    models::qwen3_5::PreparedPrompt value;
+    models::qwen_common::PreparedPrompt value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -275,9 +276,7 @@ public:
     // artifact is reported by the (Qwen3.5) model construction, after option validation.
     EngineOptions normalize(EngineOptions engine_options) {
         try {
-            if (runtime::artifact_is_qwen4_exp(engine_options.artifact_path)) {
-                architecture = models::Architecture::Qwen4Exp;
-            }
+            architecture = models::detect_artifact_architecture(engine_options.artifact_path);
         } catch (const std::exception&) {}
         runtime::validate_engine_options(engine_options, architecture);
         return runtime::normalize_engine_options(std::move(engine_options), architecture);
@@ -363,7 +362,7 @@ public:
         }
     }
 
-    [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
+    [[nodiscard]] const models::qwen_common::Frontend& frontend() const {
         return qwen4 != nullptr ? qwen4->frontend : active->frontend;
     }
 

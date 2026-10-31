@@ -1,5 +1,5 @@
-#include "models/qwen3_5/ngram.h"
-#include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen_common/ngram.h"
+#include "models/qwen_common/program/ngram_proposer.h"
 
 #include <algorithm>
 #include <array>
@@ -12,7 +12,7 @@
 #include <string>
 #include <thread>
 
-using namespace infernix::models::qwen3_5;
+using namespace infernix::models::qwen_common;
 using infernix::TokenId;
 
 namespace {

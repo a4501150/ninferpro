@@ -917,7 +917,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint64_t capped =
-            std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens);
+            std::min<std::uint64_t>(plan.capacity, qwen_common::kMaximumVisionItemTokens);
         const std::uint32_t merged = static_cast<std::uint32_t>(
             std::min(capped, static_cast<std::uint64_t>(plan.features.vision_max_merged_tokens)));
         out.vision = execution::VisionContext::plan_workspace(

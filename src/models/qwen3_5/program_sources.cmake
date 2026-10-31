@@ -1,5 +1,4 @@
 target_sources(infernix_model_runtime PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/ngram.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/measurement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/decoder_state.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/state_image.cpp"
@@ -9,7 +8,6 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/context_work.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/ledger_splits.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/round_buffers.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/program/vision_control.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graphs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefill.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/constraint.cpp"
@@ -35,7 +33,6 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/target_verification.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/tree_width_controller.cpp"
 
-  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/block_keys.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_host_layout.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_persist.cpp"

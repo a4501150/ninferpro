@@ -33,8 +33,8 @@ struct LoadPlan::Impl {
     ModelWeights weights;
     std::vector<loading::PendingWeight> pending;
     artifact::MaterializationPlan materialization;
-    std::optional<VisionOverlayLayout> vision_overlay;
-    FrontendResources resources;
+    std::optional<qwen_common::VisionOverlayLayout> vision_overlay;
+    qwen_common::FrontendResources resources;
     InstanceInfo info;
 };
 
@@ -48,7 +48,7 @@ const Config& LoadPlan::config() const { return impl_->config; }
 
 const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
 
-const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
+const qwen_common::FrontendResources& LoadPlan::resources() const { return impl_->resources; }
 
 void LoadPlan::set_host_reserve(std::uint64_t reserve_bytes) {
     impl_->materialization.host_reserve_bytes = reserve_bytes;
@@ -58,7 +58,7 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }
 
-const std::optional<VisionOverlayLayout>& LoadPlan::vision_overlay_layout() const {
+const std::optional<qwen_common::VisionOverlayLayout>& LoadPlan::vision_overlay_layout() const {
     return impl_->vision_overlay;
 }
 
@@ -170,7 +170,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto backing = artifact::materialize(*data->materialization.source,
                                          std::move(data->materialization), device, observer,
                                          std::move(pool));
-    std::optional<VisionOverlayAssets> overlay;
+    std::optional<qwen_common::VisionOverlayAssets> overlay;
     if (data->options.overlay_vision()) {
         EvictableWeightPool* eviction = backing.eviction_pool();
         if (eviction == nullptr) {
@@ -181,7 +181,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         if (pinned.empty()) {
             throw std::logic_error("overlay vision requires a pinned materialization");
         }
-        overlay = VisionOverlayAssets{
+        overlay = qwen_common::VisionOverlayAssets{
             .pool         = eviction,
             .pinned_block = pinned.data(),
             .pinned_bytes = pinned.size(),

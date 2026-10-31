@@ -82,7 +82,7 @@ separately.
 
 ## Curve interpretation and validation
 
-The [shape implementation](../../../src/ops/linear/q6/shapes/n34816_k5120.cpp) chooses, by T, among SIMT
+The [shape implementation](../../../src/models/qwen3_5/shapes/q6/n34816_k5120.cpp) chooses, by T, among SIMT
 GEMV, `k128` small-block MMA and fixed-column-width MMA capacities:
 
 - **T=1 is 105.504µs, 1320.7 GB/s, a nominal bandwidth utilization of 73.70%** (78.87% on the

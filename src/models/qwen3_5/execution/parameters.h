@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
+#include "models/qwen_common/execution/parameters.h"
 #include "infernix/ops/rope.h"
 #include "infernix/ops/weight_input.h"
 
@@ -14,6 +15,8 @@
 
 namespace infernix::models::qwen3_5::execution {
 
+// The Vision parameter types live in the shared tier (qwen_common/execution/parameters.h);
+// LinearParameters stays the text side's name for the same ops type.
 using LinearParameters = ops::SingleProjectionWeight;
 
 [[nodiscard]] inline ops::LinearPolicy residual_projection_policy(const LinearParameters& p,
@@ -87,27 +90,6 @@ struct MtpParameters {
     LinearParameters output;
     FfnParameters ffn;
     LinearParameters output_head;
-};
-
-struct NormParameters {
-    Tensor weight, bias;
-};
-
-struct VisionBlockParameters {
-    NormParameters norm1, norm2;
-    LinearParameters qkv;
-    Tensor qkv_bias;
-    LinearParameters output, fc1, fc2;
-    Tensor output_bias, fc1_bias, fc2_bias;
-};
-
-struct VisionParameters {
-    LinearParameters patch_embedding;
-    Tensor patch_embedding_bias, position_embedding;
-    std::vector<VisionBlockParameters> layers;
-    NormParameters merger_norm;
-    LinearParameters merger_fc1, merger_fc2;
-    Tensor merger_fc1_bias, merger_fc2_bias;
 };
 
 struct DynamicConvParameters {
@@ -206,7 +188,7 @@ public:
         return text;
     }
     std::optional<MtpParameters> mtp;
-    std::optional<VisionParameters> vision;
+    std::optional<qwen_common::execution::VisionParameters> vision;
     std::optional<DraftParameters> draft;
     std::optional<ProposalParameters> proposal;
 };

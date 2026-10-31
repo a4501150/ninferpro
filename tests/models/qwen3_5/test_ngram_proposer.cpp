@@ -1,12 +1,12 @@
-#include "models/qwen3_5/program/ngram_proposer.h"
-#include "models/qwen3_5/frontend/ngram_sources.h"
+#include "models/qwen_common/program/ngram_proposer.h"
+#include "models/qwen_common/frontend/ngram_sources.h"
 
 #include <iostream>
 #include <numeric>
 #include <random>
 
-using infernix::models::qwen3_5::detail::NgramProposer;
-using infernix::models::qwen3_5::frontend::ngram_numbered_sources;
+using infernix::models::qwen_common::detail::NgramProposer;
+using infernix::models::qwen_common::frontend::ngram_numbered_sources;
 
 static void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }

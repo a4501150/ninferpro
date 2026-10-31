@@ -1,7 +1,7 @@
 // The reasoning-loop measure: words split across token boundaries join; a reasoning that keeps
 // rewriting the same verification passes reaches the threshold; varied work, and a short text, stay
 // below it; a passage repeated twice is not a loop.
-#include "models/qwen3_5/frontend/reasoning_loop.h"
+#include "models/qwen_common/frontend/reasoning_loop.h"
 
 #include <iostream>
 #include <string>
@@ -9,7 +9,7 @@
 
 namespace {
 
-using namespace infernix::models::qwen3_5;
+using namespace infernix::models::qwen_common;
 
 int failures = 0;
 

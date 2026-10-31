@@ -15,7 +15,7 @@ TEXT_RESOURCES = (
 VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
 
 # Must stay byte-identical to kQwenSplitPattern in
-# src/models/qwen3_5/frontend/tokenizer.cpp: the runtime tokenizer validates
+# src/models/qwen_common/frontend/tokenizer.cpp: the runtime tokenizer validates
 # tokenizer.json's Split pattern for exact equality and rejects any artifact whose
 # pattern differs.
 STD_QWEN_SPLIT_PATTERN = (
@@ -24,7 +24,7 @@ STD_QWEN_SPLIT_PATTERN = (
 )
 
 # Qwen3.5 tokenizer_config.json invariants the runtime frontend hard-requires
-# (src/models/qwen3_5/frontend/frontend.cpp validate_tokenizer_config): a missing
+# (src/models/qwen_common/frontend/frontend.cpp validate_tokenizer_config): a missing
 # field defaults to the failing value, so each must be present and set to the
 # official Qwen3.5 value.
 KQWEN35_PAD_TOKEN = "<|endoftext|>"

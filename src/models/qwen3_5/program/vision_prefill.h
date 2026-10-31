@@ -1,7 +1,7 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
 
-#include "models/qwen3_5/program/vision_control.h"
+#include "models/qwen_common/program/vision_control.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,8 +31,8 @@ struct VisionUseSpan {
 };
 
 struct VisionPrefillPlan {
-    std::shared_ptr<const qwen3_5::VisionControlPlan> control_plan;
-    std::shared_ptr<const qwen3_5::VisionControl> control;
+    std::shared_ptr<const qwen_common::VisionControlPlan> control_plan;
+    std::shared_ptr<const qwen_common::VisionControl> control;
     std::vector<VisionUseSpan> uses;
     std::size_t max_merged_count = 0;
 };

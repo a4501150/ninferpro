@@ -1,6 +1,6 @@
 infernix_add_test(infernix_qwen4_exp_expert_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_cache.cpp"
-  LIBRARIES infernix_qwen4_exp_expert_cache
+  LIBRARIES infernix_offload
   NEEDS_SOURCE_DIR)
 
 # The SSD tier's host level (design §19.3.7, R10 host part): slots, read agent, admission. CPU and disk.
@@ -11,7 +11,7 @@ infernix_add_test(infernix_qwen4_exp_host_expert_tier_test
 # The SSD tier's RAM-level controller (design §19.3.7 RT2), host only.
 infernix_add_test(infernix_qwen4_exp_host_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_tier.cpp"
-  LIBRARIES infernix_qwen4_exp_expert_cache)
+  LIBRARIES infernix_offload)
 
 infernix_add_test(infernix_qwen4_exp_ngram_hash_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_hash.cpp"
@@ -84,7 +84,7 @@ infernix_add_test(infernix_qwen4_exp_rope_positions_test
 # round trip and the LFRU pinning. Host only.
 infernix_add_test(infernix_qwen4_exp_expert_placement_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_placement.cpp"
-  LIBRARIES infernix_qwen4_exp_expert_cache infernix_model_loading)
+  LIBRARIES infernix_offload infernix_model_loading)
 
 # The startup RAM ledger (host only).
 infernix_add_test(infernix_qwen4_exp_memory_plan_test

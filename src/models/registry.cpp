@@ -1,9 +1,18 @@
 #include "models/registry.h"
 
+#include "artifact/reader.h"
+#include "models/qwen4_exp/load.h"
+
 #include <stdexcept>
 #include <string>
 
 namespace infernix::models {
+
+Architecture detect_artifact_architecture(const std::filesystem::path& artifact) {
+    const artifact::Reader reader(artifact);
+    if (models::qwen4_exp::is_qwen4_exp(reader)) { return Architecture::Qwen4Exp; }
+    return Architecture::Qwen3_5;
+}
 
 Architecture resolve_architecture(std::string_view architecture, std::string_view model_type) {
     if (architecture == "Qwen3_5ForCausalLM" && model_type == "qwen3_5_text") {

@@ -2,7 +2,7 @@
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
 #include "runtime/prefix_cache/cost.h"
 #include <array>
 #include <chrono>
@@ -364,9 +364,9 @@ public:
     Program& operator=(const Program&) = delete;
     Program(Program&&)                 = delete;
     Program& operator=(Program&&)      = delete;
-    [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
+    [[nodiscard]] RequestBasePlan plan_request(qwen_common::PreparedPrompt&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+    [[nodiscard]] ScoreResult causal_score(qwen_common::PreparedPrompt&& prompt, std::uint32_t first_target,
                                            const ScoreOptions& options);
     // Reservations stay owned by their lane through commit. Failure leaves prior permits intact.
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);

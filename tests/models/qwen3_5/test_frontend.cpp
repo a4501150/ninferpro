@@ -1,12 +1,12 @@
-#include "models/qwen3_5/frontend/frontend.h"
-#include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen_common/frontend/frontend.h"
+#include "models/qwen_common/frontend/resources.h"
 
-#include "models/qwen3_5/frontend/chat_template.h"
-#include "models/qwen3_5/frontend/digest.h"
-#include "models/qwen3_5/frontend/media_cache.h"
-#include "models/qwen3_5/frontend/processor.h"
-#include "models/qwen3_5/frontend/test_access.h"
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "models/qwen_common/frontend/chat_template.h"
+#include "models/qwen_common/frontend/digest.h"
+#include "models/qwen_common/frontend/media_cache.h"
+#include "models/qwen_common/frontend/processor.h"
+#include "models/qwen_common/frontend/test_access.h"
+#include "models/qwen_common/frontend/tokenizer.h"
 #include "runtime/contract/execution.h"
 #include "runtime/prefix_cache/block_hash.h"
 #include "text/unicode.h"
@@ -41,8 +41,8 @@
 
 namespace {
 
-using Frontend        = infernix::models::qwen3_5::Frontend;
-using FrontendFactory = infernix::models::qwen3_5::FrontendTestAccess;
+using Frontend        = infernix::models::qwen_common::Frontend;
+using FrontendFactory = infernix::models::qwen_common::FrontendTestAccess;
 
 struct FrontendResources {
     std::string tokenizer_json, tokenizer_config_json, chat_template_jinja, generation_config_json;
@@ -50,33 +50,33 @@ struct FrontendResources {
 };
 
 Frontend make_frontend(const FrontendResources& source,
-                       infernix::models::qwen3_5::FrontendOptions options) {
-    infernix::models::qwen3_5::FrontendResources parsed{
+                       infernix::models::qwen_common::FrontendOptions options) {
+    infernix::models::qwen_common::FrontendResources parsed{
         source.tokenizer_json,           source.tokenizer_config_json,
         source.chat_template_jinja,      source.generation_config_json,
         source.preprocessor_config_json, source.video_preprocessor_config_json};
-    parsed.tokenizer = std::make_shared<const infernix::models::qwen3_5::frontend::Tokenizer>(
-        infernix::models::qwen3_5::frontend::TokenizerResources{
+    parsed.tokenizer = std::make_shared<const infernix::models::qwen_common::frontend::Tokenizer>(
+        infernix::models::qwen_common::frontend::TokenizerResources{
             source.tokenizer_json, source.tokenizer_config_json, source.generation_config_json});
     parsed.public_token_count = static_cast<std::uint32_t>(parsed.tokenizer->vocab_size());
-    return infernix::models::qwen3_5::make_frontend(parsed, options);
+    return infernix::models::qwen_common::make_frontend(parsed, options);
 }
 
 Frontend make_frontend(const FrontendResources& source, bool vision = true) {
-    infernix::models::qwen3_5::FrontendOptions options;
+    infernix::models::qwen_common::FrontendOptions options;
     options.vision_enabled = vision;
     options.max_context    = std::numeric_limits<std::uint32_t>::max();
     return make_frontend(source, options);
 }
 
-using PublishedOutput = infernix::models::qwen3_5::PublishedOutput;
-namespace fi          = infernix::models::qwen3_5::frontend;
+using PublishedOutput = infernix::models::qwen_common::PublishedOutput;
+namespace fi          = infernix::models::qwen_common::frontend;
 using TapHint         = infernix::runtime::prefix_cache::TapHint;
 using TapHintKind     = infernix::runtime::prefix_cache::TapHintKind;
 
 // The prefix-cache tap hints a request's own cache markers produced (explicit and automatic), in
 // marker order; the Engine's structural, opener and message-boundary hints are left out.
-std::vector<TapHint> marker_hints(const infernix::models::qwen3_5::PreparedPromptData& data) {
+std::vector<TapHint> marker_hints(const infernix::models::qwen_common::PreparedPromptData& data) {
     std::vector<TapHint> out;
     for (const TapHint& hint : data.tap_hints.hints) {
         if (hint.kind == TapHintKind::Explicit || hint.kind == TapHintKind::Automatic) {
@@ -768,14 +768,14 @@ int test_context_capacity_guard() {
 
     const Frontend counting         = make_frontend(resources(), false);
     const std::uint32_t exact_count = counting.count_tokens(input);
-    infernix::models::qwen3_5::FrontendOptions exact_options;
+    infernix::models::qwen_common::FrontendOptions exact_options;
     exact_options.vision_enabled = false;
     exact_options.max_context    = exact_count;
     const Frontend exact         = make_frontend(resources(), exact_options);
     int failures = check(exact.prepare(input).summary().prompt_tokens == exact_count,
                          "Frontend rejected a prompt exactly at max_context");
 
-    infernix::models::qwen3_5::FrontendOptions short_options = exact_options;
+    infernix::models::qwen_common::FrontendOptions short_options = exact_options;
     short_options.max_context                              = exact_count - 1U;
     const Frontend short_frontend = make_frontend(resources(), short_options);
     failures += check(short_frontend.count_tokens(input) == exact_count,
@@ -792,7 +792,7 @@ int test_context_capacity_guard() {
                                             exact_count + 1U, exact_count, true),
                       "prepare_tokens accepted a token vector at max_context + 1, or lost its counts");
 
-    infernix::models::qwen3_5::FrontendOptions media_options = short_options;
+    infernix::models::qwen_common::FrontendOptions media_options = short_options;
     media_options.vision_enabled                           = true;
     const Frontend media_frontend = make_frontend(resources(), media_options);
     failures += check(throws_context_length([&] {
@@ -893,7 +893,7 @@ int test_selected_template_instruction_prefix() {
     const std::size_t header           = generated.text.rfind(assistant_header);
     failures += check(header != std::string::npos && generated.rewrite_checkpoint &&
                           generated.rewrite_checkpoint->kind ==
-                              infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                              infernix::models::qwen_common::RewriteCheckpointKind::TurnClosure &&
                           generated.rewrite_checkpoint->offset == header &&
                           generated.text.find("current diagnostics<|im_end|>\n", 0) < header,
                       "late system was not included before the generation rewrite boundary");
@@ -941,7 +941,7 @@ int test_assistant_continuation() {
     failures +=
         check(rendered.rewrite_checkpoint &&
                   rendered.rewrite_checkpoint->kind ==
-                      infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                      infernix::models::qwen_common::RewriteCheckpointKind::ResponseReplay &&
                   rendered.rewrite_checkpoint->offset == expected.find("<|im_start|>assistant"),
               "assistant continuation did not retain its replayable opener boundary");
 
@@ -985,7 +985,7 @@ int test_rewrite_checkpoint_trace() {
     int failures =
         check(first_header != std::string::npos && open.rewrite_checkpoint &&
                   open.rewrite_checkpoint->kind ==
-                      infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                      infernix::models::qwen_common::RewriteCheckpointKind::TurnClosure &&
                   open.rewrite_checkpoint->offset == first_header,
               "tool loop did not retain the stable prefix before its first assistant turn");
     const auto initial = render_chat({tool_loop.front()});
@@ -1004,7 +1004,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t preserved_header = preserved.text.rfind(assistant_header);
     failures += check(preserved_header != std::string::npos && preserved.rewrite_checkpoint &&
                           preserved.rewrite_checkpoint->kind ==
-                              infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                              infernix::models::qwen_common::RewriteCheckpointKind::ResponseReplay &&
                           preserved.rewrite_checkpoint->offset == preserved_header &&
                           preserved.rewrite_checkpoint->recovery_offset == preserved_header &&
                           preserved.text.ends_with("<think>\n"),
@@ -1015,7 +1015,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t nonthinking_header = nonthinking.text.rfind(assistant_header);
     failures += check(nonthinking_header != std::string::npos && nonthinking.rewrite_checkpoint &&
                           nonthinking.rewrite_checkpoint->kind ==
-                              infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                              infernix::models::qwen_common::RewriteCheckpointKind::ResponseReplay &&
                           nonthinking.rewrite_checkpoint->offset == nonthinking_header &&
                           nonthinking.text.ends_with("<think>\n\n</think>\n\n"),
                       "non-thinking response replay did not checkpoint before its generation "
@@ -1027,7 +1027,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t final_header = next.text.rfind(assistant_header);
     failures += check(final_header != std::string::npos && next.rewrite_checkpoint &&
                           next.rewrite_checkpoint->kind ==
-                              infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                              infernix::models::qwen_common::RewriteCheckpointKind::TurnClosure &&
                           next.rewrite_checkpoint->offset == final_header,
                       "new user turn did not move the rewrite boundary before its generation "
                       "opener");
@@ -1041,7 +1041,7 @@ int test_rewrite_checkpoint_trace() {
     failures += check(
         source.rewrite_checkpoint &&
             source.rewrite_checkpoint->kind ==
-                infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                infernix::models::qwen_common::RewriteCheckpointKind::ResponseReplay &&
             branch.text.starts_with(source.text.substr(0, source.rewrite_checkpoint->offset)) &&
             !branch.text.starts_with(
                 source.text.substr(0, source.rewrite_checkpoint->offset + assistant_header.size())),
@@ -1068,7 +1068,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t wrapped_first = wrapped.text.find(assistant_header);
     failures += check(wrapped.rewrite_checkpoint &&
                           wrapped.rewrite_checkpoint->kind ==
-                              infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                              infernix::models::qwen_common::RewriteCheckpointKind::TurnClosure &&
                           wrapped.rewrite_checkpoint->offset == wrapped_first,
                       "bare tool-response wrapper incorrectly advanced the real user turn");
     return failures;
@@ -1260,7 +1260,7 @@ int test_template_file_execution() {
         std::ofstream stream(file.path);
         stream << source;
     }
-    infernix::models::qwen3_5::FrontendOptions options;
+    infernix::models::qwen_common::FrontendOptions options;
     options.vision_enabled     = false;
     options.chat_template_path = file.path;
     const auto overridden      = make_frontend(resources("{{ messages[0].content }}"), options);
@@ -1354,7 +1354,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
         check(text_data.token_ids == expected, "text frontend did not render/tokenize chat");
     failures += check(text_data.identity.rewrite_checkpoint &&
                           text_data.identity.rewrite_checkpoint->kind ==
-                              infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                              infernix::models::qwen_common::RewriteCheckpointKind::TurnClosure &&
                           text_data.identity.rewrite_checkpoint->frontier == 9 &&
                           text_data.identity.rewrite_checkpoint->recovery_frontier == 7 &&
                           text_data.starts_in_reasoning && !text_data.has_media(),
@@ -1375,7 +1375,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     const auto& preserved_data                = FrontendFactory::inspect(preserved_prompt);
     failures += check(preserved_data.identity.rewrite_checkpoint &&
                           preserved_data.identity.rewrite_checkpoint->kind ==
-                              infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                              infernix::models::qwen_common::RewriteCheckpointKind::ResponseReplay &&
                           preserved_data.identity.rewrite_checkpoint->frontier == 9 &&
                           preserved_data.identity.rewrite_checkpoint->frontier <
                               preserved_data.token_ids.size(),
@@ -1394,7 +1394,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     const auto& nonthinking_data                = FrontendFactory::inspect(nonthinking_prompt);
     failures += check(nonthinking_data.identity.rewrite_checkpoint &&
                           nonthinking_data.identity.rewrite_checkpoint->kind ==
-                              infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                              infernix::models::qwen_common::RewriteCheckpointKind::ResponseReplay &&
                           nonthinking_data.identity.rewrite_checkpoint->frontier == 9 &&
                           nonthinking_data.identity.rewrite_checkpoint->frontier <
                               nonthinking_data.token_ids.size() &&
@@ -1450,7 +1450,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
             prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable &&
             prepared_data.identity.rewrite_checkpoint &&
             prepared_data.identity.rewrite_checkpoint->kind ==
-                infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                infernix::models::qwen_common::RewriteCheckpointKind::TurnClosure &&
             prepared_data.identity.rewrite_checkpoint->frontier < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
     if (!prepared_data.vision_items.empty() &&
@@ -1914,7 +1914,7 @@ int test_video_prepare(const Frontend& frontend) {
     if (!prepared_data.vision_items.empty()) {
         const auto& item = prepared_data.vision_items.front();
         failures +=
-            check(item.modality == infernix::models::qwen3_5::PromptModality::Video &&
+            check(item.modality == infernix::models::qwen_common::PromptModality::Video &&
                       item.grid.temporal == 1 && item.grid.height == 4 && item.grid.width == 4 &&
                       item.patch_count == 16 && item.content_digest == kGradientDigest &&
                       item.timestamps.size() == 1 && item.timestamps.front() == 0.0 &&
@@ -2264,7 +2264,7 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
-infernix::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend) {
+infernix::models::qwen_common::PreparedPrompt thinking_prompt(const Frontend& frontend) {
     infernix::ChatMessage message;
     message.role = infernix::ChatRole::User;
     message.parts.push_back(
@@ -2783,7 +2783,7 @@ int test_thinking_budget_control(const Frontend& frontend) {
 }
 
 int test_thinking_budget_message() {
-    infernix::models::qwen3_5::FrontendOptions message_options;
+    infernix::models::qwen_common::FrontendOptions message_options;
     message_options.vision_enabled = false;
     message_options.thinking_budget_message = "Time to act now:";
     const std::string expected_control =
@@ -2822,7 +2822,7 @@ int test_thinking_budget_message() {
                           session.thinking_stats().applied,
                       "custom thinking control accounting is incorrect");
 
-    infernix::models::qwen3_5::FrontendOptions exact_options = message_options;
+    infernix::models::qwen_common::FrontendOptions exact_options = message_options;
     exact_options.thinking_budget_message = expected_control;
     const Frontend exact_frontend = make_frontend(resources(), exact_options);
     auto exact_session = exact_frontend.make_output_session(
@@ -2837,7 +2837,7 @@ int test_thinking_budget_message() {
     failures += check(exact_text == expected_control,
                       "canonical close was appended to a message that already had it");
 
-    infernix::models::qwen3_5::FrontendOptions terminal_options = message_options;
+    infernix::models::qwen_common::FrontendOptions terminal_options = message_options;
     terminal_options.thinking_budget_message = "<eos>";
     failures += check(
         throws_invalid_argument([&] { (void)make_frontend(resources(), terminal_options); }),
@@ -3050,7 +3050,7 @@ int test_media_cache_reuses_immutable_payload() {
 }
 
 int test_media_payload_outlives_frontend_cache() {
-    infernix::models::qwen3_5::PreparedPrompt survivor;
+    infernix::models::qwen_common::PreparedPrompt survivor;
     {
         const Frontend frontend = make_frontend(resources());
         survivor                = frontend.prepare(image_input());
@@ -3202,7 +3202,7 @@ int test_media_preparation_cancellation() {
 }
 
 int test_ngram_proposal_only_sources() {
-    infernix::models::qwen3_5::FrontendOptions options;
+    infernix::models::qwen_common::FrontendOptions options;
     options.vision_enabled        = false;
     options.max_context           = 8192;
     const Frontend plain          = make_frontend(resources(), options);
@@ -3245,7 +3245,7 @@ int test_ngram_proposal_only_sources() {
     retained_input.messages.push_back(assistant);
     auto retained_prompt = retaining.prepare(retained_input);
     const auto& retained = FrontendFactory::inspect(retained_prompt);
-    using namespace infernix::models::qwen3_5;
+    using namespace infernix::models::qwen_common;
     const auto has_source = [&](std::string_view text, NgramSourceKind kind) {
         const auto expected = retaining.tokenize_text(text);
         return std::any_of(retained.ngram_archive_sources.begin(),

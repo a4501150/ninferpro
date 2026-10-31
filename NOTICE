@@ -44,6 +44,13 @@ Modifications made in this product (summary; see README.md for details):
   constrained auto contract, and such a turn may end inside its thinking
   (non-strict calls there are recovered).
 - Linux VRAM spill detection fix (no WDDM budget).
+- A model-layer restructure: each family owns its instance construction, option branches
+  and linear shape tuning under src/models/<family>/ (the shapes as extern tables the
+  ops dispatch scans), the shared expert-offload tier lives in src/models/offload/
+  (infernix_offload, parameterized by ExpertBankGeometry), and the Qwen frontend both
+  families share lives in src/models/qwen_common/; the runtime engine keeps only
+  family-neutral code (src/runtime/engine/engine_options.* holds the shared
+  artifact-free checks and defaults, and the registry detects the artifact architecture).
 
 Third-party components keep their own licenses; see third_party/ and
 packaging/windows/THIRD_PARTY_NOTICES.md.

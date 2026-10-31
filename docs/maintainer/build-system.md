@@ -81,7 +81,7 @@ project includes and the two CUDA archive policies.
 | `text/` | `infernix_text`, including bundled utf8proc C source |
 | `media/` | `infernix_media_decode` |
 | `ops/` | `infernix_ops`, `infernix_nvfp4_non_rdc` |
-| `models/` | `infernix_model_loading`, `infernix_model_runtime` |
+| `models/` | `infernix_model_loading`, `infernix_model_runtime`, `infernix_offload` |
 | `runtime/` | `infernix_runtime_support`, `infernix_engine` and its `infernix::engine` alias |
 | `product/` | media acquisition, prompt input and logging libraries |
 | `serve/` | `infernix_serve` |
@@ -100,11 +100,20 @@ with `CMAKE_CURRENT_LIST_DIR`; `include()` does not change `CMAKE_CURRENT_SOURCE
 - Every implementation under `src/` has one target owner and one explicit registration.
 - Ops register simple horizontal implementations in `basic_sources.cmake` and larger semantic
   families in their own manifests. A family also registers its files under `wrapper/`.
-- Linear includes one manifest for each of BF16, FP8, NVFP4, Q4, Q5, Q6 and Q8. Each manifest lists
-  all its shape filenames and their actual `.cpp`/`.cu` extensions.
-- Models separate loading, frontend, execution and Program source lists while retaining the
-  distinct immutable-loading and mutable-runtime targets. Checkpoints/recipes do not define
-  additional compile owners.
+- Linear includes one manifest for each of BF16, FP8, NVFP4, Q4, Q5, Q6 and Q8 covering the shared
+  launch templates, the general fallback and the dispatch. The tuned shape instantiations are
+  family-owned: each family's `shapes/<dtype>/` manifest lists its shape filenames and its
+  `<dtype>_shapes.cpp` extern table, and compiles them into `infernix_ops` (the templates and RDC
+  live there); the format's dispatch declares the family tables and scans them.
+- Models separate loading, instance, options, execution and Program source lists per family while
+  retaining the distinct immutable-loading and mutable-runtime targets; the shared Qwen frontend
+  (`qwen_common`) joins those same two targets, and the shared expert-offload tier (`offload/`)
+  builds the host-only `infernix_offload`, linked PUBLIC by model loading and runtime.
+  Checkpoints/recipes do not define additional compile owners.
+- Runtime support compiles the shared, family-neutral engine sources directly, including the
+  artifact-free option checks and defaults (`engine/engine_options.cpp`); the Engine library
+  itself is `engine.cpp` plus `contract/sampling.cpp` only, and the family instances live in the
+  model layer.
 - New files require an explicit manifest edit. New families require an explicit parent include.
   There is no recursive glob, directory discovery or generated shape/dispatch registry.
 
