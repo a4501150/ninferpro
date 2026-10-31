@@ -24,8 +24,8 @@
 #include "core/vram_budget.h"
 #include "core/host_memory.h"
 #include "core/weight_view.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
-#include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
+#include "models/qwen_common/program/ngram_proposer.h"
 #include "models/qwen4_exp/execution/dflash2.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/draft_length.h"
@@ -42,9 +42,9 @@
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "models/qwen4_exp/program/rope_positions.h"
 #include "models/qwen4_exp/program/vision_window.h"
-#include "models/qwen3_5/execution/vision_tower.h"
-#include "models/qwen3_5/execution/vision_weight_stream.h"
-#include "models/qwen3_5/program/vision_control.h"
+#include "models/qwen_common/execution/vision_tower.h"
+#include "models/qwen_common/execution/vision_weight_stream.h"
+#include "models/qwen_common/program/vision_control.h"
 #include "models/offload/route_trace.h"
 #include "models/offload/vram_monitor.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
@@ -83,7 +83,7 @@ namespace detail {
 
 // A prompt with media: its items' control plan and the encode window it needs (design §19.3.2).
 struct VisionAdmission {
-    qwen3_5::VisionControlPlan control;
+    qwen_common::VisionControlPlan control;
     VisionWindowPlan window;
 };
 
@@ -176,16 +176,16 @@ struct QuoteImpl {
 // admission steps, released once the prompt's last call is enqueued or the lane is released.
 struct LaneVision {
     std::shared_ptr<const VisionAdmission> admission;
-    qwen3_5::VisionControl control;            // the encoded items' controls
-    std::vector<std::shared_ptr<const qwen3_5::PreparedMediaPayload>> payloads; // per encoded item
+    qwen_common::VisionControl control;            // the encoded items' controls
+    std::vector<std::shared_ptr<const qwen_common::PreparedMediaPayload>> payloads; // per encoded item
     std::vector<std::uint32_t> visual;         // the encoded visual tokens' positions, ascending
     offload::ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
     DeviceBuffer fallback;                     // the same bytes when the residency lends no frame
     Tensor handoff;                            // BF16 [out, V_encoded]
-    std::unique_ptr<qwen3_5::execution::VisionWeightStream> stream;
-    std::optional<qwen3_5::execution::VisionParameters> weights; // the stream's rebased view
-    std::unique_ptr<qwen3_5::execution::VisionPassLayout> layout;
-    std::unique_ptr<qwen3_5::execution::VisionTowerPass> pass;
+    std::unique_ptr<qwen_common::execution::VisionWeightStream> stream;
+    std::optional<qwen_common::execution::VisionParameters> weights; // the stream's rebased view
+    std::unique_ptr<qwen_common::execution::VisionPassLayout> layout;
+    std::unique_ptr<qwen_common::execution::VisionTowerPass> pass;
     std::optional<CudaEventTimer> timer;
     bool encoded = false;
 };
@@ -447,7 +447,7 @@ public:
         std::array<std::uint64_t, 3> verify_at_admission{};
         NgramVolume::Counters ngram; // this request's n-gram row traffic
         GateTraffic gate;            // its verification rounds' rows read behind the n-gram gate
-        std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
+        std::unique_ptr<qwen_common::detail::NgramProposer> proposer; // copy proposals over history
         SpeculativeStats speculative;
         // MTP drafter (design 11.2; rule MR1 of 19.3.1): its KV cells [0, mtp_cells) are final. At
         // every settled point the lane's saved column holds the residual of position
@@ -1292,7 +1292,7 @@ public:
 
     // ---------------------------------------------------------------- admission
     RequestBasePlan plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {
-        const auto& data = qwen3_5::PreparedPromptAccess::view(prompt);
+        const auto& data = qwen_common::PreparedPromptAccess::view(prompt);
         std::shared_ptr<const VisionAdmission> vision;
         if (data.has_media()) { vision = plan_vision(data); }
         const auto n = static_cast<std::uint32_t>(data.token_ids.size());
@@ -1359,7 +1359,7 @@ public:
     }
 
     // A source over `selection` (absent: a root start without a prefix cache).
-    SourceCandidate make_source(const BasePlanImpl& base, const qwen3_5::PreparedPromptData& data,
+    SourceCandidate make_source(const BasePlanImpl& base, const qwen_common::PreparedPromptData& data,
                                 std::optional<PrefixSelection> selection) const {
         auto impl      = std::make_shared<QuoteImpl>();
         impl->summary  = base.summary;
@@ -1385,7 +1385,7 @@ public:
     // at start_binding), then a root start.
     std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base, std::uint32_t maximum_frontier) {
         const BasePlanImpl& b = *base.impl_;
-        const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
+        const auto& data      = qwen_common::PreparedPromptAccess::view(*b.prompt);
         std::vector<SourceCandidate> out;
         if (prefix_) {
             // A source held only on the Disk tier is read first and the request waits for it, a
@@ -1424,7 +1424,7 @@ public:
         Lane& lane = lanes_[index];
         kv_busy();
         const BasePlanImpl& b = *base.impl_;
-        const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
+        const auto& data      = qwen_common::PreparedPromptAccess::view(*b.prompt);
         std::optional<PrefixSelection> selection;
         if (prefix_) {
             if (q.prefix && q.prefix->snapshot) {
@@ -1514,7 +1514,7 @@ public:
         if (max_width_ > 1) {
             if (options_.ngram_draft_tokens > 0) {
                 lane.proposer =
-                    std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
+                    std::make_unique<qwen_common::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
                 for (const auto token : lane.history) { lane.proposer->append(token); }
             }
             lane.speculative.enabled      = true;
@@ -1605,7 +1605,7 @@ public:
     // The resumed request's ledger as a prompt: its tokens through the next input, their RoPE
     // positions, and its lookup keys (the prompt's, chained over the output blocks as
     // prefix_publish chains them); no tap hints (a replay publishes blocks, not taps).
-    qwen3_5::PreparedPromptData ledger_prompt(const qwen3_5::PreparedPromptData& prompt,
+    qwen_common::PreparedPromptData ledger_prompt(const qwen_common::PreparedPromptData& prompt,
                                               const ResumeStateImpl& r) const;
 
     // Binds a request paused after its first token: the deepest cached state of its ledger up to
@@ -1614,8 +1614,8 @@ public:
     runtime::ResourceReservation bind_replay(const BasePlanImpl& b, std::uint32_t index, ResumeStateImpl& r) {
         Lane& lane = lanes_[index];
         kv_busy();
-        const auto& prompt = qwen3_5::PreparedPromptAccess::view(*b.prompt);
-        const qwen3_5::PreparedPromptData ledger = ledger_prompt(prompt, r);
+        const auto& prompt = qwen_common::PreparedPromptAccess::view(*b.prompt);
+        const qwen_common::PreparedPromptData ledger = ledger_prompt(prompt, r);
         const std::uint32_t pages = binding_pages(b, r.target + 1U);
         std::optional<PrefixSelection> selection;
         if (prefix_) {
@@ -1698,7 +1698,7 @@ public:
         lane.next_call = 0;
         clear_prompt_uses(lane);
         if (max_width_ > 1 && options_.ngram_draft_tokens > 0) {
-            lane.proposer = std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
+            lane.proposer = std::make_unique<qwen_common::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
             for (const auto token : lane.history) { lane.proposer->append(token); }
         }
         lane.sampling = b.sampling;
@@ -6150,18 +6150,18 @@ private:
     // A lane index meaning "no lane yet" (a quote before the Engine picks the destination).
     static constexpr std::uint32_t kNoLane = 0xFFFFFFFFU;
     // The root start of a request with a prefix cache: every page reserved, the cold call grid.
-    PrefixSelection prefix_root(const qwen3_5::PreparedPromptData& prompt, const BasePlanImpl& base) {
+    PrefixSelection prefix_root(const qwen_common::PreparedPromptData& prompt, const BasePlanImpl& base) {
         PrefixSelection root;
         root.need = binding_pages(base, static_cast<std::uint32_t>(prompt.token_ids.size()));
         root.plan = plan_prefill(prompt, 0, {}, base.reuse);
         return root;
     }
-    std::optional<PrefixSelection> prefix_select(const qwen3_5::PreparedPromptData& prompt, const BasePlanImpl& base,
+    std::optional<PrefixSelection> prefix_select(const qwen_common::PreparedPromptData& prompt, const BasePlanImpl& base,
                                                  std::uint32_t lane);
     void pc_make_room(std::uint32_t pages);
     // Whether a fresh prompt reusing `reuse` tokens should wait for a prefilling sibling's snapshot
     // inside their shared prefix; plans that snapshot as a boundary tap of the sibling when so.
-    bool prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt, std::uint32_t reuse);
+    bool prefix_await_sibling(const qwen_common::PreparedPromptData& prompt, std::uint32_t reuse);
     // A restore batch prefetching a blocked head's blocks (none once it has landed).
     std::optional<prefix::RestoreTicket> prefetch_ticket_;
     [[nodiscard]] bool prefetch_landing() const noexcept {
@@ -6202,10 +6202,10 @@ private:
     void prefix_finish(Lane& lane, std::uint32_t index);
     void prefix_release(Lane& lane) noexcept;
     // The cumulative Vision key of every item of the prompt: the key of each block after it.
-    [[nodiscard]] static std::uint64_t prefix_trailing_extra(const qwen3_5::PreparedPromptData& prompt);
+    [[nodiscard]] static std::uint64_t prefix_trailing_extra(const qwen_common::PreparedPromptData& prompt);
     // Every Vision item's token span: no tap and no resume lies strictly inside one.
     [[nodiscard]] static std::vector<runtime::prefix_cache::TapExclusion>
-    prefix_exclusions(const qwen3_5::PreparedPromptData& prompt);
+    prefix_exclusions(const qwen_common::PreparedPromptData& prompt);
     [[nodiscard]] std::optional<prefix::cache_index::SnapshotRef> prefix_resident(const Lane& lane) const;
     [[nodiscard]] std::array<std::span<const cudaEvent_t>, 2> prefix_waits(const Lane& lane) const noexcept;
     void mtp_flush_cell(Lane& lane, std::uint32_t index);
@@ -6213,8 +6213,8 @@ private:
     // Starts reading a fresh request's chosen source from the Disk tier when it is held only there,
     // or finds such a read running: the request is then deferred (hybrid_sources).
     // `maximum_frontier`: a restore's paused frontier, UINT32_MAX for a fresh request.
-    [[nodiscard]] bool prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt, std::uint32_t maximum_frontier);
-    [[nodiscard]] bool prefix_disk_pending(const qwen3_5::PreparedPromptData& prompt, std::uint32_t maximum_frontier);
+    [[nodiscard]] bool prefix_disk_fetch(const qwen_common::PreparedPromptData& prompt, std::uint32_t maximum_frontier);
+    [[nodiscard]] bool prefix_disk_pending(const qwen_common::PreparedPromptData& prompt, std::uint32_t maximum_frontier);
     // Credits a lane-resident image and a landed fetch's bytes, then drops candidates that still
     // need a Disk read.
     void prefix_credit(std::vector<prefix::cache_index::MatchCandidate>& candidates,
@@ -6236,7 +6236,7 @@ private:
     // The prompt's prefill calls from `frontier`, and with `taps` the prefix taps they realize. A
     // nonzero `branch` (past the frontier) adds an exact boundary tap there: where the prompt leaves
     // a cached path (prefix_select).
-    [[nodiscard]] prefix::CallPlan plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
+    [[nodiscard]] prefix::CallPlan plan_prefill(const qwen_common::PreparedPromptData& prompt, std::uint32_t frontier,
                                                 std::span<const std::uint32_t> existing, bool taps,
                                                 std::uint32_t branch = 0) const;
     // A branch tap (prefix_select) needs the prompt to share at least this many cached tokens past
@@ -6966,10 +6966,10 @@ private:
     std::uint64_t revision_            = 1;
     // ---------------------------------------------------------------- vision (vision_program.cpp)
     // The encode window of the items ending past the reused prefix [0, reused).
-    [[nodiscard]] std::shared_ptr<const VisionAdmission> plan_vision(const qwen3_5::PreparedPromptData& prompt,
+    [[nodiscard]] std::shared_ptr<const VisionAdmission> plan_vision(const qwen_common::PreparedPromptData& prompt,
                                                                      std::uint32_t reused = 0) const;
     void vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmission> admission,
-                        const qwen3_5::PreparedPromptData& prompt);
+                        const qwen_common::PreparedPromptData& prompt);
     [[nodiscard]] static bool vision_encoded(const Lane& lane) noexcept { return !lane.vision || lane.vision->encoded; }
     void vision_step(Lane& lane);
     void vision_release(Lane& lane) noexcept;

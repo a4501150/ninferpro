@@ -6,8 +6,8 @@
 namespace infernix::models::qwen3_5 {
 
 Model::Model(Config config, LoadOptions options, ModelWeights weights,
-             std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
-             std::optional<VisionOverlayAssets> overlay_vision,
+             std::vector<BoundWeight> bound, qwen_common::FrontendResources resources, InstanceInfo info,
+             std::optional<qwen_common::VisionOverlayAssets> overlay_vision,
              artifact::MaterializedArtifact backing)
     : overlay_vision_(std::move(overlay_vision)), backing_(std::move(backing)),
       config_(std::move(config)), options_(options), weights_(std::move(weights)),

@@ -81,7 +81,7 @@ std::size_t current_free_device_bytes() {
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
-      frontend(models::qwen3_5::make_frontend(
+      frontend(models::qwen_common::make_frontend(
           model->resources(),
           {.chat_template_path       = options.chat_template_path,
            .grammar_cache_bytes      = options.grammar_cache_bytes,

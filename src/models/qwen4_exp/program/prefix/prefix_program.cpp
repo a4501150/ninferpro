@@ -3,7 +3,7 @@
 // and endpoints, and release. The binding (prefix_cache.h) moves the bytes.
 
 #include "models/qwen4_exp/program/program_impl.h"
-#include "models/qwen3_5/program/prefix/block_keys.h"
+#include "models/qwen_common/program/prefix/block_keys.h"
 #include "runtime/prefix_cache/block_hash.h"
 
 #include <algorithm>
@@ -177,7 +177,7 @@ void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
 
 // Chooses the resume source for `prompt` in lane `lane`: the deepest affordable snapshot, else the
 // root, or nothing when even the root does not fit now (design §19.3.1, plan §7.1).
-std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::PreparedPromptData& prompt,
+std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen_common::PreparedPromptData& prompt,
                                                                        const BasePlanImpl& base,
                                                                        std::uint32_t lane) {
     pc::PrefixCacheIndex& index = prefix_->index();
@@ -321,7 +321,7 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
     prefix_->poll();
     if (prefetch_landing()) { return std::nullopt; }
     prefetch_ticket_.reset();
-    const auto& prompt = qwen3_5::PreparedPromptAccess::view(*base.impl_->prompt);
+    const auto& prompt = qwen_common::PreparedPromptAccess::view(*base.impl_->prompt);
     const auto n       = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (n <= 1 || prompt.block_hashes.size() != n / kBlock) { return 0U; }
     // The source the admission would choose now, as in prefix_select.
@@ -391,7 +391,7 @@ void ProgramImpl::prefix_credit(std::vector<pc::MatchCandidate>& candidates,
 // written through to the Disk is awaited. While other requests run, the request is deferred (the
 // Engine asks again), so their rounds never wait on the Disk; an idle Engine has nothing else to
 // run and waits here, at most kDiskWaitSeconds.
-bool ProgramImpl::prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt, std::uint32_t maximum_frontier) {
+bool ProgramImpl::prefix_disk_fetch(const qwen_common::PreparedPromptData& prompt, std::uint32_t maximum_frontier) {
     if (!prefix_->disk_attached()) { return false; }
     constexpr double kDiskWaitSeconds = 5.0;
     const auto start                  = std::chrono::steady_clock::now();
@@ -409,7 +409,7 @@ bool ProgramImpl::prefix_disk_fetch(const qwen3_5::PreparedPromptData& prompt, s
 // Whether the prompt's admission must wait for the Disk tier: a fetch is running (the head's choice
 // may need it), a snapshot on the prompt's path is still being written through, or a fetch of the
 // source it would choose has just started.
-bool ProgramImpl::prefix_disk_pending(const qwen3_5::PreparedPromptData& prompt, std::uint32_t maximum_frontier) {
+bool ProgramImpl::prefix_disk_pending(const qwen_common::PreparedPromptData& prompt, std::uint32_t maximum_frontier) {
     prefix_->poll();
     if (prefix_->fetch_running()) { return true; }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -449,7 +449,7 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
     for (const RequestBasePlan* base : queue) {
         if (holds.size() == pc::kMaxQueueHolds) { break; }
         if (base == nullptr || base->impl_ == nullptr || !base->impl_->reuse || !base->impl_->prompt) { continue; }
-        const auto& prompt = qwen3_5::PreparedPromptAccess::view(*base->impl_->prompt);
+        const auto& prompt = qwen_common::PreparedPromptAccess::view(*base->impl_->prompt);
         const auto n       = static_cast<std::uint32_t>(prompt.token_ids.size());
         if (n <= 1 || prompt.block_hashes.size() != n / kBlock) { continue; }
         pc::MatchResult match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
@@ -470,7 +470,7 @@ std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
 // snapshot at the divergence instead of prefilling the shared part again (the coalescing of the
 // Qwen3.5 hybrid cache, hybrid-prefix-cache-spec): a /v1/decide fan-out's questions over one state,
 // or concurrent requests over one image, prefill the shared part once.
-bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt, std::uint32_t reuse) {
+bool ProgramImpl::prefix_await_sibling(const qwen_common::PreparedPromptData& prompt, std::uint32_t reuse) {
     // Coalescing waits on another request and inserts its tap into this one's prefill.
     if (!options_.free_cache_resume) { return false; }
     if (options_.prefix_coalesce_wait_seconds <= 0.0) { return false; }
@@ -490,7 +490,7 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
         const Lane& lane = lanes_[i];
         // A replaying lane plans no taps (its blocks are already cached up to its frontier).
         if (lane.phase == Phase::Free || !lane.prefix.reuse || !lane.prompt || lane.replay) { continue; }
-        const auto& sibling = qwen3_5::PreparedPromptAccess::view(*lane.prompt);
+        const auto& sibling = qwen_common::PreparedPromptAccess::view(*lane.prompt);
         // The waiting request keeps at least one prompt token to prefill.
         const std::size_t limit = std::min<std::size_t>(n - 1U, lane.prompt_tokens);
         const auto equal        = static_cast<std::uint32_t>(
@@ -499,7 +499,7 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
                 .first -
             prompt.token_ids.begin());
         // A sibling encoding the same image saves this request the encode as well as the prefill.
-        const std::uint32_t shared = qwen3_5::detail::media_agreed_prefix(prompt, sibling, equal);
+        const std::uint32_t shared = qwen_common::detail::media_agreed_prefix(prompt, sibling, equal);
         if (shared <= reuse) { continue; }
         // A capture of the lane's inside the shared prefix that has not landed publishes within a
         // copy time.
@@ -718,7 +718,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
 
 // The prompt's prefill calls from `frontier` (design §19.3.1, "Prefill integration"): with `taps`, the
 // prefix taps beyond the frontier (no tap inside a Vision item), exact ones admitted by their cost.
-prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
+prefix::CallPlan ProgramImpl::plan_prefill(const qwen_common::PreparedPromptData& prompt, std::uint32_t frontier,
                                            std::span<const std::uint32_t> existing, bool taps,
                                            std::uint32_t branch) const {
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -850,10 +850,10 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     return out;
 }
 
-std::vector<pc::TapExclusion> ProgramImpl::prefix_exclusions(const qwen3_5::PreparedPromptData& prompt) {
+std::vector<pc::TapExclusion> ProgramImpl::prefix_exclusions(const qwen_common::PreparedPromptData& prompt) {
     std::vector<pc::TapExclusion> out;
     if (prompt.vision_items.empty()) { return out; }
-    for (const auto& range : qwen3_5::detail::vision_ranges(prompt)) { out.push_back({range.begin, range.end}); }
+    for (const auto& range : qwen_common::detail::vision_ranges(prompt)) { out.push_back({range.begin, range.end}); }
     return out;
 }
 
@@ -862,9 +862,9 @@ std::vector<pc::TapExclusion> ProgramImpl::prefix_exclusions(const qwen3_5::Prep
 // The resumed request's ledger as a prompt: its tokens through the next input, their RoPE positions,
 // and its lookup keys (the prompt's, chained over the output blocks as prefix_publish chains them);
 // no tap hints (a replay publishes blocks, not taps).
-qwen3_5::PreparedPromptData ProgramImpl::ledger_prompt(const qwen3_5::PreparedPromptData& prompt,
+qwen_common::PreparedPromptData ProgramImpl::ledger_prompt(const qwen_common::PreparedPromptData& prompt,
                                                    const ResumeStateImpl& r) const {
-    qwen3_5::PreparedPromptData out = prompt;
+    qwen_common::PreparedPromptData out = prompt;
     const std::size_t n = r.history.size(), p = prompt.token_ids.size();
     if (r.prompt_tokens != p || n <= p || !std::equal(prompt.token_ids.begin(), prompt.token_ids.end(), r.history.begin())) {
         throw std::logic_error("Qwen4Exp: a paused ledger does not extend its prompt");
@@ -1158,10 +1158,10 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
 
 // The endpoint this lane published at its last finish, while its slot still holds that image: only
 // a snapshot the capture created (a duplicate's image came from another lineage).
-std::uint64_t ProgramImpl::prefix_trailing_extra(const qwen3_5::PreparedPromptData& prompt) {
+std::uint64_t ProgramImpl::prefix_trailing_extra(const qwen_common::PreparedPromptData& prompt) {
     std::uint64_t cumulative = 0;
-    for (const auto& range : qwen3_5::detail::vision_ranges(prompt)) {
-        cumulative = qwen3_5::detail::accumulate_vision(cumulative, range.key);
+    for (const auto& range : qwen_common::detail::vision_ranges(prompt)) {
+        cumulative = qwen_common::detail::accumulate_vision(cumulative, range.key);
     }
     return cumulative;
 }

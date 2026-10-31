@@ -5,7 +5,7 @@
 #include "models/qwen3_5/program/program.h"
 #include <cstdlib>
 
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +18,7 @@
 namespace {
 
 namespace qwen = infernix::models::qwen3_5;
+namespace qwen_common = infernix::models::qwen_common;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -29,22 +30,22 @@ void test_handoff_lifetime(infernix::DeviceContext& device,
     const auto merge       = static_cast<std::int32_t>(config.spatial_merge_size);
     const auto patches     = static_cast<std::size_t>(merge) * merge;
     const auto make_prompt = [&](std::uint32_t seed) {
-        qwen::PreparedPromptData prompt;
+        qwen_common::PreparedPromptData prompt;
         prompt.token_ids.resize(5);
-        prompt.token_types         = {0, static_cast<std::uint8_t>(qwen::PromptModality::Image), 0,
-                                      static_cast<std::uint8_t>(qwen::PromptModality::Image), 0};
+        prompt.token_types         = {0, static_cast<std::uint8_t>(qwen_common::PromptModality::Image), 0,
+                                      static_cast<std::uint8_t>(qwen_common::PromptModality::Image), 0};
         prompt.prepare.media_items = 2;
         prompt.prepare.raw_patches = 2 * patches;
         prompt.prepare.vision_tokens = 2;
         for (std::size_t item = 0; item != 2; ++item) {
-            prompt.vision_items.push_back(qwen::VisionItem{
-                .modality    = qwen::PromptModality::Image,
+            prompt.vision_items.push_back(qwen_common::VisionItem{
+                .modality    = qwen_common::PromptModality::Image,
                 .grid        = {.temporal = 1, .height = merge, .width = merge},
                 .patch_begin = item * patches,
                 .patch_count = patches,
                 .token_spans = {{.begin = 2 * item + 1, .count = 1}},
             });
-            auto payload            = std::make_shared<qwen::PreparedMediaPayload>();
+            auto payload            = std::make_shared<qwen_common::PreparedMediaPayload>();
             payload->patch_elements = patches * config.patch_width();
             payload->patches        = std::make_unique<std::uint16_t[]>(payload->patch_elements);
             for (auto& value : payload->mutable_span()) {
@@ -60,9 +61,9 @@ void test_handoff_lifetime(infernix::DeviceContext& device,
     auto prompt_b = make_prompt(3);
     qwen::detail::VisionPrefillPlan plan;
     plan.control_plan =
-        std::make_shared<qwen::VisionControlPlan>(qwen::plan_vision_control(prompt_a, config));
-    plan.control = std::make_shared<qwen::VisionControl>(
-        qwen::build_vision_control(prompt_a, *plan.control_plan, 0));
+        std::make_shared<qwen_common::VisionControlPlan>(qwen_common::plan_vision_control(prompt_a, config));
+    plan.control = std::make_shared<qwen_common::VisionControl>(
+        qwen_common::build_vision_control(prompt_a, *plan.control_plan, 0));
     plan.uses             = {{.begin = 0, .end = 2, .prepared_item_index = 0, .control_index = 0},
                              {.begin = 2, .end = 4, .prepared_item_index = 1, .control_index = 1}};
     plan.max_merged_count = 1;
@@ -72,7 +73,7 @@ void test_handoff_lifetime(infernix::DeviceContext& device,
     const infernix::DeviceSpan backing{workspace.p, workspace.bytes};
     qwen::detail::VisionHandoffState handoff;
     std::size_t peak_bytes  = 0;
-    const auto make_session = [&](const qwen::PreparedPromptData& prompt) {
+    const auto make_session = [&](const qwen_common::PreparedPromptData& prompt) {
         return std::make_unique<qwen::execution::VisionPrefillSession>(
             device, parameters, backing, workspace_plan, prompt, plan, handoff, peak_bytes);
     };
@@ -129,7 +130,7 @@ int main() {
     namespace qwen       = infernix::models::qwen3_5;
     const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (!artifact || !*artifact) { return 77; }
-    static_assert(infernix::models::qwen3_5::kMaximumVisionItemTokens == 16384);
+    static_assert(infernix::models::qwen_common::kMaximumVisionItemTokens == 16384);
     // The current Vision route fits below 827 MiB, including arena alignment and empty-scratch
     // backing. The context growth check below protects the single-item lifetime bound.
     constexpr std::size_t kWorkspaceCeiling = 827ULL << 20;

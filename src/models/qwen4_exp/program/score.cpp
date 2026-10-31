@@ -20,7 +20,7 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
         std::any_of(lanes_.begin(), lanes_.end(), [](const Lane& lane) { return lane.phase != Phase::Free; })) {
         throw std::logic_error("Qwen4Exp: causal scoring needs an idle Program");
     }
-    const auto& data = qwen3_5::PreparedPromptAccess::view(prompt);
+    const auto& data = qwen_common::PreparedPromptAccess::view(prompt);
     if (data.has_media()) { throw std::invalid_argument("causal scoring accepts text tokens only"); }
     const std::size_t n = data.token_ids.size();
     if (n < 2 || n > options_.max_context) { throw std::invalid_argument("causal score token count must be in [2,max_context]"); }

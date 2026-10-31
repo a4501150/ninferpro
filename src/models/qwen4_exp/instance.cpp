@@ -122,7 +122,7 @@ void validate(const EngineOptions& options) {
 
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
-      frontend(models::qwen3_5::make_frontend(model->resources(),
+      frontend(models::qwen_common::make_frontend(model->resources(),
                                               {.chat_template_path      = options.chat_template_path,
                                                .architecture            = models::Architecture::Qwen4Exp,
                                                .vision_enabled          = options.enable_vision,

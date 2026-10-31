@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/internal.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include <stdexcept>
@@ -99,14 +99,14 @@ Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std
 
 Program::~Program() noexcept = default;
 
-RequestBasePlan Program::plan_request(PreparedPrompt&& prompt,
+RequestBasePlan Program::plan_request(qwen_common::PreparedPrompt&& prompt,
                                       const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request(PreparedPromptAccess::take(std::move(prompt)), options);
+    return impl_->plan_request(qwen_common::PreparedPromptAccess::take(std::move(prompt)), options);
 }
 
-ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+ScoreResult Program::causal_score(qwen_common::PreparedPrompt&& prompt, std::uint32_t first_target,
                                   const ScoreOptions& options) {
-    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target,
+    return impl_->causal_score(qwen_common::PreparedPromptAccess::take(std::move(prompt)), first_target,
                                options);
 }
 

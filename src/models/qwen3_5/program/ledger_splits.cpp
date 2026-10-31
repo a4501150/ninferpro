@@ -6,7 +6,7 @@
 
 namespace infernix::models::qwen3_5::detail {
 
-void LedgerSplits::assign(const PreparedPromptData& prompt) {
+void LedgerSplits::assign(const qwen_common::PreparedPromptData& prompt) {
     tokens_    = prompt.token_ids.size();
     frontiers_ = prompt.identity.rewrite_execution_frontiers;
 }

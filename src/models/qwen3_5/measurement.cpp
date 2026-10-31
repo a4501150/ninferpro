@@ -1,6 +1,6 @@
 #include "models/qwen3_5/measurement.h"
 
-#include "models/qwen3_5/frontend/digest.h"
+#include "models/qwen_common/frontend/digest.h"
 
 #include <nlohmann/json.hpp>
 
@@ -80,7 +80,7 @@ std::string prefill_signature(const Model& model) {
         }
         inventory.push_back(std::move(item));
     }
-    return frontend::sha256_hex(frontend::sha256(facts.dump()));
+    return qwen_common::frontend::sha256_hex(qwen_common::frontend::sha256(facts.dump()));
 }
 
 } // namespace infernix::models::qwen3_5

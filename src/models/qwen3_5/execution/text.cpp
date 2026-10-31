@@ -9,7 +9,7 @@
 #include "core/nvtx.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
-#include "models/qwen3_5/program/vision_control.h"
+#include "models/qwen_common/program/vision_control.h"
 #include "infernix/ops/argmax.h"
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/causal_conv1d_silu.h"
@@ -1547,7 +1547,7 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
                         finalize_at_end);
 }
 
-PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
+PrefillChunkResult TextContext::prefill_chunk(const qwen_common::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
                                               VisionPrefillSession& vision, bool finalize_at_end) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
@@ -1561,7 +1561,7 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
                         finalize_at_end);
 }
 
-PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
+PrefillChunkResult TextContext::prefill_chunk(const qwen_common::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
                                               VisionPrefillSession& vision, bool finalize_at_end,
                                               DFlashFeatureSink& sink) {

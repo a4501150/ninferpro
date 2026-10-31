@@ -2,7 +2,7 @@
 
 #include "artifact/binder.h"
 #include "models/qwen3_5/config.h"
-#include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen_common/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
 
 #include <map>
@@ -12,7 +12,7 @@
 
 namespace infernix::models::qwen3_5::loading {
 
-[[nodiscard]] FrontendResources bind_resources(artifact::Binder& binder, const Config& config);
+[[nodiscard]] qwen_common::FrontendResources bind_resources(artifact::Binder& binder, const Config& config);
 
 struct PendingWeight {
     artifact::ParameterReference reference;
@@ -55,7 +55,7 @@ private:
                                       const std::string& prefix, MixerKind mixer);
 [[nodiscard]] TextWeights bind_text(Bindings& bindings, const TextConfig& config,
                                     const LoadOptions& options);
-[[nodiscard]] VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,
+[[nodiscard]] VisionWeights bind_vision(Bindings& bindings, const qwen_common::VisionConfig& config,
                                         const TextConfig& target, const LoadOptions& options);
 [[nodiscard]] MtpWeights bind_mtp(Bindings& bindings, const TextConfig& config,
                                   const TextWeights& target);

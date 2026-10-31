@@ -268,7 +268,7 @@ ProgramImpl::~ProgramImpl() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
-ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
+ScoreResult ProgramImpl::causal_score(qwen_common::PreparedPromptData&& prompt, std::uint32_t first_target,
                                       const ScoreOptions& options) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
@@ -517,7 +517,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     if (workspace_plan.vision) {
         out.vision_workspace = VisionWorkspaceMemorySummary{
             .aggregate_prompt_tokens = static_cast<std::uint32_t>(
-                std::min<std::uint64_t>(capacity, kMaximumPromptVisionTokens)),
+                std::min<std::uint64_t>(capacity, qwen_common::kMaximumPromptVisionTokens)),
             .max_item_tokens        = workspace_plan.vision->max_merged_tokens,
             .general_capacity_bytes = workspace_plan.vision->general_capacity_bytes,
             .encode_peak_bytes      = workspace_plan.vision->encode_peak_bytes,

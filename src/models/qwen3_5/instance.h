@@ -23,7 +23,7 @@ struct ModelInstance {
 
     std::unique_ptr<models::qwen3_5::Model> model;
     const models::qwen3_5::execution::Parameters parameters;
-    models::qwen3_5::Frontend frontend;
+    models::qwen_common::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;

@@ -1,7 +1,7 @@
 #include "core/device.h"
 #include "models/qwen3_5/execution/parameters.h"
-#include "models/qwen3_5/frontend/frontend.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen_common/frontend/frontend.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/program.h"
 #include "models/qwen3_5/program/program_impl.h"
@@ -23,6 +23,7 @@ namespace {
 
 using namespace infernix;
 namespace qwen = models::qwen3_5;
+namespace qwen_common = models::qwen_common;
 
 constexpr std::uint32_t kCapacity      = 512;
 constexpr std::uint32_t kChunk         = 128;
@@ -53,7 +54,7 @@ EngineOptions program_options(SpeculativeBackend backend) {
 
 class Fixture {
 public:
-    Fixture(DeviceContext& device, qwen::Program& program, qwen::Frontend& frontend)
+    Fixture(DeviceContext& device, qwen::Program& program, qwen_common::Frontend& frontend)
         : device_(device), program_(program), frontend_(frontend),
           empty_(program.physical_usage()) {}
 
@@ -282,7 +283,7 @@ public:
 private:
     DeviceContext& device_;
     qwen::Program& program_;
-    qwen::Frontend& frontend_;
+    qwen_common::Frontend& frontend_;
     qwen::PhysicalUsageSnapshot empty_;
 };
 
@@ -290,7 +291,7 @@ private:
 // output and reproduces the ledger's execution splits; the exact oracle counts committed output
 // events, independently of the execution route.
 void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parameters& parameters,
-                            qwen::Frontend& frontend, EngineOptions options) {
+                            qwen_common::Frontend& frontend, EngineOptions options) {
     options.max_context = 128;
     options.kv_capacity = KvCapacityPolicy::explicit_capacity(128);
     auto planner        = qwen::detail::make_sequence_planner_impl(parameters, device, options);
@@ -306,7 +307,7 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
     request.sampling.presence_penalty  = 0.5F;
     request.sampling.frequency_penalty = 0.25F;
     auto base =
-        program.plan_request(qwen::PreparedPromptAccess::take(std::move(prepared)), request);
+        program.plan_request(qwen_common::PreparedPromptAccess::take(std::move(prepared)), request);
 
     const auto settle = [&]() {
         for (unsigned step = 0; step < 8; ++step) {
@@ -437,7 +438,7 @@ int main(int argc, char** argv) {
         selected.speculative = backend;
         auto model           = qwen::load_model(artifact, selected, device);
         qwen::execution::Parameters parameters(*model);
-        auto frontend = qwen::make_frontend(model->resources(),
+        auto frontend = qwen_common::make_frontend(model->resources(),
                                             {.vision_enabled = false, .max_context = kCapacity});
         const EngineOptions options = program_options(backend);
         auto planner = qwen::make_sequence_planner(parameters, device, options);

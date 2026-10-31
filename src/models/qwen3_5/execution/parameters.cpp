@@ -169,7 +169,7 @@ public:
         return out;
     }
 
-    NormParameters norm(const NormWeights& w) const { return {tensor(w.weight), tensor(w.bias)}; }
+    qwen_common::execution::NormParameters norm(const NormWeights& w) const { return {tensor(w.weight), tensor(w.bias)}; }
 
     std::optional<Tensor> joined_bias(const std::array<WeightId, 3>& ids) const {
         WeightView view;
@@ -192,8 +192,8 @@ public:
         return weight_tensor(view, {static_cast<std::int32_t>(count)});
     }
 
-    VisionParameters vision(const VisionWeights& w) const {
-        VisionParameters out;
+    qwen_common::execution::VisionParameters vision(const VisionWeights& w) const {
+        qwen_common::execution::VisionParameters out;
         out.patch_embedding      = linear(w.patch_embedding);
         out.patch_embedding_bias = tensor(w.patch_embedding_bias);
         out.position_embedding   = tensor(w.position_embedding);
@@ -209,7 +209,7 @@ public:
                     throw std::invalid_argument(
                         "Vision QKV bias: this fixed call requires a contiguous bias bank");
                 }
-                return VisionBlockParameters{norm(layer.norm1),
+                return qwen_common::execution::VisionBlockParameters{norm(layer.norm1),
                                              norm(layer.norm2),
                                              ops::prepare_linear_weight(qkv),
                                              *bias,

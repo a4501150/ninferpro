@@ -4,7 +4,7 @@
 // separate passes (prompt rewrite frontiers and generated control spans). Replay splits at the same
 // positions, so a recovered state has the same GDN decomposition as the uninterrupted one.
 
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -16,7 +16,7 @@ namespace infernix::models::qwen3_5::detail {
 
 class LedgerSplits {
 public:
-    void assign(const PreparedPromptData& prompt);
+    void assign(const qwen_common::PreparedPromptData& prompt);
     // Extends the ledger by `count` generated tokens; `split_after` places a frontier after that
     // many of them.
     void append_generated(std::size_t count,

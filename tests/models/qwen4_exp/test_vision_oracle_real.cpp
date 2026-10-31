@@ -26,9 +26,9 @@
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "models/load_options.h"
-#include "models/qwen3_5/frontend/frontend.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
-#include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen_common/frontend/frontend.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
+#include "models/qwen_common/frontend/resources.h"
 #include "models/qwen4_exp/config.h"
 #include "models/registry.h"
 
@@ -44,7 +44,8 @@
 
 namespace {
 
-namespace q35 = infernix::models::qwen3_5;
+namespace q35  = infernix::models::qwen3_5;
+namespace q35c = infernix::models::qwen_common;
 namespace q4  = infernix::models::qwen4_exp;
 
 using Tokens = std::vector<infernix::TokenId>;
@@ -135,7 +136,7 @@ infernix::PromptInput media_input(const std::vector<std::uint8_t>& image) {
 struct FrontendHolder {
     std::unique_ptr<infernix::artifact::Reader> reader;
     std::unique_ptr<infernix::artifact::Binder> binder;
-    q35::Frontend frontend;
+    q35c::Frontend frontend;
 };
 
 FrontendHolder artifact_frontend(const char* artifact, const infernix::EngineOptions& options) {
@@ -149,7 +150,7 @@ FrontendHolder artifact_frontend(const char* artifact, const infernix::EngineOpt
         const auto span = binder->host_object(binder->resource(component, role));
         return std::string_view(reinterpret_cast<const char*>(span.data()), span.size());
     };
-    q35::FrontendResources resources;
+    q35c::FrontendResources resources;
     resources.tokenizer_json                 = bytes("text", "tokenizer.json");
     resources.tokenizer_config_json          = bytes("text", "tokenizer_config.json");
     resources.chat_template_jinja            = bytes("text", "chat_template.jinja");
@@ -159,8 +160,8 @@ FrontendHolder artifact_frontend(const char* artifact, const infernix::EngineOpt
     q35::Config domain;
     domain.text.vocab_size = config.text.vocab_size;
     domain.vision          = config.vision;
-    q35::parse_resources(resources, domain);
-    auto frontend = q35::make_frontend(resources, {.chat_template_path       = options.chat_template_path,
+    q35c::parse_resources(resources, domain);
+    auto frontend = q35c::make_frontend(resources, {.chat_template_path       = options.chat_template_path,
                                                    .architecture             = infernix::models::Architecture::Qwen4Exp,
                                                    .vision_enabled           = true,
                                                    .max_context              = options.max_context,
@@ -195,13 +196,13 @@ int main(int argc, char** argv) {
         auto frontend    = artifact_frontend(artifact, options);
         auto prepared    = frontend.frontend.prepare(input);
         if (!prepared) { throw std::runtime_error("the frontend refused the media prompt"); }
-        const q35::PreparedPromptData& data = q35::PreparedPromptAccess::view(prepared);
+        const q35c::PreparedPromptData& data = q35c::PreparedPromptAccess::view(prepared);
 
         const std::size_t n = data.token_ids.size();
-        const q35::VisionItem& item = data.vision_items.front();
+        const q35c::VisionItem& item = data.vision_items.front();
         const auto grid = item.grid;
         failures += check(data.has_media() && data.vision_items.size() == 1, "the prompt carries one image");
-        failures += check(item.modality == q35::PromptModality::Image && grid.temporal == 1 &&
+        failures += check(item.modality == q35c::PromptModality::Image && grid.temporal == 1 &&
                               grid.height == 64 && grid.width == 64,
                           "the image packs into a 64 x 64 raw patch grid (t 1)");
         failures += check(static_cast<std::uint64_t>(n) > 2051,
@@ -211,7 +212,7 @@ int main(int argc, char** argv) {
                               std::to_string(data.prepare.vision_tokens) + ")");
         failures += check(item.patch_count == 1ULL * 64 * 64 &&
                               data.media_payloads.front()->patch_elements ==
-                                  item.patch_count * q35::kPreparedVisionPatchFeatures,
+                                  item.patch_count * q35c::kPreparedVisionPatchFeatures,
                           "the item's patches match its grid (" + std::to_string(item.patch_count) +
                               " patches, " + std::to_string(data.media_payloads.front()->patch_elements) +
                               " features)");

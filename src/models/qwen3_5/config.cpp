@@ -1,5 +1,5 @@
 #include "models/qwen3_5/config.h"
-#include "models/qwen3_5/vision_config.h"
+#include "models/qwen_common/vision_config.h"
 
 #include "artifact/schema.h"
 #include "infernix/ops/softmax_attention.h"
@@ -183,39 +183,6 @@ TextConfig text(const Json& value, bool mtp) {
     return out;
 }
 
-VisionConfig vision_config(const Json& value, std::span<const std::string_view> model_types) {
-    require_members(value,
-                    {"model_type", "depth", "hidden_size", "intermediate_size", "num_heads",
-                     "patch_size", "temporal_patch_size", "spatial_merge_size",
-                     "num_position_embeddings"},
-                    {}, "vision config");
-    const auto& type = value.at("model_type");
-    if (!type.is_string() || std::none_of(model_types.begin(), model_types.end(), [&](std::string_view t) {
-            return type.get<std::string>() == t;
-        })) {
-        throw ArtifactError("unknown Vision model_type");
-    }
-    VisionConfig out;
-    out.depth                   = dimension(value, "depth");
-    out.hidden_size             = dimension(value, "hidden_size");
-    out.intermediate_size       = dimension(value, "intermediate_size");
-    out.num_heads               = dimension(value, "num_heads");
-    out.patch_size              = dimension(value, "patch_size");
-    out.temporal_patch_size     = dimension(value, "temporal_patch_size");
-    out.spatial_merge_size      = dimension(value, "spatial_merge_size");
-    out.num_position_embeddings = dimension(value, "num_position_embeddings");
-    out.position_grid_side =
-        static_cast<std::uint32_t>(std::sqrt(double(out.num_position_embeddings)));
-    if (out.hidden_size % out.num_heads || (out.hidden_size / out.num_heads) % 4 ||
-        std::uint64_t(out.position_grid_side) * out.position_grid_side !=
-            out.num_position_embeddings) {
-        throw ArtifactError("invalid Vision head or square position geometry");
-    }
-    (void)out.patch_width();
-    (void)out.merger_width();
-    return out;
-}
-
 DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
     require_members(value,
                     {"architectures", "model_type", "intermediate_size", "num_attention_heads",
@@ -298,16 +265,6 @@ std::uint64_t GdnConfig::conv_channels() const {
                                  value_width(), "GDN convolution channels");
 }
 
-std::uint64_t VisionConfig::patch_width() const {
-    return artifact::checked_mul(artifact::checked_mul(3, temporal_patch_size, "patch channels"),
-                                 std::uint64_t(patch_size) * patch_size, "patch width");
-}
-
-std::uint64_t VisionConfig::merger_width() const {
-    return artifact::checked_mul(std::uint64_t(spatial_merge_size) * spatial_merge_size,
-                                 hidden_size, "merger width");
-}
-
 std::uint32_t rope_context_ceiling(std::uint32_t native_positions, float factor) {
     if (native_positions == 0 || !std::isfinite(factor) || factor < 1.0F || factor > 4.0F) {
         throw std::invalid_argument("RoPE context requires positive native positions and finite factor in [1,4]");
@@ -356,7 +313,7 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         }
         if (options.vision) {
             constexpr std::string_view types[] = {"qwen3_5_vision", "qwen3_5_moe_vision"};
-            out.vision = vision_config(companion(directory, "vision").config, types);
+            out.vision = qwen_common::parse_vision_config(companion(directory, "vision").config, types);
         }
         if (out.mtp) {
             const auto& config = companion(directory, "mtp").config;
@@ -380,10 +337,6 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("Qwen3.5 config: ") + error.what());
     }
-}
-
-VisionConfig parse_vision_config(const artifact::Json& value, std::span<const std::string_view> model_types) {
-    return vision_config(value, model_types);
 }
 
 } // namespace infernix::models::qwen3_5

@@ -96,7 +96,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
 
-PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
+PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const qwen_common::PreparedPromptData& prompt,
                                             VisionPrefillSession& vision,
                                             std::uint32_t nominal_length,
                                             std::optional<std::uint32_t> split_frontier,
@@ -121,7 +121,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 
-void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
+void mtp_bridge_multimodal(PrefillContext& state, const qwen_common::PreparedPromptData& prompt,
                            VisionPrefillSession& vision, const MtpBridgeInput& bridge) {
     if (!state.mtp_kv.valid() || bridge.previous_hidden == nullptr || state.text_kv_base == 0 ||
         bridge.position < 0 ||
@@ -189,10 +189,10 @@ namespace infernix::models::qwen3_5::detail {
 
 namespace {
 
-std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
+std::array<std::int32_t, 3> prompt_rope_position(const qwen_common::PreparedPromptData& prompt,
                                                  std::uint32_t token);
 
-std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
+std::array<std::int32_t, 3> prompt_rope_position(const qwen_common::PreparedPromptData& prompt,
                                                  std::uint32_t token) {
     const std::size_t tokens = prompt.token_ids.size();
     if (token >= tokens || prompt.positions.size() != 3 * tokens) {

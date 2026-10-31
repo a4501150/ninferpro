@@ -1,7 +1,7 @@
 #include "models/qwen4_exp/config.h"
 
 #include "artifact/schema.h"
-#include "models/qwen3_5/vision_config.h"
+#include "models/qwen_common/vision_config.h"
 #include "models/registry.h"
 
 #include <cmath>
@@ -284,7 +284,7 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (options.vision) {
             if (!directory.components.contains("vision")) { throw ArtifactError("the artifact has no vision component"); }
             constexpr std::string_view types[] = {"qwen4_exp_vision"};
-            out.vision = qwen3_5::parse_vision_config(directory.component("vision").config, types);
+            out.vision = qwen_common::parse_vision_config(directory.component("vision").config, types);
             if (out.vision->hidden_size / out.vision->num_heads != 72) {
                 throw ArtifactError("the Vision tower must have 72-wide heads");
             }

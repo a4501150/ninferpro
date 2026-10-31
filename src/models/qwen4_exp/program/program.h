@@ -10,10 +10,10 @@
 // shortage pauses a younger request (design §19.3.13). With the prefix cache, an admission resumes
 // from the deepest affordable snapshot and maps the cached blocks below it.
 
-#include "models/qwen3_5/frontend/frontend.h"
-#include "models/qwen3_5/frontend/output_session.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
-#include "models/qwen3_5/ngram.h"
+#include "models/qwen_common/frontend/frontend.h"
+#include "models/qwen_common/frontend/output_session.h"
+#include "models/qwen_common/frontend/prepared_prompt.h"
+#include "models/qwen_common/ngram.h"
 #include "models/qwen4_exp/config.h"
 #include "models/offload/expert_placement.h"
 #include "models/qwen4_exp/memory_plan.h"
@@ -57,11 +57,11 @@ struct ResumeStateImpl;
 struct ContractAccess;
 } // namespace detail
 
-using PreparedPrompt  = qwen3_5::PreparedPrompt;
-using Frontend        = qwen3_5::Frontend;
-using OutputSession   = qwen3_5::OutputSession;
-using PublishedOutput = qwen3_5::PublishedOutput;
-using NgramArchive    = qwen3_5::NgramArchive;
+using PreparedPrompt  = qwen_common::PreparedPrompt;
+using Frontend        = qwen_common::Frontend;
+using OutputSession   = qwen_common::OutputSession;
+using PublishedOutput = qwen_common::PublishedOutput;
+using NgramArchive    = qwen_common::NgramArchive;
 
 // Read-only diagnostics of the Program's physical stores.
 struct PhysicalUsageSnapshot {

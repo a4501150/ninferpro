@@ -9,9 +9,9 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
 #include "models/qwen3_5/execution/vision.h"
-#include "models/qwen3_5/program/vision_control.h"
+#include "models/qwen_common/program/vision_control.h"
 #include "models/qwen3_5/program/vision_prefill.h"
-#include "models/qwen3_5/program/prefix/block_keys.h"
+#include "models/qwen_common/program/prefix/block_keys.h"
 #include "models/qwen3_5/program/planning/idle_prefill.h"
 #include "core/device.h"
 #include "core/startup.h"
@@ -44,16 +44,16 @@ constexpr std::uint32_t kBlock = pc::kBlockTokens;
 // may wait for blocks it is about to resume over.
 constexpr std::uint32_t kPrefetchBatchBlocks = 256;
 
-std::uint64_t all_vision_key(std::span<const VisionTokenRange> ranges) noexcept {
+std::uint64_t all_vision_key(std::span<const qwen_common::detail::VisionTokenRange> ranges) noexcept {
     std::uint64_t cumulative = 0;
-    for (const VisionTokenRange& range : ranges) {
-        cumulative = accumulate_vision(cumulative, range.key);
+    for (const qwen_common::detail::VisionTokenRange& range : ranges) {
+        cumulative = qwen_common::detail::accumulate_vision(cumulative, range.key);
     }
     return cumulative;
 }
 
-bool inside_vision(std::uint32_t frontier, std::span<const VisionTokenRange> ranges) noexcept {
-    return std::any_of(ranges.begin(), ranges.end(), [&](const VisionTokenRange& range) {
+bool inside_vision(std::uint32_t frontier, std::span<const qwen_common::detail::VisionTokenRange> ranges) noexcept {
+    return std::any_of(ranges.begin(), ranges.end(), [&](const qwen_common::detail::VisionTokenRange& range) {
         return range.begin < frontier && frontier < range.end;
     });
 }
@@ -227,7 +227,7 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
     }
     if (hybrid_) { hybrid_->poll(); }
     const RequestBasePlanImpl& plan  = *base.impl_;
-    const PreparedPromptData& prompt = *plan.prompt;
+    const qwen_common::PreparedPromptData& prompt = *plan.prompt;
     const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (n == 0 || n != plan.summary.prompt_tokens) {
         throw std::logic_error("hybrid admission prompt does not match its base plan");
@@ -296,8 +296,8 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
     }
     const auto cached          = static_cast<std::uint32_t>(match.path.size()) * kBlock;
     root->cached_prefix_tokens = cached;
-    const std::vector<VisionTokenRange> ranges =
-        prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
+    const std::vector<qwen_common::detail::VisionTokenRange> ranges =
+        prompt.vision_items.empty() ? std::vector<qwen_common::detail::VisionTokenRange>{} : qwen_common::detail::vision_ranges(prompt);
     // A source keeps at least one prompt token to prefill, and a resumed request's source never
     // passes the frontier it replays to.
     std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
@@ -350,7 +350,7 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
         !base.impl_->allow_prefix_reuse || !base.impl_->prompt->identity.reusable) {
         return 0U;
     }
-    const PreparedPromptData& prompt = *base.impl_->prompt;
+    const qwen_common::PreparedPromptData& prompt = *base.impl_->prompt;
     if (has_context_transaction() || hybrid_->restore_open()) { return std::nullopt; }
     hybrid_->poll();
     if (hybrid_->prefetch_landing()) { return std::nullopt; }
@@ -361,8 +361,8 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
     pc::PrefixCacheIndex& index = hybrid_->index();
     pc::MatchResult match =
         index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
-    const std::vector<VisionTokenRange> ranges =
-        prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
+    const std::vector<qwen_common::detail::VisionTokenRange> ranges =
+        prompt.vision_items.empty() ? std::vector<qwen_common::detail::VisionTokenRange>{} : qwen_common::detail::vision_ranges(prompt);
     std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
         return candidate.filling_blocks != 0 || candidate.frontier >= n ||
                inside_vision(candidate.frontier, ranges);
@@ -448,13 +448,13 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
             !base->impl_->allow_prefix_reuse || !base->impl_->prompt->identity.reusable) {
             continue;
         }
-        const PreparedPromptData& prompt = *base->impl_->prompt;
+        const qwen_common::PreparedPromptData& prompt = *base->impl_->prompt;
         const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
         if (n == 0 || prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) { continue; }
         pc::MatchResult match =
             index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
-        const std::vector<VisionTokenRange> ranges =
-            prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
+        const std::vector<qwen_common::detail::VisionTokenRange> ranges =
+            prompt.vision_items.empty() ? std::vector<qwen_common::detail::VisionTokenRange>{} : qwen_common::detail::vision_ranges(prompt);
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
             return candidate.frontier >= n || inside_vision(candidate.frontier, ranges);
         });
@@ -512,7 +512,7 @@ std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
     return hybrid_ ? hybrid_->index().snapshot_epoch() : 0U;
 }
 
-bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse) {
+bool ProgramImpl::hybrid_await_sibling(const qwen_common::PreparedPromptData& prompt, std::uint32_t reuse) {
     if (hybrid_coalesce_wait_seconds_ <= 0.0 || execution_schedule.grid_cache) {
         return false;
     }
@@ -541,7 +541,7 @@ bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::ui
                 .first -
             prompt.token_ids.begin());
         // A sibling encoding the same image saves this request the encode as well as the prefill.
-        const std::uint32_t shared = media_agreed_prefix(prompt, prefill.prompt, equal_tokens);
+        const std::uint32_t shared = qwen_common::detail::media_agreed_prefix(prompt, prefill.prompt, equal_tokens);
         if (shared <= reuse) { continue; }
         const auto consider = [&](const Wait& wait) {
             if (!best || wait.target > best->target) { best = wait; }
@@ -645,7 +645,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
         throw std::logic_error("a reusing source requires the prefix cache");
     }
     if (hybrid_) { hybrid_->poll(); }
-    const PreparedPromptData& prompt = *base.impl_->prompt;
+    const qwen_common::PreparedPromptData& prompt = *base.impl_->prompt;
     const HybridQuoteImpl& quote     = *candidate.hybrid;
     const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
     const std::uint32_t reuse        = quote.reuse_frontier;
@@ -885,7 +885,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     const std::uint32_t lane         = tx.lane;
     const std::uint32_t reuse        = quote.reuse_frontier;
     const RequestBasePlanImpl& base  = *tx.base;
-    const PreparedPromptData& prompt = *base.prompt;
+    const qwen_common::PreparedPromptData& prompt = *base.prompt;
     const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
 
     // A Host restore does not hold the binding: the lane's Device work queues behind its prelude
@@ -952,11 +952,11 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     pc::PrefixCacheIndex& index = hybrid_->index();
 
     // Taps are planned over the prompt the lane prefills, past its reuse frontier.
-    const std::vector<VisionTokenRange> ranges = vision_ranges(prompt);
+    const std::vector<qwen_common::detail::VisionTokenRange> ranges = qwen_common::detail::vision_ranges(prompt);
     const bool publish = base.summary.publish_continuation && prompt.identity.reusable;
     std::vector<pc::TapExclusion> exclusions;
     exclusions.reserve(ranges.size());
-    for (const VisionTokenRange& range : ranges) {
+    for (const qwen_common::detail::VisionTokenRange& range : ranges) {
         exclusions.push_back(pc::TapExclusion{range.begin, range.end});
     }
     std::vector<pc::PlannedTap> taps;

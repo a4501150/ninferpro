@@ -1,14 +1,14 @@
 #pragma once
-#include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen_common/frontend/frontend.h"
 #include "models/qwen3_5/program/program.h"
 
 namespace infernix::models::qwen3_5 {
 struct RuntimeTypes {
-    using Frontend          = qwen3_5::Frontend;
-    using PreparedPrompt    = qwen3_5::PreparedPrompt;
-    using NgramArchive      = qwen3_5::NgramArchive;
-    using OutputSession     = qwen3_5::OutputSession;
-    using PublishedOutput   = qwen3_5::PublishedOutput;
+    using Frontend          = qwen_common::Frontend;
+    using PreparedPrompt    = qwen_common::PreparedPrompt;
+    using NgramArchive      = qwen_common::NgramArchive;
+    using OutputSession     = qwen_common::OutputSession;
+    using PublishedOutput   = qwen_common::PublishedOutput;
     using SequencePlanner   = qwen3_5::SequencePlanner;
     using SequencePlan      = qwen3_5::SequencePlan;
     using RequestBasePlan   = qwen3_5::RequestBasePlan;

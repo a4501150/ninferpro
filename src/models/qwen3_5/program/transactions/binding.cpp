@@ -11,7 +11,7 @@
 namespace infernix::models::qwen3_5::detail {
 
 void ProgramImpl::preencode_overlay_vision(execution::VisionPrefillSession& session,
-                                           const PreparedPromptData& prompt,
+                                           const qwen_common::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan, std::uint32_t base) {
     if (!parameters.model.overlay_vision() || !plan.control) { return; }
     // Overlay: the full tower is absent from VRAM. Items wholly inside the reused prefix are
@@ -56,8 +56,8 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
     if (plan.vision_control_plan) {
         auto& vision        = staged.vision_plan.emplace();
         vision.control_plan = plan.vision_control_plan;
-        vision.control      = std::make_shared<VisionControl>(
-            build_vision_control(staged.prompt, *vision.control_plan, 0));
+        vision.control      = std::make_shared<qwen_common::VisionControl>(
+            qwen_common::build_vision_control(staged.prompt, *vision.control_plan, 0));
         for (std::uint32_t i = 0; i < vision.control_plan->items.size(); ++i) {
             const auto& item = vision.control_plan->items[i];
             if (item.token_end <= base) { continue; }

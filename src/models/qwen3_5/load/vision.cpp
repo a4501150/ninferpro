@@ -2,7 +2,7 @@
 
 namespace infernix::models::qwen3_5::loading {
 
-VisionWeights bind_vision(Bindings& b, const VisionConfig& config, const TextConfig& target,
+VisionWeights bind_vision(Bindings& b, const qwen_common::VisionConfig& config, const TextConfig& target,
                           const LoadOptions& options) {
     // Overlay keeps the whole vision tower in pinned host RAM; resident keeps it on device.
     const artifact::Residency residency =

@@ -3,7 +3,7 @@ infernix_add_test(infernix_ngram_proposer_test
 
 infernix_add_test(infernix_ngram_archive_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_ngram_archive.cpp"
-  "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/ngram.cpp")
+  "${PROJECT_SOURCE_DIR}/src/models/qwen_common/ngram.cpp")
 
 # Fast-path selection rules: where each path applies and which configurations qualify it.
 infernix_add_test(infernix_qwen3_5_fast_paths_test
@@ -57,7 +57,7 @@ infernix_add_test(infernix_qwen3_5_reasoning_loop_test
 
 infernix_add_test(infernix_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
-  LIBRARIES infernix_engine infernix_core)
+  LIBRARIES infernix_engine infernix_core infernix::json)
 
 infernix_add_test(infernix_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"

@@ -41,7 +41,7 @@ ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source)
 
 } // namespace
 
-RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
+RequestBasePlan ProgramImpl::plan_request(qwen_common::PreparedPromptData&& prompt,
                                           const runtime::ResolvedExecutionOptions& options) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
@@ -66,7 +66,7 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     for (std::size_t i = 0; i < prompt.media_payloads.size(); ++i) {
         if (!prompt.media_payloads[i] ||
             prompt.media_payloads[i]->patch_elements !=
-                prompt.vision_items[i].patch_count * kPreparedVisionPatchFeatures) {
+                prompt.vision_items[i].patch_count * qwen_common::kPreparedVisionPatchFeatures) {
             throw std::invalid_argument("prepared prompt media item payload has an invalid shape");
         }
     }
@@ -144,11 +144,11 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         if (!workspace_plan.vision) {
             throw std::logic_error("Vision prompt has no startup workspace plan");
         }
-        auto vision = std::make_shared<qwen3_5::VisionControlPlan>(
-            qwen3_5::plan_vision_control(prompt, *parameters.model.config().vision));
+        auto vision = std::make_shared<qwen_common::VisionControlPlan>(
+            qwen_common::plan_vision_control(prompt, *parameters.model.config().vision));
         std::uint32_t previous_end = 0;
         for (std::size_t index = 0; index < vision->items.size(); ++index) {
-            const qwen3_5::VisionItemControlPlan& item = vision->items[index];
+            const qwen_common::VisionItemControlPlan& item = vision->items[index];
             const std::uint32_t begin =
                 speculative_backend == SpeculativeBackend::Mtp && item.token_begin != 0
                     ? item.token_begin - 1
@@ -172,7 +172,7 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
             std::size_t max_patches = 0;
             std::uint32_t max_merged = 0;
             for (std::size_t index = 0; index < vision->items.size(); ++index) {
-                const qwen3_5::VisionItemControlPlan& item = vision->items[index];
+                const qwen_common::VisionItemControlPlan& item = vision->items[index];
                 max_patches = std::max(max_patches, prompt.vision_items[index].patch_count);
                 max_merged  = std::max(max_merged, static_cast<std::uint32_t>(item.merged_count));
             }
@@ -200,7 +200,7 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         base->ngram_index = std::make_shared<PreparedNgramIndex>(
             PreparedNgramIndex{.index = std::move(prompt.ngram_index.index)});
     }
-    base->prompt = std::make_shared<const PreparedPromptData>(std::move(prompt));
+    base->prompt = std::make_shared<const qwen_common::PreparedPromptData>(std::move(prompt));
     return RequestBasePlan(std::move(base));
 }
 

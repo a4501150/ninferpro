@@ -6,7 +6,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
-#include "models/qwen3_5/program/vision_control.h"
+#include "models/qwen_common/program/vision_control.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
@@ -18,6 +18,8 @@
 #include <span>
 #include <vector>
 
+namespace infernix::models::qwen_common::execution { class VisionWeightStream; }
+
 namespace infernix::models::qwen3_5::execution {
 
 using detail::VisionWorkspacePlan;
@@ -25,56 +27,55 @@ using detail::VisionPrefillPlan;
 using detail::VisionUseSpan;
 using detail::VisionHandoffState;
 
-class VisionWeightStream;
 struct PinnedVisionResult;
 struct VisionOverlayWindowStats;
 
 struct VisionItemView {
     std::span<const std::uint16_t> patches;
-    const qwen3_5::VisionItemControl* control = nullptr;
+    const qwen_common::VisionItemControl* control = nullptr;
 };
 
 class VisionContext {
 public:
     VisionContext(DeviceContext& device, const execution::Parameters& parameters);
     // Overlay windows bind against a rebased per-window weight view.
-    VisionContext(DeviceContext& device, const VisionConfig& config,
-                  const VisionParameters& parameters);
+    VisionContext(DeviceContext& device, const qwen_common::VisionConfig& config,
+                  const qwen_common::execution::VisionParameters& parameters);
 
-    [[nodiscard]] static std::size_t workspace_bytes(const VisionConfig& config,
-                                                     const VisionParameters& parameters,
+    [[nodiscard]] static std::size_t workspace_bytes(const qwen_common::VisionConfig& config,
+                                                     const qwen_common::execution::VisionParameters& parameters,
                                                      std::size_t patches, std::size_t merged_tokens,
                                                      const VisionWorkspacePlan& plan);
-    [[nodiscard]] static VisionWorkspacePlan plan_workspace(const VisionConfig& config,
-                                                            const VisionParameters& parameters,
+    [[nodiscard]] static VisionWorkspacePlan plan_workspace(const qwen_common::VisionConfig& config,
+                                                            const qwen_common::execution::VisionParameters& parameters,
                                                             std::uint32_t max_merged_tokens,
                                                             std::size_t general_capacity_bytes);
     // Window plan for an overlay encode: the output handoff is placed after the encode
     // tensors (no general reservation), so the borrowed lease never aliases live
     // activations. max_patches/max_merged_tokens bound every item the window encodes.
-    [[nodiscard]] static VisionWorkspacePlan plan_overlay_window(const VisionConfig& config,
-                                                                 const VisionParameters& parameters,
+    [[nodiscard]] static VisionWorkspacePlan plan_overlay_window(const qwen_common::VisionConfig& config,
+                                                                 const qwen_common::execution::VisionParameters& parameters,
                                                                  std::size_t max_patches,
                                                                  std::uint32_t max_merged_tokens);
 
-    [[nodiscard]] const VisionConfig& config() const noexcept { return config_; }
+    [[nodiscard]] const qwen_common::VisionConfig& config() const noexcept { return config_; }
 
     [[nodiscard]] static Tensor bind_output(DeviceSpan backing, const VisionWorkspacePlan& plan,
                                             std::size_t merged_tokens);
     // weight_stream, when set, gates each stage on the streamed uploads of an overlay window;
     // resident execution passes nullptr.
     void encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
-                const VisionWorkspacePlan& plan, VisionWeightStream* weight_stream = nullptr) const;
+                const VisionWorkspacePlan& plan, qwen_common::execution::VisionWeightStream* weight_stream = nullptr) const;
 
 private:
     DeviceContext& ctx_;
-    const VisionConfig& config_;
-    const VisionParameters& parameters_;
+    const qwen_common::VisionConfig& config_;
+    const qwen_common::execution::VisionParameters& parameters_;
 };
 
 struct VisionChunk {
     std::int32_t length                       = 0;
-    const qwen3_5::VisionItemControl* control = nullptr;
+    const qwen_common::VisionItemControl* control = nullptr;
     Tensor embeddings;
 };
 
@@ -82,7 +83,7 @@ class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const execution::Parameters& parameters,
                          DeviceSpan workspace, const VisionWorkspacePlan& workspace_plan,
-                         const qwen3_5::PreparedPromptData& prompt, const VisionPrefillPlan& plan,
+                         const qwen_common::PreparedPromptData& prompt, const VisionPrefillPlan& plan,
                          VisionHandoffState& handoff, std::size_t& handoff_peak_bytes);
     ~VisionPrefillSession();
 
@@ -112,7 +113,7 @@ private:
     DeviceContext& device_;
     DeviceSpan workspace_;
     const VisionWorkspacePlan& workspace_plan_;
-    const qwen3_5::PreparedPromptData& prompt_;
+    const qwen_common::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     VisionHandoffState& handoff_;
     std::size_t& handoff_peak_bytes_;

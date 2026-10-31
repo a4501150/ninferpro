@@ -2,8 +2,8 @@
 
 #include "artifact/framing.h"
 #include "artifact/materializer.h"
-#include "models/qwen3_5/frontend/resources.h"
-#include "models/qwen3_5/load/vision_overlay.h"
+#include "models/qwen_common/frontend/resources.h"
+#include "models/qwen_common/load/vision_overlay.h"
 #include "models/qwen4_exp/config.h"
 #include "models/offload/expert_store.h"
 #include "models/qwen4_exp/weights.h"
@@ -20,7 +20,7 @@ namespace infernix::models::qwen4_exp {
 
 // The frontend (tokenizer, chat template, output parsing) is the Qwen3.5 family's, unchanged
 // (docs/maintainer/qwen3_8-flash-next-design.md §7).
-using FrontendResources = qwen3_5::FrontendResources;
+using FrontendResources = qwen_common::FrontendResources;
 
 struct InstanceInfo {
     std::string name;
@@ -76,7 +76,7 @@ public:
     }
     // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
     // window borrows device memory from the expert cache, design §19.3.2).
-    [[nodiscard]] const std::optional<qwen3_5::VisionOverlayAssets>& overlay_vision() const noexcept {
+    [[nodiscard]] const std::optional<qwen_common::VisionOverlayAssets>& overlay_vision() const noexcept {
         return overlay_vision_;
     }
 
@@ -85,7 +85,7 @@ private:
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
           std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
-          std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
+          std::optional<qwen_common::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
           std::optional<offload::ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
@@ -99,7 +99,7 @@ private:
     std::vector<ExpertBank> banks_;
     FrontendResources resources_;
     InstanceInfo info_;
-    std::optional<qwen3_5::VisionOverlayAssets> overlay_vision_;
+    std::optional<qwen_common::VisionOverlayAssets> overlay_vision_;
 };
 
 } // namespace infernix::models::qwen4_exp

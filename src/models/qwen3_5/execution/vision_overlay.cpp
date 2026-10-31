@@ -25,7 +25,7 @@ using OverlayClock = std::chrono::steady_clock;
 
 std::vector<PinnedVisionResult>
 encode_items_overlay(DeviceContext& device, const Parameters& parameters,
-                     const qwen3_5::PreparedPromptData& prompt, const detail::VisionPrefillPlan& plan,
+                     const qwen_common::PreparedPromptData& prompt, const detail::VisionPrefillPlan& plan,
                      std::size_t first_item, VisionOverlayWindowStats* stats) {
     const Model& model = parameters.model;
     if (!model.weights().vision) {
@@ -34,7 +34,7 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
     if (!model.overlay_vision()) {
         throw std::logic_error("overlay window requires overlay assets");
     }
-    const VisionOverlayAssets& assets = *model.overlay_vision();
+    const qwen_common::VisionOverlayAssets& assets = *model.overlay_vision();
     EvictableWeightPool& pool         = *assets.pool;
     if (plan.control == nullptr || plan.uses.empty()) {
         throw std::invalid_argument("overlay window has no vision items");
@@ -55,7 +55,7 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
     std::size_t max_patches = 0;
     std::uint32_t max_merged = 0;
     for (std::size_t index = first_control; index < plan.control->items.size(); ++index) {
-        const qwen3_5::VisionItemControl& control = plan.control->items[index];
+        const qwen_common::VisionItemControl& control = plan.control->items[index];
         max_patches = std::max(max_patches, control.patch_count);
         max_merged  = std::max(max_merged, static_cast<std::uint32_t>(control.merged_count));
     }
@@ -65,9 +65,9 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
     const auto window_start = OverlayClock::now();
     std::size_t mapped      = 0;
     std::byte* staging      =
-        pool.evict(vision_staging_align(assets.layout.staging_bytes) + window_plan.capacity_bytes,
+        pool.evict(qwen_common::execution::vision_staging_align(assets.layout.staging_bytes) + window_plan.capacity_bytes,
                    &mapped);
-    std::byte* lease = staging + vision_staging_align(assets.layout.staging_bytes);
+    std::byte* lease = staging + qwen_common::execution::vision_staging_align(assets.layout.staging_bytes);
 
     struct RestoreGuard {
         EvictableWeightPool& pool;
@@ -85,17 +85,17 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
     std::vector<PinnedVisionResult> results;
     std::size_t staged_bytes = 0;
     {
-        VisionWeightStream stream(device, assets, staging);
-        const VisionParameters window_view = stream.window_weights(params);
+        qwen_common::execution::VisionWeightStream stream(device, assets, staging);
+        const qwen_common::execution::VisionParameters window_view = stream.window_weights(params);
         const VisionContext context(device, config, window_view);
         results.reserve(prepared_end);
         for (std::size_t skipped = 0; skipped < first_item; ++skipped) {
             results.push_back(PinnedVisionResult{});  // prefix-reused: never consumed
         }
         for (std::size_t index = first_control; index < plan.control->items.size(); ++index) {
-            const qwen3_5::VisionItemControl& control = plan.control->items[index];
+            const qwen_common::VisionItemControl& control = plan.control->items[index];
             const std::size_t prepared_index          = prepared_begin + index;
-            const qwen3_5::VisionItem& source         = prompt.vision_items.at(prepared_index);
+            const qwen_common::VisionItem& source         = prompt.vision_items.at(prepared_index);
             const std::size_t patch_elements =
                 control.patch_count * static_cast<std::size_t>(config.patch_width());
             const auto& payload = prompt.media_payloads.at(prepared_index);
@@ -135,7 +135,7 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
 }
 
 void encode_overlay_suffix(DeviceContext& device, const Parameters& parameters,
-                           const qwen3_5::PreparedPromptData& prompt,
+                           const qwen_common::PreparedPromptData& prompt,
                            const detail::VisionPrefillPlan& plan, std::uint32_t reused,
                            VisionPrefillSession& session) {
     const std::size_t item_end = plan.control->prepared_item_begin + plan.control->items.size();

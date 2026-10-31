@@ -124,14 +124,14 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 class PreparedPrompt::Impl {
 public:
     Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         models::qwen3_5::PreparedPrompt prepared)
+         models::qwen_common::PreparedPrompt prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    models::qwen3_5::PreparedPrompt value;
+    models::qwen_common::PreparedPrompt value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -362,7 +362,7 @@ public:
         }
     }
 
-    [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
+    [[nodiscard]] const models::qwen_common::Frontend& frontend() const {
         return qwen4 != nullptr ? qwen4->frontend : active->frontend;
     }
 

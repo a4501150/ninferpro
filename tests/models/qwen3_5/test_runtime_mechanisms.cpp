@@ -2,7 +2,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/program/speculative/mtp_alignment.h"
 #include "models/qwen3_5/program/round_buffers.h"
-#include "models/qwen3_5/program/vision_control.h"
+#include "models/qwen_common/program/vision_control.h"
 
 #include "models/qwen3_5/program/ledger_splits.h"
 #include "runtime/contract/timing.h"
@@ -17,7 +17,8 @@
 
 namespace {
 
-namespace q36 = infernix::models::qwen3_5;
+namespace q36  = infernix::models::qwen3_5;
+namespace q36c = infernix::models::qwen_common;
 
 int failures = 0;
 
@@ -365,31 +366,31 @@ void test_mtp_alignment() {
 }
 
 void test_vision_control() {
-    q36::PreparedPromptData prompt;
+    q36c::PreparedPromptData prompt;
     prompt.token_ids.resize(7);
-    prompt.token_types           = {0, static_cast<std::uint8_t>(q36::PromptModality::Image),
-                                    0, static_cast<std::uint8_t>(q36::PromptModality::Video),
-                                    0, static_cast<std::uint8_t>(q36::PromptModality::Video),
+    prompt.token_types           = {0, static_cast<std::uint8_t>(q36c::PromptModality::Image),
+                                    0, static_cast<std::uint8_t>(q36c::PromptModality::Video),
+                                    0, static_cast<std::uint8_t>(q36c::PromptModality::Video),
                                     0};
     prompt.prepare.media_items   = 2;
     prompt.prepare.raw_patches   = 12;
     prompt.prepare.vision_tokens = 3;
     prompt.vision_items          = {
-        q36::VisionItem{.modality    = q36::PromptModality::Image,
+        q36c::VisionItem{.modality    = q36c::PromptModality::Image,
                                  .grid        = {.temporal = 1, .height = 2, .width = 2},
                                  .patch_begin = 0,
                                  .patch_count = 4,
                                  .token_spans = {{.begin = 1, .count = 1}}},
-        q36::VisionItem{.modality    = q36::PromptModality::Video,
+        q36c::VisionItem{.modality    = q36c::PromptModality::Video,
                                  .grid        = {.temporal = 2, .height = 2, .width = 2},
                                  .patch_begin = 4,
                                  .patch_count = 8,
                                  .token_spans = {{.begin = 3, .count = 1}, {.begin = 5, .count = 1}}},
     };
 
-    const q36::VisionControlPlan plan =
-        q36::plan_vision_control(prompt, {.spatial_merge_size = 2, .position_grid_side = 48});
-    const q36::VisionControl control = q36::build_vision_control(prompt, plan, 0);
+    const q36c::VisionControlPlan plan =
+        q36c::plan_vision_control(prompt, {.spatial_merge_size = 2, .position_grid_side = 48});
+    const q36c::VisionControl control = q36c::build_vision_control(prompt, plan, 0);
     expect(control.items.size() == 2, "Vision per-item control count");
     expect(control.items[0].patch_begin == 0 && control.items[0].patch_count == 4 &&
                control.items[0].merged_count == 1 && control.items[0].segment_length == 4 &&
@@ -408,7 +409,7 @@ void test_vision_control() {
                control.items[1].position_table_weights.size() == 32,
            "video item control offsets");
 
-    const q36::VisionControl suffix = q36::build_vision_control(prompt, plan, 1);
+    const q36c::VisionControl suffix = q36c::build_vision_control(prompt, plan, 1);
     expect(suffix.prepared_item_begin == 1 && suffix.items.size() == 1 &&
                suffix.items[0].patch_begin == control.items[1].patch_begin &&
                suffix.items[0].scatter_indices == control.items[1].scatter_indices &&
@@ -419,7 +420,7 @@ void test_vision_control() {
 // Replay splits a recovered ledger where its execution was split: at the prompt's rewrite
 // frontiers and after a generated control span's split point.
 void test_ledger_splits() {
-    q36::PreparedPromptData prompt;
+    q36c::PreparedPromptData prompt;
     prompt.token_ids                             = {10, 11, 12, 13, 14, 15};
     prompt.identity.rewrite_execution_frontiers = {2, 5};
     q36::detail::LedgerSplits splits;

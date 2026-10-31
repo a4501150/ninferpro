@@ -7,8 +7,6 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/text.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision_overlay.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/execution/vision_tower.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/execution/vision_weight_stream.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/draft.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/visual_scatter.cpp"
 )
