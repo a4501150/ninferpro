@@ -342,7 +342,10 @@ different route may ship, what it is measured against, how much it may cost, and
   kernel the exact route runs takes its column-invariant route: a position's bits there do not
   depend on how the prompt and output were split into prefill calls, decode steps and
   verifications, so prefix-cache resumes at any position, coalescing and decode-state endpoints
-  give the cold run's output without `free-cache-resume`. An option
+  give the cold run's output without `free-cache-resume`. The schedule paths selected beside that
+  route (`adaptive-speculation`, `free-cache-resume`, `preemption`) couple only timing there:
+  their resumes, replays and mixed rounds keep the bits, so
+  `FastPathSelection::request_invariant` stays set with them. An option
   whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
   refused with `--disable-fast-paths` at startup, never silently overridden. A
   change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix

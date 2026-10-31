@@ -142,10 +142,14 @@ enum class FastPath : std::uint8_t {
     AdaptiveMtp,
     // The prefix cache resumes from any tap or endpoint and splits prefill at taps and sibling
     // boundaries. Without it prefill splits and the cache publishes and resumes only on the
-    // prefill chunk grid, and decode-computed endpoints are not published.
+    // prefill chunk grid, and decode-computed endpoints are not published. On a construction-exact
+    // configuration the column-invariant arithmetic keeps a request's bits through any resume, so
+    // the path couples only timing there.
     FreeCacheResume,
     // KV pages grow with each unit and a short pool pauses residents, which replay their generated
-    // tokens as prefill. Without it a request holds its whole KV extent from admission.
+    // tokens as prefill. Without it a request holds its whole KV extent from admission. On a
+    // construction-exact configuration the column-invariant arithmetic keeps a paused request's
+    // bits through its snapshot restore or replay, so the path couples only timing there.
     Preemption,
     // Prefill steps take a wider chunk while no request is waiting to decode (the chunk boundaries,
     // and with them the prefill arithmetic, depend on load).
