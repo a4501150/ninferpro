@@ -534,11 +534,11 @@ struct ProgramOptions {
     // The product's control over the shutdown spill to the Disk tier.
     PrefixCacheSaveControl prefix_save;
     DiagnosticObserver diagnostics;
-    // Internal (A/B measurement and tests): the runtime VRAM monitor that shrinks and grows the
-    // expert cache as other programs take and release device memory (design §19.3.7), and how long
-    // free memory must stay above the cache's target before it grows.
+    // Internal (A/B measurement and tests): the runtime VRAM monitor thread (design §19.3.7): it
+    // samples the device's video memory once a second and wakes an idle engine so it returns idle
+    // KV pages to the expert frames. The engine does not resize the cache under another program's
+    // pressure -- the client owns the placement.
     bool vram_monitor              = true;
-    double vram_grow_delay_seconds = 30.0;
     // Internal (measurement tools and tests): when set, every round's routed experts and every CUDA
     // graph executable's device memory are appended to this file for the expert-cache replay and
     // the graph-memory measurement (models/offload/route_trace.h). Changes no result.

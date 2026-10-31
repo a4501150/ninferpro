@@ -119,10 +119,10 @@ int main() {
         failures += check(exact_c.forward().gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Recurrent &&
                               exact_c.forward().column_invariant,
                           "recipe C's exact route runs the recurrent GDN prefill and the column-invariant kernels");
-        exact_c.paths = {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume};
+        exact_c.paths = {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption};
         failures += check(exact_c.forward().gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Recurrent &&
-                              !exact_c.forward().column_invariant,
-                          "recipe C's request-coupling fast route keeps the recurrent GDN prefill and its width routes");
+                              exact_c.forward().column_invariant && exact_c.request_invariant(),
+                          "recipe C's schedule paths keep the recurrent GDN prefill and the column-invariant kernels");
         exact_c.paths = {FastPath::GdnF16Accumulate};
         failures += check(!exact_c.construction_exact(), "a selected path keeps the resume grid");
     }
@@ -196,6 +196,11 @@ int main() {
     failures += check(!selection.request_invariant(), "q8-sliced-k couples a request to its round");
     selection.paths = {FastPath::GdnConvFused, FastPath::QsaPrepareFused};
     failures += check(selection.request_invariant(), "the fused kernels keep a request invariant");
+    // The schedule paths couple a request's bits outside the construction-exact configurations:
+    // there a resume or a replay moves a request's call grid and with it its bits.
+    selection.paths = {FastPath::FreeCacheResume, FastPath::Preemption};
+    failures += check(!selection.request_invariant(),
+                      "the schedule paths couple a request outside the exact route");
 
     // expert-a4-residual acts only on W4A16 experts (recipe C), and routes an expert by its column
     // count in the call, which batched rounds share between requests.

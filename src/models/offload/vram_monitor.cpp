@@ -13,14 +13,6 @@
 
 namespace infernix::models::offload {
 
-namespace testing {
-namespace {
-std::atomic<double> g_grow_delay{30.0};
-}
-void set_vram_grow_delay(double seconds) { g_grow_delay = seconds; }
-double vram_grow_delay() { return g_grow_delay; }
-} // namespace testing
-
 VramMonitor::VramMonitor(int device, VramBudgetSource& source, std::function<void(const VramSnapshot&)> on_snapshot,
                          std::chrono::milliseconds period)
     : device_(device), source_(source), on_snapshot_(std::move(on_snapshot)), period_(period) {
@@ -35,18 +27,6 @@ VramMonitor::~VramMonitor() {
     }
     stop_cv_.notify_all();
     if (thread_.joinable()) { thread_.join(); }
-}
-
-VramSnapshot VramMonitor::latest() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return latest_;
-}
-
-VramSnapshot VramMonitor::refresh() {
-    const VramSnapshot snapshot = source_.query();
-    const std::lock_guard<std::mutex> lock(mutex_);
-    latest_ = snapshot;
-    return snapshot;
 }
 
 void VramMonitor::run() {

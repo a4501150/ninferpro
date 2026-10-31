@@ -7815,7 +7815,8 @@ change at merge time.
   target when idle. The reserve is the sizing reserve less this process's usage growth other than
   the pool's (DXGI usage counts CUDA, RM0a). The D3DKMT `Demoted` trigger is not used: on this
   driver free memory is the budget less usage, so budget pressure already shows as low free
-  memory.
+  memory. (Removed 2026-10-30 by the amendment below: the monitor now only wakes the idle engine
+  for KV maintenance and reports pressure; `frame_target` keeps the sizing math for KV growth.)
 - **Boundaries.** The Program applies the decision after every `after_round` (prefill chunks,
   forced tokens, decode and verification settle): no round's kernels are in flight there, and the
   commit-phase work still running (GDN fold, tails, the drafter's catch-up) reads no frame. An idle
@@ -7934,6 +7935,16 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   `before_round` after the copy publishes the slot (T7), unmaps the frame, releases it and issues
   the queued loads. The allowance is 32 per decode or verification boundary, unlimited at prefill
   chunk boundaries.
+- **Amendment (2026-10-30)**: R3's runtime shrink/regrow law (`VramControl::decide`, the monitor's
+  pressure reaction) is removed. It contradicted the mechanism/policy split the engine now runs
+  under (AGENTS.md): the client owns the tier shares through `--experts` and
+  `POST /admin/expert-placement`; the engine does not resize the expert cache because another
+  program took device memory. The law had also been unreachable in practice since the resident
+  default landed (every default boot on this 96 GB card holds all experts), so its engine test
+  (RT13) never passed here. What remains of the track: the startup sizing and its boot log line,
+  the sizing law's target as `frame_target` (KV growth spends that allowance before it takes
+  frames), and the monitor thread reduced to the idle KV-maintenance wake plus a one-line pressure
+  report naming the placement lever. RT9's law tests became `frame_target` tests; RT13 is deleted.
 
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 
@@ -8781,8 +8792,9 @@ elastic pool does the same job with no kernel change:
     - After 60 s with every lane free, the maintenance pass releases the cache's idle,
       host-backed device blocks (a later match restores them from the Host tier; nothing is lost),
       then shrinks. The delay spares a follow-up turn a restore plus an expert reload.
-  - **The control law.** `VramControl::account_fixed` moves its sizing baseline by each grow or
-    shrink, so the KV is never read as the reserve's use.
+  - **The control law.** The sizing baseline moves by each grow or shrink (the removed
+    `VramControl::account_fixed`'s bookkeeping, inlined in the Program), so the KV is never read
+    as the reserve's use.
   - **Toggle.** A temporary `INFERNIX_TMP_KV_ELASTIC_OFF` restored the fixed pool for the A/B; it
     was removed before the commit.
 - **Known costs.**

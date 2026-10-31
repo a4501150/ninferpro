@@ -59,9 +59,15 @@ struct FastPathSelection {
     [[nodiscard]] bool selected(FastPath path) const noexcept;
     // The Forward's flags for the selected paths.
     [[nodiscard]] execution::ForwardFastPaths forward() const noexcept;
-    // No request-coupling path (adaptive-speculation, free-cache-resume, preemption, q8-sliced-k,
-    // expert-a4-residual, fp8-a8-pair, ggml-bf16-prefill, gdn-compensated) is selected:
-    // a request's output depends only on the request, the artifact, the options and the build.
+    // A selected path keys a column's arithmetic to its call's width or the round's column
+    // composition (q8-sliced-k, expert-a4-residual, fp8-a8-pair, ggml-bf16-prefill, gdn-compensated,
+    // hc-sliced-k, bf16-index-mma): the column-invariant kernels cannot run with one.
+    [[nodiscard]] bool width_keyed() const noexcept;
+    // No path that couples a request's bits to the other requests of the Engine is selected: the
+    // width-keyed paths do anywhere; the schedule paths (adaptive-speculation, free-cache-resume,
+    // preemption) do only where the configuration is not construction-exact (there their resumes,
+    // replays and mixed rounds move a request's call grid and with it its bits). A request's output
+    // depends only on the request, the artifact, the options and the build.
     [[nodiscard]] bool request_invariant() const noexcept;
     // The exact route (no path selected) in a construction-exact configuration: prefix-cache resumes,
     // taps, sibling coalescing and endpoints at any position give the bits a cold run gives

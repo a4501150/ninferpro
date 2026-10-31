@@ -1209,6 +1209,12 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
   question failed returns the first question's error status instead.
 - Each question is one engine request in the request log and metrics (`protocol: "decide"`): a
   readout with one staged output token that is never returned, a generated primitive with its run.
+- A readout of a prompt the prefix cache resumes reads exactly what the same prompt's cold run
+  reads on the exact route (`--disable-fast-paths`). On the default fast route a resumed readout
+  drifts a little: the resume reuses KV blocks the earlier run computed at another prefill call
+  width, and the fast route's width-keyed arithmetic differs there (up to about 0.5 nats measured;
+  the top token agrees). Read probabilities that must compare across runs with
+  `--disable-fast-paths`.
 
 ## Authentication and CORS
 

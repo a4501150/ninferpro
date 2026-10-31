@@ -160,47 +160,15 @@ struct VramSizing {
 // clamp(frame_bytes / frame size, 0, max_frames).
 [[nodiscard]] VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand);
 
-// The runtime law of an elastic frame pool (design §19.3.7): from the latest snapshot, the pool's
-// size and the time, the frame count it should have. Pure and single-threaded; the Program guards
-// it. The reserve is spent only by Infernix's own allocations after sizing (graph executables): with
-// an OS budget, the growth of this process's usage other than the pool's.
-class VramControl {
-public:
-    // `demand` as sized at startup (elastic); `usage` and `pool_bytes` at that moment.
-    VramControl(const VramDemand& demand, std::uint64_t chunk_bytes, std::uint64_t usage, std::uint64_t pool_bytes,
-                double grow_delay_seconds = 30.0);
-
-    struct Decision {
-        std::uint32_t frames = 0; // the frame count to resize to (the current one: no change)
-        bool shrink          = false;
-        bool grow            = false;
-        bool pressure        = false; // free memory below half the headroom, or the budget exceeded
-    };
-    // Shrinks at once when free memory falls below half the headroom or this process is over its
-    // OS budget, to one chunk below the sizing function's target; grows toward the target once it
-    // has stayed two chunks above the pool for the grow delay, by at most four chunks a boundary
-    // while rounds run and all at once when `idle`.
-    [[nodiscard]] Decision decide(const VramSnapshot& snapshot, std::uint64_t pool_bytes, std::uint32_t frames,
-                                  double now_seconds, bool idle);
-    // The frame count the sizing function gives now (no hysteresis).
-    [[nodiscard]] std::uint32_t target(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const;
-    [[nodiscard]] std::uint64_t headroom(DisplayState display) const;
-    [[nodiscard]] std::uint64_t reserve_left(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const;
-    // A fixed allocation grew (positive) or shrank by `bytes` since sizing (the elastic KV pool, design
-    // §19.3.11): it is not the reserve's use.
-    void account_fixed(std::int64_t bytes) noexcept {
-        usage_at_sizing_ = static_cast<std::uint64_t>(static_cast<std::int64_t>(usage_at_sizing_) + bytes);
-    }
-
-private:
-    [[nodiscard]] std::int64_t frame_bytes(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const;
-
-    VramDemand demand_;
-    std::uint64_t chunk_;
-    std::uint64_t usage_at_sizing_;
-    std::uint64_t pool_at_sizing_;
-    double grow_delay_;
-    double grow_since_ = -1.0; // when the target first stood two chunks above the pool; < 0: not now
-};
+// The frame count the free memory beside the pool supports now, in whole chunks (design §19.3.7's
+// sizing law, without the removed shrink/regrow policy): the frames an elastic pool holds beyond it
+// sit on memory the sizing would not give them, so KV growth spends that allowance before it takes
+// frames. `pool_bytes` are the bytes the pool maps now (the law counts them as reclaimable), and
+// under an OS budget the unspent reserve tracks this process's growth since sizing that is not the
+// pool's (`usage_at_sizing` and `pool_at_sizing` at that moment, moved by the caller with the
+// elastic KV pool's mappings).
+[[nodiscard]] std::uint32_t frame_target(const VramDemand& demand, std::uint64_t chunk_bytes,
+                                         const VramSnapshot& snapshot, std::uint64_t pool_bytes,
+                                         std::uint64_t usage_at_sizing, std::uint64_t pool_at_sizing);
 
 } // namespace infernix::models::qwen4_exp

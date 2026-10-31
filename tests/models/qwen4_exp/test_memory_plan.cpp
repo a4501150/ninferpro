@@ -3,9 +3,11 @@
 // margin, the commit limit and the OS's pin bound limit the experts like physical memory, and the
 // reserve is applied once. RT7, the VRAM sizing: the display headroom by display state, the OS budget without
 // stacking the headroom on it, the graph reserve, fixed allocations that do not fit, the frame
-// clamp, and the spill test with noisy free-memory readings. RT9, the runtime law of the elastic
-// pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary
-// cap, display hot-plug, and the reserve spent by Infernix's own later allocations.
+// clamp, and the spill test with noisy free-memory readings. RT9, the sizing law's runtime target
+// (the elastic pool's shrink/regrow policy was removed 2026-10-30; the client owns the placement):
+// the whole-chunk target beside the pool, the headroom by display state, the OS budget, the frame
+// clamp, the reserve spent by Infernix's own later allocations, and the usage baseline the elastic
+// KV pool's mappings move.
 
 #include "models/qwen4_exp/memory_plan.h"
 
@@ -411,7 +413,7 @@ VramSnapshot wddm(std::uint64_t pool, std::uint64_t other, DisplayState display 
 
 std::uint32_t frames_in(std::uint64_t bytes) { return static_cast<std::uint32_t>(bytes / kRecord); }
 
-void test_control_law() {
+void test_frame_target() {
     VramDemand d;
     d.graphs      = 20;
     d.frame_bytes = kRecord;
@@ -419,66 +421,53 @@ void test_control_law() {
     const std::uint64_t other = 6 * kGiB; // dense weights, KV, workspace, staging, context
     // Sizing left headroom (256) + reserve (256) free, on the chunk grid.
     const std::uint64_t pool = (31'419 * kMiB - other - 512 * kMiB) / kChunk * kChunk;
-    VramControl control(d, kChunk, pool + other, pool);
     const std::uint32_t frames = frames_in(pool);
-    double t = 0.0;
+    const std::uint64_t usage = pool + other, pool_at = pool;
 
-    auto steady = control.decide(wddm(pool, other), pool, frames, t, true);
-    require(!steady.shrink && !steady.grow && steady.frames == frames, "the sized pool is stable when idle");
+    // The sized pool is its own target: no spare allowance for KV growth, nothing missing.
+    require(frame_target(d, kChunk, wddm(pool, other), pool, usage, pool_at) == frames,
+            "the sized pool is its own target");
 
-    // Another program takes 2 GiB: this process's budget falls by it, free memory to 0.
-    const std::uint64_t squeezed_budget = 31'419 * kMiB - 2 * kGiB;
-    auto shrink = control.decide(wddm(pool, other, DisplayState::Headless, squeezed_budget), pool, frames, t += 1, false);
-    require(shrink.shrink && shrink.pressure && shrink.frames < frames, "low free memory shrinks at once");
-    const std::uint64_t new_pool = (static_cast<std::uint64_t>(shrink.frames) * kRecord + kChunk - 1) / kChunk * kChunk;
-    // After the shrink the same pressure no longer holds and the pool is stable.
-    const VramSnapshot after = wddm(new_pool, other, DisplayState::Headless, squeezed_budget);
-    auto settled             = control.decide(after, new_pool, shrink.frames, t += 1, false);
-    require(!settled.shrink && !settled.pressure && settled.frames == shrink.frames,
-            "one chunk below the target: the next reading does not shrink again");
-    require(after.device_free >= control.headroom(DisplayState::Headless), "the shrink restores the headroom");
+    // Another program takes 2 GiB: the target falls by about it. The engine no longer resizes
+    // anything itself -- the client names a placement -- but grow_kv's spare allowance is gone,
+    // so KV growth beyond the target takes frames.
+    const std::uint64_t squeezed = 31'419 * kMiB - 2 * kGiB;
+    const std::uint32_t squeezed_target =
+        frame_target(d, kChunk, wddm(pool, other, DisplayState::Headless, squeezed), pool, usage, pool_at);
+    require(squeezed_target < frames, "external pressure lowers the target");
+    require(frames - squeezed_target <= frames_in(2 * kGiB) + frames_in(kChunk),
+            "the target falls by what was taken, at most a chunk more");
 
-    // The other program exits: room for the startup pool again. No growth before the delay.
-    VramSnapshot freed = wddm(new_pool, other);
-    for (double step = 0; step < 29.5; step += 1.0) {
-        const auto wait = control.decide(freed, new_pool, shrink.frames, t + step, false);
-        require(!wait.grow && wait.frames == shrink.frames, "no growth before 30 s");
-    }
-    const auto grow = control.decide(freed, new_pool, shrink.frames, t + 30.0, false);
-    require(grow.grow && grow.frames == frames_in(new_pool + 4 * kChunk),
-            "during rounds the pool grows by at most four chunks per boundary");
-    const auto idle_grow = control.decide(freed, new_pool, shrink.frames, t + 30.5, true);
-    require(idle_grow.grow && idle_grow.frames >= frames - frames_in(kChunk) && idle_grow.frames <= frames,
-            "an idle engine grows to the target at once");
+    // A display appears and the desktop takes 400 MiB: the elastic headroom rises from 256 to
+    // 512 MiB, and the target falls by what that leaves.
+    const std::uint32_t with_display = frame_target(
+        d, kChunk, wddm(pool, other, DisplayState::Attached, 31'419 * kMiB - 400 * kMiB), pool, usage, pool_at);
+    require(with_display < frames, "a display's headroom lowers the target");
 
-    // Hysteresis: one chunk of room never grows the pool.
-    VramControl tight(d, kChunk, pool + other, pool);
-    const VramSnapshot one_chunk = wddm(pool - kChunk, other);
-    for (double step = 0; step < 120; step += 10) {
-        require(!tight.decide(one_chunk, pool - kChunk, frames_in(pool - kChunk), step, true).grow,
-                "a target one chunk above the pool does not grow it");
-    }
-
-    // A display appears and the desktop takes 400 MiB: the headroom rises from 256 to 512 MiB
-    // (elastic) and the remaining ~170 MiB free is below half of it.
-    VramControl plugged(d, kChunk, pool + other, pool);
-    const VramSnapshot display = wddm(pool, other, DisplayState::Attached, 31'419 * kMiB - 400 * kMiB);
-    require(plugged.headroom(DisplayState::Attached) == 512 * kMiB, "elastic headroom with a display");
-    require(plugged.decide(display, pool, frames, 0.0, false).shrink, "a display appearing shrinks the pool");
-
-    // Infernix's own later allocations (graph executables, 64 MiB) spend the reserve, not the frames:
-    // the target falls by what remains of the reserve's use, and growth never eats into it.
-    VramControl reserve(d, kChunk, pool + other, pool);
+    // Infernix's own later allocations (graph executables, 64 MiB) spend the unspent reserve, so
+    // the target never grows into what they spent; the caller moves the usage baseline with its
+    // fixed mappings (the elastic KV pool's), which are this process's growth but not that spend.
     const VramSnapshot graphs = wddm(pool, other + 64 * kMiB);
-    require(reserve.reserve_left(graphs, pool) == 256 * kMiB - 64 * kMiB, "graph memory spends the reserve");
-    require(reserve.target(graphs, pool) <= frames, "an idle start never grows into the internal reserve");
-    require(!reserve.decide(graphs, pool, frames, 100.0, true).shrink, "spending the reserve is not pressure");
+    require(frame_target(d, kChunk, graphs, pool, usage, pool_at) <= frames - frames_in(64 * kMiB) + frames_in(kChunk),
+            "graph memory spends the reserve, not the frames");
+    require(frame_target(d, kChunk, wddm(pool, other), pool, usage + kGiB, pool_at) == frames,
+            "the moved baseline keeps the KV pool's mappings out of the reserve");
 
-    // The OS budget falls below this process's usage: shrink even with free memory reported.
+    // The OS budget falls below this process's usage: the target loses the deficit (nothing
+    // beyond the pool is affordable), even with free memory reported.
     VramSnapshot trimmed = wddm(pool, other);
     trimmed.local_budget = pool + other - kGiB;
     trimmed.device_free  = kGiB;
-    require(control.decide(trimmed, pool, frames, 200.0, false).shrink, "an exceeded budget shrinks the pool");
+    const std::uint32_t over = frame_target(d, kChunk, trimmed, pool, usage, pool_at);
+    require(over < frames, "an exceeded budget lowers the target below the pool");
+    require(frames - over >= frames_in(kGiB) && frames - over <= frames_in(kGiB) + frames_in(512 * kMiB),
+            "the target loses the budget deficit and the reserve");
+
+    // The frame clamp caps the target however much memory is free.
+    VramDemand capped = d;
+    capped.max_frames = 100;
+    require(frame_target(capped, kChunk, wddm(pool, other), pool, usage, pool_at) == 100,
+            "the frame clamp caps the target");
 }
 
 } // namespace
@@ -498,7 +487,7 @@ int main() {
         test_internal_reserve();
         test_sizing();
         test_spill();
-        test_control_law();
+        test_frame_target();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

@@ -485,8 +485,8 @@ bool FastPathSelection::selected(FastPath path) const noexcept {
     return std::find(paths.begin(), paths.end(), path) != paths.end();
 }
 
-bool FastPathSelection::request_invariant() const noexcept {
-    return std::none_of(paths.begin(), paths.end(), [](FastPath path) {
+bool FastPathSelection::width_keyed() const noexcept {
+    return std::any_of(paths.begin(), paths.end(), [](FastPath path) {
         // q8-sliced-k picks its reduction order by the round's column count, so a decode column's bits
         // depend on the other requests of its round.
         // expert-a4-residual routes an expert, and fp8-a8-pair a dense problem, by its column count in
@@ -495,11 +495,24 @@ bool FastPathSelection::request_invariant() const noexcept {
         // chunk grids, whose boundaries prefix-cache resumes move. hc-sliced-k splits the
         // hyper-connection mix's K, and bf16-index-mma tiles the index projection, by the call's
         // width, which batched rounds share.
+        return path == FastPath::Q8SlicedK || path == FastPath::ExpertA4Residual ||
+               path == FastPath::Fp8A8Pair || path == FastPath::GgmlBf16Prefill ||
+               path == FastPath::GdnCompensated || path == FastPath::HcSlicedK ||
+               path == FastPath::Bf16IndexMma;
+    });
+}
+
+bool FastPathSelection::request_invariant() const noexcept {
+    if (width_keyed()) { return false; }
+    // The schedule paths (adaptive-speculation, free-cache-resume, preemption) couple a request by
+    // moving its call boundaries and round composition: on a construction-exact configuration the
+    // column-invariant arithmetic keeps the bits through any resume, replay or mixed round, so there
+    // they couple only timing; elsewhere their resumes and replays change the call grid and with it
+    // the bits.
+    if (qwen4_exp::construction_exact(configuration)) { return true; }
+    return std::none_of(paths.begin(), paths.end(), [](FastPath path) {
         return path == FastPath::AdaptiveSpeculation || path == FastPath::FreeCacheResume ||
-               path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
-               path == FastPath::ExpertA4Residual || path == FastPath::Fp8A8Pair ||
-               path == FastPath::GgmlBf16Prefill || path == FastPath::GdnCompensated ||
-               path == FastPath::HcSlicedK || path == FastPath::Bf16IndexMma;
+               path == FastPath::Preemption;
     });
 }
 
@@ -512,8 +525,10 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     if (selected(FastPath::Bf16IndexMma)) { routes = routes | ops::LinearRoutes::Bf16IndexMma; }
     // The construction-exact arithmetic runs only in the configurations it was qualified on: there the
     // exact route takes the column-invariant kernels and the recurrent GDN prefill, which the fast route
-    // keeps unless gdn-compensated is selected. Elsewhere both routes keep the arithmetic their own
-    // gates qualified.
+    // keeps unless gdn-compensated is selected. The width-keyed paths replace that arithmetic with
+    // width-dependent routes; the schedule paths do not (the column-invariant kernels keep the bits
+    // through their resumes, replays and mixed rounds). Elsewhere both routes keep the arithmetic
+    // their own gates qualified.
     const bool invariant = qwen4_exp::construction_exact(configuration);
     const auto gdn       = selected(FastPath::GdnF16Accumulate) ? ops::GdnChunkArithmetic::Fp16Accumulate
                            : selected(FastPath::GdnCompensated)  ? ops::GdnChunkArithmetic::Compensated
@@ -524,7 +539,7 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
             .expert_a4_residual = selected(FastPath::ExpertA4Residual),
             .gdn_arithmetic     = gdn,
-            .column_invariant   = invariant && request_invariant()};
+            .column_invariant   = invariant && !width_keyed()};
 }
 
 bool FastPathSelection::construction_exact() const noexcept {

@@ -81,8 +81,10 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     options.max_pending_requests = 4;
     options.context_cache.host_capacity_bytes = 2ULL << 30;
     // Solo equality holds on the exact route (model-quality.md §6.1), where the default route's
-    // q8-sliced-k and gdn-conv-fused couple a request to its round; pausing a resident is the
-    // preemption path, and resuming from its published decode state is free-cache-resume.
+    // q8-sliced-k and gdn-conv-fused couple a request to its round; the two candidates below are
+    // schedule paths, so the construction-exact arithmetic keeps the bits through the pauses, the
+    // snapshot resumes and the mixed rounds. Pausing a resident is the preemption path, and
+    // resuming from its published decode state is free-cache-resume.
     options.fast_paths           = false;
     options.fast_path_candidates = {infernix::FastPath::Preemption,
                                     infernix::FastPath::FreeCacheResume};

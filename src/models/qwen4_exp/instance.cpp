@@ -252,7 +252,6 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.route_trace   = options.route_trace_path.empty()
                                         ? models::offload::testing::route_trace()
                                         : options.route_trace_path;
-    program_options.vram_grow_delay_seconds = models::offload::testing::vram_grow_delay();
     program_options.vram_headroom = options.vram_headroom_bytes;
     program_options.vram_past_budget = options.vram_past_budget;
     program_options.expert_tail_skip = options.expert_tail_skip;
