@@ -2,7 +2,7 @@
 
 // Explicit expert placement for Qwen3.8-Flash-Next (design §19.3.7): which routed experts the VRAM
 // frame pool pins, which the RAM tier holds, and the placement file that assigns (layer, expert)
-// pairs to tiers. The startup resolution (runtime/engine/qwen4_exp_instance.cpp) turns a
+// pairs to tiers. The startup resolution (models/qwen4_exp/instance.cpp) turns a
 // placement into the frame-pool target, the RAM tier's slot count and the pinned key set; the
 // Program's warm start and tier fill realize it, and the /admin/expert-placement endpoint can
 // apply a new frame target at runtime.

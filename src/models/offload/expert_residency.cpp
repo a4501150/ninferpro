@@ -36,16 +36,16 @@ std::uint8_t* ExpertResidency::Pool::base() const noexcept {
     return static_cast<std::uint8_t*>(arena ? arena->base() : memory.p);
 }
 
-std::uint64_t ExpertResidency::table_bytes(const qwen4_exp::TextConfig& config, std::int32_t max_columns) noexcept {
-    const std::uint64_t keys = static_cast<std::uint64_t>(config.num_hidden_layers) * config.moe.experts;
+std::uint64_t ExpertResidency::table_bytes(const ExpertBankGeometry& geometry, std::int32_t max_columns) noexcept {
+    const std::uint64_t keys = static_cast<std::uint64_t>(geometry.banks) * geometry.experts_per_bank;
     const std::uint64_t route =
-        static_cast<std::uint64_t>(config.moe.top_k) * static_cast<std::uint64_t>(max_columns) * config.num_hidden_layers;
-    const std::uint64_t landing = 2ULL * config.num_hidden_layers * kLandingSlots; // table + landed log
+        static_cast<std::uint64_t>(geometry.top_k) * static_cast<std::uint64_t>(max_columns) * geometry.banks;
+    const std::uint64_t landing = 2ULL * geometry.banks * kLandingSlots; // table + landed log
     return (keys + route + landing) * sizeof(std::int32_t);
 }
 
-std::uint32_t ExpertResidency::max_frames(const qwen4_exp::TextConfig& config) noexcept {
-    return config.num_hidden_layers * config.moe.experts;
+std::uint32_t ExpertResidency::max_frames(const ExpertBankGeometry& geometry) noexcept {
+    return geometry.banks * geometry.experts_per_bank;
 }
 
 std::uint64_t ExpertResidency::average_frame_bytes(std::span<const std::uint64_t> strides) noexcept {
@@ -55,13 +55,13 @@ std::uint64_t ExpertResidency::average_frame_bytes(std::span<const std::uint64_t
     return (sum + strides.size() - 1) / strides.size();
 }
 
-ExpertResidency::ExpertResidency(const qwen4_exp::TextConfig& config, std::vector<const std::uint8_t*> banks,
+ExpertResidency::ExpertResidency(const ExpertBankGeometry& geometry, std::vector<const std::uint8_t*> banks,
                                  std::uint64_t record_stride, std::int32_t max_columns, int device,
                                  std::vector<std::uint64_t> host_strides)
-    : c_(config), banks_(std::move(banks)), host_strides_(std::move(host_strides)), stride_(record_stride) {
-    experts_ = config.moe.experts;
-    layers_  = config.num_hidden_layers;
-    top_k_   = config.moe.top_k;
+    : geometry_(geometry), banks_(std::move(banks)), host_strides_(std::move(host_strides)), stride_(record_stride) {
+    experts_ = geometry.experts_per_bank;
+    layers_  = geometry.banks;
+    top_k_   = geometry.top_k;
     if (banks_.size() != layers_) { throw std::invalid_argument("expert residency: one bank per layer"); }
     if (stride_ == 0) { throw std::invalid_argument("expert residency: empty records"); }
     if (host_strides_.empty()) { host_strides_.assign(layers_, stride_); }
@@ -154,7 +154,7 @@ std::uint32_t ExpertResidency::frames() const noexcept {
 std::uint32_t ExpertResidency::frame_limit() const noexcept {
     std::uint64_t n = 0;
     for (const auto& pool : pools_) { n += pool.limit; }
-    return static_cast<std::uint32_t>(std::min<std::uint64_t>(n, max_frames(c_)));
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(n, max_frames(geometry_)));
 }
 
 std::uint64_t ExpertResidency::pool_bytes() const noexcept {

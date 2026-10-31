@@ -738,10 +738,10 @@ public:
                4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words + kGateStatsBytes * lanes +
                (o.ngram_table && o.ngram_table->fp8_scale ? sizeof(std::uint16_t) : 0) + constraint_bytes(lanes, W) +
                grammar_mask_bytes(d.token_domain, lanes, W) + d.score_residuals + d.score_logits + d.score_io;
-        b.residency            = offload::ExpertResidency::table_bytes(c, d.columns);
+        b.residency            = offload::ExpertResidency::table_bytes(bank_geometry(c), d.columns);
         b.expert_record_stride = d.record_stride;
         b.expert_frame_bytes   = d.frame_bytes;
-        b.max_frames           = offload::ExpertResidency::max_frames(c);
+        b.max_frames           = offload::ExpertResidency::max_frames(bank_geometry(c));
         b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
                                              static_cast<std::uint32_t>(d.mtp_k), o.sampled_mtp_drafts && d.mtp,
                                              static_cast<std::uint32_t>(d.dflash_k));
@@ -1011,7 +1011,7 @@ public:
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = plan_.staging_slots;
         // The expert cache's tables and route log; its frames come last (below).
-        residency_ = std::make_unique<offload::ExpertResidency>(c_, std::move(banks), record_stride, columns_, device_.device,
+        residency_ = std::make_unique<offload::ExpertResidency>(bank_geometry(c_), std::move(banks), record_stride, columns_, device_.device,
                                                        host_strides);
         // An explicit placement pins its vram set; a resident placement also stops every frame
         // lender (the wide workspace falls back to a temporary allocation).
