@@ -942,7 +942,7 @@ model type `deepseek_v41`).
 |---|---|---|
 | Config interpretation (exact key set, refusals), mathematics, binding, block order, the two prompt rules, DSpark alignment | Model | `src/models/deepseek_v41/` (`config`, `weights`, `load`, `execution/forward`, `execution/parameters`) |
 | Program: lanes, windows and compressed planes, Engram rows, prefix-cache binding, DSpark drafter, graphs, expert-offload composition | Program | `src/models/deepseek_v41/program/` |
-| Engine instance | Runtime | `src/runtime/engine/deepseek_v41_instance.{h,cpp}`; a new `Architecture` value in `src/models/registry.cpp`; an `EngineCore` arm |
+| Engine instance | Model | `src/models/deepseek_v41/instance.{h,cpp}`; a new `Architecture` value in `src/models/registry.cpp`; an `EngineCore` arm |
 | MX8 activation codec and exact block combination | Ops (common) | `src/ops/common/mx8.h`, beside `exact_combine.h`; the scalar form is the exact oracle |
 | Tokenizer pre-tokenizer, DeepSeek encoding, DSML tool-call and reasoning parsing | Frontend | §21 |
 | Recipe, streaming conversion, MX recovery, expert and Engram volume writers, verification, reference forward | Converter / tools | `tools/convert/deepseek_v41.py`, `official_recipes.py`, `tools/artifact/expert_volume.py`, `tools/artifact/restripe.py`, `tools/deepseek_v41/` |
@@ -952,8 +952,8 @@ DeepSeek's reference code and DS4 are MIT-licensed; any code ported from them ke
 ### 8.2 Shared components
 
 Three explicit families now need host-offloaded experts: Qwen4Exp (built), GLM-5.3-Flash (designed)
-and this one. The shared pieces are extracted by whichever of the two new families is implemented
-first, as GLM §8.2 describes, with no base class, virtual model interface or registry:
+and this one. The shared pieces are already extracted into `src/models/offload/`, as GLM §8.2
+describes, with no base class, virtual model interface or registry:
 
 - **`src/models/offload/`**: expert cache, residency controller, RAM tier with pinned and unpinned
   records, expert store, state file, ledger terms, route trace, VRAM monitor, parameterized by an

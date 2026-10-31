@@ -85,7 +85,7 @@ At T=1 the logical bandwidth is **1069.4 GB/s, a nominal bandwidth utilization o
 
 ## Curve interpretation and validation
 
-The [shape implementation](../../../src/ops/linear/q4/shapes/n6144_k5120.cu) chooses among GEMV,
+The [shape implementation](../../../src/models/qwen3_5/shapes/q4/n6144_k5120.cu) chooses among GEMV,
 in-CTA sliced-K and ordinary MMA; the source is authoritative for the exact configuration.
 
 - T=1→2 rises from 15.648 to 21.792 µs (+39.26%), the largest adjacent increase in the hot range,

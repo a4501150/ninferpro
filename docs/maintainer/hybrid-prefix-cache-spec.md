@@ -1712,7 +1712,7 @@ tokens in two base runs. Among requests with an identical prompt and cache hit, 
 ran alone differed, against 27 of 49 that overlapped another request. Two lanes share one decode
 and verification batch per round, the NVFP4 linear routes change with its column count (GEMV at
 1, SIMT to 5, sliced-K at 8, 16, 24, 32 and 64, A4 MMA tiles from 8; for example
-`ops/linear/nvfp4/shapes/n5120_k17408.cu`), and which rounds two requests share depends on wall
+`models/qwen3_5/shapes/nvfp4/n5120_k17408.cu`), and which rounds two requests share depends on wall
 time, so near-ties flip and the conversation diverges from there. The two-lane results are noise
 of the same size as the effects (base against base: up to 20 % average TTFT, 6.5 points of cache
 hits, 44 % of prefilled tokens on one seed) and are not tabulated.

@@ -53,6 +53,11 @@ constraints and launch kernels, and Output/Epilogue define output mapping and fu
 Each semantic Op selects its own production instances. A template's availability neither registers
 a public shape nor implies that production dispatch uses it.
 
+The tuned (n, k) instantiations are owned by the family that needs them: each family's set lives
+under `src/models/<family>/shapes/<dtype>/`, one `<dtype>_shapes.cpp` extern table per format that
+the format's dispatch in the ops directory scans beside its selectors; the shared templates, the
+general fallback and the dispatch stay in the format directories.
+
 CTA-local sliced-K reduces partial sums within a block. Cross-CTA split-K requires caller-owned
 workspace and a final reduction; apply the epilogue once, after the complete reduction.
 New configuration/epilogue combinations receive development qualification; permanent tests cover

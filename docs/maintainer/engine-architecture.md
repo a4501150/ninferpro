@@ -433,14 +433,19 @@ no cached prefix that external requests could hit.
 |---|---|
 | Public Engine facade | `include/infernix/engine.h`, `src/runtime/engine/engine.cpp` |
 | Request lifecycle, scheduling and observation | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl` |
-| Instance construction | `src/runtime/engine/model_instance.*` |
+| Shared artifact-free option checks, defaults and the hybrid-cache fingerprint | `src/runtime/engine/engine_options.*` |
+| Family instance construction and family option branches | `src/models/<family>/instance.*`, `options.*` (qwen3_5, qwen4_exp) |
+| Artifact architecture detection | `src/models/registry.cpp` |
 | Engine connection to the prefix cache | `src/runtime/engine/context_cache/` |
 | Model-agnostic prefix index, tap planner and cost model | `src/runtime/prefix_cache/` |
 | Public request, execution and resource contracts | `src/runtime/contract/` |
 | Model config, binding and read-only data | `src/models/qwen3_5/config.*`, `load/`, `model.*` |
 | Native parameters and fixed model calls | `src/models/qwen3_5/execution/` |
 | Program planning, stores, context and model transactions | `src/models/qwen3_5/program/` |
-| Frontend and model state layout | `src/models/qwen3_5/frontend/`, `state/` |
+| Shared Qwen frontend, n-gram archive and vision pieces | `src/models/qwen_common/` |
+| Shared expert-offload tier (placement, store, host cache, host and SSD tiers, residency, route trace, VRAM monitor), parameterized by `ExpertBankGeometry` | `src/models/offload/` |
+| Model state layout | `src/models/qwen3_5/state/` |
+| Family-owned linear shape tuning, one extern table per family and format beside the Ops dispatch | `src/models/<family>/shapes/` |
 | Tensors, arenas, graphs, physical KV and raw transfers | `src/core/` |
 | Generic artifact framing and materialization | `src/artifact/` |
 | Closed compute and state-transition Ops | `src/ops/`, `include/infernix/ops/` |
