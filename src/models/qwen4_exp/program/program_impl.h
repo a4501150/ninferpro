@@ -2922,32 +2922,26 @@ private:
         if (!options_.vram_monitor || options_.expert_frame_ceiling != 0) { return; }
         const VramSnapshot now = vram_->query();
         if (residency_->elastic()) {
-            control_.emplace(demand, offload::ExpertResidency::kChunkBytes, now.local_usage, residency_->pool_bytes(),
-                             options_.vram_grow_delay_seconds);
+            // The sizing law's inputs for grow_kv's spare allowance: the pool covers its own bytes
+            // through pool_bytes, and the KV pool's later mappings move the usage baseline.
+            spare_demand_       = demand;
+            spare_demand_.elastic = true;
+            spare_demand_.fixed   = 0;
+            usage_at_sizing_    = now.local_usage;
+            pool_at_sizing_     = residency_->pool_bytes();
         }
-        frames_now_     = residency_->frames();
-        pool_now_       = residency_->pool_bytes();
-        startup_frames_ = frames_now_;
         placement_ceiling_ = options_.expert_frame_ceiling;
-        vram_epoch_     = Clock::now();
         monitor_ = std::make_unique<offload::VramMonitor>(device_.device, *vram_,
                                                  [this](const VramSnapshot& snapshot) { on_vram_snapshot(snapshot); });
     }
 
-    double vram_seconds() const {
-        return std::chrono::duration<double>(Clock::now() - vram_epoch_).count();
-    }
-
-    // The monitor thread: wakes an idle engine when the cache should resize; without an elastic
-    // pool, warns once per pressure episode that nothing absorbs it.
+    // The monitor thread: wakes an idle engine so it returns idle KV pages to the frames. Free
+    // VRAM below the headroom is only reported -- the engine does not resize the expert cache
+    // under another program's pressure; the client owns the placement (--experts, or
+    // POST /admin/expert-placement).
     void on_vram_snapshot(const VramSnapshot& snapshot) {
         const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
         if (kv_idle_due() && waker_) { waker_(); }
-        if (control_) {
-            const auto d = control_->decide(snapshot, pool_now_, frames_now_, vram_seconds(), true);
-            if ((d.shrink || d.grow) && waker_) { waker_(); }
-            return;
-        }
         const std::uint64_t headroom = display_headroom(snapshot.display, false, options_.vram_headroom);
         const bool pressure = snapshot.device_free < headroom / 2 ||
                               (snapshot.has_budget && snapshot.local_usage > snapshot.local_budget);
@@ -2955,9 +2949,9 @@ private:
             const std::uint64_t short_by = headroom > snapshot.device_free ? headroom - snapshot.device_free : 0;
             diagnostic("free VRAM is " + std::to_string(snapshot.device_free >> 20) + " MiB, below the " +
                        std::to_string(headroom >> 20) + " MiB headroom by " + std::to_string(short_by >> 20) +
-                       " MiB; the expert cache cannot shrink on this system, so Infernix memory may move to system "
-                       "memory and slow down. Raise --vram-headroom-mib to " +
-                       std::to_string((headroom + short_by + (256ULL << 20)) >> 20), DiagnosticLevel::Warning);
+                       " MiB; the engine does not resize the expert cache itself -- name a smaller placement "
+                       "through --experts or POST /admin/expert-placement to give the memory back",
+                       DiagnosticLevel::Warning);
         }
         pressure_warned_ = pressure;
     }
@@ -3713,10 +3707,7 @@ public:
                 }
                 {
                     const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
-                    frames_now_ = resized.frames;
-                    pool_now_   = residency_->pool_bytes();
-                    // The switch names the pool's size from here on: the control law may shrink
-                    // below it under pressure and grow back to it, but never past it.
+                    // The switch names the pool's size from here on.
                     placement_ceiling_ = resized.frames;
                 }
                 // A grow backs new frames without filling them; the resident refill walks the
@@ -4047,32 +4038,6 @@ public:
             kv_busy(); // one attempt per idle period: blocks without host copies may still hold the top
             shrink_kv(true);
         }
-        if (!control_) { return; }
-        const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
-        const auto d = control_->decide(monitor_->latest(), pool_now_, frames_now_, vram_seconds(), idle);
-        // An explicit placement (a count or a file, at startup or through /admin/expert-placement)
-        // names the pool's size: the control law may shrink below it under another program's VRAM
-        // pressure and grow back to it, but never past it -- growing to the automatic fill would
-        // undo the placement's reserved VRAM (the gaming shape) as soon as the machine looks idle.
-        std::uint32_t target = d.frames;
-        if (placement_ceiling_ != 0 && target > placement_ceiling_) { target = placement_ceiling_; }
-        if (target == frames_now_) { return; }
-        const std::uint32_t before = frames_now_;
-        const auto resized         = residency_->resize(target, device_.stream, *vram_);
-        frames_now_                = resized.frames;
-        pool_now_                  = residency_->pool_bytes();
-        const VramSnapshot after   = monitor_->refresh();
-        diagnostic(std::string(d.shrink ? "free VRAM fell to " : "free VRAM rose to ") +
-                   std::to_string(after.device_free >> 20) + " MiB: expert cache " + std::to_string(before) +
-                   " -> " + std::to_string(frames_now_) + " frames" +
-                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)" : ""), DiagnosticLevel::Info);
-        if (d.shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
-            diagnostic("another program holds VRAM: the expert cache is down to " + std::to_string(frames_now_) + " of " +
-                       std::to_string(startup_frames_) +
-                       " frames, so decode is slower until that memory is released", DiagnosticLevel::Warning);
-            low_frames_warned_ = true;
-        }
-        if (frames_now_ * 4 >= startup_frames_) { low_frames_warned_ = false; }
     }
 
 private:
@@ -6129,16 +6094,17 @@ private:
     // The control law, the waker and the cache size the monitor reads. Recursive: the control path
     // resizes the KV pool (shrink_kv, grow_kv) with it held, and other callers take it there.
     std::recursive_mutex vram_mutex_;
-    std::optional<VramControl> control_;
     std::function<void()> waker_;
-    std::uint32_t frames_now_ = 0, startup_frames_ = 0;
+    // The sizing law's inputs for grow_kv's spare allowance (design §19.3.7): set at startup when
+    // the pool is elastic. `usage_at_sizing_` moves with the elastic KV pool's mappings, which are
+    // this process's growth but not the pool's.
+    VramDemand spare_demand_{};
+    std::uint64_t usage_at_sizing_ = 0;
+    std::uint64_t pool_at_sizing_  = 0;
     // The explicit placement's frame ceiling (ProgramOptions::expert_frame_ceiling), updated by
     // each applied placement switch; read at round boundaries by apply_vram_target.
     std::uint32_t placement_ceiling_ = 0;
-    std::uint64_t pool_now_   = 0;
-    bool low_frames_warned_   = false;
     bool pressure_warned_     = false;
-    Clock::time_point vram_epoch_{};
 
     std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0, pages_per_row_ = 0;
     std::uint32_t beside_decode_chunk_ = 0; // prompt tokens per call while another lane decodes (0: no cap)
@@ -6402,7 +6368,13 @@ private:
         // Memory the sizing function would give the frames anyway comes first; the rest is taken from
         // the frames, one chunk per pool over so the pools unmap at least that much.
         const std::uint32_t spare =
-            control_ ? std::max<std::uint32_t>(control_->target(vram_->query(), pool_now_), frames) - frames : 0;
+            residency_->elastic()
+                ? std::max<std::uint32_t>(frame_target(spare_demand_, offload::ExpertResidency::kChunkBytes,
+                                                       vram_->query(), residency_->pool_bytes(), usage_at_sizing_,
+                                                       pool_at_sizing_),
+                                         frames) -
+                      frames
+                : 0;
         const std::uint64_t spare_bytes = static_cast<std::uint64_t>(spare) * stride;
         std::uint32_t give              = 0;
         if (added > spare_bytes) {
@@ -6420,9 +6392,10 @@ private:
         }
         pool_->set_backed_pages(target);
         kv_grown_.store(true);
-        if (control_) { control_->account_fixed(static_cast<std::int64_t>(added)); }
-        frames_now_ = residency_->frames();
-        pool_now_   = residency_->pool_bytes();
+        if (residency_->elastic()) {
+            usage_at_sizing_ = static_cast<std::uint64_t>(static_cast<std::int64_t>(usage_at_sizing_) +
+                                                          static_cast<std::int64_t>(added));
+        }
         diagnostic("KV pool grew to " + std::to_string(target) + " pages (" +
                    std::to_string(kv_vmm_->mapped_bytes() >> 20) + " MiB); expert cache " + std::to_string(frames) +
                    " -> " + std::to_string(residency_->frames()) + " frames");
@@ -6461,9 +6434,10 @@ private:
         const std::uint64_t stride = residency_->frame_bytes();
         const std::uint32_t frames = residency_->frames();
         (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_);
-        if (control_) { control_->account_fixed(-static_cast<std::int64_t>(freed)); }
-        frames_now_ = residency_->frames();
-        pool_now_   = residency_->pool_bytes();
+        if (residency_->elastic()) {
+            usage_at_sizing_ = static_cast<std::uint64_t>(static_cast<std::int64_t>(usage_at_sizing_) -
+                                                          static_cast<std::int64_t>(freed));
+        }
         diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
                    " -> " + std::to_string(residency_->frames()) + " frames");
     }

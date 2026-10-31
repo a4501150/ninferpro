@@ -2,12 +2,12 @@
 
 // The VRAM monitor of the Qwen4Exp Program (design §19.3.7): one thread that reads the device's
 // video memory when the OS changes this process's budget, or once a second, keeps the latest
-// snapshot, and hands each to the Program's callback, which decides (with VramControl) whether the
-// expert cache must resize and wakes an idle engine. It mutates no CUDA state.
+// snapshot, and hands each to the Program's callback, which wakes an idle engine so it returns
+// idle KV pages to the expert frames and reports pressure below the headroom. It mutates no CUDA
+// state and resizes nothing: the client owns the placement.
 
 #include "core/vram_budget.h"
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -25,12 +25,6 @@ public:
     VramMonitor(const VramMonitor&)            = delete;
     VramMonitor& operator=(const VramMonitor&) = delete;
 
-    // The latest snapshot.
-    [[nodiscard]] VramSnapshot latest() const;
-    // Reads now on the calling thread (the device is current) and makes it the latest; for the
-    // engine after it resized the pool, so its next decision sees the new free memory.
-    VramSnapshot refresh();
-
 private:
     void run();
 
@@ -44,12 +38,5 @@ private:
     VramSnapshot latest_;
     std::thread thread_;
 };
-
-namespace testing {
-// The grow delay construct_qwen4_exp passes to ProgramOptions::vram_grow_delay_seconds (default 30 s);
-// engine-level tests shorten it.
-void set_vram_grow_delay(double seconds);
-[[nodiscard]] double vram_grow_delay();
-} // namespace testing
 
 } // namespace infernix::models::offload
