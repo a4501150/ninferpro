@@ -2808,7 +2808,7 @@ model estimates for recipe B at C=1 unless marked otherwise.
 
 | ID | Option | Expected gain | Cost / risk | Gate (measured in) |
 |---|---|---|---|---|
-| **H1** | **Persistent decode megakernel.** One persistent kernel per round executes an instruction stream of the round's Op tiles. Ops provide device-callable tile functions in addition to their host entries. An on-GPU scheduler resolves dependencies with counters. Weights for instruction i+1 stream in while instruction i computes, and host waits (CPU misses, PLE rows) are just dependencies. | Insurance against the conservative column of §4.2. If PDL overlap holds, it removes the ~0.5 µs residual of each of 507 kernels: 0.25-0.4 ms per token (5-8%). If PDL overlap fails, it recovers most of the 1.7 ms gap between the columns (up to ~35%). Hazy Research reached 78% of H100 bandwidth at batch 1 against < 50% for vLLM/SGLang; Lucebox runs a hybrid DeltaNet/attention model as one persistent kernel on an RTX 3090. Counterpoint: CUDA graphs alone gave 1.26× on H100 but only 1.03× on L4, so kernel-boundary gains are hardware-specific. | Very high: a new execution framework. Op tiles must remain individually qualifiable, and graph capture becomes instruction-list capture. On sm_120's 99 KB of shared memory, pages are 8 KiB, or weights stream into registers. | M6 nsys attribution: kernel boundary and tail gaps > 10% of the token after the baseline's PDL and prefetch measures |
+| **H1** | **Persistent decode megakernel.** One persistent kernel per round executes an instruction stream of the round's Op tiles. Ops provide device-callable tile functions in addition to their host entries. An on-GPU scheduler resolves dependencies with counters. Weights for instruction i+1 stream in while instruction i computes, and host waits (CPU misses, PLE rows) are just dependencies. | Insurance against the conservative column of §4.2. If PDL overlap holds, it removes the ~0.5 µs residual of each of 507 kernels: 0.25-0.4 ms per token (5-8%). If PDL overlap fails, it recovers most of the 1.7 ms gap between the columns (up to ~35%). Hazy Research reached 78% of H100 bandwidth at batch 1 against < 50% for vLLM/SGLang; Lucebox runs a hybrid DeltaNet/attention model as one persistent kernel on an RTX 3090. Counterpoint: CUDA graphs alone gave 1.26× on H100 but only 1.03× on L4, so kernel-boundary gains are hardware-specific. A 2026-11 experiment composed only the GDN projection and middle chain into one persistent launch ordered by per-head dependency counters (bit-exact, replay-safe, deadlock-free where a grid barrier deadlocks) and did not beat PDL at 1 x 1 - the composed ops it absorbed were ~5.7 us of chain work behind a ~26 us DRAM-bound projection; the protocol is validated and the win has to come from absorbing the latency-bound ops (the atlas below). | Very high: a new execution framework. Op tiles must remain individually qualifiable, and graph capture becomes instruction-list capture. On sm_120's 99 KB of shared memory, pages are 8 KiB, or weights stream into registers. | M6 nsys attribution: kernel boundary and tail gaps > 10% of the token after the baseline's PDL and prefetch measures |
 | **H2** | **CPU cache warming for predicted misses** (§10.4). Workers pre-load the predicted CPU-served experts' parts into their own L2 caches during the GPU's dense phase, so the miss computes from cache. | Warmed miss ~3-5 µs instead of ~40 µs with the integer kernels. +0.5% at the replay hit rate; at h = 0.90, +5% plain and +16% with MTP; at h = 0.85, +10% and +30% (§4.2 model). | Low. DRAM bandwidth is wasted on mispredictions, but DRAM is idle then. | M5: warmed-miss service time and prediction recall. Keep it if the exposed stall falls by > 25%. |
 | **H3** | **Intra-expert CPU + DMA split.** For a layer with one cold miss, the CPU computes part of the expert while the copy engine lands the rest into a staging frame, and the GPU computes that part. int64 partial sums add exactly (§16.2), so any row or block split is placement-invariant. | One cold miss ~33 µs instead of ~48 µs; more at low hit rates | Medium. Two handshakes, and it competes with prefetch for the copy engine. | M5: only if cold (unwarmed) misses remain > 20% of the exposed stall |
 | **H4** | **Two-layer-ahead prediction** (router of l+2 applied to x_l) | Doubles the prefetch window, so more misses become staged hits | Low. Lower recall, wasted DMA. | M1 recall@k′ and M5 useful-byte ratio > 0.5 |
@@ -11043,6 +11043,24 @@ inside kernels at low bandwidth, and option H1's gate (§17: boundary and tail g
 the token) is read from the unused column, not from gaps in a trace. Per layer the chain is about
 25 kernels, 1,139 per round.
 
+**The unused-bandwidth atlas across shapes** (2026-10-31, build 58bbbc0, RTX PRO 6000, production
+flags, `make t1-kernels KSHAPE=S METRICS=1`): the share of the round's busy time leaving DRAM
+bandwidth unused is 34.2 % at 1 x 1, 31.7 % at 6 x 1, 36.0 % at 1 x 4, 35.5 % at 6 x 2 and 38.8 %
+at 6 x 3, and the largest single pool moves with the width. At 6 x 3 the hyper-connection pair
+holds 2.1 ms of the 7.5 ms unused (`hc_up_collapse_v4_kernel` 1.54 ms at 21.8 % DRAM,
+`hc_down_partials_v4_kernel` 0.99 ms at 10.5 %) beside `projection_tall_kernel` (1.21 ms at
+31.2 %); at 1 x 1 the dense FP8 GEMV (0.65 ms at 61.0 %) and the GDN composed kernel (1.25 ms at
+80.3 %) lead, and the routed down pass falls to 41.8 % DRAM -- 40 CTAs per job (320 at eight
+jobs, 2.2 of the 3-per-SM slots) with the per-CTA chain (weight load, the PDL wait, the column
+loop's barriers) exposed at the low occupancy. Nsight Compute on the
+hyper-connection pair at 6 x 3: memory-latency-bound (37.4 % of a 6.0-cycle issue interval on the
+L1TEX scoreboard), one CTA per SM -- consistent with the co-residency rejection recorded above;
+`__launch_bounds__(.., 2)` on both v4 kernels re-measured tonight at 6 x 3 22.83 ms and 6 x 2
+17.00 ms against 18.77 and 14.59 (reverted). A 2-row-group down CTA (128 threads, twice the CTAs
+below twelve jobs, the same per-row unit order, hashes equal) re-measured 1 x 1 at 5112.4 us and
+1 x 4 at 8098.8 us against 5123.1 and 8085.2 -- a wash (reverted): the pass's non-stream time is
+its per-job dependency chain, not CTA fill.
+
 **Candidates**, by the bandwidth they leave unused:
 
 - The dense FP8 projections (0.78 ms). Nsight Compute on the 2560 x 6144 projection at T = 6:
@@ -11069,6 +11087,20 @@ the token) is read from the unused column, not from gaps in a trace. Per layer t
   at T = 6 became 18.4-22.5 us (depth 2-8); the tile is not waiting on DRAM phase by phase.
 - The in-place route plan's encode inside the routing CTA: the kernel took 18.3 us at 12 columns
   (one SM encoding every column); it keeps a CTA per column.
+- The GDN-middle megakernel's task-list ordering (2026-11-01 experiment, branch since deleted): the
+  composed projection-and-chain launch ordered by per-head dependency counters instead of the grid
+  barrier - after each projection virtual CTA its CTA bumps the value heads its rows feed, a head's
+  chain starts on its own thirty-four feeders, and the work order bands the virtual CTAs by key
+  head in closed form so a band's feeders complete while later bands stream. Bit-exact and
+  deterministic on every T1 shape, and - unlike the grid-barrier form, which deadlocks when the
+  launch's 348-CTA occupancy query overshoots real co-residency - safe on an oversubscribed grid.
+  Best end-to-end 5165 us at 48 clusters (288 CTAs) against the 5124 us composed baseline: the
+  kernel replaces about 1160 us of separated projection, convolution, recurrence and norm with
+  1194 us of its own. The chains are only about 5.7 us per layer, the projection is DRAM-bound, and
+  the counter bumps plus the 512-thread CTA's lower GEMV occupancy eat what the early chain start
+  saves. The ordering protocol is proven and reusable; a megakernel that also absorbs the
+  latency-bound hyper-connection pair and the down pass (the atlas's real pools) is where a win
+  would come from.
 
 ---
 

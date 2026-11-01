@@ -3287,7 +3287,7 @@ public:
             const std::span<const std::uint64_t> hits   = residency_->hits_by_layer();
             if (routed.empty()) { return; }
             std::string text = "expert cache per layer (hit% of routed uses):";
-            char part[40];
+            char part[64]; // one layer term plus the run term fit their worst case
             std::uint64_t total_routed = 0, total_hits = 0;
             for (std::size_t layer = 0; layer < routed.size(); ++layer) {
                 total_routed += routed[layer];
