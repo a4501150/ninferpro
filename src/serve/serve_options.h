@@ -68,6 +68,9 @@ struct ServeOptions {
     // --fast-path NAME (repeatable): also run these, qualified or not (qualification and timing
     // runs; EngineOptions::fast_path_candidates).
     std::vector<FastPath> fast_path_candidates;
+    // --no-fast-path NAME (repeatable): run without these even where qualified
+    // (EngineOptions::fast_path_exclusions).
+    std::vector<FastPath> fast_path_exclusions;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;

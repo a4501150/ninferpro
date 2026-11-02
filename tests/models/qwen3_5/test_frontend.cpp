@@ -2599,8 +2599,9 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
     return failures;
 }
 
-// Free tool output in tolerant mode recovers calls the model stranded in thinking it never closed;
-// a closed thinking, a quoted marker or a turn cut by its budget keeps everything as reasoning.
+// A turn that ends inside its thinking strands the calls it wrote there: they stay reasoning
+// text, never execute, and nothing leaks into content. The constrained grammar refuses a call
+// opener inside thinking outright, so this is the free route's shape.
 int test_open_reasoning_tool_recovery() {
     const Frontend frontend = make_frontend(resources());
     infernix::PromptInput input;
@@ -2619,6 +2620,8 @@ int test_open_reasoning_tool_recovery() {
     const std::string call =
         "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"
         "</tool_call>";
+    const std::string open  = call.substr(0, call.find('\n'));
+    const std::string close(fi::kCanonicalReasoningCloseSerialization);
     struct Turn {
         PublishedOutput output;
         std::vector<infernix::GeneratedToolCall> calls;
@@ -2640,27 +2643,24 @@ int test_open_reasoning_tool_recovery() {
     };
 
     int failures = 0;
+    const auto stranded = [&](const Turn& turn, const std::string& label) {
+        return check(turn.calls.empty() &&
+                         channel_text(turn.output, infernix::OutputChannel::Content).empty(),
+                     ("a stranded call executed or leaked content for " + label).c_str());
+    };
     {
         const Turn turn = run(planning + call, true);
-        failures += check(turn.calls.size() == 1 && turn.calls[0].name == "bash" &&
-                              turn.calls[0].arguments_json == R"({"command":"ls"})" &&
-                              turn.diagnostics.recovered_from_reasoning &&
-                              channel_text(turn.output, infernix::OutputChannel::Content).empty() &&
-                              channel_text(turn.output, infernix::OutputChannel::Reasoning) ==
-                                  planning + call,
-                          "a call stranded in unclosed thinking was not recovered");
+        failures += stranded(turn, "a turn ended inside its thinking") &&
+                    check(channel_text(turn.output, infernix::OutputChannel::Reasoning) ==
+                              planning + call,
+                          "a call stranded in unclosed thinking lost its text");
     }
-    const auto rejected = [&](const Turn& turn, const std::string& label) {
-        return check(turn.calls.empty() && !turn.diagnostics.recovered_from_reasoning &&
-                         channel_text(turn.output, infernix::OutputChannel::Content).empty(),
-                     ("open-thinking recovery fired or leaked content for " + label).c_str());
-    };
-    failures += rejected(run(planning + call + "\n</think>\n\n", true),
-                         "a closed thinking with no content");
-    failures += rejected(run("I could emit <tool_call> now, but the question needs no tool.\n", true),
+    failures += stranded(run(planning + call + close, true), "a closed thinking with no content");
+    failures += stranded(run("I could quote " + open + " here, but the question needs no tool.\n",
+                             true),
                          "a quoted marker");
-    failures += rejected(run(planning + call, false), "a turn cut by its output budget");
-    failures += rejected(run(planning + call, true, false), "strict tool output");
+    failures += stranded(run(planning + call, false), "a turn cut by its output budget");
+    failures += stranded(run(planning + call, true, false), "strict tool output");
     return failures;
 }
 

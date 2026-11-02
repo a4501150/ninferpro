@@ -598,6 +598,11 @@ BenchOptions parse_args(int argc, char** argv) {
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--no-fast-path") {
+            const std::string name(value("--no-fast-path"));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_exclusions.push_back(*path);
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {

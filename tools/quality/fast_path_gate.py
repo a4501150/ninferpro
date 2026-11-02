@@ -94,7 +94,8 @@ FAST_PATHS = ("prompt-pv8", "decode-split64", "batched-decode", "batched-a8-deco
               "expert-a4-residual", "batch-split-attention", "adaptive-speculation",
               "free-cache-resume", "preemption", "q8-sliced-k", "gdn-conv-fused",
               "qsa-prepare-fused", "adaptive-mtp", "idle-wide-prefill", "fp8-a8-pair", "q4-w4a8",
-              "sampled-mtp-drafts", "gdn-f16-accumulate", "ggml-bf16-prefill", "gdn-compensated")
+              "sampled-mtp-drafts", "gdn-f16-accumulate", "ggml-bf16-prefill", "gdn-compensated",
+              "hc-sliced-k", "bf16-index-mma")
 
 
 class MeasurementError(RuntimeError):
@@ -870,6 +871,7 @@ def run_prefill(args: argparse.Namespace) -> Path:
     claim_out(out, {"command": "prefill", "artifact": args.artifact, "corpus": args.corpus,
                     "text": args.text, "quick": args.quick, "context": args.context,
                     "stride": args.stride, "ngram_volume": args.ngram_volume,
+                    "no_fast_path": list(args.no_fast_path),
                     "fast_chunk": args.fast_chunk},
               args.fast_path, ["*/fast-c*"])
     workload = ["--context", str(args.context), "--stride", str(args.stride), "--log-level",
@@ -913,10 +915,15 @@ def run_prefill(args: argparse.Namespace) -> Path:
 
 
 def candidate_options(args: argparse.Namespace, option: str) -> list[str]:
-    """The fast run's options: every qualified path, plus each --fast-path candidate."""
+    """The fast run's options: every qualified path, plus each --fast-path candidate, less each
+    --no-fast-path exclusion. Mind the selection's coupling: excluding one width-keyed path keeps
+    the others' width-routed arithmetic (the exact route loses column invariance) until every
+    width-keyed path is excluded."""
     out = []
     for name in args.fast_path:
         out += [option, name]
+    for name in getattr(args, "no_fast_path", []):
+        out += ["--no-fast-path", name]
     return out
 
 
@@ -939,6 +946,7 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
                     "concurrency": args.concurrency, "kv_tokens": args.kv_tokens,
                     "prefix_reuse": args.prefix_reuse, "warm_tokens": args.warm_tokens,
                     "ngram_volume": args.ngram_volume,
+                    "no_fast_path": list(args.no_fast_path),
                     "free_running_segments": args.free_running_segments},
               args.fast_path, ["fast-forced.json", "fast.txt", "judge.json"])
     text = args.text or str(corpus_text(Path(args.corpus), out))
@@ -975,6 +983,11 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
         run([args.forced, args.artifact, text, str(target), "--observe", str(reference),
              "--mode", args.mode, "--kv-dtype", args.kv] + segments + arm + volume + extra,
             out / f"{route}-forced.log")
+    selected = load_forced(out / "fast-forced.json")["fast_paths"]
+    if any(name in selected for name in args.no_fast_path):
+        kept = [name for name in args.no_fast_path if name in selected]
+        raise MeasurementError(f"the fast run still selected {', '.join(kept)}; the exclusion "
+                               "did not apply to this tool")
     # The preemption path acts only on a preempted request: a run that never preempted is no
     # evidence for it.
     if "preemption" in args.fast_path and load_forced(out / "fast-forced.json")["preemptions"] == 0:
@@ -984,7 +997,8 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
     if args.free_running:
         modes = [] if args.mode == "dflash2" else [args.mode]
         for route, extra in (("default", ["exact", f"kv={args.kv}"]),
-                             ("fast", [f"path={p}" for p in args.fast_path] + [f"kv={args.kv}"])):
+                             ("fast", [f"path={p}" for p in args.fast_path]
+                              + [f"no-path={p}" for p in args.no_fast_path] + [f"kv={args.kv}"])):
             target = out / f"{route}.txt"
             if target.is_file():
                 continue
@@ -1056,6 +1070,9 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     prefill.add_argument("--ngram-volume", help="Qwen3.8-Flash-Next n-gram volume")
     prefill.add_argument("--fast-path", action="append", default=[], choices=FAST_PATHS,
                          help="a candidate to qualify, run with the qualified paths")
+    prefill.add_argument("--no-fast-path", action="append", default=[], choices=FAST_PATHS,
+                         help="a qualified path to leave out (attribution; a changed set needs a "
+                              "fresh --out)")
     prefill.add_argument("--fast-chunk", type=int, default=0,
                          help="prefill chunk of every fast run, each paired with the default run "
                               "at its --chunk (a schedule fast path that widens prefill steps); "
@@ -1088,6 +1105,9 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     decode.add_argument("--free-running-segments", type=int, default=128)
     decode.add_argument("--fast-path", action="append", default=[], choices=FAST_PATHS,
                         help="a candidate to qualify, run with the qualified paths")
+    decode.add_argument("--no-fast-path", action="append", default=[], choices=FAST_PATHS,
+                        help="a qualified path to leave out (attribution; a changed set needs a "
+                             "fresh --out)")
     decode.add_argument("--ngram-volume", help="Qwen3.8-Flash-Next n-gram volume")
     decode.add_argument("--forced", default=default_tool("infernix_decode_quality_forced"))
     decode.add_argument("--gen", default=default_tool("infernix_decode_quality_gen"))

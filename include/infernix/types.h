@@ -636,6 +636,12 @@ struct EngineOptions {
     // whether or not they are qualified for this configuration, so their cost can be measured.
     // Each must apply to the configuration (its kernel must run in it).
     std::vector<FastPath> fast_path_candidates;
+    // Quality attribution (the quality tools): run without these fast paths even where they are
+    // qualified. Each must apply to the configuration, and none may also be a candidate. A
+    // width-keyed path's exact counterpart stays width-routed while any other width-keyed path
+    // still runs (the selection loses column invariance for the whole forward pass), so arms that
+    // attribute one path must mind the coupling.
+    std::vector<FastPath> fast_path_exclusions;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -964,8 +970,6 @@ struct ToolCallParseDiagnostics {
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
     // Tolerant tool-call mode turned output the strict parser rejects into structured calls.
     bool tolerant_recovered = false;
-    // Tolerant tool-call mode took the structured calls from a turn that ended inside its thinking.
-    bool recovered_from_reasoning = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;

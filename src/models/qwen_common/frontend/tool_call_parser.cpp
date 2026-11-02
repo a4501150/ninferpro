@@ -925,30 +925,6 @@ void publish_structured_calls(ParsedToolCallOutput& out, const std::vector<RawTo
     out.is_tool_call_response             = true;
 }
 
-// A turn that ended inside its thinking can hold the calls it meant to make. Accept the earliest
-// marker from which the rest of the thinking is nothing but complete, declared calls, parsed
-// strictly: prose after a call, a quoted marker or a cut call leaves the thinking as reasoning.
-// The prose before the accepted region is never returned.
-ParsedToolCallOutput parse_open_reasoning_calls(std::string_view reasoning,
-                                                std::size_t max_tool_name_length,
-                                                const Contract& contract) {
-    std::size_t candidate = find_first_tool_marker(reasoning);
-    while (candidate != std::string_view::npos) {
-        std::vector<RawToolCall> calls;
-        QwenToolRegionParser parser(reasoning.substr(candidate), max_tool_name_length, contract,
-                                    false);
-        if (parser.parse(calls) == FallbackReason::None) {
-            ParsedToolCallOutput out;
-            out.diagnostics.marker_seen              = true;
-            out.diagnostics.recovered_from_reasoning = true;
-            publish_structured_calls(out, calls, parser.duplicate_parameters_repaired(), contract);
-            return out;
-        }
-        const std::size_t next = find_first_tool_marker(reasoning.substr(candidate + 1));
-        candidate = next == std::string_view::npos ? next : candidate + 1 + next;
-    }
-    return {};
-}
 
 } // namespace
 
@@ -986,6 +962,24 @@ void MarkdownCodeTracker::end_line() {
 bool MarkdownCodeTracker::in_code() const noexcept {
     return fence_ != '\0' ||
            (ticks_ + static_cast<std::uint32_t>(std::count(line_.begin(), line_.end(), '`'))) % 2 == 1;
+}
+
+bool contains_unquoted_tool_marker(std::string_view text) {
+    // A marker inside Markdown code is a quoted example; only a marker the code state leaves is
+    // one the reasoning section would refuse.
+    MarkdownCodeTracker code;
+    std::size_t tracked = 0;
+    const auto quoted   = [&](std::size_t at) {
+        code.feed(text.substr(tracked, at - tracked));
+        tracked = at;
+        return code.in_code();
+    };
+    std::size_t candidate = find_first_tool_marker(text);
+    while (candidate != std::string_view::npos && quoted(candidate)) {
+        const std::size_t next = find_first_tool_marker(text.substr(candidate + 1));
+        candidate = next == std::string_view::npos ? next : candidate + 1 + next;
+    }
+    return candidate != std::string_view::npos;
 }
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
@@ -1161,38 +1155,10 @@ void ToolCallOutputDecoder::initialize_continuation(std::string_view prefix) {
         trailing_whitespace_.size() + pending_tag_.size() + tool_region_.size();
 }
 
-ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reason,
-                                                              std::string_view open_reasoning) {
+ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reason) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     finished_ = true;
     if (!contract_) { return {}; }
-
-    // Only a turn the model ended itself recovers calls from its open thinking; an output,
-    // context or cancellation cut leaves a call it was still deliberating over unexecuted. The
-    // grammar never checked thinking, so a constrained turn keeps only what its grammar would have
-    // admitted without checking values: calls to non-strict tools, one unless parallel.
-    if (tolerant_ && reason == FinishReason::StopToken && !open_reasoning.empty() &&
-        !fed_content_ && !(contract_->constrained && contract_->required)) {
-        ParsedToolCallOutput recovered =
-            parse_open_reasoning_calls(open_reasoning, max_tool_name_length_, *contract_);
-        const auto admitted = [&] {
-            if (!contract_->constrained) return true;
-            if (!contract_->parallel && recovered.tool_calls.size() > 1) return false;
-            return std::all_of(recovered.tool_calls.begin(), recovered.tool_calls.end(),
-                               [&](const GeneratedToolCall& call) {
-                                   return std::any_of(
-                                       contract_->tools.begin(), contract_->tools.end(),
-                                       [&](const auto& tool) {
-                                           return tool.name == call.name && !tool.strict;
-                                       });
-                               });
-        };
-        if (recovered.is_tool_call_response && admitted()) {
-            return Terminal{.content     = {},
-                            .tool_calls  = std::move(recovered.tool_calls),
-                            .diagnostics = recovered.diagnostics};
-        }
-    }
 
     if (contract_->constrained && saw_tool_marker_) {
         Terminal result;

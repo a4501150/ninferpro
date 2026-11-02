@@ -64,6 +64,7 @@ struct Options {
     bool a16_activations                = false;
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
+    std::vector<infernix::FastPath> fast_path_exclusions;
     std::optional<std::filesystem::path> ngram_volume;
     infernix::product::LogLevel log_level = infernix::product::LogLevel::Info;
 };
@@ -156,6 +157,11 @@ Options parse_options(int argc, char** argv) {
             const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
             if (!path) { usage_error("unknown fast path: " + std::string(name)); }
             out.fast_path_candidates.push_back(*path);
+        } else if (option == "--no-fast-path") {
+            const std::string_view name = value("--no-fast-path");
+            const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
+            if (!path) { usage_error("unknown fast path: " + std::string(name)); }
+            out.fast_path_exclusions.push_back(*path);
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -296,6 +302,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     // The 16-bit-activation reference runs the exact route.
     engine_options.fast_paths           = options.fast_paths && !options.a16_activations;
     engine_options.fast_path_candidates = options.fast_path_candidates;
+    engine_options.fast_path_exclusions = options.fast_path_exclusions;
     if (options.ngram_volume) { engine_options.ngram_volume_path = *options.ngram_volume; }
     engine_options.expert_stripe_path   = options.expert_stripe;
     engine_options.startup_observer = startup_log.observer();

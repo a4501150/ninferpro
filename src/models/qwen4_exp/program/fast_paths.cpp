@@ -554,13 +554,27 @@ FastPathSelection select_fast_paths(const execution::Parameters& parameters, con
                                         " does not apply to " + describe(out.configuration));
         }
     }
+    for (const FastPath path : options.fast_path_exclusions) {
+        if (!fast_path_applies(path, out.configuration, options)) {
+            throw std::invalid_argument(std::string("excluded fast path ") + fast_path_name(path) +
+                                        " does not apply to " + describe(out.configuration));
+        }
+        if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(), path) !=
+            options.fast_path_candidates.end()) {
+            throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +
+                                        " is both a candidate and an exclusion");
+        }
+    }
     for (const FastPath path : kFastPaths) {
         const bool candidate = std::find(options.fast_path_candidates.begin(),
                                          options.fast_path_candidates.end(),
                                          path) != options.fast_path_candidates.end();
+        const bool excluded  = std::find(options.fast_path_exclusions.begin(),
+                                        options.fast_path_exclusions.end(),
+                                        path) != options.fast_path_exclusions.end();
         const bool qualified = options.fast_paths && fast_path_applies(path, out.configuration, options) &&
                                fast_path_qualified(path, out.configuration);
-        if (candidate || qualified) { out.paths.push_back(path); }
+        if ((candidate || qualified) && !excluded) { out.paths.push_back(path); }
     }
     return out;
 }

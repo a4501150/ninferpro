@@ -774,6 +774,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--no-fast-path") {
+            const std::string name(require_value("--no-fast-path"));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_exclusions.push_back(*path);
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {

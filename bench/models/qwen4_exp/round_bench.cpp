@@ -138,6 +138,7 @@ struct Options {
     std::int32_t staging_slots = 80;
     bool miss_route = false;
     std::vector<FastPath> fast_path_candidates; // --fast-path: run before its registry entry
+    std::vector<FastPath> fast_path_exclusions; // --no-fast-path: run without it even where qualified
 };
 
 std::vector<Shape> parse_shapes(const std::string& text) {
@@ -218,6 +219,11 @@ Options parse(int argc, char** argv) {
             const auto path        = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("--fast-path " + name + ": no such fast path"); }
             o.fast_path_candidates.push_back(*path);
+        } else if (arg == "--no-fast-path") {
+            const std::string name = value();
+            const auto path        = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("--no-fast-path " + name + ": no such fast path"); }
+            o.fast_path_exclusions.push_back(*path);
         } else if (arg == "--check") {
             o.check = value();
         } else if (arg == "--record") {
@@ -1027,6 +1033,7 @@ std::string hash_key(const Options& o, const Shape& shape) {
         << " kv=" << o.kv_name << " experts=" << (o.sample_experts == 0 ? std::string("all") : std::to_string(o.sample_experts))
         << ' ' << (o.exact ? "exact" : "fast") << " accept=" << (o.accept < 0 ? shape.width : std::clamp(o.accept, 0, shape.width));
     for (const FastPath path : o.fast_path_candidates) { key << " +" << fast_path_name(path); }
+    for (const FastPath path : o.fast_path_exclusions) { key << " -" << fast_path_name(path); }
     return key.str();
 }
 
@@ -1083,6 +1090,7 @@ int main(int argc, char** argv) {
         engine.fast_paths = !o.exact;
         engine.kv_cache   = storage;
         engine.fast_path_candidates = o.fast_path_candidates;
+        engine.fast_path_exclusions = o.fast_path_exclusions;
         const q4::FastPathSelection selection = q4::select_fast_paths(parameters, engine);
         std::printf("fast paths:");
         for (const FastPath path : selection.paths) { std::printf(" %s", fast_path_name(path)); }

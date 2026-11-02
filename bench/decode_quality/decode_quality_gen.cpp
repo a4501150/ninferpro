@@ -3,8 +3,9 @@
 // optimized proposal head, INT8 KV, CUDA Graph decode; with `mtp`, Qwen3.8-Flash-Next's: its MTP
 // drafter with 4 drafts and the optimized proposal head; with `plain`, no speculation (one token per
 // round, the single-column decode kernels). Fast paths run as in infernix-serve; `exact` runs the
-// exact route (EngineOptions::fast_paths off) and `path=NAME` also runs that fast path whether or
-// not it is qualified (qualification). Qwen3.8-Flash-Next's DFlash2 drafter is a companion artifact:
+// exact route (EngineOptions::fast_paths off), `path=NAME` also runs that fast path whether or
+// not it is qualified (qualification), and `no-path=NAME` runs without it even where it is
+// qualified (attribution). Qwen3.8-Flash-Next's DFlash2 drafter is a companion artifact:
 // `draft-model=FILE` selects it (`drafts=N`, 1-7, its draft count, also MTP's; `auto` its per-round length;
 // `full-head` drafts with the text head instead of the proposal head). `temperature=T` samples
 // instead (top-k 20, top-p 0.95, segment s seeded s + 1: a speed workload; the judge scores greedy
@@ -18,6 +19,7 @@
 //
 // Usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> <prompt_tokens>
 //                                  <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [exact] [path=NAME]...
+//                                  [no-path=NAME]...
 //                                  [draft-model=FILE [drafts=N] [auto] [full-head]] (Qwen3.8-Flash-Next DFlash2)
 //                                  [temperature=T]
 //                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
@@ -49,6 +51,7 @@ int main(int argc, char** argv) {
         const auto new_tokens    = static_cast<std::uint32_t>(std::stoul(argv[6]));
         bool ngram = false, mtp = false, plain = false, exact = false, draft_auto = false, full_head = false;
         std::vector<std::string> paths;
+        std::vector<std::string> no_paths;
         std::string ngram_volume, route_trace, draft_model;
         std::uint32_t drafts = 7;
         bool drafts_set      = false;
@@ -84,6 +87,8 @@ int main(int argc, char** argv) {
                 temperature = std::stof(flag.substr(12));
             } else if (flag.starts_with("path=")) {
                 paths.push_back(flag.substr(5));
+            } else if (flag.starts_with("no-path=")) {
+                no_paths.push_back(flag.substr(8));
             } else if (flag.starts_with("kv=")) {
                 const std::string name = flag.substr(3);
                 if (name == "bf16") {
@@ -180,6 +185,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
             options.fast_path_candidates.push_back(*path);
+        }
+        for (const std::string& name : no_paths) {
+            const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
+            if (!path) {
+                std::cerr << "unknown fast path " << name << '\n';
+                return 2;
+            }
+            options.fast_path_exclusions.push_back(*path);
         }
 #endif
         if (!ngram_volume.empty()) { options.ngram_volume_path = ngram_volume; }

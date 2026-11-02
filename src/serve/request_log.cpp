@@ -110,8 +110,7 @@ Json tool_call_parse_json(const infernix::ToolCallParseDiagnostics& diagnostics)
                 {"duplicate_parameters_repaired", diagnostics.duplicate_parameters_repaired},
                 {"fallback_reason",
                  infernix::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
-                {"tolerant_recovered", diagnostics.tolerant_recovered},
-                {"recovered_from_reasoning", diagnostics.recovered_from_reasoning}};
+                {"tolerant_recovered", diagnostics.tolerant_recovered}};
 }
 
 std::string tool_choice_name(const ToolChoice& choice) {

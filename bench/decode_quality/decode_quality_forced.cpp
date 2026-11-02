@@ -77,6 +77,7 @@ struct Options {
     std::string kv        = "int8";
     bool fast_paths       = true;
     std::vector<infernix::FastPath> candidates;
+    std::vector<infernix::FastPath> exclusions;
     std::uint32_t concurrency   = 1;
     std::uint32_t prefill_chunk = 4096;
     // KV pool tokens; 0: every lane's whole context. Less makes concurrent requests preempt.
@@ -88,10 +89,10 @@ struct Options {
     std::string ngram_volume;
 };
 
-std::uint32_t parse_u32(std::string_view text, const char* label) {
+std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zero = false) {
     std::uint32_t value = 0;
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (error != std::errc{} || end != text.data() + text.size() || value == 0) {
+    if (error != std::errc{} || end != text.data() + text.size() || (!allow_zero && value == 0)) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + std::string(text));
     }
     return value;
@@ -109,7 +110,7 @@ Options parse(int argc, char** argv) {
         if (option == "--segments") {
             out.segments = parse_u32(value(), "segments");
         } else if (option == "--first-segment") {
-            out.first_segment = parse_u32(value(), "first segment");
+            out.first_segment = parse_u32(value(), "first segment", true);
         } else if (option == "--prompts") {
             out.prompts.clear();
             std::string_view list = value();
@@ -147,6 +148,11 @@ Options parse(int argc, char** argv) {
             const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path " + std::string(name)); }
             out.candidates.push_back(*path);
+        } else if (option == "--no-fast-path") {
+            const std::string_view name = value();
+            const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path " + std::string(name)); }
+            out.exclusions.push_back(*path);
         } else {
             throw std::invalid_argument("unknown option " + std::string(option));
         }
@@ -369,6 +375,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk   = options.prefill_chunk;
         engine_options.fast_paths           = options.fast_paths;
         engine_options.fast_path_candidates = options.candidates;
+        engine_options.fast_path_exclusions = options.exclusions;
         if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
         if (!options.prefix_reuse) {
             engine_options.context_cache.enabled             = false;

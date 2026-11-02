@@ -53,6 +53,9 @@ struct Options {
     // --fast-path NAME (repeatable): also run these, qualified or not (qualification runs;
     // EngineOptions::fast_path_candidates).
     std::vector<FastPath> fast_path_candidates;
+    // --no-fast-path NAME (repeatable): run without these even where qualified (attribution runs;
+    // EngineOptions::fast_path_exclusions).
+    std::vector<FastPath> fast_path_exclusions;
     SpeculativeOptions speculative;
     bool enable_vision                     = false;
     VisionOffload vision_offload                    = VisionOffload::Auto;

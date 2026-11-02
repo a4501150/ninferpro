@@ -47,6 +47,11 @@ parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_l
                             const ToolCallOutputContract& contract, bool tolerant = false,
                             MarkdownCodeTracker code = {});
 
+// Whether `text` holds a tool-call marker outside Markdown code. The constraint grammar's
+// reasoning section refuses such a marker inside thinking, so a thinking control message
+// holding one would fail every budget-limited constrained request.
+[[nodiscard]] bool contains_unquoted_tool_marker(std::string_view text);
+
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
 // suffix. At terminal time, constrained output retains completed calls across interruptions;
 // free output restores malformed regions verbatim.
@@ -66,11 +71,7 @@ public:
     }
     [[nodiscard]] std::string feed(std::string_view text);
     void initialize_continuation(std::string_view prefix);
-    // `open_reasoning` is the thinking of a turn that ended without closing it. For free tool
-    // output in tolerant mode, when the turn ended on a stop token and no content was fed,
-    // complete calls stranded at the end of that thinking become the structured turn.
-    [[nodiscard]] Terminal finish(FinishReason reason             = FinishReason::StopToken,
-                                  std::string_view open_reasoning = {});
+    [[nodiscard]] Terminal finish(FinishReason reason = FinishReason::StopToken);
 
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;

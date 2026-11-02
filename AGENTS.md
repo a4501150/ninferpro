@@ -52,8 +52,9 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
     split to `--prefill-chunk-beside-decode` and each but the last rides in the decode round's
     Forward (mixed rounds, `ForwardBatch::prefill_part`); only the column-invariant exact route
     (where the bits equal the separate calls') and request-coupled fast routes mix;
-  - tool-call grammar fixes: under a constrained auto contract a call opener inside Markdown code
-    is text, and the turn may end inside its thinking (non-strict calls there are recovered);
+  - tool-call grammar fixes: a call opener inside Markdown code is text, and the constraint
+    grammar's reasoning section refuses an unquoted opener, so a call cannot start inside
+    thinking and the turn cannot end there; the thinking-recovery machinery is gone;
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
 
 ### Mechanism and policy

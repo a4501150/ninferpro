@@ -79,6 +79,7 @@ struct BenchOptions {
     bool original_nvfp4_prefill_kernel = false;
     bool fast_paths                    = true;
     std::vector<FastPath> fast_path_candidates;
+    std::vector<FastPath> fast_path_exclusions;
     std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

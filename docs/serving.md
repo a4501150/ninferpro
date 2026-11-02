@@ -352,17 +352,13 @@ its closing tags, or the closing bracket after the function name is missing: the
 reported structurally with a `truncated_tail` diagnostic (logged at Info severity) rather than
 demoted to text, and an undeclared tool name stays structured for the consumer to judge.
 
-Tolerant mode also recovers calls the model wrote inside its thinking when it ends the turn with
-its stop token without closing the thinking, so no call reached the answer. If, from some marker to
-the end of that thinking, there is nothing but complete calls to declared tools (parsed strictly),
-those calls become the structured turn (logged at Info severity). The thinking before them stays
-reasoning and is never published as content. Nothing is recovered when the thinking was closed,
-when the turn published any content, when it ended at the output limit, context capacity or a
-cancellation, or when prose or a cut call follows the last call. Constrained tool calls (below) are
-well formed by construction and do not use the first recovery. An `auto` constrained turn may also
-end inside its thinking, and in tolerant mode the same rule recovers the calls written there when
-they go to non-strict tools (their values were never checked) and, without parallel calls, there
-is only one; a required or named choice, or a JSON answer, still needs the closed thinking.
+A call cannot start inside thinking. Under a tool constraint the reasoning section of the
+constraint grammar refuses the call opener outside Markdown code, so the model closes its
+thinking before any call and a turn cannot end inside its thinking; a quoted opener inside a
+fence or inline code stays text. Without a constraint (or with thinking off) there is no such
+refusal: a call the model writes inside open thinking stays reasoning text, never executes, and
+nothing is shown twice. A `--thinking-budget-message` containing an unquoted call opener is
+rejected at startup, because it would fail every budget-limited constrained request.
 
 ### Tool constraints
 
@@ -1318,7 +1314,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--prefix-cache-save-mins N` | Qwen3.5, with `--prefix-cache-file`: also save the Host tier there every `N` minutes while serving, counted from the end of the previous save, and only when it changed since the last save or load. The save runs at the first point between execution units once due, also while requests run: they wait while it is written (the log reports the size, the save time and how long requests waited). It writes `PATH.tmp` and replaces `PATH` only once complete, so a crash or power loss leaves the previous file; stopping the server during a periodic save abandons it before the shutdown save. Each save rewrites the whole file (up to `--host-context-mib`, several GB), so a short interval writes a lot to the drive and wears an SSD faster: at 7.5 GB every 5 minutes that is up to ~2 TB a day, every 30 minutes ~360 GB. | off: saved only when the server stops |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
-| `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and complete calls stranded in thinking the model never closed | off |
+| `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |
@@ -1556,7 +1552,6 @@ suffix or a call cut at the region end), and with none the region was returned a
 `tolerant_recovered` is true when `--tolerant-tool-calls` turned output the strict parser rejects
 into structured calls: a recovered `truncated_tail`, or a kept call whose opener (a dropped `<` or
 keyword, a missing `>` after the name) was repaired or whose name is not a declared tool.
-`recovered_from_reasoning` is true when the calls came from a turn that ended inside its thinking.
 These counters contain no tool arguments or generated text.
 
 `request_done.constraint` carries the same constraint observation as the HTTP terminal result,

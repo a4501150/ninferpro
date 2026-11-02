@@ -128,6 +128,7 @@ constexpr std::array kCliOptions{
     CliOption{"--use-original-nvfp4-prefill-kernel", false},
     CliOption{"--disable-fast-paths", false},
     CliOption{"--fast-path", true, true},
+    CliOption{"--no-fast-path", true, true},
     CliOption{"--stop-token-id", true, true},
     CliOption{"--stop", true, true},
     CliOption{"--reasoning-stop", true, true},
@@ -534,6 +535,11 @@ Options parse_options(int argc, char** argv) {
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--no-fast-path") {
+            const std::string name(value(arg));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_exclusions.push_back(*path);
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

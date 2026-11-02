@@ -189,8 +189,8 @@ struct Fed {
 
 Fed feed(infernix::text::GrammarCompiler& compiler,
          const frontend::ToolCallOutputContract& contract, std::string_view close,
-         std::string_view text) {
-    auto matcher = frontend::compile_tool_grammar(compiler, contract, close, {});
+         std::string_view text, const std::optional<infernix::OutputConstraint>& body = {}) {
+    auto matcher = frontend::compile_tool_grammar(compiler, contract, close, {}, body);
     std::vector<std::uint32_t> words(matcher->mask_words());
     for (unsigned char c : text) {
         if (matcher->masks({}, words) || !(words[c / 32] & (1u << (c % 32)))) return {};
@@ -256,37 +256,62 @@ void quoted_openers(infernix::text::GrammarCompiler& compiled) {
             "an unquoted opener no longer starts a call");
 }
 
-// A turn of an auto contract may end in its thinking; tolerant recovery then keeps the calls the
-// model wrote there. Without the end, such a turn could only write more calls (2026-10-28).
-void open_thinking(infernix::text::GrammarCompiler& compiled) {
+// The reasoning section refuses a call opener outside Markdown code, so a call cannot start
+// inside thinking and the turn cannot end there: the model closes its thinking first (the
+// 2026-10-28 turns could only write more calls).
+void masked_reasoning(infernix::text::GrammarCompiler& compiled) {
     const std::string_view close = frontend::kCanonicalReasoningCloseSerialization;
-    const auto loose             = contract(schema({{"type", "string"}}), false);
-    const auto thinking          = "Let me look.\n\n" + call("ls");
-    require(feed(compiled, *loose, close, thinking).eos, "an auto turn cannot end in its thinking");
+    const auto loose     = contract(schema({{"type", "string"}}), false);
+    const std::string whole  = call("v");
+    const std::string opener = whole.substr(0, whole.find("\n<function="));
+    const std::string head   = "Let me look.\n\n" + opener.substr(0, opener.size() - 1);
+    const char last          = opener.back();
+
+    require(feed(compiled, *loose, close, head).admitted, "the grammar refused thinking text");
+    require(!feed(compiled, *loose, close, head + last).admitted,
+            "a call opener was admitted inside thinking");
+    require(!feed(compiled, *loose, close, "Let me look.\n\n" + call("ls")).admitted,
+            "a complete call was admitted inside thinking");
+    const auto open_ended = feed(compiled, *loose, close, "Still thinking.");
+    require(open_ended.admitted && !open_ended.eos, "the turn ended inside its thinking");
+    require(feed(compiled, *loose, close, "Quoted:\n```\n" + opener + "\n```\nstays quoted text.")
+                 .admitted,
+            "a fenced opener inside thinking was refused");
+    require(feed(compiled, *loose, close, "Use `" + opener + "` inline.\n").admitted,
+            "an inline-quoted opener inside thinking was refused");
     require(feed(compiled, *loose, close, "Done." + std::string(close) + "Answer.").eos,
             "a closed thinking lost its answer");
-    require(!feed(compiled, *loose, close, "Done." + std::string(close) + "<tool_call>").other,
+    require(!feed(compiled, *loose, close, "Done." + std::string(close) + opener).other,
             "the close no longer leads into the answer grammar");
-    infernix::ToolChoice required;
-    required.mode       = infernix::ToolChoiceMode::Required;
-    const auto forced   = contract(schema({{"type", "string"}}), false, required);
-    require(!feed(compiled, *forced, close, thinking).eos, "a required call ended in thinking");
+    require(feed(compiled, *loose, close, "Done." + std::string(close) + call("2")).eos,
+            "a closed thinking lost its call");
 
-    const auto recover = [&](const auto& bound, std::string_view reasoning) {
-        frontend::ToolCallOutputDecoder decoder(bound, 64, true);
-        return decoder.finish(infernix::FinishReason::StopToken, reasoning).tool_calls.size();
-    };
-    require(recover(loose, thinking) == 1, "a constrained turn lost the call in its thinking");
-    require(recover(contract(schema({{"type", "string"}}), true), thinking) == 0,
-            "a strict call was recovered without its value check");
-    infernix::ToolChoice single;
-    single.parallel = false;
-    require(recover(contract(schema({{"type", "string"}}), false, single),
-                    thinking + "\n" + call("pwd")) == 0,
-            "recovery admitted calls a single-call contract refuses");
-    frontend::ToolCallOutputDecoder strict_mode(loose, 64, false);
-    require(strict_mode.finish(infernix::FinishReason::StopToken, thinking).tool_calls.empty(),
-            "recovery ran without tolerant mode");
+    infernix::ToolChoice required;
+    required.mode   = infernix::ToolChoiceMode::Required;
+    const auto forced = contract(schema({{"type", "string"}}), false, required);
+    require(!feed(compiled, *forced, close, head + last).admitted,
+            "a required choice relaxed the thinking refusal");
+    require(feed(compiled, *forced, close, "Planning." + std::string(close) + call("2")).eos,
+            "a required call lost its closed thinking");
+    const auto bounded =
+        contract(schema({{"type", "integer"}, {"minimum", 2}, {"maximum", 3}}), true, required);
+    require(feed(compiled, *bounded, close, "Planning." + std::string(close) + call("2")).eos,
+            "a strict call lost its closed thinking");
+    require(!feed(compiled, *bounded, close, "Planning." + std::string(close) + call("4")).admitted,
+            "a strict call escaped its value check after the close");
+
+    const auto json = infernix::OutputConstraint::json_schema(R"({"type": "object"})");
+    require(feed(compiled, *loose, close, head, json).admitted, "a JSON union refused thinking text");
+    require(!feed(compiled, *loose, close, head + last, json).admitted,
+            "a JSON union relaxed the thinking refusal");
+    require(feed(compiled, *loose, close, "Planning." + std::string(close) + call("v"), json).eos,
+            "a JSON union lost its call path");
+
+    bool rejected = false;
+    try {
+        (void)frontend::compile_tool_grammar(compiled, *loose, close, "Half-thought " + opener, {});
+    } catch (const infernix::RequestError&) { rejected = true; }
+    require(rejected, "a prefill holding an opener inside open thinking was accepted");
 }
 
 void run() {
@@ -294,7 +319,7 @@ void run() {
     basic_contracts(compiled);
     selected_contracts(compiled);
     quoted_openers(compiled);
-    open_thinking(compiled);
+    masked_reasoning(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =

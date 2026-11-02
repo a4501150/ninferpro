@@ -595,6 +595,11 @@ public:
         if (!options.thinking_budget_message.empty()) {
             control_name = "thinking budget message";
             control_suffix = options.thinking_budget_message;
+            if (fi::contains_unquoted_tool_marker(control_suffix)) {
+                throw std::invalid_argument(
+                    "thinking budget message holds a tool-call marker outside Markdown code, which "
+                    "the tool constraint grammar refuses inside thinking");
+            }
             if (!control_suffix.ends_with(fi::kCanonicalReasoningCloseSerialization)) {
                 control_suffix += fi::kCanonicalReasoningCloseSerialization;
             }
