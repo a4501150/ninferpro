@@ -62,6 +62,7 @@ struct Options {
     bool original_int8_prefill_kernel   = false;
     bool original_nvfp4_prefill_kernel  = false;
     bool a16_activations                = false;
+    bool width_routed_kernels           = false;
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
     std::vector<infernix::FastPath> fast_path_exclusions;
@@ -82,6 +83,8 @@ std::string usage_text() {
            "       [--a16-activations] (16-bit activations in every linear: the reference for\n"
            "        measuring activation quantization, on the exact route; at least 3x slower\n"
            "        on NVFP4 artifacts)\n"
+           "       [--width-routed-kernels] (a reference on the width-routed kernels where the exact\n"
+           "        route runs column-invariant ones: the quality gate's second reference)\n"
            "       [--disable-fast-paths] (score the exact route; by default the qualified fast\n"
            "        paths run, as in infernix-serve)\n"
            "       [--fast-path NAME]... (qualification: also run this fast path, qualified or\n"
@@ -148,6 +151,8 @@ Options parse_options(int argc, char** argv) {
             out.original_nvfp4_prefill_kernel = true;
         } else if (option == "--a16-activations") {
             out.a16_activations = true;
+        } else if (option == "--width-routed-kernels") {
+            out.width_routed_kernels = true;
         } else if (option == "--ngram-volume") {
             out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
         } else if (option == "--disable-fast-paths") {
@@ -299,6 +304,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
     engine_options.a16_activations               = options.a16_activations;
+    engine_options.width_routed_kernels          = options.width_routed_kernels;
     // The 16-bit-activation reference runs the exact route.
     engine_options.fast_paths           = options.fast_paths && !options.a16_activations;
     engine_options.fast_path_candidates = options.fast_path_candidates;
@@ -567,6 +573,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
           {"a16_activations", options.a16_activations},
+          {"width_routed_kernels", options.width_routed_kernels},
+          {"column_invariant_kernels", load.column_invariant_kernels},
           {"fast_paths", load.fast_paths},
           {"fast_path_configuration", load.fast_path_configuration},
           {"stride_tokens", options.stride},

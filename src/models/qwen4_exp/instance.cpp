@@ -667,6 +667,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.request_invariance_capable = true;
     // Tail skip makes the output depend on which experts the cache holds.
     summary.request_invariant          = fast.request_invariant() && options.expert_tail_skip == 0;
+    summary.column_invariant_kernels   = fast.forward().column_invariant;
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

@@ -503,7 +503,7 @@ bool FastPathSelection::width_keyed() const noexcept {
 }
 
 bool FastPathSelection::request_invariant() const noexcept {
-    if (width_keyed()) { return false; }
+    if (width_keyed() || width_routed) { return false; }
     // The schedule paths (adaptive-speculation, free-cache-resume, preemption) couple a request by
     // moving its call boundaries and round composition: on a construction-exact configuration the
     // column-invariant arithmetic keeps the bits through any resume, replay or mixed round, so there
@@ -539,15 +539,21 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
             .expert_a4_residual = selected(FastPath::ExpertA4Residual),
             .gdn_arithmetic     = gdn,
-            .column_invariant   = invariant && !width_keyed()};
+            .column_invariant   = invariant && !width_keyed() && !width_routed};
 }
 
 bool FastPathSelection::construction_exact() const noexcept {
-    return paths.empty() && qwen4_exp::construction_exact(configuration);
+    return paths.empty() && !width_routed && qwen4_exp::construction_exact(configuration);
 }
 
 FastPathSelection select_fast_paths(const execution::Parameters& parameters, const EngineOptions& options) {
-    FastPathSelection out{.configuration = fast_path_configuration(parameters, options), .paths = {}};
+    FastPathSelection out{.configuration = fast_path_configuration(parameters, options),
+                          .paths         = {},
+                          .width_routed  = options.width_routed_kernels};
+    if (out.width_routed && !qwen4_exp::construction_exact(out.configuration)) {
+        throw std::invalid_argument("width-routed kernels: the exact route of " + describe(out.configuration) +
+                                    " runs no column-invariant kernels");
+    }
     for (const FastPath path : options.fast_path_candidates) {
         if (!fast_path_applies(path, out.configuration, options)) {
             throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +

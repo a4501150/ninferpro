@@ -12,7 +12,9 @@
 // one pass), for the same segments. --observe REFERENCE then makes each forced step also report the
 // log-probabilities of the reference's top tokens and its own largest log-probability
 // (TokenConstraint::observe), so the gate measures the decode route's KL divergence from the
-// reference and its top-1 agreement exactly as the prefill gate does.
+// reference and its top-1 agreement exactly as the prefill gate does. --width-routed writes the
+// reference on the width-routed kernels (EngineOptions::width_routed_kernels); a reference records
+// whether its route ran column-invariant kernels, which tells the gate it needs that second one.
 //
 // Segments lie back to back from the corpus's first token, no two sharing a token, and cycle
 // through the prompt lengths, so the forced steps read short and long contexts. --first-segment N
@@ -34,7 +36,8 @@
 // prefill and decode time, which shows which of the two its wall time went to.
 //
 // Usage: infernix_decode_quality_forced <artifact> <corpus.txt> <out.json> [--segments N]
-//          [--first-segment N] [--prompts L1,L2,...] [--forced N] [--reference | --observe REFERENCE.json]
+//          [--first-segment N] [--prompts L1,L2,...] [--forced N]
+//          [--reference [--width-routed] | --observe REFERENCE.json]
 //          [--mode plain|dflash2|ngram|mtp|mtp-ngram] [--kv-dtype int8|bf16|fp8|nvfp4]
 //          [--disable-fast-paths] [--fast-path NAME]...
 //          [--concurrency 1..8] [--prefill-chunk N] [--prefix-reuse [--warm-tokens N]]
@@ -85,6 +88,7 @@ struct Options {
     bool prefix_reuse           = false;
     std::uint32_t warm_tokens   = 0; // 0: the whole prompt
     bool reference              = false;
+    bool width_routed           = false;
     std::string observe;
     std::string ngram_volume;
 };
@@ -139,6 +143,8 @@ Options parse(int argc, char** argv) {
             out.warm_tokens = parse_u32(value(), "warm tokens");
         } else if (option == "--reference") {
             out.reference = true;
+        } else if (option == "--width-routed") {
+            out.width_routed = true;
         } else if (option == "--observe") {
             out.observe = value();
         } else if (option == "--disable-fast-paths") {
@@ -168,6 +174,7 @@ Options parse(int argc, char** argv) {
     if (out.reference && !out.observe.empty()) {
         throw std::invalid_argument("--reference and --observe exclude each other");
     }
+    if (out.width_routed && !out.reference) { throw std::invalid_argument("--width-routed needs --reference"); }
     return out;
 }
 
@@ -271,16 +278,20 @@ void write_reference(const Options& options, std::uint32_t longest, std::ostream
     engine_options.prefill_chunk   = engine_options.max_context;
     engine_options.a16_activations = true;
     engine_options.fast_paths      = false;
+    engine_options.width_routed_kernels = options.width_routed;
     if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
     infernix::Engine engine(engine_options);
     const std::vector<infernix::TokenId> tokens = read_tokens(engine, options);
     const Segments segments(tokens, options);
+    const infernix::LoadSummary load = engine.load_summary();
 
     constexpr std::uint32_t kTop = infernix::kMaximumObservedTokens;
     static_assert(kTop <= infernix::kMaximumScoreTopTokens);
     out << "{\"artifact\": ";
     write_string(out, artifact_path(options.artifact));
-    out << ", \"kind\": \"reference\", \"forced_tokens\": " << options.forced
+    out << ", \"kind\": \"reference\", \"width_routed\": " << (options.width_routed ? "true" : "false")
+        << ", \"column_invariant_kernels\": " << (load.column_invariant_kernels ? "true" : "false")
+        << ", \"forced_tokens\": " << options.forced
         << ", \"top_tokens\": " << kTop << ", \"segments\": [";
     for (std::uint32_t segment = 0; segment < options.segments; ++segment) {
         std::vector<infernix::TokenId> input = segments.prompt(segment);

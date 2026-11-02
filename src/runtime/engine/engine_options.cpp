@@ -103,6 +103,7 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";fast=" + std::to_string(options.fast_paths ? 1 : 0);
     for (const FastPath path : options.fast_path_candidates) { out += std::string(",") + fast_path_name(path); }
     for (const FastPath path : options.fast_path_exclusions) { out += std::string(";no-") + fast_path_name(path); }
+    if (options.width_routed_kernels) { out += ";width-routed"; }
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
     return out;
 }

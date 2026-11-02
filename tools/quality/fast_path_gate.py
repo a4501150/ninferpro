@@ -10,7 +10,10 @@ measure, the same for every artifact and KV format (about what llama.cpp's q8_0 
 FP16); the floor (the default route's own divergence from the reference) is reported, not used.
 Every decision is a one-sided 95 % upper confidence bound over independent units (scoring windows
 or decode segments), so noise makes a fast path harder to pass, never easier: a noisier comparison
-needs more data.
+needs more data. Where the reference route runs column-invariant kernels (Qwen3.8-Flash-Next's
+construction-exact configurations), the exact route shares its roundings, so every run is also
+scored against a reference on the width-routed kernels (WIDTH_ROUTED) and each unit is averaged
+over both references.
 
 Subcommands:
   prefill          run (or reuse) the reference and the default and fast-path
@@ -172,6 +175,37 @@ def bounded(name: str, units: Sequence[PairedUnit], budget: float, policy: Polic
     return Criterion(name, mean, bound, budget, bound <= budget, detail)
 
 
+# Where the reference route runs column-invariant kernels (the forced tool's reference, the judge's
+# report and infernix-perplexity's report record column_invariant_kernels), the exact route shares
+# their roundings and a width-routed fast route does not, so the excess would also count distance
+# from those roundings: every run is scored against a second reference on the width-routed kernels
+# too, kept under this subdirectory, and each unit is averaged over both (model-quality.md 6.4).
+WIDTH_ROUTED = "width-routed"
+
+
+def mean_units(sets: Sequence[Sequence[PairedUnit]]) -> list[PairedUnit]:
+    """Each unit's default and fast totals averaged over the references it was scored against;
+    every set holds the same units (windows or segments) in the same order."""
+    if any(len(s) != len(sets[0]) for s in sets):
+        raise MeasurementError("the references scored different numbers of units")
+    out = []
+    for units in zip(*sets):
+        if any(u.weight != units[0].weight for u in units):
+            raise MeasurementError("a unit's weight differs between references")
+        out.append(PairedUnit(units[0].weight, sum(u.default for u in units) / len(units),
+                              sum(u.fast for u in units) / len(units)))
+    return out
+
+
+def reference_flag(record: dict, source: Path | str) -> bool:
+    """Whether a reference ran column-invariant kernels (and so needs the width-routed second)."""
+    flag = record.get("column_invariant_kernels")
+    if flag is None:
+        raise MeasurementError(f"{source} predates column_invariant_kernels; recompute it "
+                               "(--recompute-reference, or a fresh --out)")
+    return bool(flag)
+
+
 # --- prefill -------------------------------------------------------------------------------------
 
 
@@ -271,28 +305,42 @@ def compared_pairs(base: Sequence[Path], candidate: Sequence[Path]) -> list[Chun
 
 def evaluate_prefill_pairs(pairs: Sequence[ChunkPair], scope: str,
                            policy: Policy = POLICY) -> Verdict:
+    return evaluate_prefill_sets([pairs], scope, policy)
+
+
+def evaluate_prefill_sets(sets: Sequence[Sequence[ChunkPair]], scope: str,
+                          policy: Policy = POLICY) -> Verdict:
+    """sets: the same runs scored against each reference (WIDTH_ROUTED), averaged per window."""
     verdict = Verdict(scope=scope)
     # Each window is one unit; its runs (chunk sizes) are summed into it.
     # totals: positions, KL default, KL fast, disagreement default/fast, NLL default/fast
-    units: dict[tuple[str, int], list[float]] = {}
-    for pair in pairs:
-        default = window_records(pair.default)
-        fast = window_records(pair.fast)
-        if default.keys() != fast.keys():
-            raise MeasurementError(f"{pair.label}: the runs scored different windows")
-        for key, d in default.items():
-            f = fast[key]
-            if d["positions"] != f["positions"] or d["scored_tokens"] != f["scored_tokens"]:
-                raise MeasurementError(f"{pair.label}: window {key} position counts differ")
-            n = d["positions"]
-            totals = units.setdefault(key, [0.0] * 7)
-            totals[0] += n
-            totals[1] += n * d["mean_kl"]
-            totals[2] += n * f["mean_kl"]
-            totals[3] += n * (1.0 - d["top1_agreement"])
-            totals[4] += n * (1.0 - f["top1_agreement"])
-            totals[5] += d["total_nll"]
-            totals[6] += f["total_nll"]
+    per_reference: list[dict[tuple[str, int], list[float]]] = []
+    for pairs in sets:
+        scored: dict[tuple[str, int], list[float]] = {}
+        for pair in pairs:
+            default = window_records(pair.default)
+            fast = window_records(pair.fast)
+            if default.keys() != fast.keys():
+                raise MeasurementError(f"{pair.label}: the runs scored different windows")
+            for key, d in default.items():
+                f = fast[key]
+                if d["positions"] != f["positions"] or d["scored_tokens"] != f["scored_tokens"]:
+                    raise MeasurementError(f"{pair.label}: window {key} position counts differ")
+                n = d["positions"]
+                totals = scored.setdefault(key, [0.0] * 7)
+                totals[0] += n
+                totals[1] += n * d["mean_kl"]
+                totals[2] += n * f["mean_kl"]
+                totals[3] += n * (1.0 - d["top1_agreement"])
+                totals[4] += n * (1.0 - f["top1_agreement"])
+                totals[5] += d["total_nll"]
+                totals[6] += f["total_nll"]
+        per_reference.append(scored)
+    if any(scored.keys() != per_reference[0].keys() for scored in per_reference):
+        raise MeasurementError("the runs scored against each reference cover different windows")
+    units = {key: [sum(scored[key][i] for scored in per_reference) / len(per_reference)
+                   for i in range(7)] for key in per_reference[0]}
+    pairs = [pair for chunk_pairs in sets for pair in chunk_pairs]
     if len(units) < policy.min_units:
         raise MeasurementError(
             f"{len(units)} scoring windows; the bound needs at least {policy.min_units}")
@@ -307,7 +355,8 @@ def evaluate_prefill_pairs(pairs: Sequence[ChunkPair], scope: str,
     floor_kl = sum(t[1] for t in units.values()) / positions
     floor_top1 = sum(t[3] for t in units.values()) / positions
     verdict.facts = {
-        "runs": [p.label for p in pairs],
+        "runs": [p.label for p in sets[0]],
+        "references": len(sets),
         "kv_dtype": pairs[0].default["execution"]["kv_dtype"],
         "windows": len(units),
         "positions_per_route": positions,
@@ -373,8 +422,19 @@ def evaluate_prefill_pairs(pairs: Sequence[ChunkPair], scope: str,
 
 
 def evaluate_prefill(directory: Path, policy: Policy = POLICY, fast_chunk: int = 0) -> Verdict:
-    return evaluate_prefill_pairs(prefill_pairs(directory, fast_chunk), f"prefill {directory}",
-                                  policy)
+    """One KV format's runs; with their WIDTH_ROUTED subdirectory, scored against both references.
+    A run directory's own reference (../reference) that ran column-invariant kernels requires it."""
+    sets = [prefill_pairs(directory, fast_chunk)]
+    if (directory / WIDTH_ROUTED).is_dir():
+        sets.append(prefill_pairs(directory / WIDTH_ROUTED, fast_chunk))
+    else:
+        reference = directory.parent / "reference" / "report.json"
+        if reference.is_file():
+            with reference.open(encoding="utf-8") as handle:
+                if json.load(handle)["execution"].get("column_invariant_kernels"):
+                    raise MeasurementError(f"{directory} lacks its runs against the width-routed "
+                                           f"reference ({WIDTH_ROUTED}/)")
+    return evaluate_prefill_sets(sets, f"prefill {directory}", policy)
 
 
 # --- decode --------------------------------------------------------------------------------------
@@ -509,46 +569,67 @@ def quantile(values: Sequence[float], q: float) -> float:
 
 
 def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
-                    policy: Policy = POLICY, *, fast_route: bool = True) -> Verdict:
+                    policy: Policy = POLICY, *, fast_route: bool = True,
+                    second: tuple[Path, Path, Path] | None = None) -> Verdict:
     """The decode criteria: the prefill criteria at teacher-forced decode positions.
 
     The floor is the default run's own decode divergence from the reference. With fast_route=False
-    (compare-decode) any two runs of one reference are compared, for controls.
+    (compare-decode) any two runs of one reference are compared, for controls. second: the default
+    and fast runs that observed the width-routed reference, and that reference (WIDTH_ROUTED); each
+    segment is then averaged over both references.
     """
-    default, fast = load_forced(default_path), load_forced(fast_path)
-    reference = load_forced(reference_path)
-    for key in ("mode", "kv_dtype", "forced_tokens"):
-        if default[key] != fast[key] and fast_route:
-            raise MeasurementError(f"the teacher-forced runs differ in {key}")
-    if fast_route and (default["fast_paths"] or not fast["fast_paths"]):
-        raise MeasurementError("expected an exact-route run and a run with fast paths active")
-    if fast_route and not all(same_artifact(run["artifact"], reference["artifact"])
-                              for run in (default, fast)):
-        raise MeasurementError("the reference and the teacher-forced runs scored other artifacts")
-    if reference.get("kind") != "reference" or reference["forced_tokens"] != default["forced_tokens"]:
-        raise MeasurementError(f"{reference_path} is not a reference for these runs")
-    a, coverage = forced_segments(default, reference)
-    b, _ = forced_segments(fast, reference)
+    triples = [(default_path, fast_path, reference_path)] + ([second] if second else [])
+    scored: list[tuple[list[ForcedSegment], list[ForcedSegment], float]] = []
+    runs: list[tuple[dict, dict]] = []
+    for d_path, f_path, r_path in triples:
+        default, fast = load_forced(d_path), load_forced(f_path)
+        reference = load_forced(r_path)
+        for key in ("mode", "kv_dtype", "forced_tokens"):
+            if default[key] != fast[key] and fast_route:
+                raise MeasurementError(f"the teacher-forced runs differ in {key}")
+        if fast_route and (default["fast_paths"] or not fast["fast_paths"]):
+            raise MeasurementError("expected an exact-route run and a run with fast paths active")
+        if fast_route and not all(same_artifact(run["artifact"], reference["artifact"])
+                                  for run in (default, fast)):
+            raise MeasurementError("the reference and the teacher-forced runs scored other artifacts")
+        if reference.get("kind") != "reference" or reference["forced_tokens"] != default["forced_tokens"]:
+            raise MeasurementError(f"{r_path} is not a reference for these runs")
+        a, coverage = forced_segments(default, reference)
+        b, _ = forced_segments(fast, reference)
+        scored.append((a, b, coverage))
+        runs.append((default, fast))
+    if second and not reference_flag(load_forced(reference_path), reference_path):
+        raise MeasurementError(f"{reference_path} ran no column-invariant kernels; it needs no second")
+    a = scored[0][0]
+    if any([s.prompt_tokens for s in x] != [s.prompt_tokens for s in a] for x, _, _ in scored):
+        raise MeasurementError("the references' runs forced different segments")
     if len(a) < policy.min_units:
         raise MeasurementError(f"{len(a)} segments; the bound needs at least {policy.min_units}")
+    coverage = min(c for _, _, c in scored)
     if coverage < policy.coverage_minimum:
         raise MeasurementError(
             f"the reference's top tokens cover {coverage:.3f} of its distribution; the KL bound "
             f"needs at least {policy.coverage_minimum}")
-    kl_units = [PairedUnit(len(d.kl), sum(d.kl), sum(f.kl)) for d, f in zip(a, b)]
-    tv_units = [PairedUnit(len(d.tv), sum(d.tv), sum(f.tv)) for d, f in zip(a, b)]
-    top1_units = [PairedUnit(len(d.kl), sum(d.disagreement), sum(f.disagreement))
-                  for d, f in zip(a, b)]
-    nll_units = [PairedUnit(len(d.kl), d.nll, f.nll) for d, f in zip(a, b)]
+
+    def units(value: Callable[[ForcedSegment], float]) -> list[PairedUnit]:
+        return mean_units([[PairedUnit(len(d.kl), value(d), value(f)) for d, f in zip(x, y)]
+                           for x, y, _ in scored])
+
+    kl_units = units(lambda s: sum(s.kl))
+    tv_units = units(lambda s: sum(s.tv))
+    top1_units = units(lambda s: sum(s.disagreement))
+    nll_units = units(lambda s: s.nll)
     positions = sum(u.weight for u in kl_units)
     floor_kl = sum(u.default for u in kl_units) / positions
     floor_tv = sum(u.default for u in tv_units) / positions
     floor_top1 = sum(u.default for u in top1_units) / positions
+    default, fast = runs[0]
     verdict = Verdict(scope=f"teacher-forced decode {default['mode']} {fast_path.parent}")
     verdict.facts = {
         "mode": default["mode"],
         "kv_dtype": default["kv_dtype"],
         "segments": len(a),
+        "references": len(triples),
         "forced_positions_per_route": positions,
         "reference_top_mass": coverage,
         "floor_kl": floor_kl,
@@ -575,12 +656,12 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
     # Gross caps on point estimates, their bounds reported: KL and NLL (NLL moves at first order,
     # as in prefill), the far tail, and each prompt length.
     cap = policy.decode_kl_cap
-    for name, units in (("decode mean KL excess", kl_units), ("decode NLL excess", nll_units)):
-        mean, bound = paired_excess(units, policy.z)
+    for name, criterion_units in (("decode mean KL excess", kl_units), ("decode NLL excess", nll_units)):
+        mean, bound = paired_excess(criterion_units, policy.z)
         verdict.criteria.append(Criterion(name, mean, mean, cap, mean <= cap,
                                           f"95% bound {bound:.4e}"))
-    default_tail = quantile([k for s in a for k in s.kl], 0.999)
-    fast_tail = quantile([k for s in b for k in s.kl], 0.999)
+    default_tail = quantile([k for x, _, _ in scored for s in x for k in s.kl], 0.999)
+    fast_tail = quantile([k for _, y, _ in scored for s in y for k in s.kl], 0.999)
     tail_ratio = fast_tail / default_tail if default_tail > 0 else (0.0 if fast_tail == 0 else math.inf)
     verdict.criteria.append(Criterion("decode p99.9 KL ratio", tail_ratio, tail_ratio,
                                       policy.tail_ratio,
@@ -588,60 +669,79 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
                                       f"default {default_tail:.6g}, fast {fast_tail:.6g}; "
                                       f"a fast p99.9 to {policy.tail_minimum:g} passes"))
     by_prompt: dict[int, list[float]] = {}
-    for d, f in zip(a, b):
-        totals = by_prompt.setdefault(d.prompt_tokens, [0.0, 0.0, 0.0])
-        totals[0] += len(d.tv)
-        totals[1] += sum(d.tv)
-        totals[2] += sum(f.tv)
+    for x, y, _ in scored:
+        for d, f in zip(x, y):
+            totals = by_prompt.setdefault(d.prompt_tokens, [0.0, 0.0, 0.0])
+            totals[0] += len(d.tv)
+            totals[1] += sum(d.tv)
+            totals[2] += sum(f.tv)
     for prompt in sorted(by_prompt):
         n, d, f = by_prompt[prompt]
         excess = (f - d) / n
         bucket_cap = policy.point_cap_factor * policy.tv_budget
         verdict.criteria.append(
             Criterion(f"prompt {prompt} decode TV excess", excess, excess, bucket_cap,
-                      excess <= bucket_cap, f"{int(n)} positions, default {d / n:.6g}"))
+                      excess <= bucket_cap,
+                      f"{int(n / len(scored))} positions, default {d / n:.6g}"))
     return verdict
 
 
-def evaluate_free_running(report_path: Path, policy: Policy = POLICY) -> Verdict:
-    """Greedy continuations, each judged on its own prefix against the reference."""
-    with report_path.open(encoding="utf-8") as handle:
-        report = json.load(handle)
-    runs = report["runs"]
-    if len(runs) != 2:
-        raise MeasurementError("the judge report must hold exactly the default and the fast run")
-    default, fast = runs[0]["segments"], runs[1]["segments"]
-    if [s["offset"] for s in default] != [s["offset"] for s in fast]:
-        raise MeasurementError("default and fast runs generated from different segments")
-    if len(default) < policy.min_units:
-        raise MeasurementError(
-            f"{len(default)} segments; the bound needs at least {policy.min_units}")
-    for s in default + fast:
-        if s["tokens"] <= 0:
-            raise MeasurementError("a segment generated no tokens")
+def evaluate_free_running(report_path: Path, policy: Policy = POLICY,
+                          second: Path | None = None) -> Verdict:
+    """Greedy continuations, each judged on its own prefix against the reference. second: the
+    same generations judged against the width-routed reference (WIDTH_ROUTED); each segment is
+    then averaged over both."""
+    reports = []
+    for path in [report_path] + ([second] if second else []):
+        with path.open(encoding="utf-8") as handle:
+            reports.append(json.load(handle))
+    if second and not reference_flag(reports[0], report_path):
+        raise MeasurementError(f"{report_path}'s reference ran no column-invariant kernels; it "
+                               "needs no second")
+    disagreement_sets, regret_sets = [], []
+    for report in reports:
+        runs = report["runs"]
+        if len(runs) != 2:
+            raise MeasurementError("the judge report must hold exactly the default and the fast run")
+        if [r["file"] for r in runs] != [r["file"] for r in reports[0]["runs"]]:
+            raise MeasurementError("the judge reports judged different generations")
+        default, fast = runs[0]["segments"], runs[1]["segments"]
+        if [s["offset"] for s in default] != [s["offset"] for s in fast]:
+            raise MeasurementError("default and fast runs generated from different segments")
+        if len(default) < policy.min_units:
+            raise MeasurementError(
+                f"{len(default)} segments; the bound needs at least {policy.min_units}")
+        for s in default + fast:
+            if s["tokens"] <= 0:
+                raise MeasurementError("a segment generated no tokens")
+        # Per-token rates of each build, weighted by the segment's mean length.
+        disagreement_sets.append([
+            PairedUnit(
+                (d["tokens"] + f["tokens"]) / 2,
+                (1.0 - d["agree"] / d["tokens"]) * (d["tokens"] + f["tokens"]) / 2,
+                (1.0 - f["agree"] / f["tokens"]) * (d["tokens"] + f["tokens"]) / 2,
+            )
+            for d, f in zip(default, fast)
+        ])
+        regret_sets.append([
+            PairedUnit(
+                (d["tokens"] + f["tokens"]) / 2,
+                d["regret"] / d["tokens"] * (d["tokens"] + f["tokens"]) / 2,
+                f["regret"] / f["tokens"] * (d["tokens"] + f["tokens"]) / 2,
+            )
+            for d, f in zip(default, fast)
+        ])
+    report = reports[0]
+    default = report["runs"][0]["segments"]
+    disagreement = mean_units(disagreement_sets)
+    regret = mean_units(regret_sets)
     verdict = Verdict(scope=f"free-running decode {report_path}")
-    # Per-token rates of each build, weighted by the segment's mean length.
-    disagreement = [
-        PairedUnit(
-            (d["tokens"] + f["tokens"]) / 2,
-            (1.0 - d["agree"] / d["tokens"]) * (d["tokens"] + f["tokens"]) / 2,
-            (1.0 - f["agree"] / f["tokens"]) * (d["tokens"] + f["tokens"]) / 2,
-        )
-        for d, f in zip(default, fast)
-    ]
-    regret = [
-        PairedUnit(
-            (d["tokens"] + f["tokens"]) / 2,
-            d["regret"] / d["tokens"] * (d["tokens"] + f["tokens"]) / 2,
-            f["regret"] / f["tokens"] * (d["tokens"] + f["tokens"]) / 2,
-        )
-        for d, f in zip(default, fast)
-    ]
     tokens = sum(u.weight for u in disagreement)
     floor_disagreement = sum(u.default for u in disagreement) / tokens
     floor_regret = sum(u.default for u in regret) / tokens
     verdict.facts = {
         "reference": report.get("reference"),
+        "references": len(reports),
         "segments": len(default),
         "tokens_per_route": tokens,
         "default_disagreement": floor_disagreement,
@@ -873,7 +973,7 @@ def run_prefill(args: argparse.Namespace) -> Path:
                     "stride": args.stride, "ngram_volume": args.ngram_volume,
                     "no_fast_path": list(args.no_fast_path),
                     "fast_chunk": args.fast_chunk},
-              args.fast_path, ["*/fast-c*"])
+              args.fast_path, ["*/fast-c*", f"*/{WIDTH_ROUTED}/fast-c*"])
     workload = ["--context", str(args.context), "--stride", str(args.stride), "--log-level",
                 "warning"]
     workload += ["--corpus", args.corpus] if args.corpus else ["--text", args.text]
@@ -885,7 +985,8 @@ def run_prefill(args: argparse.Namespace) -> Path:
     # 16-bit activations, BF16 KV, one pass per window.
     one_pass = ["--kv-dtype", "bf16", "--prefill-chunk", str(args.context), "--a16-activations"]
     reference = out / "reference.top"
-    key = {"kind": "prefill", "artifact": artifact_identity(args.artifact),
+    # format 2: the reference records column_invariant_kernels.
+    key = {"kind": "prefill", "format": 2, "artifact": artifact_identity(args.artifact),
            "corpus": corpus_identity(args.corpus, args.text), "quick": args.quick,
            "context": args.context, "stride": args.stride,
            "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None,
@@ -897,20 +998,41 @@ def run_prefill(args: argparse.Namespace) -> Path:
         args.reference_cache, args.recompute_reference,
         [p for p in out.glob("*/*-c*") if p.is_dir()])
     print(f"  reference: {source}", flush=True)
+    references = [(reference, Path())]
+    record = out / "reference" / "report.json"
+    with record.open(encoding="utf-8") as handle:
+        width_routed = reference_flag(json.load(handle)["execution"], record)
+    if width_routed:
+        second = out / WIDTH_ROUTED / "reference.top"
+        second.parent.mkdir(exist_ok=True)
+        source = ensure_reference(
+            out, [f"{WIDTH_ROUTED}/reference.top", f"{WIDTH_ROUTED}/reference"],
+            dict(key, route=one_pass + ["--width-routed-kernels"]),
+            lambda: run(common + one_pass + ["--width-routed-kernels", "--save-top-tokens",
+                                             str(second), "--output",
+                                             str(out / WIDTH_ROUTED / "reference")],
+                        out / WIDTH_ROUTED / "reference.log"),
+            args.reference_cache, args.recompute_reference,
+            [p for p in out.glob(f"*/{WIDTH_ROUTED}/*-c*") if p.is_dir()])
+        print(f"  width-routed reference: {source}", flush=True)
+        references.append((second, Path(WIDTH_ROUTED)))
     for kv in args.kv:
         for chunk in args.chunk:
-            for route, extra in (("default", ["--disable-fast-paths"]),
-                                 ("fast", candidate_options(args, "--fast-path"))):
-                target = out / kv / f"{route}-c{chunk}"
-                if (target / "report.json").is_file():
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                # A schedule fast path's fast run may prefill at another width than the default
-                # run it pairs with (--fast-chunk); the pair keeps the default run's chunk name.
-                width = args.fast_chunk if route == "fast" and args.fast_chunk else chunk
-                run(common + ["--kv-dtype", kv, "--prefill-chunk", str(width), "--kl-reference",
-                              str(reference), "--output", str(target)] + extra,
-                    out / kv / f"{route}-c{chunk}.log")
+            for scored_against, subdirectory in references:
+                for route, extra in (("default", ["--disable-fast-paths"]),
+                                     ("fast", candidate_options(args, "--fast-path"))):
+                    directory = out / kv / subdirectory
+                    target = directory / f"{route}-c{chunk}"
+                    if (target / "report.json").is_file():
+                        continue
+                    directory.mkdir(parents=True, exist_ok=True)
+                    # A schedule fast path's fast run may prefill at another width than the
+                    # default run it pairs with (--fast-chunk); the pair keeps the default run's
+                    # chunk name.
+                    width = args.fast_chunk if route == "fast" and args.fast_chunk else chunk
+                    run(common + ["--kv-dtype", kv, "--prefill-chunk", str(width), "--kl-reference",
+                                  str(scored_against), "--output", str(target)] + extra,
+                        directory / f"{route}-c{chunk}.log")
     return out
 
 
@@ -948,7 +1070,8 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
                     "ngram_volume": args.ngram_volume,
                     "no_fast_path": list(args.no_fast_path),
                     "free_running_segments": args.free_running_segments},
-              args.fast_path, ["fast-forced.json", "fast.txt", "judge.json"])
+              args.fast_path, ["fast-forced.json", "fast.txt", "judge.json",
+                               f"{WIDTH_ROUTED}/fast-forced.json", f"{WIDTH_ROUTED}/judge.json"])
     text = args.text or str(corpus_text(Path(args.corpus), out))
     volume = ["--ngram-volume", args.ngram_volume] if args.ngram_volume else []
     segments = ["--segments", str(args.segments), "--prompts",
@@ -964,7 +1087,8 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
         arm += ["--warm-tokens", str(args.warm_tokens)]
     # The reference: the 16-bit-activation, BF16-KV scoring route at the same positions.
     reference = out / "reference.json"
-    key = {"kind": "decode", "artifact": artifact_identity(args.artifact),
+    # format 2: the reference records column_invariant_kernels.
+    key = {"kind": "decode", "format": 2, "artifact": artifact_identity(args.artifact),
            "corpus": corpus_identity(None, text), "segments": args.segments,
            "prompts": list(args.prompts),
            "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None}
@@ -975,14 +1099,29 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
         args.reference_cache, args.recompute_reference,
         [p for p in (out / "default-forced.json", out / "fast-forced.json") if p.exists()])
     print(f"  reference: {source}", flush=True)
-    for route, extra in (("default", ["--disable-fast-paths"]),
-                         ("fast", candidate_options(args, "--fast-path"))):
-        target = out / f"{route}-forced.json"
-        if target.is_file():
-            continue
-        run([args.forced, args.artifact, text, str(target), "--observe", str(reference),
-             "--mode", args.mode, "--kv-dtype", args.kv] + segments + arm + volume + extra,
-            out / f"{route}-forced.log")
+    width_routed = out / WIDTH_ROUTED
+    second = width_routed / "reference.json"
+    observed = [(reference, out)]
+    if reference_flag(load_forced(reference), reference):
+        width_routed.mkdir(exist_ok=True)
+        source = ensure_reference(
+            out, [f"{WIDTH_ROUTED}/reference.json"], dict(key, width_routed=True),
+            lambda: run([args.forced, args.artifact, text, str(second), "--reference",
+                         "--width-routed"] + segments + volume, width_routed / "reference.log"),
+            args.reference_cache, args.recompute_reference,
+            [p for p in (width_routed / "default-forced.json", width_routed / "fast-forced.json")
+             if p.exists()])
+        print(f"  width-routed reference: {source}", flush=True)
+        observed.append((second, width_routed))
+    for scored_against, directory in observed:
+        for route, extra in (("default", ["--disable-fast-paths"]),
+                             ("fast", candidate_options(args, "--fast-path"))):
+            target = directory / f"{route}-forced.json"
+            if target.is_file():
+                continue
+            run([args.forced, args.artifact, text, str(target), "--observe", str(scored_against),
+                 "--mode", args.mode, "--kv-dtype", args.kv] + segments + arm + volume + extra,
+                directory / f"{route}-forced.log")
     selected = load_forced(out / "fast-forced.json")["fast_paths"]
     if any(name in selected for name in args.no_fast_path):
         kept = [name for name in args.no_fast_path if name in selected]
@@ -993,7 +1132,10 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
     if "preemption" in args.fast_path and load_forced(out / "fast-forced.json")["preemptions"] == 0:
         raise MeasurementError("the fast run never preempted; lower --kv-tokens or raise "
                                "--concurrency so the preemption candidate acts")
-    verdicts = [evaluate_forced(out / "default-forced.json", out / "fast-forced.json", reference)]
+    verdicts = [evaluate_forced(
+        out / "default-forced.json", out / "fast-forced.json", reference,
+        second=(width_routed / "default-forced.json", width_routed / "fast-forced.json", second)
+        if len(observed) > 1 else None)]
     if args.free_running:
         modes = [] if args.mode == "dflash2" else [args.mode]
         for route, extra in (("default", ["exact", f"kv={args.kv}"]),
@@ -1006,13 +1148,19 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
             run([args.gen, args.artifact, text, str(target), str(args.free_running_segments),
                  "1536", "384"] + modes + extra + volume,
                 out / f"{route}.log")
+        volume = ["--ngram-volume", args.ngram_volume] if args.ngram_volume else []
+        generations = [args.artifact, text, str(out / "default.txt"), str(out / "fast.txt")]
         report = out / "judge.json"
         if not report.is_file():
-            volume = ["--ngram-volume", args.ngram_volume] if args.ngram_volume else []
-            run([args.judge, "--report", str(report)] + volume + [args.artifact, text,
-                 str(out / "default.txt"), str(out / "fast.txt")],
-                out / "judge.log")
-        verdicts.append(evaluate_free_running(report))
+            run([args.judge, "--report", str(report)] + volume + generations, out / "judge.log")
+        with report.open(encoding="utf-8") as handle:
+            judged_twice = reference_flag(json.load(handle), report)
+        report_second = width_routed / "judge.json"
+        if judged_twice and not report_second.is_file():
+            width_routed.mkdir(exist_ok=True)
+            run([args.judge, "--width-routed", "--report", str(report_second)] + volume
+                + generations, width_routed / "judge.log")
+        verdicts.append(evaluate_free_running(report, second=report_second if judged_twice else None))
     return verdicts
 
 
@@ -1131,15 +1279,22 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     forced.add_argument("fast", type=Path)
     forced.add_argument("--reference", type=Path, required=True,
                         help="the reference both runs observed (--reference of the forced tool)")
+    forced.add_argument("--second", type=Path, nargs=3, metavar=("DEFAULT", "FAST", "REFERENCE"),
+                        help="the runs that observed the width-routed reference, and it")
 
     compare_forced = commands.add_parser(
         "compare-decode", help="decide any two teacher-forced runs of one reference (controls)")
     compare_forced.add_argument("--base", type=Path, required=True)
     compare_forced.add_argument("--candidate", type=Path, required=True)
     compare_forced.add_argument("--reference", type=Path, required=True)
+    compare_forced.add_argument("--second", type=Path, nargs=3,
+                                metavar=("BASE", "CANDIDATE", "REFERENCE"),
+                                help="the runs that observed the width-routed reference, and it")
 
     judged = commands.add_parser("evaluate-free-running", help="decide an existing judge report")
     judged.add_argument("report")
+    judged.add_argument("--second", type=Path,
+                        help="the same generations judged against the width-routed reference")
 
     for sub in (prefill, decode, evaluate, compare, forced, compare_forced, judged):
         sub.add_argument("--json", type=Path, help="also write the verdicts as JSON")
@@ -1181,12 +1336,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             pairs = compared_pairs(args.base, args.candidate)
             return finish([evaluate_prefill_pairs(pairs, "compare-prefill")], args.json)
         if args.command == "evaluate-decode":
-            return finish([evaluate_forced(args.default, args.fast, args.reference)], args.json)
+            return finish([evaluate_forced(args.default, args.fast, args.reference,
+                                           second=tuple(args.second) if args.second else None)],
+                          args.json)
         if args.command == "compare-decode":
             return finish([evaluate_forced(args.base, args.candidate, args.reference,
-                                           fast_route=False)], args.json)
+                                           fast_route=False,
+                                           second=tuple(args.second) if args.second else None)],
+                          args.json)
         if args.command == "evaluate-free-running":
-            return finish([evaluate_free_running(Path(args.report))], args.json)
+            return finish([evaluate_free_running(Path(args.report), second=args.second)], args.json)
         if args.command == "concat-forced":
             joined = concat_forced(args.parts, args.out)
             print(f"{args.out}: {len(joined['segments'])} segments from {len(args.parts)} parts")

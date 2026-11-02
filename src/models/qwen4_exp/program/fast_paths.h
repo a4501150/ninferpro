@@ -55,6 +55,8 @@ struct FastPathSelection {
     FastPathConfiguration configuration;
     // In kFastPaths order.
     std::vector<FastPath> paths;
+    // EngineOptions::width_routed_kernels: a quality reference on the width-routed kernels.
+    bool width_routed = false;
 
     [[nodiscard]] bool selected(FastPath path) const noexcept;
     // The Forward's flags for the selected paths.
@@ -69,7 +71,8 @@ struct FastPathSelection {
     // replays and mixed rounds move a request's call grid and with it its bits). A request's output
     // depends only on the request, the artifact, the options and the build.
     [[nodiscard]] bool request_invariant() const noexcept;
-    // The exact route (no path selected) in a construction-exact configuration: prefix-cache resumes,
+    // The exact route (no path selected, column-invariant kernels) in a construction-exact
+    // configuration: prefix-cache resumes,
     // taps, sibling coalescing and endpoints at any position give the bits a cold run gives
     // (ProgramOptions::free_cache_resume without the free-cache-resume path).
     [[nodiscard]] bool construction_exact() const noexcept;

@@ -642,6 +642,12 @@ struct EngineOptions {
     // still runs (the selection loses column invariance for the whole forward pass), so arms that
     // attribute one path must mind the coupling.
     std::vector<FastPath> fast_path_exclusions;
+    // Quality references only (the quality tools): where the exact route runs column-invariant
+    // kernels (LoadSummary::column_invariant_kernels), run their width-routed counterparts instead,
+    // with the same arithmetic otherwise. The column-invariant kernels round like no width-routed
+    // fast route, so a reference on them favours the exact route; the gate scores every run against
+    // a reference on each kernel set (model-quality.md 6.4). Elsewhere it is refused.
+    bool width_routed_kernels          = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -1933,6 +1939,9 @@ struct LoadSummary {
     // and no request-coupling fast path (FastPath::BatchedDecode and after) runs.
     bool request_invariant          = false;
     bool request_invariance_capable = false;
+    // Whether the Forward runs its column-invariant kernels (Qwen3.8-Flash-Next's construction-exact
+    // configurations without width-keyed fast paths or EngineOptions::width_routed_kernels).
+    bool column_invariant_kernels   = false;
     // Effective prefill chunk (tokens), and the width a prefill step takes while no request waits
     // to decode when idle-wide-prefill runs: the widest that fit the memory plan, or the chunk when
     // none wider fit. Zero when idle-wide-prefill is not selected (Qwen3.5 family only).

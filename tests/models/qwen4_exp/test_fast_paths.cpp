@@ -125,6 +125,13 @@ int main() {
                           "recipe C's schedule paths keep the recurrent GDN prefill and the column-invariant kernels");
         exact_c.paths = {FastPath::GdnF16Accumulate};
         failures += check(!exact_c.construction_exact(), "a selected path keeps the resume grid");
+        // A quality reference on the width-routed kernels: the exact route's arithmetic otherwise.
+        const q::FastPathSelection routed{.configuration = recipe_c, .paths = {}, .width_routed = true};
+        failures += check(!routed.forward().column_invariant &&
+                              routed.forward().gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Recurrent &&
+                              routed.forward().dense_routes == infernix::ops::LinearRoutes::Exact &&
+                              !routed.request_invariant() && !routed.construction_exact(),
+                          "width-routed kernels drop only column invariance from the exact route");
     }
     failures += check(!q::construction_exact(dense8), "Dense8 has no column-invariant route set");
 

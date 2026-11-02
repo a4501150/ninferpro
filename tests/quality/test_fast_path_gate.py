@@ -206,6 +206,29 @@ def test_a_fast_route_pairs_runs_of_one_artifact(tmp_path):
     assert gate.evaluate_prefill_pairs(pairs, "control").passed
 
 
+def test_prefill_averages_each_window_over_both_references(tmp_path):
+    runs = tmp_path / "int8"
+    make_prefill(runs, windows=40, floor=0.02, excess=0.004, noise=0.0, chunks=(896,))
+    assert not gate.evaluate_prefill(runs).passed
+    make_prefill(runs / gate.WIDTH_ROUTED, windows=40, floor=0.02, excess=-0.004, noise=0.0,
+                 chunks=(896,))
+    both = gate.evaluate_prefill(runs)
+    assert both.facts["references"] == 2
+    assert criterion(both, "mean KL excess").estimate == pytest.approx(0.0, abs=1e-9)
+    assert both.passed
+
+
+def test_a_column_invariant_reference_needs_the_width_routed_runs(tmp_path):
+    runs = make_prefill(tmp_path / "int8", windows=40, floor=0.02, excess=0.0, noise=0.0,
+                        chunks=(896,))
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    (reference / "report.json").write_text(
+        json.dumps({"execution": {"column_invariant_kernels": True}}), encoding="utf-8")
+    with pytest.raises(gate.MeasurementError, match=gate.WIDTH_ROUTED):
+        gate.evaluate_prefill(runs)
+
+
 def test_a_run_directory_serves_one_artifact_and_settings(tmp_path):
     settings = {"command": "decode", "artifact": "a.infernix", "kv_tokens": 4096}
     fast_runs = ["fast-forced.json"]
@@ -418,13 +441,90 @@ def test_decode_needs_reference_coverage(tmp_path):
         gate.evaluate_forced(default, fast, reference)
 
 
+def shared_rounding(tmp_path: Path, *, rounding: float, kv: float, loss: float = 0.0,
+                    count: int = 60, seed: int = 5) -> tuple[Path, Path, Path, Path]:
+    """Reference A rounds like the exact route and reference B like the fast route: each carries
+    its kernel set's own rounding noise around one true distribution. The exact run shares A's
+    rounding and the fast run B's, each plus its own KV noise; loss adds error of the fast route's
+    own. Returns reference A (column-invariant-flagged), reference B, and the default and fast
+    runs, whose observations serve both references (the same top tokens)."""
+    rng = random.Random(seed)
+    rest = math.log(1.0 - sum(math.exp(lp) for lp in REFERENCE_TOP))
+    base = REFERENCE_TOP + [rest]
+
+    def step(*noises: list[float]) -> list[float]:
+        logits = [b + sum(n[i] for n in noises) for i, b in enumerate(base)]
+        normalizer = math.log(sum(math.exp(v) for v in logits))
+        return [v - normalizer for v in logits[:-1]]
+
+    def noise(sigma: float) -> list[float]:
+        return [rng.gauss(0.0, sigma) for _ in base]
+
+    flat = {name: [] for name in ("a", "b", "default", "fast")}
+    for _ in range(count):
+        segment = {name: [] for name in flat}
+        for _ in range(64):
+            ra, rb = noise(rounding), noise(rounding)
+            segment["a"] += step(ra)
+            segment["b"] += step(rb)
+            segment["default"] += step(ra, noise(kv))
+            segment["fast"] += step(rb, noise(kv), noise(loss))
+        for name in flat:
+            flat[name].append(segment[name])
+    paths = []
+    for name in ("a", "b"):
+        path = tmp_path / f"reference-{name}.json"
+        path.write_text(json.dumps({
+            "artifact": "model.infernix", "kind": "reference", "forced_tokens": 64,
+            "column_invariant_kernels": name == "a", "top_tokens": 4,
+            "segments": [{"offset": 1000 * i, "prompt_tokens": [512, 2048, 8192][i % 3],
+                          "logprobs": [-1.0] * 64, "top_ids": list(range(4)) * 64,
+                          "top_logprobs": values}
+                         for i, values in enumerate(flat[name])]}), encoding="utf-8")
+        paths.append(path)
+    logprobs, _ = forced_segments(count, 0.0, random.Random(4))
+    for name in ("default", "fast"):
+        observed = [(values, [max(values[4 * s:4 * s + 4]) for s in range(64)])
+                    for values in flat[name]]
+        paths.append(write_forced(tmp_path / f"{name}.json", logprobs, fast=name == "fast",
+                                  observed=observed))
+    return paths[0], paths[1], paths[2], paths[3]
+
+
+def test_a_shared_rounding_counts_against_one_reference_but_not_both(tmp_path):
+    first, second, default, fast = shared_rounding(tmp_path, rounding=0.3, kv=0.1)
+    alone = gate.evaluate_forced(default, fast, first)
+    assert not criterion(alone, "decode mean TV excess").passed
+    both = gate.evaluate_forced(default, fast, first, second=(default, fast, second))
+    assert both.facts["references"] == 2
+    assert criterion(both, "decode mean TV excess").passed
+
+
+def test_a_fast_route_error_of_its_own_fails_against_both_references(tmp_path):
+    first, second, default, fast = shared_rounding(tmp_path, rounding=0.3, kv=0.1, loss=0.5)
+    both = gate.evaluate_forced(default, fast, first, second=(default, fast, second))
+    assert not criterion(both, "decode mean TV excess").passed
+
+
+def test_a_second_reference_only_where_the_first_ran_column_invariant_kernels(tmp_path):
+    first, second, default, fast = shared_rounding(tmp_path, rounding=0.3, kv=0.1)
+    with pytest.raises(gate.MeasurementError, match="needs no second"):
+        gate.evaluate_forced(default, fast, second, second=(default, fast, first))
+    record = json.loads(first.read_text(encoding="utf-8"))
+    del record["column_invariant_kernels"]
+    first.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(gate.MeasurementError, match="predates"):
+        gate.evaluate_forced(default, fast, first, second=(default, fast, second))
+
+
 def write_judge(path: Path, default: list[tuple[int, int, float]],
-                fast: list[tuple[int, int, float]]) -> Path:
+                fast: list[tuple[int, int, float]], column_invariant: bool = False) -> Path:
     def segments(values):
         return [{"offset": 100 * i, "tokens": t, "agree": a, "logprob": -r, "regret": r}
                 for i, (t, a, r) in enumerate(values)]
 
-    path.write_text(json.dumps({"reference": "a16_activations", "runs": [
+    path.write_text(json.dumps({"reference": "a16_activations",
+                                "column_invariant_kernels": column_invariant, "runs": [
         {"file": "default.txt", "segments": segments(default)},
         {"file": "fast.txt", "segments": segments(fast)}]}), encoding="utf-8")
     return path
@@ -439,6 +539,22 @@ def test_free_running_criteria(tmp_path):
     verdict = gate.evaluate_free_running(write_judge(tmp_path / "b.json", default, worse))
     assert not criterion(verdict, "reference-top disagreement excess").passed
     assert not criterion(verdict, "mean regret excess").passed
+
+
+def test_free_running_averages_each_segment_over_both_references(tmp_path):
+    rng = random.Random(3)
+    default = [(384, 375, 3.0) for _ in range(64)]
+    worse = [(384, 375, 3.0 + rng.uniform(0.5, 1.0)) for _ in range(64)]
+    # Against its own kernel set's reference the fast route regrets less by the same amount.
+    better = [(t, a, 2 * 3.0 - r) for t, a, r in worse]
+    first = write_judge(tmp_path / "a.json", default, worse, column_invariant=True)
+    second = write_judge(tmp_path / "b.json", default, better)
+    assert not criterion(gate.evaluate_free_running(first), "mean regret excess").passed
+    both = gate.evaluate_free_running(first, second=second)
+    assert criterion(both, "mean regret excess").estimate == pytest.approx(0.0, abs=1e-12)
+    assert both.passed
+    with pytest.raises(gate.MeasurementError, match="needs no second"):
+        gate.evaluate_free_running(second, second=first)
 
 
 def test_free_running_needs_paired_segments(tmp_path):

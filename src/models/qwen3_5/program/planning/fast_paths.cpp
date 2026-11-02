@@ -343,6 +343,11 @@ FastPathSelection select_fast_paths(const Model& model, const EngineOptions& opt
     FastPathSelection out{.configuration     = fast_path_configuration(model, options),
                           .paths             = {},
                           .invariant_capable = invariant_capable};
+    // Its exact route keeps the routes its gates qualified, which are width-routed.
+    if (options.width_routed_kernels) {
+        throw std::invalid_argument("width-routed kernels: the exact route of " + describe(out.configuration) +
+                                    " runs no column-invariant kernels");
+    }
     for (const FastPath path : options.fast_path_candidates) {
         if (!fast_path_applies(path, out.configuration, options, invariant_capable)) {
             throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +

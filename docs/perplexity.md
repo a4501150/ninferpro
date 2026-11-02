@@ -33,7 +33,9 @@ activations, moved 15 times less (KL 0.0021). So treat a perplexity difference u
 between two NVFP4 builds or settings as noise unless it holds at several chunk sizes.
 `--a16-activations` runs every linear with 16-bit activations (at least 3x slower on NVFP4
 artifacts): saved with `--save-top-tokens`, it is the reference that `--kl-reference` measures
-other runs against. [Model-level numerical quality](maintainer/model-quality.md) has the method and
+other runs against. `--width-routed-kernels` makes such a reference on the width-routed kernels
+where the exact route runs column-invariant ones (Qwen3.8-Flash-Next recipe C with BF16, INT8 or FP8
+KV); the quality gate scores against both. [Model-level numerical quality](maintainer/model-quality.md) has the method and
 the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
 `--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` as there too). Its windows
 prefill through the generation path, the SSD expert tier included, keeping each position's final

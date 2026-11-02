@@ -502,6 +502,24 @@ joint gates; this arm decides only what preemption adds.
 - **The reference** for an artifact is the same artifact with 16-bit activations in every linear
   (`--a16-activations`), BF16 KV, each window or sequence in one pass. It holds the weights fixed,
   so it measures what the route's arithmetic costs, not what the weight format costs.
+- **Two references where the reference shares the exact route's roundings.** Where the reference
+  route runs column-invariant kernels (Qwen3.8-Flash-Next's construction-exact configurations,
+  `LoadSummary::column_invariant_kernels`), it is the exact route itself with BF16 KV: the exact
+  route repeats its roundings at every position, and a width-routed fast route does not, so its
+  excess would also count distance from those roundings. Every run is therefore also scored
+  against a second reference on the width-routed kernels (`EngineOptions::width_routed_kernels`,
+  the same arithmetic otherwise), and each unit (6.4) is averaged over both. Measured on recipe C
+  with FP8 KV (2026-11-02, 1,024 forced decode segments): a run that changes only the kernel set
+  (the ByWidth kernels, through `hc-sliced-k` alone) was 6.0e-4 TV further from the first
+  reference than the exact route (z 4.5) and 2.2e-4 nearer to a ByWidth reference (z -1.7). The
+  average is still conservative: the width-routed reference runs prefill-width kernels, so it
+  shares the fast route's decode roundings less closely than the first shares the exact route's.
+  It does not make the free-running check rounding-neutral: the exact route's column-invariant
+  decode computes what a prefill-width call computes, and the width-routed prefill tiles mostly
+  are the invariant ones, so both prefill-pass references share its decode roundings. The kernel
+  set alone (`hc-sliced-k` beside `qsa-prepare-fused` and `preemption`) passes teacher-forced decode
+  (TV bound 4.3e-4) and fails free-running regret (8.8e-4, bound 1.66e-3 of 1.5e-3; 512 segments,
+  2026-11-02).
 - **Cost, not difference.** Every route scatters around the reference: on the official 27B NVFP4
   artifact, two chunk sizes differ from each other by more (KL 0.025-0.033, section 1) than either
   differs from the reference (KL 0.020-0.023). The direct divergence between two routes is mostly
@@ -610,7 +628,8 @@ Scoring windows are independent (each starts from empty state) and so are decode
 the units. For each unit the gate sums both routes over the chunk sizes, then forms the
 ratio estimator (total excess over total positions) and its cluster-robust standard error. A
 criterion passes when the one-sided 95 % upper bound, estimate + 1.645 standard errors, is within
-budget, with at least 30 units. This is a non-inferiority test: the fast path carries the burden of
+budget, with at least 30 units. Where two references apply (6.2), each unit's default and fast
+totals are averaged over them before the estimator. This is a non-inferiority test: the fast path carries the burden of
 proof, and noise widens the bound, never the budget. A fast path whose effect cannot be resolved
 needs more units (a longer corpus or more segments), not a looser criterion. A fast path that leaves
 a phase bit-identical passes that phase with a zero bound, and the gate reports it as identical.
