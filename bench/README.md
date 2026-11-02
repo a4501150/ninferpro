@@ -204,7 +204,7 @@ if the corpus is too short for them. `--first-segment N` computes the set's segm
 (references or runs), which is how a 1,024-segment gate extends a 256-segment one
 ([acceptance policy](../docs/maintainer/model-quality.md#61-the-exact-route-and-the-fast-paths)). `--forced N` sets the forced tokens per segment (at most 64,
 the constraint step limit); `--mode`
-is `plain`, `dflash2`, `ngram` or `mtp`. `--reference` writes the reference for the same segments
+is `plain`, `dflash2`, `ngram`, `mtp` or `mtp-ngram`. `--reference` writes the reference for the same segments
 instead (the 16-bit-activation, BF16-KV scoring route in one pass: each forced token's
 log-probability and the 64 most probable tokens there), and `--observe REFERENCE.json` makes every
 forced step also record the log-probabilities of those tokens and its own largest one

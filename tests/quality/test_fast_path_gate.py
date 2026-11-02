@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import shutil
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,8 @@ def window(positions: int, mean_kl: float, agreement: float, nll: float) -> dict
 
 def write_report(directory: Path, *, chunk: int, fast: bool, windows: list[dict],
                  p999: float, reference: str = "ref.top", coverage: float = 0.95,
-                 artifact: str = "model.infernix") -> None:
+                 artifact: str = "model.infernix", invariant: bool = False,
+                 width_routed: bool = False) -> None:
     directory.mkdir(parents=True)
     positions = sum(w["positions"] for w in windows)
     mean_kl = sum(w["positions"] * w["mean_kl"] for w in windows) / positions
@@ -25,7 +27,9 @@ def write_report(directory: Path, *, chunk: int, fast: bool, windows: list[dict]
         "artifact": {"path": artifact, "prefill_signature": "sig"},
         "execution": {"context_tokens": 14336, "stride_tokens": 7168, "kv_dtype": "int8-g64",
                       "prefill_chunk_tokens": chunk,
-                      "fast_paths": ["decode-split64"] if fast else []},
+                      "fast_paths": ["decode-split64"] if fast else [],
+                      "column_invariant_kernels": invariant,
+                      "width_routed_kernels": width_routed},
         "streams": [{"id": "s", "windows": [
             {"index": i, "scored_tokens": w["positions"], "total_nll": w["nll"],
              "kl_divergence": {"positions": w["positions"], "mean_kl": w["mean_kl"],
@@ -47,7 +51,7 @@ def make_prefill(root: Path, *, windows: int, floor: float, excess: float, noise
                  nll_excess: float | None = None, chunks: tuple[int, ...] = (896, 3584),
                  tail_ratio: float = 1.0, alternating: float = 0.0, coverage: float = 0.95,
                  fast_flag: bool = True, fast_chunk: int = 0, seed: int = 1,
-                 default_p999: float = 1.0) -> Path:
+                 default_p999: float = 1.0, default_invariant: bool = False) -> Path:
     """Synthetic default and fast runs: the fast route's KL and NLL move by excess per position
     (NLL by nll_excess when given), plus per-window noise."""
     rng = random.Random(seed)
@@ -64,21 +68,28 @@ def make_prefill(root: Path, *, windows: int, floor: float, excess: float, noise
             fast.append(window(7168, base + excess + shift, 1.0 - top1_floor - top1_excess,
                                nll + 7168 * (nll_excess + shift)))
         write_report(root / f"default-c{chunk}", chunk=chunk, fast=False, windows=default,
-                     p999=default_p999, coverage=coverage)
+                     p999=default_p999, coverage=coverage, invariant=default_invariant)
         write_report(root / f"fast-c{chunk}", chunk=fast_chunk or chunk, fast=fast_flag, windows=fast,
                      p999=tail_ratio, coverage=coverage)
     return root
+
+
+def prefill_gate(root: Path, **options) -> gate.Verdict:
+    """The gate's verdict of runs whose default role is the exact route itself (no control)."""
+    verdicts = gate.evaluate_prefill(root, **options)
+    assert len(verdicts) == 1
+    return verdicts[0]
 
 
 def test_a_widened_fast_run_pairs_only_under_its_fast_chunk(tmp_path):
     # prefill --fast-chunk: the fast runs prefill at one width, each paired with a default chunk.
     root = make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=1e-4, fast_chunk=3584,
                         chunks=(896, 1792))
-    assert gate.evaluate_prefill(root, fast_chunk=3584).passed
+    assert prefill_gate(root, fast_chunk=3584).passed
     with pytest.raises(gate.MeasurementError, match="prefills at 3584"):
-        gate.evaluate_prefill(root)
+        prefill_gate(root)
     with pytest.raises(gate.MeasurementError, match="expected 7168"):
-        gate.evaluate_prefill(root, fast_chunk=7168)
+        prefill_gate(root, fast_chunk=7168)
 
 
 def criterion(verdict: gate.Verdict, name: str) -> gate.Criterion:
@@ -98,7 +109,7 @@ def test_paired_excess_matches_the_cluster_robust_ratio_estimator():
 
 def test_a_fast_path_identical_to_the_default_passes(tmp_path):
     root = make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0)
-    verdict = gate.evaluate_prefill(root)
+    verdict = prefill_gate(root)
     assert verdict.passed
     assert verdict.facts["fast_identical_to_default"]
     assert criterion(verdict, "mean KL excess").bound == 0.0
@@ -109,10 +120,10 @@ def test_one_kl_budget_for_every_configuration(tmp_path):
     # The same excess gets the same verdict whatever the configuration's floor: a 4-bit-like, an
     # 8-bit-like and an exact route that is the reference itself (floor 0).
     for floor in (0.03, 0.003, 0.0):
-        passing = gate.evaluate_prefill(
+        passing = prefill_gate(
             make_prefill(tmp_path / f"pass-{floor}", windows=60, floor=floor, excess=0.0012,
                          noise=1e-5))
-        failing = gate.evaluate_prefill(
+        failing = prefill_gate(
             make_prefill(tmp_path / f"fail-{floor}", windows=60, floor=floor, excess=0.0018,
                          noise=1e-5))
         kl = criterion(passing, "mean KL excess")
@@ -124,12 +135,12 @@ def test_one_kl_budget_for_every_configuration(tmp_path):
 def test_a_zero_floor_configuration_can_pass(tmp_path):
     # Floor 0 (the exact route is the reference): the default's tail is 0, so the tail cap admits
     # a fast p99.9 up to tail_minimum.
-    small = gate.evaluate_prefill(
+    small = prefill_gate(
         make_prefill(tmp_path / "a", windows=40, floor=0.0, excess=5e-4, noise=0.0, top1_floor=0.0,
                      top1_excess=0.004, default_p999=0.0, tail_ratio=0.03))
     assert small.passed
     assert criterion(small, "p99.9 KL ratio").estimate == math.inf
-    large = gate.evaluate_prefill(
+    large = prefill_gate(
         make_prefill(tmp_path / "b", windows=40, floor=0.0, excess=2e-3, noise=0.0, top1_floor=0.0,
                      default_p999=0.0, tail_ratio=0.2))
     assert not criterion(large, "mean KL excess").passed
@@ -138,7 +149,7 @@ def test_a_zero_floor_configuration_can_pass(tmp_path):
 
 def test_noise_widens_the_bound_instead_of_the_budget(tmp_path):
     # A zero-mean but noisy difference must not pass on its point estimate.
-    verdict = gate.evaluate_prefill(
+    verdict = prefill_gate(
         make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0, alternating=0.01))
     kl = criterion(verdict, "mean KL excess")
     assert kl.estimate == pytest.approx(0.0, abs=1e-12)
@@ -147,7 +158,7 @@ def test_noise_widens_the_bound_instead_of_the_budget(tmp_path):
 
 
 def test_top1_and_tail_criteria(tmp_path):
-    verdict = gate.evaluate_prefill(
+    verdict = prefill_gate(
         make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0,
                      top1_floor=0.04, top1_excess=0.006, tail_ratio=1.5))
     assert not criterion(verdict, "top-1 disagreement excess").passed
@@ -158,14 +169,14 @@ def test_top1_and_tail_criteria(tmp_path):
 def test_a_corpus_nll_loss_fails_even_with_kl_inside_budget(tmp_path):
     # A change the truncated KL cannot see (mass moved within the unsaved tail) still raises the
     # corpus tokens' NLL; the cap is twice the KL budget, on the point estimate.
-    verdict = gate.evaluate_prefill(
+    verdict = prefill_gate(
         make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0, nll_excess=0.006))
     assert criterion(verdict, "mean KL excess").passed
     nll = criterion(verdict, "corpus NLL excess")
     assert nll.estimate == pytest.approx(0.006)
     assert nll.budget == pytest.approx(gate.POLICY.point_cap_factor * gate.POLICY.kl_budget)
     assert not nll.passed
-    noisy = gate.evaluate_prefill(
+    noisy = prefill_gate(
         make_prefill(tmp_path / "noisy", windows=40, floor=0.02, excess=0.0, noise=0.0,
                      nll_excess=0.002))
     assert criterion(noisy, "corpus NLL excess").passed
@@ -173,14 +184,14 @@ def test_a_corpus_nll_loss_fails_even_with_kl_inside_budget(tmp_path):
 
 def test_a_reference_that_resolves_too_little_cannot_decide(tmp_path):
     with pytest.raises(gate.MeasurementError, match="cover"):
-        gate.evaluate_prefill(make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0,
-                                           noise=0.0, coverage=0.8))
+        prefill_gate(make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0,
+                                  coverage=0.8))
 
 
 def test_too_few_windows_cannot_decide(tmp_path):
     with pytest.raises(gate.MeasurementError):
-        gate.evaluate_prefill(make_prefill(tmp_path, windows=10, floor=0.02, excess=0.0,
-                                           noise=0.0, chunks=(896,)))
+        prefill_gate(make_prefill(tmp_path, windows=10, floor=0.02, excess=0.0, noise=0.0,
+                                  chunks=(896,)))
 
 
 def test_mismatched_runs_cannot_decide(tmp_path):
@@ -190,7 +201,7 @@ def test_mismatched_runs_cannot_decide(tmp_path):
     report["kl_divergence"]["reference"] = "other.top"
     report_path.write_text(json.dumps(report), encoding="utf-8")
     with pytest.raises(gate.MeasurementError):
-        gate.evaluate_prefill(root)
+        prefill_gate(root)
 
 
 def test_a_fast_route_pairs_runs_of_one_artifact(tmp_path):
@@ -200,32 +211,59 @@ def test_a_fast_route_pairs_runs_of_one_artifact(tmp_path):
     report["artifact"]["prefill_signature"] = "other"
     report_path.write_text(json.dumps(report), encoding="utf-8")
     with pytest.raises(gate.MeasurementError, match="other artifacts"):
-        gate.evaluate_prefill(root)
+        prefill_gate(root)
     # A comparison may set two artifacts against one reference.
     pairs = gate.compared_pairs([root / "default-c896"], [root / "fast-c896"])
     assert gate.evaluate_prefill_pairs(pairs, "control").passed
 
 
-def test_prefill_averages_each_window_over_both_references(tmp_path):
-    runs = tmp_path / "int8"
-    make_prefill(runs, windows=40, floor=0.02, excess=0.004, noise=0.0, chunks=(896,))
-    assert not gate.evaluate_prefill(runs).passed
-    make_prefill(runs / gate.WIDTH_ROUTED, windows=40, floor=0.02, excess=-0.004, noise=0.0,
-                 chunks=(896,))
-    both = gate.evaluate_prefill(runs)
-    assert both.facts["references"] == 2
-    assert criterion(both, "mean KL excess").estimate == pytest.approx(0.0, abs=1e-9)
-    assert both.passed
+def test_the_default_role_runs_the_fast_runs_kernel_set(tmp_path):
+    root = make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0, chunks=(896,),
+                        default_invariant=True)
+    with pytest.raises(gate.MeasurementError, match="kernel set"):
+        prefill_gate(root)
 
 
-def test_a_column_invariant_reference_needs_the_width_routed_runs(tmp_path):
-    runs = make_prefill(tmp_path / "int8", windows=40, floor=0.02, excess=0.0, noise=0.0,
-                        chunks=(896,))
-    reference = tmp_path / "reference"
-    reference.mkdir()
-    (reference / "report.json").write_text(
-        json.dumps({"execution": {"column_invariant_kernels": True}}), encoding="utf-8")
-    with pytest.raises(gate.MeasurementError, match=gate.WIDTH_ROUTED):
+def control_prefill(root: Path, *, switch: float, loss: float = 0.0) -> Path:
+    """One KV format's runs at chunk 896 with a width-routed default role: the exact route on the
+    column-invariant kernels (exact) and on the width-routed ones (default) and the fast route
+    against reference A, and both exact routes against reference B (WIDTH_ROUTED). The kernel
+    switch moves KL by +switch against A, which rounds like the column-invariant kernels, and by
+    -switch against B, plus loss against both."""
+    rng = random.Random(2)
+    base = [0.02 * (1.0 + rng.uniform(-0.3, 0.3)) for _ in range(40)]
+    nll = [7168 * rng.uniform(1.0, 2.0) for _ in range(40)]
+    flags = {"exact": (False, True, False), "default": (False, False, True),
+             "fast": (True, False, False)}
+    for directory, reference, sign, names in ((root, "a.top", 1.0, ("exact", "default", "fast")),
+                                              (root / gate.WIDTH_ROUTED, "b.top", -1.0,
+                                               ("exact", "default"))):
+        for name in names:
+            fast, invariant, routed = flags[name]
+            shift = 0.0 if name == "exact" else sign * switch + loss
+            write_report(directory / f"{name}-c896", chunk=896, fast=fast, p999=1.0,
+                         windows=[window(7168, b + shift, 0.96, n) for b, n in zip(base, nll)],
+                         reference=reference, invariant=invariant, width_routed=routed)
+    return root
+
+
+def test_a_width_routed_default_role_brings_the_kernel_switch_control(tmp_path):
+    runs = control_prefill(tmp_path / "fp8", switch=0.004)
+    verdicts = gate.evaluate_prefill(runs)
+    assert len(verdicts) == 2
+    decided, control = verdicts
+    assert decided.passed and decided.facts["references"] == 1
+    assert control.scope.startswith("kernel-switch control")
+    assert control.facts["references"] == 2
+    # Against A alone the switch would cost 0.004; averaged over both references, nothing.
+    assert criterion(control, "mean KL excess").estimate == pytest.approx(0.0, abs=1e-12)
+    assert control.passed
+    # A width-routed kernel that loses precision moves away from both references.
+    lossy = gate.evaluate_prefill(control_prefill(tmp_path / "lossy", switch=0.004, loss=0.003))
+    assert lossy[0].passed
+    assert not criterion(lossy[1], "mean KL excess").passed
+    shutil.rmtree(runs / gate.WIDTH_ROUTED)
+    with pytest.raises(gate.MeasurementError, match="control needs"):
         gate.evaluate_prefill(runs)
 
 
@@ -258,16 +296,18 @@ def test_a_fast_route_needs_the_fast_path_flag_but_a_comparison_does_not(tmp_pat
     root = make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0, chunks=(896,),
                         fast_flag=False)
     with pytest.raises(gate.MeasurementError, match="fast paths active"):
-        gate.evaluate_prefill(root)
+        prefill_gate(root)
     pairs = gate.compared_pairs([root / "default-c896"], [root / "fast-c896"])
     assert gate.evaluate_prefill_pairs(pairs, "control").passed
 
 
 def write_forced(path: Path, segments: list[tuple[int, list[float]]], *, fast: bool,
-                 observed: list[tuple[list[float], list[float]]] | None = None) -> Path:
+                 observed: list[tuple[list[float], list[float]]] | None = None,
+                 invariant: bool = False, width_routed: bool = False) -> Path:
     run = {
         "artifact": "model.infernix", "mode": "plain", "kv_dtype": "int8", "forced_tokens": 64,
         "fast_paths": ["decode-split64"] if fast else [],
+        "column_invariant_kernels": invariant, "width_routed": width_routed,
         "underflows": 0,
         "observed_reference": "reference.json" if observed is not None else "",
         "segments": [{"offset": 1000 * i, "prompt_tokens": prompt, "logprobs": logprobs}
@@ -418,8 +458,8 @@ def test_teacher_forced_runs_must_match(tmp_path):
     unflagged = make_decode(tmp_path / "u", count=40, fast_flag=False)[2]
     with pytest.raises(gate.MeasurementError, match="fast paths active"):
         gate.evaluate_forced(default, unflagged, reference)
-    # A control compares any two runs of one reference.
-    assert gate.evaluate_forced(default, unflagged, reference, fast_route=False).passed
+    # A comparison sets any two runs of one reference against each other.
+    assert gate.evaluate_forced(default, unflagged, reference, role=gate.COMPARE).passed
     short = write_reference(tmp_path / "short.json", 39)
     with pytest.raises(gate.MeasurementError):
         gate.evaluate_forced(default, fast, short)
@@ -441,13 +481,25 @@ def test_decode_needs_reference_coverage(tmp_path):
         gate.evaluate_forced(default, fast, reference)
 
 
+def test_a_decode_default_role_runs_the_fast_runs_kernel_set(tmp_path):
+    reference, _, fast = make_decode(tmp_path, count=40)
+    logprobs, _ = forced_segments(40, 0.0, random.Random(4))
+    invariant = write_forced(tmp_path / "invariant.json", logprobs, fast=False,
+                             observed=observations(40, 0.05, 1), invariant=True)
+    with pytest.raises(gate.MeasurementError, match="kernel set"):
+        gate.evaluate_forced(invariant, fast, reference)
+    with pytest.raises(gate.MeasurementError, match="one reference"):
+        gate.evaluate_forced(invariant, fast, reference, second=(invariant, fast, reference))
+
+
 def shared_rounding(tmp_path: Path, *, rounding: float, kv: float, loss: float = 0.0,
                     count: int = 60, seed: int = 5) -> tuple[Path, Path, Path, Path]:
-    """Reference A rounds like the exact route and reference B like the fast route: each carries
-    its kernel set's own rounding noise around one true distribution. The exact run shares A's
-    rounding and the fast run B's, each plus its own KV noise; loss adds error of the fast route's
-    own. Returns reference A (column-invariant-flagged), reference B, and the default and fast
-    runs, whose observations serve both references (the same top tokens)."""
+    """The control's runs. Reference A rounds like the column-invariant kernels and reference B
+    like the width-routed ones: each carries its kernel set's own rounding noise around one true
+    distribution. The exact route on the column-invariant kernels shares A's rounding and on the
+    width-routed kernels B's, each plus its own KV noise; loss adds error of the width-routed
+    kernels' own. Returns references A and B and the two exact-route runs, whose observations serve
+    both references (the same top tokens)."""
     rng = random.Random(seed)
     rest = math.log(1.0 - sum(math.exp(lp) for lp in REFERENCE_TOP))
     base = REFERENCE_TOP + [rest]
@@ -460,15 +512,15 @@ def shared_rounding(tmp_path: Path, *, rounding: float, kv: float, loss: float =
     def noise(sigma: float) -> list[float]:
         return [rng.gauss(0.0, sigma) for _ in base]
 
-    flat = {name: [] for name in ("a", "b", "default", "fast")}
+    flat = {name: [] for name in ("a", "b", "exact", "routed")}
     for _ in range(count):
         segment = {name: [] for name in flat}
         for _ in range(64):
             ra, rb = noise(rounding), noise(rounding)
             segment["a"] += step(ra)
             segment["b"] += step(rb)
-            segment["default"] += step(ra, noise(kv))
-            segment["fast"] += step(rb, noise(kv), noise(loss))
+            segment["exact"] += step(ra, noise(kv))
+            segment["routed"] += step(rb, noise(kv), noise(loss))
         for name in flat:
             flat[name].append(segment[name])
     paths = []
@@ -476,55 +528,60 @@ def shared_rounding(tmp_path: Path, *, rounding: float, kv: float, loss: float =
         path = tmp_path / f"reference-{name}.json"
         path.write_text(json.dumps({
             "artifact": "model.infernix", "kind": "reference", "forced_tokens": 64,
-            "column_invariant_kernels": name == "a", "top_tokens": 4,
+            "column_invariant_kernels": name == "a", "width_routed": name == "b", "top_tokens": 4,
             "segments": [{"offset": 1000 * i, "prompt_tokens": [512, 2048, 8192][i % 3],
                           "logprobs": [-1.0] * 64, "top_ids": list(range(4)) * 64,
                           "top_logprobs": values}
                          for i, values in enumerate(flat[name])]}), encoding="utf-8")
         paths.append(path)
     logprobs, _ = forced_segments(count, 0.0, random.Random(4))
-    for name in ("default", "fast"):
+    for name in ("exact", "routed"):
         observed = [(values, [max(values[4 * s:4 * s + 4]) for s in range(64)])
                     for values in flat[name]]
-        paths.append(write_forced(tmp_path / f"{name}.json", logprobs, fast=name == "fast",
-                                  observed=observed))
+        paths.append(write_forced(tmp_path / f"{name}.json", logprobs, fast=False,
+                                  observed=observed, invariant=name == "exact",
+                                  width_routed=name == "routed"))
     return paths[0], paths[1], paths[2], paths[3]
 
 
-def test_a_shared_rounding_counts_against_one_reference_but_not_both(tmp_path):
-    first, second, default, fast = shared_rounding(tmp_path, rounding=0.3, kv=0.1)
-    alone = gate.evaluate_forced(default, fast, first)
+def test_the_control_averages_each_segment_over_both_references(tmp_path):
+    first, second, exact, routed = shared_rounding(tmp_path, rounding=0.3, kv=0.1)
+    alone = gate.evaluate_forced(exact, routed, first, role=gate.CONTROL)
     assert not criterion(alone, "decode mean TV excess").passed
-    both = gate.evaluate_forced(default, fast, first, second=(default, fast, second))
+    both = gate.evaluate_forced(exact, routed, first, role=gate.CONTROL,
+                                second=(exact, routed, second))
+    assert both.scope.startswith("kernel-switch control")
     assert both.facts["references"] == 2
     assert criterion(both, "decode mean TV excess").passed
 
 
-def test_a_fast_route_error_of_its_own_fails_against_both_references(tmp_path):
-    first, second, default, fast = shared_rounding(tmp_path, rounding=0.3, kv=0.1, loss=0.5)
-    both = gate.evaluate_forced(default, fast, first, second=(default, fast, second))
+def test_a_kernel_switch_that_loses_precision_fails_the_control(tmp_path):
+    first, second, exact, routed = shared_rounding(tmp_path, rounding=0.3, kv=0.1, loss=0.5)
+    both = gate.evaluate_forced(exact, routed, first, role=gate.CONTROL,
+                                second=(exact, routed, second))
     assert not criterion(both, "decode mean TV excess").passed
 
 
-def test_a_second_reference_only_where_the_first_ran_column_invariant_kernels(tmp_path):
-    first, second, default, fast = shared_rounding(tmp_path, rounding=0.3, kv=0.1)
-    with pytest.raises(gate.MeasurementError, match="needs no second"):
-        gate.evaluate_forced(default, fast, second, second=(default, fast, first))
-    record = json.loads(first.read_text(encoding="utf-8"))
+def test_the_control_needs_its_kernel_sets_and_references(tmp_path):
+    first, second, exact, routed = shared_rounding(tmp_path, rounding=0.3, kv=0.1)
+    with pytest.raises(gate.MeasurementError, match="must be the width-routed reference"):
+        gate.evaluate_forced(exact, routed, second, role=gate.CONTROL, second=(exact, routed, first))
+    with pytest.raises(gate.MeasurementError, match="column-invariant kernels with"):
+        gate.evaluate_forced(routed, exact, first, role=gate.CONTROL)
+    record = json.loads(exact.read_text(encoding="utf-8"))
     del record["column_invariant_kernels"]
-    first.write_text(json.dumps(record), encoding="utf-8")
+    exact.write_text(json.dumps(record), encoding="utf-8")
     with pytest.raises(gate.MeasurementError, match="predates"):
-        gate.evaluate_forced(default, fast, first, second=(default, fast, second))
+        gate.evaluate_forced(exact, routed, first, role=gate.CONTROL)
 
 
 def write_judge(path: Path, default: list[tuple[int, int, float]],
-                fast: list[tuple[int, int, float]], column_invariant: bool = False) -> Path:
+                fast: list[tuple[int, int, float]]) -> Path:
     def segments(values):
         return [{"offset": 100 * i, "tokens": t, "agree": a, "logprob": -r, "regret": r}
                 for i, (t, a, r) in enumerate(values)]
 
-    path.write_text(json.dumps({"reference": "a16_activations",
-                                "column_invariant_kernels": column_invariant, "runs": [
+    path.write_text(json.dumps({"reference": "a16_activations", "runs": [
         {"file": "default.txt", "segments": segments(default)},
         {"file": "fast.txt", "segments": segments(fast)}]}), encoding="utf-8")
     return path
@@ -539,22 +596,6 @@ def test_free_running_criteria(tmp_path):
     verdict = gate.evaluate_free_running(write_judge(tmp_path / "b.json", default, worse))
     assert not criterion(verdict, "reference-top disagreement excess").passed
     assert not criterion(verdict, "mean regret excess").passed
-
-
-def test_free_running_averages_each_segment_over_both_references(tmp_path):
-    rng = random.Random(3)
-    default = [(384, 375, 3.0) for _ in range(64)]
-    worse = [(384, 375, 3.0 + rng.uniform(0.5, 1.0)) for _ in range(64)]
-    # Against its own kernel set's reference the fast route regrets less by the same amount.
-    better = [(t, a, 2 * 3.0 - r) for t, a, r in worse]
-    first = write_judge(tmp_path / "a.json", default, worse, column_invariant=True)
-    second = write_judge(tmp_path / "b.json", default, better)
-    assert not criterion(gate.evaluate_free_running(first), "mean regret excess").passed
-    both = gate.evaluate_free_running(first, second=second)
-    assert criterion(both, "mean regret excess").estimate == pytest.approx(0.0, abs=1e-12)
-    assert both.passed
-    with pytest.raises(gate.MeasurementError, match="needs no second"):
-        gate.evaluate_free_running(second, second=first)
 
 
 def test_free_running_needs_paired_segments(tmp_path):
@@ -604,11 +645,11 @@ def test_identity_compares_forced_runs_and_generations(tmp_path):
     assert not gate.identical(x, y)[0]
 
 
-# --- shared reference cache ----------------------------------------------------------------------
+# --- shared cache of references and exact-route runs ---------------------------------------------
 
 
 class Producer:
-    """Stands for the reference tool: writes a reference file and a report directory."""
+    """Stands for a tool: writes a reference file and a report directory."""
 
     def __init__(self, out: Path, content: str) -> None:
         self.out, self.content, self.calls = out, content, 0
@@ -620,10 +661,21 @@ class Producer:
         (self.out / "reference" / "report.json").write_text(self.content, encoding="utf-8")
 
 
+class Sample:
+    """Stands for a spot check: counts its runs and reports a fixed difference (None: none)."""
+
+    def __init__(self, difference: str | None = None) -> None:
+        self.difference, self.calls = difference, 0
+
+    def __call__(self) -> str | None:
+        self.calls += 1
+        return self.difference
+
+
 NAMES = ["reference.json", "reference"]
 
 
-def reference_key(artifact: Path, corpus: Path, segments: int = 256) -> dict:
+def run_key(artifact: Path, corpus: Path, segments: int = 256) -> dict:
     return {"kind": "decode", "artifact": gate.artifact_identity(str(artifact)),
             "corpus": gate.corpus_identity(None, str(corpus)), "segments": segments}
 
@@ -637,83 +689,143 @@ def inputs(tmp_path):
     return artifact, corpus, tmp_path / "cache"
 
 
-def test_a_reference_is_computed_once_and_reused_by_other_run_directories(tmp_path, inputs):
-    artifact, corpus, cache = inputs
-    first, second = tmp_path / "a", tmp_path / "b"
-    first.mkdir()
-    second.mkdir()
-    produce = Producer(first, "reference A")
-    assert gate.ensure_reference(first, NAMES, reference_key(artifact, corpus), produce, cache,
-                                 False).startswith("computed")
-    reuse = Producer(second, "never written")
-    assert gate.ensure_reference(second, NAMES, reference_key(artifact, corpus), reuse, cache,
-                                 False).startswith("reused")
-    assert (produce.calls, reuse.calls) == (1, 0)
-    assert (second / "reference.json").read_text(encoding="utf-8") == "reference A"
-    assert (second / "reference" / "report.json").read_text(encoding="utf-8") == "reference A"
-    # A directory that has its reference keeps it.
-    assert gate.ensure_reference(second, NAMES, reference_key(artifact, corpus), reuse, cache,
-                                 False) == "kept"
+def directories(root: Path, *names: str) -> list[Path]:
+    out = [root / name for name in names]
+    for directory in out:
+        directory.mkdir()
+    return out
 
 
-def test_another_corpus_artifact_or_setting_computes_its_own_reference(tmp_path, inputs):
+def test_a_run_is_computed_once_and_reused_after_its_sample_matches(tmp_path, inputs):
     artifact, corpus, cache = inputs
-    base = tmp_path / "base"
-    base.mkdir()
-    gate.ensure_reference(base, NAMES, reference_key(artifact, corpus), Producer(base, "A"), cache,
-                          False)
+    first, second = directories(tmp_path, "a", "b")
+    key = run_key(artifact, corpus)
+    produce = Producer(first, "run A")
+    assert gate.ensure_cached(first, NAMES, key, produce, Sample(), cache, False).startswith(
+        "computed")
+    reuse, sample = Producer(second, "never written"), Sample()
+    source = gate.ensure_cached(second, NAMES, key, reuse, sample, cache, False)
+    assert source.startswith("reused") and source.endswith("verified")
+    assert (produce.calls, reuse.calls, sample.calls) == (1, 0, 1)
+    assert (second / "reference.json").read_text(encoding="utf-8") == "run A"
+    assert (second / "reference" / "report.json").read_text(encoding="utf-8") == "run A"
+    # Files already in a directory are checked against the build too.
+    assert gate.ensure_cached(second, NAMES, key, reuse, sample, cache, False) == "kept, verified"
+    assert sample.calls == 2
+
+
+def test_an_entry_that_differs_from_this_build_is_recomputed(tmp_path, inputs):
+    artifact, corpus, cache = inputs
+    first, second = directories(tmp_path, "a", "b")
+    key = run_key(artifact, corpus)
+    gate.ensure_cached(first, NAMES, key, Producer(first, "old build"), Sample(), cache, False)
+    produce = Producer(second, "this build")
+    source = gate.ensure_cached(second, NAMES, key, produce, Sample("segment 0 differs"), cache,
+                                False)
+    assert source.startswith("computed, stored") and produce.calls == 1
+    later, = directories(tmp_path, "c")
+    gate.ensure_cached(later, NAMES, key, Producer(later, "unused"), Sample(), cache, False)
+    assert (later / "reference.json").read_text(encoding="utf-8") == "this build"
+    # The earlier directory's linked files kept their own content, and are refused now.
+    assert (first / "reference.json").read_text(encoding="utf-8") == "old build"
+    with pytest.raises(gate.MeasurementError, match="differs from this build"):
+        gate.ensure_cached(first, NAMES, key, Producer(first, "x"), Sample("window 0 differs"),
+                           cache, False)
+
+
+def test_kept_runs_seed_a_missing_entry(tmp_path, inputs):
+    artifact, corpus, cache = inputs
+    seeded, later = directories(tmp_path, "a", "b")
+    Producer(seeded, "made earlier")()
+    key = run_key(artifact, corpus)
+    assert gate.ensure_cached(seeded, NAMES, key, Producer(seeded, "unused"), Sample(), cache,
+                              False).startswith("kept, verified, stored")
+    produce = Producer(later, "unused")
+    gate.ensure_cached(later, NAMES, key, produce, Sample(), cache, False)
+    assert produce.calls == 0
+    assert (later / "reference.json").read_text(encoding="utf-8") == "made earlier"
+
+
+def test_another_corpus_artifact_or_setting_computes_its_own_run(tmp_path, inputs):
+    artifact, corpus, cache = inputs
+    base, = directories(tmp_path, "base")
+    gate.ensure_cached(base, NAMES, run_key(artifact, corpus), Producer(base, "A"), Sample(),
+                       cache, False)
     other_corpus = tmp_path / "other.txt"
     other_corpus.write_text("other text", encoding="utf-8")
     rewritten = tmp_path / "rewritten.infernix"
     rewritten.write_bytes(b"weights, rewritten")
-    for index, key in enumerate((reference_key(artifact, other_corpus),
-                                 reference_key(rewritten, corpus),
-                                 reference_key(artifact, corpus, segments=1024))):
-        out = tmp_path / f"run{index}"
-        out.mkdir()
-        produce = Producer(out, f"reference {index}")
-        gate.ensure_reference(out, NAMES, key, produce, cache, False)
+    for index, key in enumerate((run_key(artifact, other_corpus), run_key(rewritten, corpus),
+                                 run_key(artifact, corpus, segments=1024))):
+        out, = directories(tmp_path, f"run{index}")
+        produce = Producer(out, f"run {index}")
+        gate.ensure_cached(out, NAMES, key, produce, Sample(), cache, False)
         assert produce.calls == 1
     # The corpus key follows content, not the file name.
     renamed = tmp_path / "renamed.txt"
     renamed.write_text("some text", encoding="utf-8")
-    assert reference_key(artifact, renamed) == reference_key(artifact, corpus)
+    assert run_key(artifact, renamed) == run_key(artifact, corpus)
 
 
-def test_recompute_replaces_the_entry_and_refuses_with_dependent_runs(tmp_path, inputs):
+def test_recompute_replaces_the_entry_in_a_fresh_directory(tmp_path, inputs):
     artifact, corpus, cache = inputs
-    key = reference_key(artifact, corpus)
-    first = tmp_path / "a"
-    first.mkdir()
-    gate.ensure_reference(first, NAMES, key, Producer(first, "old"), cache, False)
-    (first / "default-forced.json").write_text("{}", encoding="utf-8")
-    with pytest.raises(gate.MeasurementError):
-        gate.ensure_reference(first, NAMES, key, Producer(first, "new"), cache, True,
-                              [first / "default-forced.json"])
-    fresh = tmp_path / "b"
-    fresh.mkdir()
-    produce = Producer(fresh, "new")
-    gate.ensure_reference(fresh, NAMES, key, produce, cache, True)
-    assert produce.calls == 1
-    later = tmp_path / "c"
-    later.mkdir()
-    gate.ensure_reference(later, NAMES, key, Producer(later, "unused"), cache, False)
+    key = run_key(artifact, corpus)
+    first, fresh, later = directories(tmp_path, "a", "b", "c")
+    gate.ensure_cached(first, NAMES, key, Producer(first, "old"), Sample(), cache, False)
+    with pytest.raises(gate.MeasurementError, match="fresh --out"):
+        gate.refuse_recompute_over_runs(first, True)
+    gate.refuse_recompute_over_runs(first, False)
+    (fresh / "gate.json").write_text("{}", encoding="utf-8")
+    gate.refuse_recompute_over_runs(fresh, True)
+    produce, sample = Producer(fresh, "new"), Sample()
+    gate.ensure_cached(fresh, NAMES, key, produce, sample, cache, True)
+    assert (produce.calls, sample.calls) == (1, 0)
+    gate.ensure_cached(later, NAMES, key, Producer(later, "unused"), Sample(), cache, False)
     assert (later / "reference.json").read_text(encoding="utf-8") == "new"
-    # The earlier directory's linked files kept their own content.
     assert (first / "reference.json").read_text(encoding="utf-8") == "old"
 
 
-def test_without_a_cache_every_directory_computes_its_reference(tmp_path, inputs):
+def test_without_a_cache_every_directory_computes_its_run(tmp_path, inputs):
     artifact, corpus, _ = inputs
     for name in ("a", "b"):
-        out = tmp_path / name
-        out.mkdir()
+        out, = directories(tmp_path, name)
         produce = Producer(out, name)
-        assert gate.ensure_reference(out, NAMES, reference_key(artifact, corpus), produce, None,
-                                     False) == "computed"
+        assert gate.ensure_cached(out, NAMES, run_key(artifact, corpus), produce, Sample(), None,
+                                  False) == "computed"
         assert produce.calls == 1
-    args = gate.parse_arguments(["decode", "model", "--out", "x", "--reference-cache", "none"])
-    assert args.reference_cache is None
+    args = gate.parse_arguments(["decode", "model", "--out", "x", "--cache", "none"])
+    assert args.cache is None
+
+
+def test_a_reused_prefill_run_names_this_directorys_reference(tmp_path):
+    entry, out = directories(tmp_path, "entry", "out")
+    write_report(entry / "exact-c896", chunk=896, fast=False, windows=[window(10, 0.1, 0.9, 5.0)],
+                 p999=1.0, reference=str(tmp_path / "elsewhere" / "reference.top"))
+    gate.place(entry / "exact-c896", out / "exact-c896")
+    gate.adopt_reference(out / "exact-c896" / "report.json", out / "reference.top")
+    assert (gate.load_report(out / "exact-c896")["kl_divergence"]["reference"] ==
+            str(out / "reference.top"))
+    # The cache entry it was linked from keeps its own record.
+    assert gate.load_report(entry / "exact-c896")["kl_divergence"]["reference"].startswith(
+        str(tmp_path / "elsewhere"))
+
+
+def test_a_spot_check_compares_the_sample_with_the_saved_run():
+    def report(nll: list[float]) -> dict:
+        return {"streams": [{"id": "s", "windows": [
+            {"index": i, "scored_tokens": 7168, "total_nll": value} for i, value in enumerate(nll)]}]}
+
+    saved = report([1.25, 2.5, 3.75])
+    assert gate.window_difference(saved, report([1.25])) is None
+    assert "window ('s', 0)" in gate.window_difference(saved, report([1.2500000000000002]))
+    assert gate.window_difference(saved, report([])) == "the sample scored no windows"
+    segments = [{"offset": i, "logprobs": [-1.0], "observed": [float(i)]} for i in range(4)]
+    assert gate.segment_difference(segments, segments[:2]) is None
+    # A run's fingerprint leaves out what depends on the reference it observed.
+    observed_otherwise = [dict(s, observed=[9.0]) for s in segments[:2]]
+    assert gate.segment_difference(segments, observed_otherwise) == "segment 0 differs"
+    assert gate.segment_difference(segments, observed_otherwise, gate.RUN_FINGERPRINT) is None
+    assert gate.segment_difference(segments[:1], segments[:2]) is not None
 
 
 def write_range(path: Path, first: int, count: int, *, kind: str = "run", kv: str = "int8") -> Path:

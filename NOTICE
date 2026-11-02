@@ -44,10 +44,12 @@ Modifications made in this product (summary; see README.md for details):
   constraint grammar's reasoning section refuses an unquoted opener, so a call
   cannot start inside thinking and the turn cannot end there.
 - Linux VRAM spill detection fix (no WDDM budget).
-- The fast-path quality gate scores every run against a second reference on the
-  width-routed kernels where the reference route runs column-invariant ones
-  (EngineOptions::width_routed_kernels), averaging each unit over both, and
-  Qwen3.8-Flash-Next's expert-a4-residual takes three NVFP4 terms instead of two.
+- The fast-path quality gate runs its default role on the fast run's kernel set (the
+  exact route on the width-routed kernels, EngineOptions::width_routed_kernels, where
+  it would run column-invariant ones), decides that kernel switch by a control against
+  two references, and shares references and exact-route runs through a cache checked
+  by a bit-exact sample before every reuse; Qwen3.8-Flash-Next's expert-a4-residual
+  takes three NVFP4 terms instead of two.
 - A model-layer restructure: each family owns its instance construction, option branches
   and linear shape tuning under src/models/<family>/ (the shapes as extern tables the
   ops dispatch scans), the shared expert-offload tier lives in src/models/offload/

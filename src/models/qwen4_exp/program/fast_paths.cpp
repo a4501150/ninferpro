@@ -93,7 +93,7 @@ constexpr std::array kQualified{
     // segments) on INT8, the passing format with the lowest floor; the path leaves attention and the
     // KV cache alone, so the others are registered from the INT8 increments (model-quality.md 6.1,
     // step 3). BF16 KV fails: there recipe C's exact route is the reference itself (floor 0)
-    // (2026-10-15). FP8 gated again with both references at three terms (2026-11-02).
+    // (2026-10-15). FP8 gated again at three terms, free-running included (2026-11-03).
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16}},

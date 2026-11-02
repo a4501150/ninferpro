@@ -642,11 +642,12 @@ struct EngineOptions {
     // still runs (the selection loses column invariance for the whole forward pass), so arms that
     // attribute one path must mind the coupling.
     std::vector<FastPath> fast_path_exclusions;
-    // Quality references only (the quality tools): where the exact route runs column-invariant
+    // Quality measurement only (the quality tools): where the exact route runs column-invariant
     // kernels (LoadSummary::column_invariant_kernels), run their width-routed counterparts instead,
-    // with the same arithmetic otherwise. The column-invariant kernels round like no width-routed
-    // fast route, so a reference on them favours the exact route; the gate scores every run against
-    // a reference on each kernel set (model-quality.md 6.4). Elsewhere it is refused.
+    // with the same arithmetic otherwise. The column-invariant kernels round like the reference and
+    // like no width-routed fast route, so the gate's default role against a width-routed fast run
+    // runs these, and its kernel-switch control scores both sets against a reference on each
+    // (model-quality.md 6.2). Elsewhere it is refused.
     bool width_routed_kernels          = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

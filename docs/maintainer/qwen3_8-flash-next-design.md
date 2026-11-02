@@ -10228,10 +10228,10 @@ Student-t, outlier and SiLU-product rows; searching the first term's scale among
 max/4 to max/6 recovers at most 19 %), and on FP8 KV they carried about half of the qualified set's
 teacher-forced decode excess (TV +4.3e-4 of +9.6e-4, z 3.2). A third term brings the wide entries to
 the BF16 output floor (op test mean 0.086-0.098 %). Measured with chunk 16,384: prefill 7.0-7.4 %
-slower than two terms at 4K-32K and 35-43 % faster than the exact limb route; the gate with both
-references (model-quality.md 6.2) passes prefill and teacher-forced decode with about a third of two
-terms' excess, and free-running regret, which the kernel set alone also fails there, does not
-block (model-quality.md 6.7).
+slower than two terms at 4K-32K and 35-43 % faster than the exact limb route. The gate whose
+default role runs the fast route's width-routed kernels (model-quality.md 6.2) passes every
+criterion, free-running regret included (bound 8.1e-4 of 1.5e-3), and its kernel-switch control
+passes (model-quality.md 6.7).
 
 **The prefill hyper-connection up projection fused with its collapse: adopted (bit-exact).** For
 Q8_G32_FP16 W_up and more than 96 columns, one Q8 MMA tile computes 16 features x 4 streams of u

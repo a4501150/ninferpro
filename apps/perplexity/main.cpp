@@ -63,6 +63,7 @@ struct Options {
     bool original_nvfp4_prefill_kernel  = false;
     bool a16_activations                = false;
     bool width_routed_kernels           = false;
+    std::uint32_t max_windows           = 0; // 0: every window
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
     std::vector<infernix::FastPath> fast_path_exclusions;
@@ -83,8 +84,10 @@ std::string usage_text() {
            "       [--a16-activations] (16-bit activations in every linear: the reference for\n"
            "        measuring activation quantization, on the exact route; at least 3x slower\n"
            "        on NVFP4 artifacts)\n"
-           "       [--width-routed-kernels] (a reference on the width-routed kernels where the exact\n"
-           "        route runs column-invariant ones: the quality gate's second reference)\n"
+           "       [--width-routed-kernels] (the width-routed kernels where the exact route runs\n"
+           "        column-invariant ones: the quality gate's baseline and control)\n"
+           "       [--max-windows N] (score only each stream's first N windows: a spot check of a\n"
+           "        saved run; excludes --save-top-tokens and --kl-reference)\n"
            "       [--disable-fast-paths] (score the exact route; by default the qualified fast\n"
            "        paths run, as in infernix-serve)\n"
            "       [--fast-path NAME]... (qualification: also run this fast path, qualified or\n"
@@ -153,6 +156,9 @@ Options parse_options(int argc, char** argv) {
             out.a16_activations = true;
         } else if (option == "--width-routed-kernels") {
             out.width_routed_kernels = true;
+        } else if (option == "--max-windows") {
+            out.max_windows = parse_integer<std::uint32_t>(value("--max-windows"), "max-windows");
+            if (out.max_windows == 0) { usage_error("--max-windows must be positive"); }
         } else if (option == "--ngram-volume") {
             out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
         } else if (option == "--disable-fast-paths") {
@@ -204,6 +210,9 @@ Options parse_options(int argc, char** argv) {
         usage_error("exactly one of --corpus and --text is required");
     }
     if (out.quick && !out.corpus) { usage_error("--quick requires --corpus"); }
+    if (out.max_windows != 0 && (out.save_top_tokens || out.kl_reference)) {
+        usage_error("--max-windows excludes --save-top-tokens and --kl-reference");
+    }
     if (out.context < 2 || out.stride == 0 || out.stride >= out.context) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
     }
@@ -334,8 +343,13 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         }
         std::vector<WindowPlan> windows =
             infernix::perplexity::plan_windows(tokens.size(), options.context, options.stride);
+        if (options.max_windows != 0 && windows.size() > options.max_windows) {
+            windows.resize(options.max_windows);
+        }
         total_input_tokens += static_cast<std::uint64_t>(tokens.size());
-        total_scored_tokens += static_cast<std::uint64_t>(tokens.size() - 1);
+        for (const WindowPlan& window : windows) {
+            total_scored_tokens += static_cast<std::uint64_t>(window.target_end - window.target_begin);
+        }
         total_windows += static_cast<std::uint64_t>(windows.size());
         streams.push_back(EvaluationStream{.source  = std::move(source),
                                            .tokens  = std::move(tokens),
@@ -575,6 +589,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"a16_activations", options.a16_activations},
           {"width_routed_kernels", options.width_routed_kernels},
           {"column_invariant_kernels", load.column_invariant_kernels},
+          {"max_windows", options.max_windows},
           {"fast_paths", load.fast_paths},
           {"fast_path_configuration", load.fast_path_configuration},
           {"stride_tokens", options.stride},

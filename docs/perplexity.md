@@ -33,10 +33,12 @@ activations, moved 15 times less (KL 0.0021). So treat a perplexity difference u
 between two NVFP4 builds or settings as noise unless it holds at several chunk sizes.
 `--a16-activations` runs every linear with 16-bit activations (at least 3x slower on NVFP4
 artifacts): saved with `--save-top-tokens`, it is the reference that `--kl-reference` measures
-other runs against. `--width-routed-kernels` makes such a reference on the width-routed kernels
-where the exact route runs column-invariant ones (Qwen3.8-Flash-Next recipe C with BF16, INT8 or FP8
-KV); the quality gate scores against both. [Model-level numerical quality](maintainer/model-quality.md) has the method and
-the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
+other runs against. `--width-routed-kernels` runs the width-routed kernels where the exact route
+runs column-invariant ones (Qwen3.8-Flash-Next recipe C with BF16, INT8 or FP8 KV): the quality
+gate's default role against a width-routed fast route, and its second reference. `--max-windows N`
+scores only each stream's first N windows, a spot check of a saved run (it excludes
+`--save-top-tokens` and `--kl-reference`). [Model-level numerical quality](maintainer/model-quality.md)
+has the method and the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
 `--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` as there too). Its windows
 prefill through the generation path, the SSD expert tier included, keeping each position's final
 residual; the LM head then runs over them in tiles of 64 positions with FP32 logits. The available Main
@@ -106,8 +108,8 @@ windows hold different tokens.
 `--fast-path NAME` (repeatable) also runs that fast path whether or not it is qualified for the
 configuration; it exists to measure a candidate. Qwen3.8-Flash-Next artifacts score through the
 same route as generation; `--ngram-volume FILE` names their n-gram volume when it is not
-`<artifact>.ngram`, and `--a16-activations` runs every expert bank W4A16. `tools/quality/fast_path_gate.py` pairs an
-exact-route run and a fast-path run window by window to decide the
+`<artifact>.ngram`, and `--a16-activations` runs every expert bank W4A16. `tools/quality/fast_path_gate.py` pairs a
+default-role run (the exact route on the fast run's kernel set) and a fast-path run window by window to decide the
 [numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
 
 ## Runtime YaRN override

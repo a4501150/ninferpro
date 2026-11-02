@@ -12,16 +12,12 @@
 // (Qwen3.8-Flash-Next): it isolates what decoding changes (KV format, chunking, speculation,
 // batching) but not the cost of the stored activation precision itself.
 //
-// --width-routed scores on the width-routed kernels (EngineOptions::width_routed_kernels); the report
-// records whether the reference ran column-invariant kernels, which tells the gate it needs that
-// second reference.
-//
 // --report FILE also writes each build's per-segment counts as JSON (segments are independent
 // samples: tools/quality/fast_path_gate.py pairs them between builds).
 //
 // --ngram-volume FILE names a Qwen3.8-Flash-Next n-gram volume (default <artifact>.ngram).
 //
-// Usage: infernix_decode_quality_judge [--stored-activations] [--width-routed] [--report <file.json>]
+// Usage: infernix_decode_quality_judge [--stored-activations] [--report <file.json>]
 //                                      [--ngram-volume <file>] <artifact> <corpus.txt> <gen_file>...
 
 #include "infernix/engine.h"
@@ -70,16 +66,13 @@ struct SegmentScore {
 } // namespace
 
 int main(int argc, char** argv) {
-    bool stored       = false;
-    bool width_routed = false;
+    bool stored = false;
     std::string report_path;
     std::string ngram_volume;
     while (argc > 1 && std::string(argv[1]).starts_with("--")) {
         const std::string option = argv[1];
         if (option == "--stored-activations") {
             stored = true;
-        } else if (option == "--width-routed") {
-            width_routed = true;
         } else if (option == "--report" && argc > 2) {
             report_path = argv[2];
             ++argv;
@@ -96,8 +89,7 @@ int main(int argc, char** argv) {
         --argc;
     }
     if (argc < 4) {
-        std::cerr << "usage: infernix_decode_quality_judge [--stored-activations] [--width-routed] "
-                     "[--report <file.json>] "
+        std::cerr << "usage: infernix_decode_quality_judge [--stored-activations] [--report <file.json>] "
                      "[--ngram-volume <file>] <artifact> <corpus.txt> <gen_file>...\n";
         return 2;
     }
@@ -123,10 +115,8 @@ int main(int argc, char** argv) {
         options.a16_activations = !stored;
         // The reference runs the exact route.
         options.fast_paths      = false;
-        options.width_routed_kernels = width_routed;
         if (!ngram_volume.empty()) { options.ngram_volume_path = ngram_volume; }
         infernix::Engine engine(options);
-        const infernix::LoadSummary load = engine.load_summary();
 
         std::ifstream corpus(argv[2], std::ios::binary);
         if (!corpus) { throw std::runtime_error(std::string("cannot read ") + argv[2]); }
@@ -204,9 +194,7 @@ int main(int argc, char** argv) {
             if (!report) { throw std::runtime_error("cannot write " + report_path); }
             report << std::setprecision(17) << "{\"reference\": \""
                    << (stored ? "stored_activations" : "a16_activations")
-                   << "\", \"width_routed\": " << (width_routed ? "true" : "false")
-                   << ", \"column_invariant_kernels\": " << (load.column_invariant_kernels ? "true" : "false")
-                   << ", \"runs\": [";
+                   << "\", \"runs\": [";
             for (std::size_t run = 0; run < runs.size(); ++run) {
                 // Generation files are paths the user chose; JSON-escape the two characters a
                 // Windows path may hold that JSON reserves.

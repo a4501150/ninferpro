@@ -358,7 +358,8 @@ different route may ship, what it is measured against, how much it may cost, and
   lower therefore runs the gate against the new route's reference, and the corpus NLL, which no
   reference enters, must not rise. Speed alone never justifies an exact-route numerics change: a faster route whose
   arithmetic differs is a fast path. The exact route is the quality
-  reference's route and every gate's default run. Prompt attention there runs P×V in FP16 for every
+  reference's route, and every gate's default run is the exact route on the fast run's kernel set
+  (6.2). Prompt attention there runs P×V in FP16 for every
   KV format; until 2026-10-13 NVFP4, K8V4 and VQ2 KV defaulted to their 8-bit forms, which are now
   the prompt-pv8 fast path. The fast INT8 and NVFP4 prompt kernels, measured when adopted, remain
   part of the exact route.
@@ -502,24 +503,34 @@ joint gates; this arm decides only what preemption adds.
 - **The reference** for an artifact is the same artifact with 16-bit activations in every linear
   (`--a16-activations`), BF16 KV, each window or sequence in one pass. It holds the weights fixed,
   so it measures what the route's arithmetic costs, not what the weight format costs.
-- **Two references where the reference shares the exact route's roundings.** Where the reference
-  route runs column-invariant kernels (Qwen3.8-Flash-Next's construction-exact configurations,
-  `LoadSummary::column_invariant_kernels`), it is the exact route itself with BF16 KV: the exact
-  route repeats its roundings at every position, and a width-routed fast route does not, so its
-  excess would also count distance from those roundings. Every run is therefore also scored
-  against a second reference on the width-routed kernels (`EngineOptions::width_routed_kernels`,
-  the same arithmetic otherwise), and each unit (6.4) is averaged over both. Measured on recipe C
-  with FP8 KV (2026-11-02, 1,024 forced decode segments): a run that changes only the kernel set
-  (the ByWidth kernels, through `hc-sliced-k` alone) was 6.0e-4 TV further from the first
-  reference than the exact route (z 4.5) and 2.2e-4 nearer to a ByWidth reference (z -1.7). The
-  average is still conservative: the width-routed reference runs prefill-width kernels, so it
-  shares the fast route's decode roundings less closely than the first shares the exact route's.
-  It does not make the free-running check rounding-neutral: the exact route's column-invariant
-  decode computes what a prefill-width call computes, and the width-routed prefill tiles mostly
-  are the invariant ones, so both prefill-pass references share its decode roundings. The kernel
-  set alone (`hc-sliced-k` beside `qsa-prepare-fused` and `preemption`) passes teacher-forced decode
-  (TV bound 4.3e-4) and fails free-running regret (8.8e-4, bound 1.66e-3 of 1.5e-3; 512 segments,
-  2026-11-02).
+- **The default role runs the fast run's kernel set.** Where the exact route runs
+  column-invariant kernels (Qwen3.8-Flash-Next's construction-exact configurations,
+  `LoadSummary::column_invariant_kernels`, which every run records), the reference is the exact
+  route itself with BF16 KV: those kernels repeat its roundings at every position, and a
+  width-routed fast route does not, so an excess over them would also count distance from those
+  roundings. Where the fast run is width-routed, the default run there is the exact route on the
+  width-routed kernels (`EngineOptions::width_routed_kernels`, the same arithmetic otherwise), and
+  the excess measures only what the fast paths' arithmetic adds. Measured on recipe C with FP8 KV
+  (2026-11-02, 1,024 forced decode segments): a run that changes only the kernel set (the ByWidth
+  kernels, through `hc-sliced-k` alone) was 6.0e-4 TV further from the reference than the
+  column-invariant exact route (z 4.5) and 2.2e-4 nearer to a reference on the ByWidth kernels
+  (z -1.7). Free-running decode showed the same coupling more strongly: the column-invariant
+  decode computes what a prefill-width call computes, so the prefill-pass judge shares its decode
+  roundings, and the kernel set alone (`hc-sliced-k` beside `qsa-prepare-fused` and `preemption`)
+  failed free-running regret against that exact route (8.8e-4, bound 1.66e-3 of 1.5e-3; 512
+  segments) while it passed teacher-forced decode (TV bound 4.3e-4).
+- **The kernel-switch control.** A width-routed kernel that loses precision would hide in a
+  width-routed default role, which runs it too, and the column-invariant exact route never runs
+  it. Wherever the default role is width-routed, the gate therefore also decides the switch
+  itself, under the same budgets: the exact route on the column-invariant kernels against the
+  exact route on the width-routed ones, in prefill and teacher-forced decode, scored against the
+  reference and against a second reference on the width-routed kernels, each unit (6.4) averaged
+  over both, so neither kernel set's shared roundings count. The average is conservative: the
+  second reference runs prefill-width kernels, so it shares the width-routed decode's roundings
+  less closely than the first shares the column-invariant decode's. Free-running decode has no
+  such control, since both prefill-pass references share the column-invariant decode's roundings
+  (the width-routed prefill tiles mostly are the invariant ones). The control's runs are all
+  exact-route runs, which the cache shares (6.5), so it costs runs only when a kernel changes.
 - **Cost, not difference.** Every route scatters around the reference: on the official 27B NVFP4
   artifact, two chunk sizes differ from each other by more (KL 0.025-0.033, section 1) than either
   differs from the reference (KL 0.020-0.023). The direct divergence between two routes is mostly
@@ -564,9 +575,8 @@ joint gates; this arm decides only what preemption adds.
   16-bit activations where prefill uses the artifact's, so the decode floor can be lower.
   Free-running greedy decoding, judged on each route's own prefixes
   ([decode-quality pair](../../bench/README.md#decode-quality)), is an optional supplementary check:
-  routes diverge after a few dozen tokens, which makes it far less sensitive, and on the
-  construction-exact configurations it charges any width-routed route for the exact route's
-  roundings (the second-reference bullet above), so it does not block a registration there.
+  routes diverge after a few dozen tokens, which makes it far less sensitive. Its default role
+  follows the fast run's kernel set like the others' (the bullet above).
 
 ### 6.3 Criteria
 
@@ -630,8 +640,8 @@ Scoring windows are independent (each starts from empty state) and so are decode
 the units. For each unit the gate sums both routes over the chunk sizes, then forms the
 ratio estimator (total excess over total positions) and its cluster-robust standard error. A
 criterion passes when the one-sided 95 % upper bound, estimate + 1.645 standard errors, is within
-budget, with at least 30 units. Where two references apply (6.2), each unit's default and fast
-totals are averaged over them before the estimator. This is a non-inferiority test: the fast path carries the burden of
+budget, with at least 30 units. In the kernel-switch control (6.2), which scores against two
+references, each unit's totals are averaged over them before the estimator. This is a non-inferiority test: the fast path carries the burden of
 proof, and noise widens the bound, never the budget. A fast path whose effect cannot be resolved
 needs more units (a longer corpus or more segments), not a looser criterion. A fast path that leaves
 a phase bit-identical passes that phase with a zero bound, and the gate reports it as identical.
@@ -725,21 +735,32 @@ for a decode-only change). NVFP4 KV's NLL bound was 1.06e-2 and the INT8 pair's 
 reuses any run already present in its directory, and prints each criterion with its estimate, bound,
 budget and result. Exit status 0 is a pass, 1 a failed criterion, 2 an unusable measurement. A run
 directory's `gate.json` records the artifact and run settings it serves; another artifact or
-workload needs a fresh `--out`, and another candidate set reuses the reference and default runs
-once the fast runs are removed (the gate names them). Every pair it decides must come from one
+workload needs a fresh `--out`, and another candidate set reuses the references and exact-route
+runs once the runs that depend on the candidates are removed: the fast runs, and the default role
+and control, which follow the fast run's kernel set (the gate names them). Every pair it decides must come from one
 artifact, and a `preemption` candidate's decode run must have preempted.
 
-A reference depends only on the artifact, the corpus content and the settings that shape it (prefill:
-context, stride, `--quick`, the n-gram volume; decode: segments, prompt lengths, the n-gram volume),
-never on the KV format, mode, arm or candidates, so the gate shares references between run
-directories through `--reference-cache DIR` (default `profiles/quality/reference-cache`, `none`
-disables it). The key holds the artifact's resolved path, size and modification time, a SHA-256 of
-the corpus text (a manifest with its streams), and those settings; a directory takes an existing
-entry by hard link (a copy across volumes) and stores what it computes, and the gate prints which
-it did. The key cannot see a change to the reference route itself (6.1): after one,
-`--recompute-reference` recomputes the reference into a directory without runs and replaces the
-cache entry. Sharing changes no measurement: every run directory still observes the same reference
-it would have computed.
+References and exact-route runs depend only on the artifact, the corpus content and the settings
+that shape them, never on the candidates: prefill context, stride, `--quick` and the n-gram volume,
+and for a run its KV format, chunk size and route; decode segments, prompt lengths and the n-gram
+volume, and for a run its mode, KV format, arm and route; a scored run also on its reference's
+content. The gate shares them between run directories through `--cache DIR` (default
+`profiles/quality/cache`, `none` disables it). The key holds the artifact's resolved path, size
+and modification time, a SHA-256 of the corpus text (a manifest with its streams), and those
+settings; a directory takes an existing entry by hard link (a copy across volumes), stores what it
+computes, and prints which it did. The key cannot see the build, so before any reuse, of an entry
+or of files already in the directory, the gate reruns a sample of the route and requires it bit
+for bit: each stream's first window in prefill (`infernix-perplexity --max-windows 1`, one stream
+per domain from a manifest), the first two segments of each prompt length in teacher-forced
+decode, and the first four continuations of a generation. An entry that differs is recomputed and
+replaced; files in the directory that differ are refused. A sample covers every chunk size and
+prompt length its run uses but not every position, so after a change the sample may miss,
+`--recompute` (with a fresh `--out`) recomputes every entry a directory uses. Only single-lane
+decode runs are cached: the rounds of several lanes depend on their timing. Sharing changes no
+measurement: every run directory observes the runs it would have computed. On recipe C with FP8 KV
+(2026-11-03, the full protocol with 512 free-running segments) a first gate took 3 h 18 min and a
+later one, whose exact-route runs all came from the cache, 60 min with the same verdicts bit for
+bit.
 
 ```bat
 rem Prefill: reference, then default and fast-path runs at four chunk sizes per KV format
@@ -753,7 +774,8 @@ rem Default route unchanged between two builds (perplexity runs, forced runs or 
 py -3.11 -m tools.quality.fast_path_gate identical old-run new-run
 ```
 
-The default run uses the exact route (`--disable-fast-paths`); the fast run uses every path
+The default run uses the exact route (`--disable-fast-paths`) on the fast run's kernel set (6.2,
+with the kernel-switch control where that is the width-routed set); the fast run uses every path
 already qualified for the configuration, plus each `--fast-path NAME` candidate, so a candidate is
 always measured together with the paths it will run beside. Without a candidate the gate re-checks
 the configuration's current selection. `--mode` selects the decode route a fast path touches:
@@ -769,7 +791,9 @@ the default run at each `--chunk` (a separate `--out`).
 `evaluate-free-running judge.json` decide existing runs. `compare-prefill --base RUN... --candidate
 RUN...` decides any two sets of runs scored against one reference, paired in order, and
 `compare-decode --base A.json --candidate B.json --reference REFERENCE.json` two teacher-forced runs
-that observed one reference: a numerics change to the exact route (6.1), or a control. On
+that observed one reference (with `--second BASE CANDIDATE REFERENCE`, also the two that observed
+the width-routed reference, averaged per segment): a numerics change to the exact route (6.1), or
+a control. On
 Qwen3.8-27B on an RTX 5090 the prefill gate takes 27 minutes per KV format (eight runs) after a
 13-minute reference recorded once per artifact, and the decode gate 18 minutes per run after a
 22-minute reference (60 minutes for a first gate; a later candidate reuses the reference and,
@@ -1668,17 +1692,21 @@ and recomputes the previous output) or admission (whole extents held without `pr
 - **Op qualification (three terms):** `infernix_offloaded_moe_wide_test` X1 against the exact
   canonical arithmetic: mean relative L2 0.086-0.098 % per case (the BF16 output floor), worst entry
   0.76 % (bounds 2^-9 and 2^-6, which two terms' means of 0.31-0.41 % fail).
-- **Three terms on FP8 KV (2026-11-02, RTX PRO 6000, the gate with both references of 6.2):** the
-  full perplexity corpus at four chunk sizes and 1,024 forced plain decode segments, beside every
-  path qualified there. Prefill KL excess 1.32e-4 (bound 1.84e-4; two terms 5.24e-4), top-1 bound
-  4.6e-4, perplexity ratio 0.99964, p99.9 KL ratio 1.01; decode TV excess 3.0e-4 (bound 4.95e-4;
-  two terms 9.09e-4), top-1 bound 2.29e-3, p99.9 KL ratio 0.95. Free-running regret over 512
-  segments exceeds its budget (1.13e-3, bound 1.84e-3 of 1.5e-3; two terms 2.31e-3), but that
-  optional check (6.2) does not block here: the kernel set alone, which every width-keyed path
-  selects and which loses no precision, fails it too (8.8e-4, bound 1.66e-3), because its
-  prefill-pass references share the column-invariant exact route's decode roundings. The other
-  formats keep the registration of the earlier gates below, which three terms on both sides passed
-  first. Speed (`infernix_bench`, FP8 KV, chunk 16,384, ABBA): pp4096 / 16384 / 32768 at 12,796 /
+- **Three terms on FP8 KV (2026-11-03, RTX PRO 6000, the gate of 6.2 with a width-routed default
+  role):** the full perplexity corpus at four chunk sizes, 1,024 forced plain decode segments and
+  512 free-running segments, beside every path qualified there. Prefill KL excess -1.06e-4 (bound
+  -1.3e-6), top-1 bound 1.19e-4, perplexity ratio 1.00065, p99.9 KL ratio 0.95; decode TV excess
+  -2.3e-5 (bound 1.93e-4), top-1 bound 1.73e-3, p99.9 KL ratio 1.00; free-running regret excess
+  -7.9e-5 (bound 8.08e-4), disagreement bound 1.18e-3. The kernel-switch control passes: prefill
+  KL excess 6.2e-5 (bound 1.62e-4), decode TV excess 1.70e-4 (bound 3.59e-4), top-1 bound 1.52e-3.
+  Records: `results/quality/gate-2026-11-03`.
+- **Three terms on FP8 KV (2026-11-02, the earlier gate that scored against the column-invariant
+  exact route, each unit averaged over both references):** prefill KL excess 1.32e-4 (bound
+  1.84e-4; two terms 5.24e-4), decode TV excess 3.0e-4 (bound 4.95e-4; two terms 9.09e-4).
+  Free-running regret failed there (1.13e-3, bound 1.84e-3 of 1.5e-3; two terms 2.31e-3), as did the
+  kernel set alone (8.8e-4, bound 1.66e-3): the prefill-pass judge shares the column-invariant
+  decode's roundings (6.2), which led to the width-routed default role. The other formats keep the
+  registration of the earlier gates below, which three terms on both sides passed first. Speed (`infernix_bench`, FP8 KV, chunk 16,384, ABBA): pp4096 / 16384 / 32768 at 12,796 /
   13,035 / 12,813 tok/s against two terms' 13,818 / 14,036 / 13,773 (-7.0 to -7.4 %) and the exact
   route's 8,932 / 9,620 / 9,466 (+35 to +43 %); the wide expert call at 1,024 / 4,096 / 16,384
   columns 1,715 / 2,390-2,510 / 7,050 us against 1,616 / 1,990 / 5,348 (a third MMA per weight

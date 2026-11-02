@@ -10,10 +10,12 @@ measure, the same for every artifact and KV format (about what llama.cpp's q8_0 
 FP16); the floor (the default route's own divergence from the reference) is reported, not used.
 Every decision is a one-sided 95 % upper confidence bound over independent units (scoring windows
 or decode segments), so noise makes a fast path harder to pass, never easier: a noisier comparison
-needs more data. Where the reference route runs column-invariant kernels (Qwen3.8-Flash-Next's
-construction-exact configurations), the exact route shares its roundings, so every run is also
-scored against a reference on the width-routed kernels (WIDTH_ROUTED) and each unit is averaged
-over both references.
+needs more data. The default role runs the exact route on the fast run's kernel set: where the
+exact route runs column-invariant kernels and the fast route does not (Qwen3.8-Flash-Next's
+construction-exact configurations), on the width-routed kernels, and a control then decides that
+kernel switch against the reference and a second one on the width-routed kernels (WIDTH_ROUTED).
+Exact-route runs and references are shared between run directories through a cache and checked
+against the current build by a bit-exact sample before every reuse.
 
 Subcommands:
   prefill          run (or reuse) the reference and the default and fast-path
@@ -22,11 +24,12 @@ Subcommands:
                    the default and fast-path teacher-forced decode runs observing them (and, with
                    --free-running, greedy generations and the judge); decide the decode KL, top-1,
                    NLL, tail and prompt-length criteria
+  (both decide the kernel-switch control too where the default role is width-routed)
   evaluate-prefill decide an existing prefill directory
   compare-prefill  decide any two sets of perplexity runs of one reference (a numerics change to
                    the default route, or a control)
   evaluate-decode  decide two existing teacher-forced decode runs of one reference
-  compare-decode   decide any two teacher-forced runs of one reference (controls)
+  compare-decode   decide any two teacher-forced runs of one reference, or of two (controls)
   evaluate-free-running  decide an existing judge report
   identical        check that two builds' default routes agree bit for bit: two infernix-perplexity
                    run directories (every window's NLL and divergence), two teacher-forced decode
@@ -175,11 +178,14 @@ def bounded(name: str, units: Sequence[PairedUnit], budget: float, policy: Polic
     return Criterion(name, mean, bound, budget, bound <= budget, detail)
 
 
-# Where the reference route runs column-invariant kernels (the forced tool's reference, the judge's
-# report and infernix-perplexity's report record column_invariant_kernels), the exact route shares
-# their roundings and a width-routed fast route does not, so the excess would also count distance
-# from those roundings: every run is scored against a second reference on the width-routed kernels
-# too, kept under this subdirectory, and each unit is averaged over both (model-quality.md 6.4).
+# The default role runs the exact route on the kernels the fast run runs (every run records
+# column_invariant_kernels). Where the exact route runs column-invariant kernels and the fast route
+# does not, those kernels repeat the reference's roundings (the reference is the exact route itself
+# with BF16 KV), which no width-routed route shares, so an excess over them would also count
+# distance from those roundings (model-quality.md 6.2): the default role then runs the width-routed
+# kernels (EngineOptions::width_routed_kernels), and the control decides that kernel switch, the
+# exact route on each kernel set scored against the reference and against a second reference on the
+# width-routed kernels (kept under this subdirectory), each unit averaged over both.
 WIDTH_ROUTED = "width-routed"
 
 
@@ -197,13 +203,19 @@ def mean_units(sets: Sequence[Sequence[PairedUnit]]) -> list[PairedUnit]:
     return out
 
 
-def reference_flag(record: dict, source: Path | str) -> bool:
-    """Whether a reference ran column-invariant kernels (and so needs the width-routed second)."""
+def kernel_flag(record: dict, source: Path | str) -> bool:
+    """Whether a run or reference ran column-invariant kernels."""
     flag = record.get("column_invariant_kernels")
     if flag is None:
         raise MeasurementError(f"{source} predates column_invariant_kernels; recompute it "
-                               "(--recompute-reference, or a fresh --out)")
+                               "(a fresh --out)")
     return bool(flag)
+
+
+# The roles a pair of runs plays: the gate (the exact route on the fast run's kernel set, and the
+# fast route), the control (the exact route on the column-invariant kernels, and on the width-routed
+# ones) and a comparison (any two runs of one reference).
+GATE, CONTROL, COMPARE = "gate", "control", "compare"
 
 
 # --- prefill -------------------------------------------------------------------------------------
@@ -254,7 +266,19 @@ def same_artifact(first: str, second: str) -> bool:
                 os.path.normcase(os.path.abspath(second)))
 
 
-def check_pair(pair: ChunkPair, *, fast_route: bool, fast_chunk: int = 0) -> None:
+def check_kernel_sets(label: str, default: bool, fast: bool, role: str) -> None:
+    """default, fast: whether each run ran column-invariant kernels."""
+    if role == GATE and default != fast:
+        raise MeasurementError(
+            f"{label}: the default run ran {'column-invariant' if default else 'width-routed'} "
+            f"kernels and the fast run {'column-invariant' if fast else 'width-routed'} ones; the "
+            "default role runs the fast run's kernel set")
+    if role == CONTROL and not (default and not fast):
+        raise MeasurementError(f"{label}: a control pairs the exact route's column-invariant "
+                               "kernels with its width-routed ones")
+
+
+def check_pair(pair: ChunkPair, *, role: str, fast_chunk: int = 0) -> None:
     """fast_chunk: the fast run prefills at this width instead of its default run's chunk
     (prefill --fast-chunk, a schedule fast path that widens prefill steps)."""
     a, b = pair.default, pair.fast
@@ -263,33 +287,38 @@ def check_pair(pair: ChunkPair, *, fast_route: bool, fast_chunk: int = 0) -> Non
             raise MeasurementError(f"{pair.label}: the runs differ in {key}")
     if a["kl_divergence"]["reference"] != b["kl_divergence"]["reference"]:
         raise MeasurementError(f"{pair.label}: the runs used different references")
-    if fast_route:
-        # Both routes of one artifact (compare-prefill may set two artifacts against one reference).
-        if (not same_artifact(a["artifact"]["path"], b["artifact"]["path"]) or
-                a["artifact"]["prefill_signature"] != b["artifact"]["prefill_signature"]):
-            raise MeasurementError(f"{pair.label}: the default and fast runs scored other artifacts")
-        if a["execution"]["kv_dtype"] != b["execution"]["kv_dtype"]:
-            raise MeasurementError(f"{pair.label}: default and fast differ in kv_dtype")
-        expected = fast_chunk or a["execution"]["prefill_chunk_tokens"]
-        if b["execution"]["prefill_chunk_tokens"] != expected:
-            raise MeasurementError(
-                f"{pair.label}: the fast run prefills at {b['execution']['prefill_chunk_tokens']}"
-                f" tokens, expected {expected}")
-        if a["execution"].get("fast_paths") or not b["execution"].get("fast_paths"):
-            raise MeasurementError(
-                f"{pair.label}: expected an exact-route run and a run with fast paths active")
+    if role == COMPARE:
+        return
+    # Both routes of one artifact (compare-prefill may set two artifacts against one reference).
+    if (not same_artifact(a["artifact"]["path"], b["artifact"]["path"]) or
+            a["artifact"]["prefill_signature"] != b["artifact"]["prefill_signature"]):
+        raise MeasurementError(f"{pair.label}: the default and fast runs scored other artifacts")
+    if a["execution"]["kv_dtype"] != b["execution"]["kv_dtype"]:
+        raise MeasurementError(f"{pair.label}: default and fast differ in kv_dtype")
+    expected = (fast_chunk if role == GATE else 0) or a["execution"]["prefill_chunk_tokens"]
+    if b["execution"]["prefill_chunk_tokens"] != expected:
+        raise MeasurementError(
+            f"{pair.label}: the fast run prefills at {b['execution']['prefill_chunk_tokens']}"
+            f" tokens, expected {expected}")
+    if a["execution"].get("fast_paths") or bool(b["execution"].get("fast_paths")) != (role == GATE):
+        raise MeasurementError(
+            f"{pair.label}: expected an exact-route run and a run with fast paths active"
+            if role == GATE else f"{pair.label}: a control pairs two exact-route runs")
+    check_kernel_sets(pair.label, kernel_flag(a["execution"], pair.label),
+                      kernel_flag(b["execution"], pair.label), role)
 
 
-def prefill_pairs(directory: Path, fast_chunk: int = 0) -> list[ChunkPair]:
+def prefill_pairs(directory: Path, fast_chunk: int = 0, *, base: str = "default",
+                  candidate: str = "fast", role: str = GATE) -> list[ChunkPair]:
     pairs = []
-    for default_dir in sorted(d for d in directory.glob("default-c*") if d.is_dir()):
-        chunk = default_dir.name.removeprefix("default-c")
-        pairs.append(ChunkPair(f"chunk {chunk}", load_report(default_dir),
-                               load_report(directory / f"fast-c{chunk}")))
+    for base_dir in sorted(d for d in directory.glob(f"{base}-c*") if d.is_dir()):
+        chunk = base_dir.name.removeprefix(f"{base}-c")
+        pairs.append(ChunkPair(f"chunk {chunk}", load_report(base_dir),
+                               load_report(directory / f"{candidate}-c{chunk}")))
     if not pairs:
-        raise MeasurementError(f"no default-c<chunk> runs in {directory}")
+        raise MeasurementError(f"no {base}-c<chunk> runs in {directory}")
     for pair in pairs:
-        check_pair(pair, fast_route=True, fast_chunk=fast_chunk)
+        check_pair(pair, role=role, fast_chunk=fast_chunk)
     return pairs
 
 
@@ -299,7 +328,7 @@ def compared_pairs(base: Sequence[Path], candidate: Sequence[Path]) -> list[Chun
     pairs = [ChunkPair(f"{b.name} vs {c.name}", load_report(b), load_report(c))
              for b, c in zip(base, candidate)]
     for pair in pairs:
-        check_pair(pair, fast_route=False)
+        check_pair(pair, role=COMPARE)
     return pairs
 
 
@@ -421,20 +450,25 @@ def evaluate_prefill_sets(sets: Sequence[Sequence[ChunkPair]], scope: str,
     return verdict
 
 
-def evaluate_prefill(directory: Path, policy: Policy = POLICY, fast_chunk: int = 0) -> Verdict:
-    """One KV format's runs; with their WIDTH_ROUTED subdirectory, scored against both references.
-    A run directory's own reference (../reference) that ran column-invariant kernels requires it."""
-    sets = [prefill_pairs(directory, fast_chunk)]
-    if (directory / WIDTH_ROUTED).is_dir():
-        sets.append(prefill_pairs(directory / WIDTH_ROUTED, fast_chunk))
-    else:
-        reference = directory.parent / "reference" / "report.json"
-        if reference.is_file():
-            with reference.open(encoding="utf-8") as handle:
-                if json.load(handle)["execution"].get("column_invariant_kernels"):
-                    raise MeasurementError(f"{directory} lacks its runs against the width-routed "
-                                           f"reference ({WIDTH_ROUTED}/)")
-    return evaluate_prefill_sets(sets, f"prefill {directory}", policy)
+def evaluate_prefill(directory: Path, policy: Policy = POLICY, fast_chunk: int = 0) -> list[Verdict]:
+    """One KV format's runs: the gate (default-c<chunk> against fast-c<chunk>) and, where the
+    default runs are width-routed, the control (exact-c<chunk> against default-c<chunk>, here and
+    against the width-routed reference in WIDTH_ROUTED/)."""
+    pairs = prefill_pairs(directory, fast_chunk)
+    verdicts = [evaluate_prefill_sets([pairs], f"prefill {directory}", policy)]
+    if any(p.default["execution"].get("width_routed_kernels") for p in pairs):
+        if not (directory / WIDTH_ROUTED).is_dir():
+            raise MeasurementError(f"{directory}'s default runs are width-routed; the control needs "
+                                   f"its runs against the width-routed reference ({WIDTH_ROUTED}/)")
+        sets = [prefill_pairs(directory, base="exact", candidate="default", role=CONTROL),
+                prefill_pairs(directory / WIDTH_ROUTED, base="exact", candidate="default",
+                              role=CONTROL)]
+        if ({p.default["kl_divergence"]["reference"] for p in sets[0]} &
+                {p.default["kl_divergence"]["reference"] for p in sets[1]}):
+            raise MeasurementError(f"{directory}: the control's two sets share a reference")
+        verdicts.append(evaluate_prefill_sets(sets, f"kernel-switch control, prefill {directory}",
+                                              policy))
+    return verdicts
 
 
 # --- decode --------------------------------------------------------------------------------------
@@ -569,37 +603,44 @@ def quantile(values: Sequence[float], q: float) -> float:
 
 
 def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
-                    policy: Policy = POLICY, *, fast_route: bool = True,
+                    policy: Policy = POLICY, *, role: str = GATE,
                     second: tuple[Path, Path, Path] | None = None) -> Verdict:
     """The decode criteria: the prefill criteria at teacher-forced decode positions.
 
-    The floor is the default run's own decode divergence from the reference. With fast_route=False
-    (compare-decode) any two runs of one reference are compared, for controls. second: the default
-    and fast runs that observed the width-routed reference, and that reference (WIDTH_ROUTED); each
-    segment is then averaged over both references.
+    The floor is the default run's own decode divergence from the reference. role CONTROL compares
+    the exact route's column-invariant kernels with its width-routed ones, COMPARE any two runs of
+    one reference. second (a control or comparison): the two runs that observed the width-routed
+    reference, and that reference (WIDTH_ROUTED); each segment is then averaged over both.
     """
+    if second and role == GATE:
+        raise MeasurementError("the gate scores its runs against one reference")
     triples = [(default_path, fast_path, reference_path)] + ([second] if second else [])
     scored: list[tuple[list[ForcedSegment], list[ForcedSegment], float]] = []
     runs: list[tuple[dict, dict]] = []
     for d_path, f_path, r_path in triples:
         default, fast = load_forced(d_path), load_forced(f_path)
         reference = load_forced(r_path)
-        for key in ("mode", "kv_dtype", "forced_tokens"):
-            if default[key] != fast[key] and fast_route:
-                raise MeasurementError(f"the teacher-forced runs differ in {key}")
-        if fast_route and (default["fast_paths"] or not fast["fast_paths"]):
-            raise MeasurementError("expected an exact-route run and a run with fast paths active")
-        if fast_route and not all(same_artifact(run["artifact"], reference["artifact"])
-                                  for run in (default, fast)):
-            raise MeasurementError("the reference and the teacher-forced runs scored other artifacts")
+        if role != COMPARE:
+            for key in ("mode", "kv_dtype", "forced_tokens"):
+                if default[key] != fast[key]:
+                    raise MeasurementError(f"the teacher-forced runs differ in {key}")
+            if default["fast_paths"] or bool(fast["fast_paths"]) != (role == GATE):
+                raise MeasurementError("expected an exact-route run and a run with fast paths active"
+                                       if role == GATE else "a control pairs two exact-route runs")
+            if not all(same_artifact(run["artifact"], reference["artifact"]) for run in (default, fast)):
+                raise MeasurementError("the reference and the teacher-forced runs scored other artifacts")
+            check_kernel_sets(f"{d_path} and {f_path}", kernel_flag(default, d_path),
+                              kernel_flag(fast, f_path), role)
         if reference.get("kind") != "reference" or reference["forced_tokens"] != default["forced_tokens"]:
             raise MeasurementError(f"{r_path} is not a reference for these runs")
         a, coverage = forced_segments(default, reference)
         b, _ = forced_segments(fast, reference)
         scored.append((a, b, coverage))
         runs.append((default, fast))
-    if second and not reference_flag(load_forced(reference_path), reference_path):
-        raise MeasurementError(f"{reference_path} ran no column-invariant kernels; it needs no second")
+    if second and (load_forced(reference_path).get("width_routed")
+                   or not load_forced(second[2]).get("width_routed")):
+        raise MeasurementError(f"{second[2]} must be the width-routed reference, {reference_path} "
+                               "the other")
     a = scored[0][0]
     if any([s.prompt_tokens for s in x] != [s.prompt_tokens for s in a] for x, _, _ in scored):
         raise MeasurementError("the references' runs forced different segments")
@@ -624,7 +665,8 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
     floor_tv = sum(u.default for u in tv_units) / positions
     floor_top1 = sum(u.default for u in top1_units) / positions
     default, fast = runs[0]
-    verdict = Verdict(scope=f"teacher-forced decode {default['mode']} {fast_path.parent}")
+    verdict = Verdict(scope=("kernel-switch control, " if role == CONTROL else "")
+                      + f"teacher-forced decode {default['mode']} {fast_path.parent}")
     verdict.facts = {
         "mode": default["mode"],
         "kv_dtype": default["kv_dtype"],
@@ -686,62 +728,45 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
     return verdict
 
 
-def evaluate_free_running(report_path: Path, policy: Policy = POLICY,
-                          second: Path | None = None) -> Verdict:
-    """Greedy continuations, each judged on its own prefix against the reference. second: the
-    same generations judged against the width-routed reference (WIDTH_ROUTED); each segment is
-    then averaged over both."""
-    reports = []
-    for path in [report_path] + ([second] if second else []):
-        with path.open(encoding="utf-8") as handle:
-            reports.append(json.load(handle))
-    if second and not reference_flag(reports[0], report_path):
-        raise MeasurementError(f"{report_path}'s reference ran no column-invariant kernels; it "
-                               "needs no second")
-    disagreement_sets, regret_sets = [], []
-    for report in reports:
-        runs = report["runs"]
-        if len(runs) != 2:
-            raise MeasurementError("the judge report must hold exactly the default and the fast run")
-        if [r["file"] for r in runs] != [r["file"] for r in reports[0]["runs"]]:
-            raise MeasurementError("the judge reports judged different generations")
-        default, fast = runs[0]["segments"], runs[1]["segments"]
-        if [s["offset"] for s in default] != [s["offset"] for s in fast]:
-            raise MeasurementError("default and fast runs generated from different segments")
-        if len(default) < policy.min_units:
-            raise MeasurementError(
-                f"{len(default)} segments; the bound needs at least {policy.min_units}")
-        for s in default + fast:
-            if s["tokens"] <= 0:
-                raise MeasurementError("a segment generated no tokens")
-        # Per-token rates of each build, weighted by the segment's mean length.
-        disagreement_sets.append([
-            PairedUnit(
-                (d["tokens"] + f["tokens"]) / 2,
-                (1.0 - d["agree"] / d["tokens"]) * (d["tokens"] + f["tokens"]) / 2,
-                (1.0 - f["agree"] / f["tokens"]) * (d["tokens"] + f["tokens"]) / 2,
-            )
-            for d, f in zip(default, fast)
-        ])
-        regret_sets.append([
-            PairedUnit(
-                (d["tokens"] + f["tokens"]) / 2,
-                d["regret"] / d["tokens"] * (d["tokens"] + f["tokens"]) / 2,
-                f["regret"] / f["tokens"] * (d["tokens"] + f["tokens"]) / 2,
-            )
-            for d, f in zip(default, fast)
-        ])
-    report = reports[0]
-    default = report["runs"][0]["segments"]
-    disagreement = mean_units(disagreement_sets)
-    regret = mean_units(regret_sets)
+def evaluate_free_running(report_path: Path, policy: Policy = POLICY) -> Verdict:
+    """Greedy continuations, each judged on its own prefix against the reference."""
+    with report_path.open(encoding="utf-8") as handle:
+        report = json.load(handle)
+    runs = report["runs"]
+    if len(runs) != 2:
+        raise MeasurementError("the judge report must hold exactly the default and the fast run")
+    default, fast = runs[0]["segments"], runs[1]["segments"]
+    if [s["offset"] for s in default] != [s["offset"] for s in fast]:
+        raise MeasurementError("default and fast runs generated from different segments")
+    if len(default) < policy.min_units:
+        raise MeasurementError(
+            f"{len(default)} segments; the bound needs at least {policy.min_units}")
+    for s in default + fast:
+        if s["tokens"] <= 0:
+            raise MeasurementError("a segment generated no tokens")
+    # Per-token rates of each build, weighted by the segment's mean length.
+    disagreement = [
+        PairedUnit(
+            (d["tokens"] + f["tokens"]) / 2,
+            (1.0 - d["agree"] / d["tokens"]) * (d["tokens"] + f["tokens"]) / 2,
+            (1.0 - f["agree"] / f["tokens"]) * (d["tokens"] + f["tokens"]) / 2,
+        )
+        for d, f in zip(default, fast)
+    ]
+    regret = [
+        PairedUnit(
+            (d["tokens"] + f["tokens"]) / 2,
+            d["regret"] / d["tokens"] * (d["tokens"] + f["tokens"]) / 2,
+            f["regret"] / f["tokens"] * (d["tokens"] + f["tokens"]) / 2,
+        )
+        for d, f in zip(default, fast)
+    ]
     verdict = Verdict(scope=f"free-running decode {report_path}")
     tokens = sum(u.weight for u in disagreement)
     floor_disagreement = sum(u.default for u in disagreement) / tokens
     floor_regret = sum(u.default for u in regret) / tokens
     verdict.facts = {
         "reference": report.get("reference"),
-        "references": len(reports),
         "segments": len(default),
         "tokens_per_route": tokens,
         "default_disagreement": floor_disagreement,
@@ -837,7 +862,7 @@ def run(command: list[str], log: Path) -> None:
         raise MeasurementError(f"command failed ({result.returncode}); see {log}")
 
 
-DEFAULT_REFERENCE_CACHE = Path("profiles/quality/reference-cache")
+DEFAULT_CACHE = Path("profiles/quality/cache")
 
 
 def file_digest(*paths: Path) -> str:
@@ -852,7 +877,7 @@ def file_digest(*paths: Path) -> str:
 
 
 def artifact_identity(artifact: str) -> dict:
-    """The artifact as a reference depends on it: its file, and the size and modification time
+    """The artifact as a cached run depends on it: its file, and the size and modification time
     that change whenever it is rewritten (published artifacts are never rewritten in place)."""
     path = Path(artifact).resolve()
     stat = path.stat()
@@ -860,7 +885,7 @@ def artifact_identity(artifact: str) -> dict:
 
 
 def corpus_identity(corpus: str | None, text: str | None) -> str:
-    """The content of the text a reference scores (a manifest with its streams, or one file)."""
+    """The content of the text a run scores (a manifest with its streams, or one file)."""
     if text:
         return file_digest(Path(text))
     manifest = Path(corpus)
@@ -868,48 +893,122 @@ def corpus_identity(corpus: str | None, text: str | None) -> str:
     return file_digest(manifest, *[manifest.parent / s["path"] for s in spec["streams"]])
 
 
-def ensure_reference(out: Path, names: Sequence[str], key: dict, produce: Callable[[], None],
-                     cache: Path | None, recompute: bool, dependents: Sequence[Path] = ()) -> str:
-    """Puts the reference files `names` (relative to `out`) in place and says where they came from.
+# The sample a spot check reruns before a cached run or reference is reused: each stream's first
+# window in prefill (each domain's stream, from a corpus manifest), every prompt length's first two
+# segments in teacher-forced decode, and a generation's first continuations.
+SAMPLE_WINDOWS = 1
+SAMPLE_PROMPT_ROUNDS = 2
+SAMPLE_CONTINUATIONS = 4
+# A teacher-forced run's own values, the same whichever reference it observed.
+RUN_FINGERPRINT = ("offset", "prompt_tokens", "logprobs", "top_logprobs")
 
-    A reference is deterministic in its key (the artifact, the corpus content and every setting
-    that shapes it, never the KV format, mode or candidate), so a run directory takes it from the
-    shared cache when an entry for the key exists, linked (or copied) in, and stores what it
-    computes there. recompute (--recompute-reference) recomputes it and replaces the cache entry,
-    for a change to the reference route itself, which the key does not see; it refuses while
-    `dependents` (runs already scored against the directory's reference) exist.
+
+def cache_entry(cache: Path | None, key: dict) -> Path | None:
+    if cache is None:
+        return None
+    return cache / hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()[:32]
+
+
+def store(out: Path, names: Sequence[str], key: dict, entry: Path) -> None:
+    staging = entry.with_name(entry.name + f".tmp{os.getpid()}")
+    remove_path(staging)
+    staging.mkdir(parents=True)
+    for name in names:
+        place(out / name, staging / name)
+    (staging / "key.json").write_text(json.dumps(key, indent=2, sort_keys=True) + "\n",
+                                      encoding="utf-8")
+    remove_path(entry)
+    staging.rename(entry)
+
+
+def ensure_cached(out: Path, names: Sequence[str], key: dict, produce: Callable[[], None],
+                  verify: Callable[[], str | None], cache: Path | None, recompute: bool) -> str:
+    """Puts the files `names` (relative to `out`) of one exact-route run or reference in place and
+    says where they came from.
+
+    Such a run is deterministic in its key (the artifact, the corpus content, every setting that
+    shapes it and, for a scored run, its reference's content, never the candidates), so a run
+    directory takes it from the shared cache when an entry exists, linked (or copied) in, and stores
+    what it computes there. The key cannot see the build, so every reuse, of a cache entry or of
+    files already in the directory, first reruns a sample of the route (verify returns its first
+    difference from the files in place, or None): a cache entry that differs is recomputed and
+    replaced, and files in the directory that differ are refused (use a fresh --out). recompute
+    (--recompute) computes every entry the directory uses and replaces it.
     """
-    present = all((out / name).exists() for name in names)
-    if present and not recompute:
-        return "kept"
-    if recompute:
-        if dependents:
-            raise MeasurementError(
-                f"{out} holds runs scored against its reference ({', '.join(map(str, dependents))}); "
-                "remove them or use a fresh --out to recompute the reference")
+    entry = cache_entry(cache, key)
+    if all((out / name).exists() for name in names) and not recompute:
+        difference = verify()
+        if difference is not None:
+            raise MeasurementError(f"{out / names[0]} differs from this build ({difference}); use a "
+                                   "fresh --out")
+        if entry is not None and not (entry / "key.json").is_file():
+            store(out, names, key, entry)
+            return f"kept, verified, stored in {entry}"
+        return "kept, verified"
+    for name in names:
+        remove_path(out / name)
+    if entry is not None and not recompute and (entry / "key.json").is_file():
+        for name in names:
+            place(entry / name, out / name)
+        difference = verify()
+        if difference is None:
+            return f"reused {entry}, verified"
+        print(f"  {entry} differs from this build ({difference}); recomputing it", flush=True)
         for name in names:
             remove_path(out / name)
-    entry = None
-    if cache is not None:
-        digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()[:32]
-        entry = cache / digest
-        if not recompute and (entry / "key.json").is_file():
-            for name in names:
-                place(entry / name, out / name)
-            return f"reused {entry}"
     produce()
     if entry is not None:
-        staging = entry.with_name(entry.name + f".tmp{os.getpid()}")
-        remove_path(staging)
-        staging.mkdir(parents=True)
-        for name in names:
-            place(out / name, staging / name)
-        (staging / "key.json").write_text(json.dumps(key, indent=2, sort_keys=True) + "\n",
-                                          encoding="utf-8")
-        remove_path(entry)
-        staging.rename(entry)
+        store(out, names, key, entry)
         return f"computed, stored in {entry}"
     return "computed"
+
+
+def scratch(out: Path) -> Path:
+    """An empty directory for a spot check's sample run."""
+    path = out / ".sample"
+    remove_path(path)
+    path.mkdir(parents=True)
+    return path
+
+
+def window_difference(saved: dict, sample: dict) -> str | None:
+    """The first sampled window whose scored tokens or NLL differ from the saved run's."""
+    a, b = window_values(saved), window_values(sample)
+    if not b:
+        return "the sample scored no windows"
+    for key in sorted(b):
+        if key not in a:
+            return f"window {key} is not in the saved run"
+        if a[key][:2] != b[key][:2]:
+            return f"window {key}: NLL {a[key][1]!r} saved, {b[key][1]!r} now"
+    return None
+
+
+def segment_difference(saved: Sequence[dict], sample: Sequence[dict],
+                       fields: Sequence[str] | None = None) -> str | None:
+    """The first sampled segment that differs from the saved one (in fields, or entirely)."""
+    if len(saved) < len(sample):
+        return "the saved run holds fewer segments than the sample"
+    for index, (x, y) in enumerate(zip(saved, sample)):
+        if (x != y) if fields is None else any(x.get(f) != y.get(f) for f in fields):
+            return f"segment {index} differs"
+    return None
+
+
+def adopt_reference(report: Path, reference: Path) -> None:
+    """A run taken from the cache names the reference of the directory that computed it; its key
+    holds that reference's content, which equals this directory's, so it names this one's."""
+    record = json.loads(report.read_text(encoding="utf-8"))
+    local = os.path.abspath(reference)
+    if record["kl_divergence"]["reference"] != local:
+        record["kl_divergence"]["reference"] = local
+        report.unlink()  # a link to the cache entry
+        report.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+
+def refuse_recompute_over_runs(out: Path, recompute: bool) -> None:
+    if recompute and any(p.name not in ("gate.json", "corpus.txt") for p in out.iterdir()):
+        raise MeasurementError(f"{out} holds runs; --recompute needs a fresh --out")
 
 
 def remove_path(path: Path) -> None:
@@ -920,8 +1019,8 @@ def remove_path(path: Path) -> None:
 
 
 def place(source: Path, target: Path) -> None:
-    """target becomes source's content: hard links (references are large and never modified),
-    a copy where linking fails (another volume)."""
+    """target becomes source's content: hard links (runs are large and never modified), a copy
+    where linking fails (another volume)."""
     target.parent.mkdir(parents=True, exist_ok=True)
     if source.is_dir():
         target.mkdir(exist_ok=True)
@@ -938,7 +1037,9 @@ def claim_out(out: Path, settings: dict, fast_path: Sequence[str],
               fast_runs: Sequence[str]) -> None:
     """Reused runs are skipped, so a run directory (gate.json) serves one artifact and one set of
     run settings: another artifact or workload needs a fresh --out. Another candidate set reuses
-    the reference and default runs once the fast runs (the fast_runs globs) are removed."""
+    the references and exact runs once the runs that depend on the candidates (the fast_runs globs:
+    the fast runs, and the default role and control, which follow the fast run's kernel set) are
+    removed."""
     out.mkdir(parents=True, exist_ok=True)
     manifest = out / "gate.json"
     settings = dict(settings, artifact=os.path.abspath(settings["artifact"]))
@@ -973,7 +1074,8 @@ def run_prefill(args: argparse.Namespace) -> Path:
                     "stride": args.stride, "ngram_volume": args.ngram_volume,
                     "no_fast_path": list(args.no_fast_path),
                     "fast_chunk": args.fast_chunk},
-              args.fast_path, ["*/fast-c*", f"*/{WIDTH_ROUTED}/fast-c*"])
+              args.fast_path, ["*/fast-c*", "*/default-c*", f"*/{WIDTH_ROUTED}"])
+    refuse_recompute_over_runs(out, args.recompute)
     workload = ["--context", str(args.context), "--stride", str(args.stride), "--log-level",
                 "warning"]
     workload += ["--corpus", args.corpus] if args.corpus else ["--text", args.text]
@@ -984,55 +1086,98 @@ def run_prefill(args: argparse.Namespace) -> Path:
     common = [args.perplexity, args.artifact] + workload
     # 16-bit activations, BF16 KV, one pass per window.
     one_pass = ["--kv-dtype", "bf16", "--prefill-chunk", str(args.context), "--a16-activations"]
-    reference = out / "reference.top"
-    # format 2: the reference records column_invariant_kernels.
-    key = {"kind": "prefill", "format": 2, "artifact": artifact_identity(args.artifact),
-           "corpus": corpus_identity(args.corpus, args.text), "quick": args.quick,
-           "context": args.context, "stride": args.stride,
-           "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None,
-           "route": one_pass}
-    source = ensure_reference(
-        out, ["reference.top", "reference"], key,
-        lambda: run(common + one_pass + ["--save-top-tokens", str(reference), "--output",
-                                         str(out / "reference")], out / "reference.log"),
-        args.reference_cache, args.recompute_reference,
-        [p for p in out.glob("*/*-c*") if p.is_dir()])
-    print(f"  reference: {source}", flush=True)
-    references = [(reference, Path())]
-    record = out / "reference" / "report.json"
-    with record.open(encoding="utf-8") as handle:
-        width_routed = reference_flag(json.load(handle)["execution"], record)
-    if width_routed:
-        second = out / WIDTH_ROUTED / "reference.top"
-        second.parent.mkdir(exist_ok=True)
-        source = ensure_reference(
-            out, [f"{WIDTH_ROUTED}/reference.top", f"{WIDTH_ROUTED}/reference"],
-            dict(key, route=one_pass + ["--width-routed-kernels"]),
-            lambda: run(common + one_pass + ["--width-routed-kernels", "--save-top-tokens",
-                                             str(second), "--output",
-                                             str(out / WIDTH_ROUTED / "reference")],
-                        out / WIDTH_ROUTED / "reference.log"),
-            args.reference_cache, args.recompute_reference,
-            [p for p in out.glob(f"*/{WIDTH_ROUTED}/*-c*") if p.is_dir()])
-        print(f"  width-routed reference: {source}", flush=True)
-        references.append((second, Path(WIDTH_ROUTED)))
+    shared = {"artifact": artifact_identity(args.artifact),
+              "corpus": corpus_identity(args.corpus, args.text), "quick": args.quick,
+              "context": args.context, "stride": args.stride,
+              "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None}
+    samples: dict[tuple, dict] = {}
+    digests: dict[Path, str] = {}
+
+    def verifier(command: list[str], saved: Path) -> Callable[[], str | None]:
+        """Reruns the route's sample windows once per command and compares them with saved."""
+        def verify() -> str | None:
+            key = tuple(command)
+            if key not in samples:
+                directory = scratch(out)
+                sample = command + ["--max-windows", str(SAMPLE_WINDOWS), "--output",
+                                    str(directory / "run")]
+                if args.corpus and not args.quick:
+                    sample.append("--quick")
+                run(sample, directory / "run.log")
+                samples[key] = json.loads((directory / "run" / "report.json").read_text(
+                    encoding="utf-8"))
+                remove_path(directory)
+            return window_difference(json.loads(saved.read_text(encoding="utf-8")), samples[key])
+        return verify
+
+    def reference(subdirectory: str, route: list[str], label: str) -> Path:
+        directory = out / subdirectory
+        directory.mkdir(parents=True, exist_ok=True)
+        command = common + one_pass + route
+        top = directory / "reference.top"
+        # format 2: the reference records column_invariant_kernels.
+        key = dict(shared, kind="prefill", format=2, route=one_pass + route)
+        source = ensure_cached(
+            out, [str(Path(subdirectory, "reference.top")), str(Path(subdirectory, "reference"))],
+            key, lambda: run(command + ["--save-top-tokens", str(top), "--output",
+                                        str(directory / "reference")], directory / "reference.log"),
+            verifier(command, directory / "reference" / "report.json"), args.cache, args.recompute)
+        print(f"  {label}: {source}", flush=True)
+        return top
+
+    def scored(directory: Path, name: str, kv: str, width: int, route: list[str], against: Path,
+               cached: bool) -> dict:
+        target = directory / name
+        directory.mkdir(parents=True, exist_ok=True)
+        command = common + ["--kv-dtype", kv, "--prefill-chunk", str(width)] + route
+
+        def produce() -> None:
+            run(command + ["--kl-reference", str(against), "--output", str(target)],
+                directory / f"{name}.log")
+
+        if not cached:
+            if not (target / "report.json").is_file():
+                produce()
+            return load_report(target)
+        if against not in digests:
+            digests[against] = file_digest(against)
+        label = str(target.relative_to(out))
+        key = dict(shared, kind="prefill-run", format=3, kv=kv, chunk=width, route=route,
+                   reference=digests[against])
+        source = ensure_cached(out, [label], key, produce,
+                               verifier(command, target / "report.json"), args.cache,
+                               args.recompute)
+        print(f"  {label}: {source}", flush=True)
+        adopt_reference(target / "report.json", against)
+        return load_report(target)
+
+    first = reference("", [], "reference")
+    exact_route = ["--disable-fast-paths"]
+    width_routed = exact_route + ["--width-routed-kernels"]
     for kv in args.kv:
+        runs = out / kv
+        switches = set()
         for chunk in args.chunk:
-            for scored_against, subdirectory in references:
-                for route, extra in (("default", ["--disable-fast-paths"]),
-                                     ("fast", candidate_options(args, "--fast-path"))):
-                    directory = out / kv / subdirectory
-                    target = directory / f"{route}-c{chunk}"
-                    if (target / "report.json").is_file():
-                        continue
-                    directory.mkdir(parents=True, exist_ok=True)
-                    # A schedule fast path's fast run may prefill at another width than the
-                    # default run it pairs with (--fast-chunk); the pair keeps the default run's
-                    # chunk name.
-                    width = args.fast_chunk if route == "fast" and args.fast_chunk else chunk
-                    run(common + ["--kv-dtype", kv, "--prefill-chunk", str(width), "--kl-reference",
-                                  str(scored_against), "--output", str(target)] + extra,
-                        directory / f"{route}-c{chunk}.log")
+            exact = scored(runs, f"exact-c{chunk}", kv, chunk, exact_route, first, True)
+            # A schedule fast path's fast run may prefill at another width than the default run it
+            # pairs with (--fast-chunk); the pair keeps the default run's chunk name.
+            fast = scored(runs, f"fast-c{chunk}", kv, args.fast_chunk or chunk,
+                          candidate_options(args, "--fast-path"), first, False)
+            switches.add(kernel_flag(exact["execution"], runs / f"exact-c{chunk}") and
+                         not kernel_flag(fast["execution"], runs / f"fast-c{chunk}"))
+        if len(switches) != 1:
+            raise MeasurementError(f"{runs}: the chunk sizes ran different kernel sets")
+        if switches.pop():
+            for chunk in args.chunk:
+                scored(runs, f"default-c{chunk}", kv, chunk, width_routed, first, True)
+            second = reference(WIDTH_ROUTED, ["--width-routed-kernels"], "width-routed reference")
+            for chunk in args.chunk:
+                for name, route in (("exact", exact_route), ("default", width_routed)):
+                    scored(runs / WIDTH_ROUTED, f"{name}-c{chunk}", kv, chunk, route, second, True)
+        else:
+            for chunk in args.chunk:
+                if not (runs / f"default-c{chunk}").exists():
+                    place(runs / f"exact-c{chunk}", runs / f"default-c{chunk}")
     return out
 
 
@@ -1070,12 +1215,12 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
                     "ngram_volume": args.ngram_volume,
                     "no_fast_path": list(args.no_fast_path),
                     "free_running_segments": args.free_running_segments},
-              args.fast_path, ["fast-forced.json", "fast.txt", "judge.json",
-                               f"{WIDTH_ROUTED}/fast-forced.json", f"{WIDTH_ROUTED}/judge.json"])
+              args.fast_path, ["fast-forced.json", "default-forced.json", WIDTH_ROUTED, "fast.txt",
+                               "default.txt", "judge.json"])
+    refuse_recompute_over_runs(out, args.recompute)
     text = args.text or str(corpus_text(Path(args.corpus), out))
     volume = ["--ngram-volume", args.ngram_volume] if args.ngram_volume else []
-    segments = ["--segments", str(args.segments), "--prompts",
-                ",".join(str(p) for p in args.prompts)]
+    prompts = ",".join(str(p) for p in args.prompts)
     # The arm: both routes run the same Engine conditions, so the request-coupling paths act in
     # the fast run (other requests in the round, a short KV pool, prefix-cache resumes).
     arm = ["--concurrency", str(args.concurrency)]
@@ -1085,82 +1230,154 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
         arm += ["--prefix-reuse"]
     if args.warm_tokens:
         arm += ["--warm-tokens", str(args.warm_tokens)]
+    shared = {"artifact": artifact_identity(args.artifact), "corpus": corpus_identity(None, text),
+              "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None}
+    forced_shared = dict(shared, segments=args.segments, prompts=list(args.prompts))
+    # The rounds of a run with several lanes depend on their timing: only single-lane runs repeat
+    # bit for bit, so only they are cached.
+    cached_runs = args.concurrency == 1
+    sample = min(args.segments, SAMPLE_PROMPT_ROUNDS * len(args.prompts))
+    samples: dict[tuple, list] = {}
+    digests: dict[Path, str] = {}
+
+    def forced(target: Path, count: int, extra: list[str]) -> list[str]:
+        return ([args.forced, args.artifact, text, str(target), "--segments", str(count),
+                 "--prompts", prompts] + extra + volume)
+
     # The reference: the 16-bit-activation, BF16-KV scoring route at the same positions.
-    reference = out / "reference.json"
-    # format 2: the reference records column_invariant_kernels.
-    key = {"kind": "decode", "format": 2, "artifact": artifact_identity(args.artifact),
-           "corpus": corpus_identity(None, text), "segments": args.segments,
-           "prompts": list(args.prompts),
-           "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None}
-    source = ensure_reference(
-        out, ["reference.json"], key,
-        lambda: run([args.forced, args.artifact, text, str(reference), "--reference"] + segments
-                    + volume, out / "reference.log"),
-        args.reference_cache, args.recompute_reference,
-        [p for p in (out / "default-forced.json", out / "fast-forced.json") if p.exists()])
-    print(f"  reference: {source}", flush=True)
-    width_routed = out / WIDTH_ROUTED
-    second = width_routed / "reference.json"
-    observed = [(reference, out)]
-    if reference_flag(load_forced(reference), reference):
-        width_routed.mkdir(exist_ok=True)
-        source = ensure_reference(
-            out, [f"{WIDTH_ROUTED}/reference.json"], dict(key, width_routed=True),
-            lambda: run([args.forced, args.artifact, text, str(second), "--reference",
-                         "--width-routed"] + segments + volume, width_routed / "reference.log"),
-            args.reference_cache, args.recompute_reference,
-            [p for p in (width_routed / "default-forced.json", width_routed / "fast-forced.json")
-             if p.exists()])
-        print(f"  width-routed reference: {source}", flush=True)
-        observed.append((second, width_routed))
-    for scored_against, directory in observed:
-        for route, extra in (("default", ["--disable-fast-paths"]),
-                             ("fast", candidate_options(args, "--fast-path"))):
-            target = directory / f"{route}-forced.json"
-            if target.is_file():
-                continue
-            run([args.forced, args.artifact, text, str(target), "--observe", str(scored_against),
-                 "--mode", args.mode, "--kv-dtype", args.kv] + segments + arm + volume + extra,
-                directory / f"{route}-forced.log")
-    selected = load_forced(out / "fast-forced.json")["fast_paths"]
-    if any(name in selected for name in args.no_fast_path):
-        kept = [name for name in args.no_fast_path if name in selected]
+    def reference(subdirectory: str, route: list[str], label: str) -> Path:
+        directory = out / subdirectory
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / "reference.json"
+
+        def verify() -> str | None:
+            check = scratch(out)
+            run(forced(check / "reference.json", sample, ["--reference"] + route), check / "run.log")
+            difference = segment_difference(load_forced(target)["segments"],
+                                            load_forced(check / "reference.json")["segments"])
+            remove_path(check)
+            return difference
+
+        # format 2: the reference records column_invariant_kernels.
+        key = dict(forced_shared, kind="decode", format=2, **({"width_routed": True} if route else {}))
+        source = ensure_cached(
+            out, [str(Path(subdirectory, "reference.json"))], key,
+            lambda: run(forced(target, args.segments, ["--reference"] + route),
+                        directory / "reference.log"),
+            verify, args.cache, args.recompute)
+        print(f"  {label}: {source}", flush=True)
+        return target
+
+    def observed(directory: Path, name: str, route: list[str], against: Path, cached: bool) -> dict:
+        target = directory / name
+        directory.mkdir(parents=True, exist_ok=True)
+        options = ["--mode", args.mode, "--kv-dtype", args.kv] + arm + route
+
+        def produce() -> None:
+            run(forced(target, args.segments, ["--observe", str(against)] + options),
+                directory / f"{target.stem}.log")
+
+        if not cached:
+            if not target.is_file():
+                produce()
+            return load_forced(target)
+
+        def verify() -> str | None:
+            key = tuple(options)
+            if key not in samples:
+                check = scratch(out)
+                truncated = load_forced(against)
+                truncated["segments"] = truncated["segments"][:sample]
+                (check / "reference.json").write_text(json.dumps(truncated), encoding="utf-8")
+                run(forced(check / "run.json", sample,
+                           ["--observe", str(check / "reference.json")] + options), check / "run.log")
+                samples[key] = load_forced(check / "run.json")["segments"]
+                remove_path(check)
+            return segment_difference(load_forced(target)["segments"], samples[key],
+                                      RUN_FINGERPRINT)
+
+        if against not in digests:
+            digests[against] = file_digest(against)
+        label = str(target.relative_to(out))
+        key = dict(forced_shared, kind="forced-run", format=3, mode=args.mode, kv=args.kv, arm=arm,
+                   route=route, reference=digests[against])
+        source = ensure_cached(out, [label], key, produce, verify, args.cache, args.recompute)
+        print(f"  {label}: {source}", flush=True)
+        return load_forced(target)
+
+    first = reference("", [], "reference")
+    exact_route = ["--disable-fast-paths"]
+    width_routed = exact_route + ["--width-routed"]
+    exact = observed(out, "exact-forced.json", exact_route, first, cached_runs)
+    fast = observed(out, "fast-forced.json", candidate_options(args, "--fast-path"), first, False)
+    switch = (kernel_flag(exact, out / "exact-forced.json") and
+              not kernel_flag(fast, out / "fast-forced.json"))
+    second = out / WIDTH_ROUTED / "reference.json"
+    if switch:
+        observed(out, "default-forced.json", width_routed, first, cached_runs)
+        reference(WIDTH_ROUTED, ["--width-routed"], "width-routed reference")
+        for name, route in (("exact-forced.json", exact_route), ("default-forced.json", width_routed)):
+            observed(out / WIDTH_ROUTED, name, route, second, cached_runs)
+    elif not (out / "default-forced.json").exists():
+        place(out / "exact-forced.json", out / "default-forced.json")
+    if any(name in fast["fast_paths"] for name in args.no_fast_path):
+        kept = [name for name in args.no_fast_path if name in fast["fast_paths"]]
         raise MeasurementError(f"the fast run still selected {', '.join(kept)}; the exclusion "
                                "did not apply to this tool")
     # The preemption path acts only on a preempted request: a run that never preempted is no
     # evidence for it.
-    if "preemption" in args.fast_path and load_forced(out / "fast-forced.json")["preemptions"] == 0:
+    if "preemption" in args.fast_path and fast["preemptions"] == 0:
         raise MeasurementError("the fast run never preempted; lower --kv-tokens or raise "
                                "--concurrency so the preemption candidate acts")
-    verdicts = [evaluate_forced(
-        out / "default-forced.json", out / "fast-forced.json", reference,
-        second=(width_routed / "default-forced.json", width_routed / "fast-forced.json", second)
-        if len(observed) > 1 else None)]
+    verdicts = [evaluate_forced(out / "default-forced.json", out / "fast-forced.json", first)]
+    if switch:
+        verdicts.append(evaluate_forced(
+            out / "exact-forced.json", out / "default-forced.json", first, role=CONTROL,
+            second=(out / WIDTH_ROUTED / "exact-forced.json",
+                    out / WIDTH_ROUTED / "default-forced.json", second)))
     if args.free_running:
         modes = [] if args.mode == "dflash2" else [args.mode]
-        for route, extra in (("default", ["exact", f"kv={args.kv}"]),
-                             ("fast", [f"path={p}" for p in args.fast_path]
-                              + [f"no-path={p}" for p in args.no_fast_path] + [f"kv={args.kv}"])):
-            target = out / f"{route}.txt"
-            if target.is_file():
-                continue
-            volume = [f"ngram-volume={args.ngram_volume}"] if args.ngram_volume else []
-            run([args.gen, args.artifact, text, str(target), str(args.free_running_segments),
-                 "1536", "384"] + modes + extra + volume,
-                out / f"{route}.log")
-        volume = ["--ngram-volume", args.ngram_volume] if args.ngram_volume else []
-        generations = [args.artifact, text, str(out / "default.txt"), str(out / "fast.txt")]
+        gen_volume = [f"ngram-volume={args.ngram_volume}"] if args.ngram_volume else []
+        count = args.free_running_segments
+
+        def generation(target: Path, continuations: int, extra: list[str]) -> list[str]:
+            return ([args.gen, args.artifact, text, str(target), str(continuations), "1536", "384"]
+                    + modes + extra + gen_volume)
+
+        baseline = ["exact", f"kv={args.kv}"] + (["width-routed"] if switch else [])
+        default = out / "default.txt"
+
+        def verify() -> str | None:
+            check = scratch(out)
+            run(generation(check / "run.txt", count,
+                           baseline + [f"first-segments={SAMPLE_CONTINUATIONS}"]),
+                check / "run.log")
+            now = (check / "run.txt").read_text(encoding="utf-8").splitlines()
+            remove_path(check)
+            saved = default.read_text(encoding="utf-8").splitlines()
+            if not now:
+                return "the sample generated nothing"
+            for index, line in enumerate(now):
+                if index >= len(saved) or saved[index] != line:
+                    return f"continuation {index} differs"
+            return None
+
+        key = dict(shared, kind="generation", format=3, continuations=count, prompt_tokens=1536,
+                   new_tokens=384, modes=modes, route=baseline)
+        source = ensure_cached(out, ["default.txt"], key,
+                               lambda: run(generation(default, count, baseline), out / "default.log"),
+                               verify, args.cache, args.recompute)
+        print(f"  default.txt: {source}", flush=True)
+        fast_generation = out / "fast.txt"
+        if not fast_generation.is_file():
+            run(generation(fast_generation, count, [f"path={p}" for p in args.fast_path]
+                           + [f"no-path={p}" for p in args.no_fast_path] + [f"kv={args.kv}"]),
+                out / "fast.log")
         report = out / "judge.json"
         if not report.is_file():
-            run([args.judge, "--report", str(report)] + volume + generations, out / "judge.log")
-        with report.open(encoding="utf-8") as handle:
-            judged_twice = reference_flag(json.load(handle), report)
-        report_second = width_routed / "judge.json"
-        if judged_twice and not report_second.is_file():
-            width_routed.mkdir(exist_ok=True)
-            run([args.judge, "--width-routed", "--report", str(report_second)] + volume
-                + generations, width_routed / "judge.log")
-        verdicts.append(evaluate_free_running(report, second=report_second if judged_twice else None))
+            run([args.judge, "--report", str(report)] + volume
+                + [args.artifact, text, str(default), str(fast_generation)], out / "judge.log")
+        verdicts.append(evaluate_free_running(report))
     return verdicts
 
 
@@ -1188,14 +1405,15 @@ def finish(verdicts: Iterable[Verdict], output: Path | None) -> int:
     return 0 if all(v.passed for v in verdicts) else 1
 
 
-def add_reference_options(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--reference-cache", type=Path, default=DEFAULT_REFERENCE_CACHE,
-                         help="directory of references shared between run directories, keyed by "
-                              "artifact, corpus content and reference settings (default "
-                              f"{DEFAULT_REFERENCE_CACHE}; 'none' disables it)")
-    command.add_argument("--recompute-reference", action="store_true",
-                         help="recompute the reference and replace its cache entry (after a "
-                              "change to the reference route, which the key does not see)")
+def add_cache_options(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--cache", type=Path, default=DEFAULT_CACHE,
+                         help="directory of references and exact-route runs shared between run "
+                              "directories, keyed by artifact, corpus content and run settings, "
+                              "each checked against this build by a bit-exact sample before it "
+                              f"is reused (default {DEFAULT_CACHE}; 'none' disables it)")
+    command.add_argument("--recompute", action="store_true",
+                         help="compute every reference and exact-route run this gate uses and "
+                              "replace its cache entry (a fresh --out)")
 
 
 def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
@@ -1226,7 +1444,7 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
                               "at its --chunk (a schedule fast path that widens prefill steps); "
                               "use a separate --out")
     prefill.add_argument("--out", required=True, help="run directory (reused runs are skipped)")
-    add_reference_options(prefill)
+    add_cache_options(prefill)
 
     decode = commands.add_parser("decode", help="run and decide the decode criteria")
     decode.add_argument("artifact")
@@ -1261,7 +1479,7 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     decode.add_argument("--gen", default=default_tool("infernix_decode_quality_gen"))
     decode.add_argument("--judge", default=default_tool("infernix_decode_quality_judge"))
     decode.add_argument("--out", required=True)
-    add_reference_options(decode)
+    add_cache_options(decode)
 
     evaluate = commands.add_parser("evaluate-prefill", help="decide an existing prefill run")
     evaluate.add_argument("directory",
@@ -1279,8 +1497,6 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     forced.add_argument("fast", type=Path)
     forced.add_argument("--reference", type=Path, required=True,
                         help="the reference both runs observed (--reference of the forced tool)")
-    forced.add_argument("--second", type=Path, nargs=3, metavar=("DEFAULT", "FAST", "REFERENCE"),
-                        help="the runs that observed the width-routed reference, and it")
 
     compare_forced = commands.add_parser(
         "compare-decode", help="decide any two teacher-forced runs of one reference (controls)")
@@ -1293,8 +1509,6 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
 
     judged = commands.add_parser("evaluate-free-running", help="decide an existing judge report")
     judged.add_argument("report")
-    judged.add_argument("--second", type=Path,
-                        help="the same generations judged against the width-routed reference")
 
     for sub in (prefill, decode, evaluate, compare, forced, compare_forced, judged):
         sub.add_argument("--json", type=Path, help="also write the verdicts as JSON")
@@ -1308,19 +1522,19 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     concat.add_argument("parts", nargs="+", type=Path)
     concat.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
-    if getattr(args, "reference_cache", None) is not None and str(args.reference_cache) == "none":
-        args.reference_cache = None
+    if getattr(args, "cache", None) is not None and str(args.cache) == "none":
+        args.cache = None
     return args
 
 
 def prefill_verdicts(directory: Path, fast_chunk: int = 0) -> list[Verdict]:
     if any(d.is_dir() for d in directory.glob("default-c*")):
-        return [evaluate_prefill(directory, fast_chunk=fast_chunk)]
+        return evaluate_prefill(directory, fast_chunk=fast_chunk)
     kv_dirs = sorted(d for d in directory.iterdir()
                      if d.is_dir() and any(c.is_dir() for c in d.glob("default-c*")))
     if not kv_dirs:
         raise MeasurementError(f"no prefill runs under {directory}")
-    return [evaluate_prefill(d, fast_chunk=fast_chunk) for d in kv_dirs]
+    return [v for d in kv_dirs for v in evaluate_prefill(d, fast_chunk=fast_chunk)]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1336,16 +1550,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             pairs = compared_pairs(args.base, args.candidate)
             return finish([evaluate_prefill_pairs(pairs, "compare-prefill")], args.json)
         if args.command == "evaluate-decode":
-            return finish([evaluate_forced(args.default, args.fast, args.reference,
-                                           second=tuple(args.second) if args.second else None)],
-                          args.json)
+            return finish([evaluate_forced(args.default, args.fast, args.reference)], args.json)
         if args.command == "compare-decode":
-            return finish([evaluate_forced(args.base, args.candidate, args.reference,
-                                           fast_route=False,
+            return finish([evaluate_forced(args.base, args.candidate, args.reference, role=COMPARE,
                                            second=tuple(args.second) if args.second else None)],
                           args.json)
         if args.command == "evaluate-free-running":
-            return finish([evaluate_free_running(Path(args.report), second=args.second)], args.json)
+            return finish([evaluate_free_running(Path(args.report))], args.json)
         if args.command == "concat-forced":
             joined = concat_forced(args.parts, args.out)
             print(f"{args.out}: {len(joined['segments'])} segments from {len(args.parts)} parts")

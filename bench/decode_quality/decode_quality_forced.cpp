@@ -12,9 +12,10 @@
 // one pass), for the same segments. --observe REFERENCE then makes each forced step also report the
 // log-probabilities of the reference's top tokens and its own largest log-probability
 // (TokenConstraint::observe), so the gate measures the decode route's KL divergence from the
-// reference and its top-1 agreement exactly as the prefill gate does. --width-routed writes the
-// reference on the width-routed kernels (EngineOptions::width_routed_kernels); a reference records
-// whether its route ran column-invariant kernels, which tells the gate it needs that second one.
+// reference and its top-1 agreement exactly as the prefill gate does. --width-routed runs the
+// width-routed kernels where the exact route runs column-invariant ones
+// (EngineOptions::width_routed_kernels): the gate's baseline, and its control's second reference.
+// Every run and reference records whether its route ran column-invariant kernels.
 //
 // Segments lie back to back from the corpus's first token, no two sharing a token, and cycle
 // through the prompt lengths, so the forced steps read short and long contexts. --first-segment N
@@ -37,7 +38,7 @@
 //
 // Usage: infernix_decode_quality_forced <artifact> <corpus.txt> <out.json> [--segments N]
 //          [--first-segment N] [--prompts L1,L2,...] [--forced N]
-//          [--reference [--width-routed] | --observe REFERENCE.json]
+//          [--reference | --observe REFERENCE.json] [--width-routed]
 //          [--mode plain|dflash2|ngram|mtp|mtp-ngram] [--kv-dtype int8|bf16|fp8|nvfp4]
 //          [--disable-fast-paths] [--fast-path NAME]...
 //          [--concurrency 1..8] [--prefill-chunk N] [--prefix-reuse [--warm-tokens N]]
@@ -174,7 +175,6 @@ Options parse(int argc, char** argv) {
     if (out.reference && !out.observe.empty()) {
         throw std::invalid_argument("--reference and --observe exclude each other");
     }
-    if (out.width_routed && !out.reference) { throw std::invalid_argument("--width-routed needs --reference"); }
     return out;
 }
 
@@ -387,6 +387,7 @@ int main(int argc, char** argv) {
         engine_options.fast_paths           = options.fast_paths;
         engine_options.fast_path_candidates = options.candidates;
         engine_options.fast_path_exclusions = options.exclusions;
+        engine_options.width_routed_kernels = options.width_routed;
         if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
         if (!options.prefix_reuse) {
             engine_options.context_cache.enabled             = false;
@@ -428,7 +429,9 @@ int main(int argc, char** argv) {
         for (std::size_t i = 0; i < load.fast_paths.size(); ++i) {
             out << (i ? ", " : "") << '"' << load.fast_paths[i] << '"';
         }
-        out << "], \"forced_tokens\": " << options.forced << ", \"segments\": [";
+        out << "], \"width_routed\": " << (options.width_routed ? "true" : "false")
+            << ", \"column_invariant_kernels\": " << (load.column_invariant_kernels ? "true" : "false")
+            << ", \"forced_tokens\": " << options.forced << ", \"segments\": [";
 
         std::uint64_t underflows = 0;
         std::uint64_t reused     = 0;
