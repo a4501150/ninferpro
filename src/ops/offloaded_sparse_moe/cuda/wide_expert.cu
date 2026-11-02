@@ -160,7 +160,7 @@ struct Offsets {
     std::size_t h_blocks, x_plane;                      // W4A4
     std::size_t x_limbs, h_rows, x_emax, h_emax;        // W4A16
     std::size_t x_acts, x_acts_emax;                    // W4A16 narrow route
-    std::size_t x_terms_plane, x_token_terms, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
+    std::size_t x_terms_plane, x_token_terms, x_row_scale, h_terms_plane, h_row_scale; // W4A16 residual A4
     std::size_t ggml_planes;                            // GGUF banks' kGgmlBf16
     bool has_ggml_planes;
     std::size_t end;
@@ -319,7 +319,7 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
     }
 }
 
-// ---------------------------------------------------------- W4A16 two-term A4 (design §19.3.23)
+// ---------------------------------------------------------- W4A16 residual A4 (design §19.3.23)
 
 // A row scale: amax / (6 * 448), so every block's first-term E4M3 scale stays finite. An all-zero row
 // has scale 0 and zero terms; a non-finite row has scale NaN and zero terms, so the epilogues'
@@ -363,7 +363,7 @@ __device__ __forceinline__ void term_block(const std::uint16_t* block, float row
     }
 }
 
-// Writes block b's terms into a two-term plane row: term t's A4 row at row + t * term_stride.
+// Writes block b's terms into a residual plane row: term t's A4 row at row + t * term_stride.
 __device__ __forceinline__ void store_terms(std::uint8_t* row, int b, int code_bytes, int term_stride,
                                             const TermBlock& q) {
     const int position = plane_block(b);
@@ -491,18 +491,18 @@ Descriptors make_descriptors_terms(const std::uint8_t* x_terms_plane, const std:
     const auto x_maps = [&](std::uint8_t* base, CUtensorMap& codes, CUtensorMap& scales) {
         codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, kXCodeBytes, rows, kXTermsRowBytes,
                                            Schedule::kCodeRowBytes, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_64B,
-                                           "encode wide two-term x codes TMA");
+                                           "encode wide residual x codes TMA");
         scales = detail::nvfp4_make_tma_2d(base + kXCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8, kXScaleBytes, rows,
                                            kXTermsRowBytes, 16, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_NONE,
-                                           "encode wide two-term x scales TMA");
+                                           "encode wide residual x scales TMA");
     };
     const auto h_maps = [&](std::uint8_t* base, CUtensorMap& codes, CUtensorMap& scales) {
         codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, kHCodeBytes, rows, kHTermsRowBytes,
                                            Schedule::kCodeRowBytes, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_64B,
-                                           "encode wide two-term h codes TMA");
+                                           "encode wide residual h codes TMA");
         scales = detail::nvfp4_make_tma_2d(base + kHCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8, kHScaleMapBytes, rows,
                                            kHTermsRowBytes, 16, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_NONE,
-                                           "encode wide two-term h scales TMA");
+                                           "encode wide residual h scales TMA");
     };
     x_maps(x, d.x_codes, d.x_scales);
     x_maps(x + kXRowBytes, d.x2_codes, d.x2_scales);
@@ -583,7 +583,7 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
                                                 workspace.tiles, workspace.pass_tiles);
     check_launch("plan");
     if (source.activation == ExpertActivation::kA16 && source.wide_a16 == WideA16::kA4Residual) {
-        // W4A16 two-term A4: every token's row scale, then each wide entry's x terms; h's terms
+        // W4A16 residual A4: every token's row scale, then each wide entry's x terms; h's terms
         // are formed per pass from the BF16 h the gate/up epilogue writes.
         call.a4_residual   = true;
         call.h_rows        = workspace.h_rows;
@@ -593,11 +593,11 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.h_row_scale   = workspace.h_row_scale;
         x_token_terms_kernel<<<x.ne[1], kEncodeXThreads, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
                                                                       workspace.x_row_scale, workspace.x_token_terms);
-        check_launch("two-term x");
+        check_launch("residual x");
         copy_x_terms_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
             top_k, dispatch, workspace.tiles, workspace.pass_tiles, call.passes, workspace.x_token_terms,
             workspace.x_terms_plane);
-        check_launch("copy two-term x");
+        check_launch("copy residual x");
         const Descriptors descriptors = make_descriptors_terms(workspace.x_terms_plane, workspace.h_terms_plane, entries);
 #ifdef _WIN32
         call.descriptors = descriptor_staging().stage(descriptors, stream);
@@ -643,7 +643,7 @@ void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
             stream);
         quantize_h_terms_kernel<<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(
             call.dispatch, call.tiles, call.pass_tiles, pass, call.h_rows, call.h_terms_plane, call.h_row_scale);
-        check_launch("quantize two-term h");
+        check_launch("quantize residual h");
         launch<Matrix::Down, ScheduleResidual>(
             call, pass, DownEpilogueResidual{call.scales, call.dispatch.entries, call.h_row_scale, call.outputs},
             stream);

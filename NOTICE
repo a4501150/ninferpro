@@ -40,10 +40,14 @@ Modifications made in this product (summary; see README.md for details):
   prompt calls are split (--prefill-chunk-beside-decode) and each but the
   prompt's last runs inside the decode round's Forward (mixed rounds; bit for
   bit the separate calls on the construction-exact exact route).
-- Tool-call grammar fixes: call openers inside Markdown code stay text under a
-  constrained auto contract, and such a turn may end inside its thinking
-  (non-strict calls there are recovered).
+- Tool-call grammar fixes: a call opener inside Markdown code is text, and the
+  constraint grammar's reasoning section refuses an unquoted opener, so a call
+  cannot start inside thinking and the turn cannot end there.
 - Linux VRAM spill detection fix (no WDDM budget).
+- The fast-path quality gate scores every run against a second reference on the
+  width-routed kernels where the reference route runs column-invariant ones
+  (EngineOptions::width_routed_kernels), averaging each unit over both, and
+  Qwen3.8-Flash-Next's expert-a4-residual takes three NVFP4 terms instead of two.
 - A model-layer restructure: each family owns its instance construction, option branches
   and linear shape tuning under src/models/<family>/ (the shapes as extern tables the
   ops dispatch scans), the shared expert-offload tier lives in src/models/offload/

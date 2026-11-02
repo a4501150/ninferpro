@@ -952,7 +952,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
     Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
-    // The two-term route exists for NVFP4 W4A16 banks only; its layout carries no x limbs, which the
+    // The residual A4 route exists for NVFP4 W4A16 banks only; its layout carries no x limbs, which the
     // GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the flag.
     // ggml-bf16-prefill takes a GGUF bank's wide jobs in prefill calls onto the BF16 planes.
     const QType gate_up_format = p.bank->planes.gate_up_format;

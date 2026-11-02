@@ -631,16 +631,16 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
 //       `nonfinite` set holds an Inf, so its outputs are the canonical NaN on every route.
 //   A2  Placement invariance: outputs bit-identical for every staging layout, the fork stream,
 //       zero-copy records and a rerun.
-// With `a4_residual` the wide experts take the two-term A4 fast path (design §19.3.23):
+// With `a4_residual` the wide experts take the residual A4 fast path, three terms (design §19.3.23):
 //   X1  Narrow entries as A1. Each wide entry against the exact canonical arithmetic (the CPU engine):
-//       relative L2 error <= 2^-5, and the mean over the wide entries <= 2^-7. Two terms measured
-//       means of 0.31-0.41 % and a worst entry of 2.0 %; one 4-bit term misses by several percent
-//       and a layout or scale error by ~100 %, which both bounds reject. A non-finite column's
-//       outputs are the canonical NaN.
+//       relative L2 error <= 2^-6, and the mean over the wide entries <= 2^-9. Two terms measured
+//       means of 0.31-0.41 %, which the mean bound rejects; one 4-bit term misses by several
+//       percent and a layout or scale error by ~100 %. A non-finite column's outputs are the
+//       canonical NaN.
 //   A2  as above (the route depends on the data and the column count only).
 void test_layer_a16(const char* name, int experts, int columns, int top_k, const std::vector<double>& weight,
                     std::uint32_t seed, bool nonfinite = false, bool a4_residual = false) {
-    std::printf("== W4A16%s %s: E=%d T=%d k=%d\n", a4_residual ? " two-term" : "", name, experts, columns, top_k);
+    std::printf("== W4A16%s %s: E=%d T=%d k=%d\n", a4_residual ? " residual A4" : "", name, experts, columns, top_k);
     const moe::WideA16 route = a4_residual ? moe::WideA16::kA4Residual : moe::WideA16::kExact;
     std::mt19937 rng(seed);
     const std::size_t stride = moe::kRecordBytes;
@@ -800,8 +800,8 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
         std::printf("   X1 wide entries' relative L2 against the exact arithmetic: mean %.5f, worst %.5f (%ld entries)\n",
                     mean, worst, measured);
         check(mismatch[0] == 0, "X1: every narrow W4A16 entry equals the CPU engine bit for bit");
-        check(worst <= std::ldexp(1.0, -5), "X1: every wide entry within 2^-5 relative L2 of the exact arithmetic");
-        check(mean <= std::ldexp(1.0, -7), "X1: the wide entries' mean relative L2 within 2^-7");
+        check(worst <= std::ldexp(1.0, -6), "X1: every wide entry within 2^-6 relative L2 of the exact arithmetic");
+        check(mean <= std::ldexp(1.0, -9), "X1: the wide entries' mean relative L2 within 2^-9");
     } else {
         check(mismatch[0] == 0 && mismatch[1] == 0, "A1: every W4A16 entry equals the CPU engine bit for bit");
     }
@@ -852,7 +852,7 @@ int main() {
         test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43);
         test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47, true);
         test_layer_a16("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), 53);
-        // The two-term A4 fast path of the W4A16 wide route (§19.3.23): the same cases.
+        // The residual A4 fast path of the W4A16 wide route (§19.3.23): the same cases.
         test_layer_a16("prefill mix", 20, 300, 4, popularity, 41, false, true);
         test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43, false, true);
         test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47, true, true);

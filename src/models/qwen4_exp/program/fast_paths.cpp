@@ -88,11 +88,12 @@ constexpr std::array kQualified{
     Qualification{FastPath::Q8SlicedK, {DenseKernels::Q8, true, KvCacheStorage::Q4KeyVq2Value}},
     Qualification{FastPath::GdnConvFused, {DenseKernels::Q8, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::GdnConvFused, {DenseKernels::Q8, true, KvCacheStorage::Q4KeyVq2Value}},
-    // Recipe C (FP8 dense, W4A16 experts): two-term A4 expert activations. Prefill (quick corpus,
-    // 896 and 7,168 tokens) on every format, decode (MTP at concurrency 2, 256 segments) on INT8, the
-    // passing format with the lowest floor; the path leaves attention and the KV cache alone, so the
-    // others are registered from the INT8 increments (model-quality.md 6.1, step 3). BF16 KV fails:
-    // there recipe C's exact route is the reference itself (floor 0) (2026-10-15).
+    // Recipe C (FP8 dense, W4A16 experts): residual A4 expert activations, three terms. Prefill
+    // (quick corpus, 896 and 7,168 tokens) on every format, decode (MTP at concurrency 2, 256
+    // segments) on INT8, the passing format with the lowest floor; the path leaves attention and the
+    // KV cache alone, so the others are registered from the INT8 increments (model-quality.md 6.1,
+    // step 3). BF16 KV fails: there recipe C's exact route is the reference itself (floor 0)
+    // (2026-10-15). FP8 gated again with both references at three terms (2026-11-02).
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16}},

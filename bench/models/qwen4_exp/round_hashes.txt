@@ -1,10 +1,10 @@
 # T1 golden hashes (infernix_qwen4_exp_round_bench --record): logits and lane state after one round.
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 1x1 context=1024 kv=fp8 experts=64 fast accept=1 = 8ffda29ea7ab332c 858e6cef38222e2a
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 1x4 context=1024 kv=fp8 experts=64 fast accept=4 = 0b9cec1216e7b2ce ecdd26623dceae4d
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 1x1 context=1024 kv=fp8 experts=64 fast accept=1 = 6d7572d27bc59438 7f75001dd2723726
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 1x4 context=1024 kv=fp8 experts=64 fast accept=4 = 8dd0177f6b3f932d 8c14c8c0fa378dbb
 Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x1 context=1024 kv=fp8 experts=64 exact accept=1 = 76c82abc088f3952 e722e366a1f27f37
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x1 context=1024 kv=fp8 experts=64 fast accept=1 = 5d940d6316135469 935d60d51c91cf59
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x1 context=1024 kv=fp8 experts=64 fast accept=1 = 537e17566575d313 09bbe8d292da2832
 Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2 context=1024 kv=fp8 experts=64 exact accept=2 = 9995cc291206e4ea 88a6e9704d9aec8c
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2 context=1024 kv=fp8 experts=64 fast accept=2 = 307c1c75199f3437 70e2157c78991e82
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2 context=1024 kv=fp8 experts=64 fast accept=2 = 06d756f8363c350f 930ce95f9ece269e
 Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2+1024 context=1024 kv=fp8 experts=64 exact accept=2 = 9995cc291206e4ea 6846f8c5cf8ab284
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2+1024 context=1024 kv=fp8 experts=64 fast accept=2 = 8e134499eb91b96f ea6a7befcb99d2f3
-Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x3 context=1024 kv=fp8 experts=64 fast accept=3 = 168764f1f0e4445e 0776ee1ea858977c
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x2+1024 context=1024 kv=fp8 experts=64 fast accept=2 = a3165d366946561f cb39db685007268d
+Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 6x3 context=1024 kv=fp8 experts=64 fast accept=3 = 6478760e33ea8889 289b78a4f3c48735

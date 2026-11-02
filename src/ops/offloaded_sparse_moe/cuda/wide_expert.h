@@ -84,11 +84,11 @@ static_assert(kA16HRowBytes >= kIntermediate * 2 && kA16HRowBytes % 16 == 0 && k
 // << 4), the order in which the record's row-group nibbles enter an MMA register.
 INFERNIX_WIDE_HD constexpr int plane_block(int b) { return (b & ~3) | ((b & 1) << 1) | ((b & 2) >> 1); }
 
-// Two-term A4 planes of W4A16 experts (WideA16::kA4Residual): a row holds its first term's A4 row
-// (the W4A4 plane layout above), then its second term's, both scaled by one FP32 row scale. Two terms
-// per side passed the acceptance gate under its single budgets; three cost 7-8 points of prefill
-// speed (design §19.3.23).
-inline constexpr int kResidualTerms  = 2;
+// Residual A4 planes of W4A16 experts (WideA16::kA4Residual): a row holds its first term's A4 row
+// (the W4A4 plane layout above), then each further term's, all scaled by one FP32 row scale. Two
+// terms leave about 0.8 % relative error per row, four times BF16 rounding; three bring it below the
+// output's BF16 rounding (design §19.3.23).
+inline constexpr int kResidualTerms  = 3;
 inline constexpr int kXTermsRowBytes = kResidualTerms * kXRowBytes;
 inline constexpr int kHTermsRowBytes = kResidualTerms * kHRowStride;
 
@@ -127,7 +127,7 @@ struct ExpertsWorkspace {
     // W4A16 narrow route (both wide routes): every token's x in its dp4a layout, encoded once per call
     std::uint8_t* x_acts;         // [columns][kA16XRowBytes]
     std::int32_t* x_acts_emax;    // [columns]
-    // W4A16, two-term A4 (h_rows holds the BF16 h)
+    // W4A16, residual A4 (h_rows holds the BF16 h)
     std::uint8_t* x_terms_plane;  // [entries][kXTermsRowBytes]
     std::uint8_t* x_token_terms;  // [columns][kXTermsRowBytes]: each token's terms, copied to its entries
     float* x_row_scale;           // [columns]
@@ -167,7 +167,7 @@ struct Call {
     const std::int32_t* x_emax  = nullptr; // [T]
     std::int32_t* h_emax        = nullptr; // [entries]
     std::int32_t top_k          = 0;
-    // W4A16 two-term A4 (descriptors then name every term's plane)
+    // W4A16 residual A4 (descriptors then name every term's plane)
     bool a4_residual                = false;
     const float* x_row_scale        = nullptr; // [T]
     std::uint8_t* h_terms_plane     = nullptr; // [entries][kHTermsRowBytes]

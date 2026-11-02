@@ -361,7 +361,8 @@ int exercise_prefix(infernix::Engine& engine) {
 
     std::vector<infernix::TokenId> prompt{248045, 846, 198};
     prompt.insert(prompt.end(), 64, 5834);
-    prompt.insert(prompt.end(), {248046, 198});
+    prompt.push_back(248046);
+    prompt.push_back(198);
     const infernix::GenerationResult first =
         engine.generate(engine.prepare_tokens(prompt), first_options);
     if (first.generated_token_ids.size() != 70) {

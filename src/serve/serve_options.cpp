@@ -969,7 +969,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (text == "auto") {
                 options.experts.clear();
             } else {
-                models::offload::parse_experts_spec(text); // grammar checked up front
+                static_cast<void>(models::offload::parse_experts_spec(text)); // grammar checked up front
                 options.experts = text;
             }
         } else if (arg == "--expert-placement") {

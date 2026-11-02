@@ -564,7 +564,9 @@ joint gates; this arm decides only what preemption adds.
   16-bit activations where prefill uses the artifact's, so the decode floor can be lower.
   Free-running greedy decoding, judged on each route's own prefixes
   ([decode-quality pair](../../bench/README.md#decode-quality)), is an optional supplementary check:
-  routes diverge after a few dozen tokens, which makes it far less sensitive.
+  routes diverge after a few dozen tokens, which makes it far less sensitive, and on the
+  construction-exact configurations it charges any width-routed route for the exact route's
+  roundings (the second-reference bullet above), so it does not block a registration there.
 
 ### 6.3 Criteria
 
@@ -1022,7 +1024,7 @@ the Engine, and each acts only where the artifact can be request-invariant
   before the scales apply. Its error is about the 8-bit route's squared. Output and down
   projections keep 16-bit activations: two terms never beat A16 on their 5,120 outputs.
 - `expert-a4-residual` (Qwen3.8-Flash-Next with W4A16 experts): expert calls of more than eight
-  columns (prefill, wide verification) take each x and h row as two terms of the same A4 residual
+  columns (prefill, wide verification) take each x and h row as three terms of the same A4 residual
   profile, with an FP32 row scale of amax / (6 · 448) in place of an input scale (the export has
   none), on the FP4 Tensor Cores (design §19.3.23). Without it W4A16 experts run the exact integer
   limb route. An expert's route depends on its column count in the call, which other requests'
@@ -1649,27 +1651,48 @@ and recomputes the previous output) or admission (whole extents held without `pr
   so the Dense8 registration stands.
 - **Not qualified:** 16-bit expert activations, and other dense formats (no kernels).
 
-**`expert-a4-residual`: two-term A4 activations in recipe C's wide expert calls (qualified
-2026-10-15).**
-- **What changes:** expert calls of more than eight columns on W4A16 experts take x and h as two
+**`expert-a4-residual`: residual A4 activations in recipe C's wide expert calls (qualified
+2026-10-15; three terms since 2026-11-02).**
+- **What changes:** expert calls of more than eight columns on W4A16 experts take x and h as three
   NVFP4 terms of the A4 residual profile with an FP32 row scale, on the FP4 Tensor Cores, instead of
-  the exact limb route (design §19.3.23).
+  the exact limb route (design §19.3.23). Decode rounds at one or two requests stay on the exact
+  narrow route (at most eight columns per expert).
 - **History:** two terms first failed the INT8 prefill gate on mean KL (excess bound 8.92e-4
   against the then budget of 6.11e-4, four chunk sizes). Three terms on both sides, the only
   variant of a one-chunk screen within that budget, then passed every gate below except BF16 KV
   (prefill KL bound 4.24e-4, decode top-1 bound 2.95e-3 of 3.31e-3, pp32768/65536 +25.7/+26.9 %).
   With the absolute floor, and the single budgets that replaced it (6.3), two terms pass, and they replaced three, which cost 7-8 points of
-  prefill speed.
-- **Op qualification:** `infernix_offloaded_moe_wide_test` X1 against the exact canonical
-  arithmetic: mean relative L2 0.31-0.41 % per case, worst entry 2.0 % (bounds 2^-7 and 2^-5).
+  prefill speed. Three terms replaced two again on 2026-11-02 (below): two leave about 0.8 % relative
+  error per activation row (four times BF16 rounding; unbiased, so rounding the last term's scale up
+  only adds error), the largest real carrier of the qualified set's decode excess on FP8 KV.
+- **Op qualification (three terms):** `infernix_offloaded_moe_wide_test` X1 against the exact
+  canonical arithmetic: mean relative L2 0.086-0.098 % per case (the BF16 output floor), worst entry
+  0.76 % (bounds 2^-9 and 2^-6, which two terms' means of 0.31-0.41 % fail).
+- **Three terms on FP8 KV (2026-11-02, RTX PRO 6000, the gate with both references of 6.2):** the
+  full perplexity corpus at four chunk sizes and 1,024 forced plain decode segments, beside every
+  path qualified there. Prefill KL excess 1.32e-4 (bound 1.84e-4; two terms 5.24e-4), top-1 bound
+  4.6e-4, perplexity ratio 0.99964, p99.9 KL ratio 1.01; decode TV excess 3.0e-4 (bound 4.95e-4;
+  two terms 9.09e-4), top-1 bound 2.29e-3, p99.9 KL ratio 0.95. Free-running regret over 512
+  segments exceeds its budget (1.13e-3, bound 1.84e-3 of 1.5e-3; two terms 2.31e-3), but that
+  optional check (6.2) does not block here: the kernel set alone, which every width-keyed path
+  selects and which loses no precision, fails it too (8.8e-4, bound 1.66e-3), because its
+  prefill-pass references share the column-invariant exact route's decode roundings. The other
+  formats keep the registration of the earlier gates below, which three terms on both sides passed
+  first. Speed (`infernix_bench`, FP8 KV, chunk 16,384, ABBA): pp4096 / 16384 / 32768 at 12,796 /
+  13,035 / 12,813 tok/s against two terms' 13,818 / 14,036 / 13,773 (-7.0 to -7.4 %) and the exact
+  route's 8,932 / 9,620 / 9,466 (+35 to +43 %); the wide expert call at 1,024 / 4,096 / 16,384
+  columns 1,715 / 2,390-2,510 / 7,050 us against 1,616 / 1,990 / 5,348 (a third MMA per weight
+  tile; three terms still fit two CTAs per SM). Records: `results/quality/gate-2026-11-02`.
+- **Two terms (2026-10-15/16, the record below):** op test mean relative L2 0.31-0.41 % per case,
+  worst entry 2.0 % (bounds 2^-7 and 2^-5 then).
 - **Artifact:** orcarouter Qwen3.8-Flash-Next Uncensored NVFP4, converted with recipe C (FP8 dense,
   W4A16 experts), the protocol reduced as the user approved (prefill quick corpus at 896 and 7,168
   tokens; decode MTP at concurrency 2 over 256 segments; the reference and exact runs shared).
-- **INT8 KV:** prefill KL excess 7.82e-4 (95 % bound 9.07e-4; budget 1.0e-3 when gated, 1.5e-3
+- **INT8 KV (two terms):** prefill KL excess 7.82e-4 (95 % bound 9.07e-4; budget 1.0e-3 when gated, 1.5e-3
   since 2026-10-16), top-1 excess 1.89e-3 (bound 2.41e-3 of 5.0e-3), perplexity ratio 0.99967,
   p99.9 KL ratio 1.08; decode TV excess 9.9e-4 (bound 1.37e-3 of 4.0e-3), top-1 excess 2.08e-3
   (bound 4.41e-3 of 5.0e-3, the closest), p99.9 KL ratio 1.09, every prompt length.
-- **The other formats (prefill):** FP8, K8V4, NVFP4, K4V2 and VQ2 pass (KL bounds 7.3e-4, 3.8e-4,
+- **The other formats (prefill, two terms):** FP8, K8V4, NVFP4, K4V2 and VQ2 pass (KL bounds 7.3e-4, 3.8e-4,
   4.6e-4, 6.6e-4 and 6.1e-4; floors 7.5e-3, 1.21e-2, 1.49e-2, 1.53e-2 and 2.17e-2, all above
   INT8's 6.11e-3); they take INT8's decode verdict (6.1), INT8 being the passing format with the
   lowest floor.
@@ -1678,7 +1701,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
   format noise absorbs any of the path's error. The fast route's whole divergence (KL 6.8e-3, top-1
   2.9 %, about INT8 KV's own; three terms 6.35e-3) counts as excess, 4.5 times the 1.5e-3 budget,
   probably mostly near-tie expert routing that any perturbation flips (not measured).
-- **Speed:** `infernix_bench` INT8 KV, chunk 4,096, ABBA (2026-10-14/15, before main 2ec268c2,
+- **Speed (two terms, RTX 5090):** `infernix_bench` INT8 KV, chunk 4,096, ABBA (2026-10-14/15, before main 2ec268c2,
   whose changes leave recipe C's route alone): pp4096 1,631 → 1,637 tok/s (level), pp16384 6,175 →
   6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 → 9,067 (+35 %); short prompts are
   bound by the expert stream over the x8 link.

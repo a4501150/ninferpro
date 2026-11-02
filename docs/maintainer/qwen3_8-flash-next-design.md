@@ -10158,15 +10158,16 @@ exactly in int64 (P x V unchanged); it passed `test_qsa` at both limb counts. At
 2,153 / 2,164 / 2,307 µs on FP16 against 2,422 / 2,446 / 2,597 (+12.5-13.1 %) with 2 limbs and
 2,590 / 2,620 / 2,796 (+20-21 %) with 3; at 512 columns +11-14 % and +18-23 %. Not kept.
 
-**Two-term A4 for W4A16 experts (fast path `expert-a4-residual`): adopted.**
+**Residual A4 for W4A16 experts (fast path `expert-a4-residual`): adopted, three terms since 2026-11-02.**
 Weight-only exports (recipe C, §16.2.1) run their wide expert calls on the exact limb route, two
 integer MMAs per 16-element block, which costs what a BF16 GEMM would. The fast path takes each x
-row (per token) and h row (per entry) as the A4 residual profile of two NVFP4 terms
+row (per token) and h row (per entry) as the A4 residual profile of NVFP4 terms
 (`quantize_nvfp4_terms_k16`, the dense residual route's codec, re-paired into the wide plane's code
-order) with an FP32 row scale amax / (6 · 448), and runs both terms through the grouped mxf4nvf4
-kernel into one accumulator (two stages of 39 KB holding both terms' A tiles, two CTAs per SM; the
-epilogues multiply by the row scale). Two terms failed the gate first, three passed, and two passed
-once the acceptance policy gained an absolute floor, kept under its single budgets (model-quality.md 6.3); the record follows.
+order) with an FP32 row scale amax / (6 · 448), and runs every term through the grouped mxf4nvf4
+kernel into one accumulator (two stages holding every term's A tiles, two CTAs per SM: 39 KB at two
+terms, 49 KB at three; the epilogues multiply by the row scale). Two terms failed the gate first,
+three passed, two passed once the acceptance policy gained an absolute floor and replaced three, and
+three replaced two again on 2026-11-02 (the last paragraph); the record follows.
 
 *Two terms first (2026-10-14/15).* `test_offloaded_moe_wide` against the exact arithmetic: mean
 relative L2 0.31-0.41 % per case, worst entry 2.0 %. End to end on the recipe C artifact
@@ -10220,6 +10221,17 @@ the larger error inside the policy. The gates ran with the screen build's term-c
 match that build's. On 2026-10-16 the policy replaced its floor-relative budgets with single ones
 (KL 1.5e-3, top-1 0.5 points, decode TV 4e-3); re-scored, two terms pass on the same six formats
 (INT8 KL bound 0.60 of the budget) and BF16 still fails (4.5 times it).
+
+*Three terms again (2026-11-02, RTX PRO 6000, FP8 KV).* Two terms leave about 0.8 % relative error
+per activation row, four times BF16 rounding and unbiased (a CPU model of the codec on Gaussian,
+Student-t, outlier and SiLU-product rows; searching the first term's scale among E4M3 neighbours or
+max/4 to max/6 recovers at most 19 %), and on FP8 KV they carried about half of the qualified set's
+teacher-forced decode excess (TV +4.3e-4 of +9.6e-4, z 3.2). A third term brings the wide entries to
+the BF16 output floor (op test mean 0.086-0.098 %). Measured with chunk 16,384: prefill 7.0-7.4 %
+slower than two terms at 4K-32K and 35-43 % faster than the exact limb route; the gate with both
+references (model-quality.md 6.2) passes prefill and teacher-forced decode with about a third of two
+terms' excess, and free-running regret, which the kernel set alone also fails there, does not
+block (model-quality.md 6.7).
 
 **The prefill hyper-connection up projection fused with its collapse: adopted (bit-exact).** For
 Q8_G32_FP16 W_up and more than 96 columns, one Q8 MMA tile computes 16 features x 4 streams of u

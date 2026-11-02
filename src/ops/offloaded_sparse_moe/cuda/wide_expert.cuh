@@ -32,7 +32,7 @@
 namespace infernix::ops::offloaded_moe::wide {
 
 // The activation planes of one call: A4(x) for the gate/up GEMM and A4(h) for the down GEMM, and with
-// two-term A4 (W4A16 fast path) the later terms' planes.
+// residual A4 (W4A16 fast path) the later terms' planes.
 struct alignas(128) Descriptors {
     CUtensorMap x_codes;
     CUtensorMap x_scales;
@@ -101,8 +101,8 @@ struct Schedule {
     static_assert(kUnitRunBytes % 16 == 0, "bulk copies move multiples of 16 bytes");
 };
 
-// Two-term A4 (W4A16 fast path): each stage holds both terms' activation tiles beside one weight
-// tile, and two stages (39 KB) keep two CTAs per SM.
+// Residual A4 (W4A16 fast path): each stage holds every term's activation tiles beside one weight
+// tile, and two stages (49 KB at three terms) keep two CTAs per SM.
 struct ScheduleResidual : Schedule {
     static constexpr int kTerms  = kResidualTerms;
     static constexpr int kStages = 2;
@@ -435,7 +435,7 @@ struct DownEpilogue {
     }
 };
 
-// Two-term A4 (W4A16 fast path): the accumulators are in units of the row scale, so the gate/up
+// Residual A4 (W4A16 fast path): the accumulators are in units of the row scale, so the gate/up
 // outputs are bf16_rn(acc * row_scale(token) * alpha), h = swiglu_bf16(gate, up) is written as the
 // entry's BF16 h row (the A16 h_rows layout), and its terms are formed by a separate pass.
 struct GateUpEpilogueResidual {
