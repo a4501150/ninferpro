@@ -254,7 +254,7 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, true, KvCacheStorage::Q4KeyVq2Value}},
     // Recipe C (FP8-row dense): the coupling paths by the kernel rule (6.1, item 2) once the TMA
-    // proxy fence (795d6f1, ported from upstream 4b5eae7a) made its exact route request-invariant:
+    // proxy fence (f597cfe, ported from upstream 4b5eae7a) made its exact route request-invariant:
     // the defect that kept them off it (2026-10-18: the real tests diverged at token 29) was the
     // wide expert's unfenced stage release. adaptive-speculation was already registered from its
     // own DFlash2 timing (above); free-cache-resume and preemption are registered on every KV

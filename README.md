@@ -42,7 +42,7 @@ The binaries keep their Infernix names (`infernix-serve`, `infernix`, `infernix-
 RTX PRO 6000 Blackwell, orcarouter Qwen3.8-Flash-Next-Uncensored-NVFP4 (recipe C conversion), BF16
 n-gram volume, DFlash2 drafter, FP8 KV, 6 lanes, 262,144-token context, no Disk prefix cache. One
 server boot, placements switched at runtime in the order shown; speeds are tok/s from the server's
-own request log (commit `fc8826e`, 2026-10-30, `make t3`). [Performance](docs/performance.md)
+own request log (commit `e984e41`, 2026-10-30, `make t3`). [Performance](docs/performance.md)
 defines each column's workload.
 
 | Placement | VRAM / RAM / SSD experts | Process VRAM, GiB (experts / KV / other) | Process RAM | Decode, 1 request | Decode at 30K context | Prefill, 30K | 6 requests, total |

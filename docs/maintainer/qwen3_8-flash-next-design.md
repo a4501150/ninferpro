@@ -4,7 +4,7 @@ This document is the current design authority for the `qwen4_exp` model family
 (`Qwen4ExpForCausalLM`, Qwen3.8-Flash-Next) as built and in production today. It states the design
 by subsystem, in the present tense, and keeps only what is true of the code. Superseded design
 proposals and the dated implementation log were removed on 2026-11-03 and remain in git at base
-commit `0af2a9b`.
+commit `0273fb5`.
 
 The offload tier this family composes — the VRAM expert cache, residency, placement, the RAM and
 SSD tiers, the CPU expert engine — is designed once for every offloaded MoE family and lives in
@@ -74,7 +74,7 @@ bit-exactly and run in the source's activation formats; tensors kept in BF16 sta
 
 ### 1.3 Status and measured speeds
 
-The engine is in production on the RTX PRO 6000 (commit `fc8826e`, 2026-10-30, `make t3`;
+The engine is in production on the RTX PRO 6000 (commit `e984e41`, 2026-10-30, `make t3`;
 production flags: DFlash2 drafter, BF16 n-gram volume, FP8 KV, 6 lanes, 262,144-token context,
 a RAM-only prefix cache — an 8 GiB Host tier, the Disk tier off since 2026-11-01). One server boot,
 placements switched at runtime; tok/s from the server's own request log. Workload definitions are
@@ -1439,7 +1439,7 @@ exact route, which decodes plain at two or more rows):
   switch back, and C = 6 fell 444 → 351 tok/s before the reset was added (2026-10-22, RTX PRO
   6000). Measured with every expert resident, INT8 KV, six rows: the aggregate went from about
   360 to 590 tok/s with 60-80 % of drafts accepted (2026-10-21, RTX PRO 6000). At commit
-  `0e71f3f` (2026-10-22) the six-lane `t2-bench` median was 505.9 tok/s, most tokens served from
+  `168b0b3` (2026-10-22) the six-lane `t2-bench` median was 505.9 tok/s, most tokens served from
   plain rounds — a 6 × 2 round costs 1.46 times a 6 × 1 (more columns touch more distinct
   experts), and plain 6 × 1 decode is capped at 6 / 11.3 ms = 531 tok/s.
 

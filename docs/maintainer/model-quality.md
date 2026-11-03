@@ -1816,7 +1816,7 @@ width:
 
 Every other configuration keeps its routes bit for bit (`FastPathSelection::forward` sets the
 construction-exact arithmetic only for registered configurations). The first version of this change
-(`33e1305`) set it on every Qwen3.8-Flash-Next configuration, ungated outside recipe C; scoping it
+(`4f61337`) set it on every Qwen3.8-Flash-Next configuration, ungated outside recipe C; scoping it
 restored the ModelOpt NVFP4 artifact's exact and fast routes exactly (`identical` on 36 quick-corpus
 prefill windows and 32 MTP decode segments, INT8 KV, against the base build).
 
@@ -1869,7 +1869,7 @@ bound 4.7e-4). Every gate here uses the new build's references (the 1,024-segmen
 reference reproduced segments 254-255 bit for bit).
 
 Cost (RTX PRO 6000; T1 device time for decode, `infernix-perplexity` scoring time for prefill at
-`33e1305`, INT8 KV, the base build against the new one):
+`4f61337`, INT8 KV, the base build against the new one):
 
 | Route | 1x1 | 6x1 | 1x4 | 6x2 | Prefill, chunk 896 / 1,792 / 3,584 / 7,168 |
 |---|---:|---:|---:|---:|---|

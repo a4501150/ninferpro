@@ -588,7 +588,7 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
 ## Performance
 
 **RTX PRO 6000 Blackwell** (orcarouter recipe C artifact, BF16 n-gram volume, DFlash2 drafter,
-FP8 KV, 6 lanes, 262,144-token context, no Disk prefix cache; commit `fc8826e`, 2026-10-30,
+FP8 KV, 6 lanes, 262,144-token context, no Disk prefix cache; commit `e984e41`, 2026-10-30,
 `make t3`; one server boot, placements switched at runtime; tok/s from the server's request
 log; process VRAM 90.3 / 68.2 / 58.7 GiB and process RAM 12.8 / 23.6 / 45.8 / 14.2 GiB at
 `vram=100%` / `65%,15%,20%` / the 50 % rows):

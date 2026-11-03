@@ -12,7 +12,7 @@ SSD tiers, the CPU expert engine — is designed once for every offloaded MoE fa
 DeepSeek-V4.1-Flash's constants, kernels, recipes and models of its own speed, and points to the
 MoE document for the shared machinery. The one implemented family,
 [Qwen3.8-Flash-Next](qwen3_8-flash-next-design.md), is cited as **FN §x** (its superseded content
-remains in git at base commit `0af2a9b`); the parallel [GLM-5.3-Flash design](glm5_3-flash-design.md)
+remains in git at base commit `0273fb5`); the parallel [GLM-5.3-Flash design](glm5_3-flash-design.md)
 is cited as **GLM §x**. DwarfStar (`antirez/ds4`), the local engine whose V4.1 implementation this
 design studied most closely, is cited as **DS4** (§4.1).
 
@@ -721,7 +721,7 @@ suffix under the full rule). Each touched expert is read once per walk span (§1
 ones cross the volumes (or the one NVMe on the 6000), every expert not in VRAM crosses the link or
 is computed by the CPU (thin experts only), and the GPU computes the rest at the exact routes'
 rates: experts ≈ 65 TFLOP/s (measured on Flash-Next's exact W4A16 wide route, RTX 5090, recorded in
-the Flash-Next design at base commit `0af2a9b`; MXFP4 shares its two-MMA limb form), dense ≈ 130
+the Flash-Next design at base commit `0273fb5`; MXFP4 shares its two-MMA limb form), dense ≈ 130
 TFLOP/s (estimated from 96-169 TFLOP/s measured there for 8-bit dense prompt routes; the 6000 is
 faster). Popular experts are the resident ones, so short prompts find more of theirs in memory.
 
@@ -744,7 +744,7 @@ minutes.
   under the bank pass); 128K in one walk span: ≈ 25 s, ≈ 5,200 tok/s, compute-bound by the experts'
   exact wide route. The W4A4 fast path (§25.3 O2) would cut the expert compute about fourfold
   (1.65 against 6.24 ms per call, measured on Flash-Next's W4A4 route, RTX 5090, base commit
-  `0af2a9b`) where a prompt is compute-bound.
+  `0273fb5`) where a prompt is compute-bound.
 - **Any fresh prompt above ~200 tokens costs a bank pass** — ≈ 11-12 s on three volumes (RTX 5090
   machine), ≈ 16-24 s on the 6000's single NVMe — and the link is the next floor. Short appends cost
   2-9 s (5090 machine). DS4 measured 2.9 / 5.4 / 8.7 s for 16 / 43 / 114-token appends with full
@@ -2256,7 +2256,7 @@ Questions for the owner:
   [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF).
 - ninferpro: the [MoE offload design](moe-offload-design.md) (the shared tier this family
   composes); the [Flash-Next design](qwen3_8-flash-next-design.md) (its superseded content,
-  which some pre-rewrite measurements here cite, remains in git at base commit `0af2a9b`); the
+  which some pre-rewrite measurements here cite, remains in git at base commit `0273fb5`); the
   [GLM-5.3-Flash design](glm5_3-flash-design.md) (its storage measurements of 2026-10-10 and the
   striped-volume, `mhc` and approximate-mode designs); [model quality](model-quality.md) §6 and
   [engine architecture](engine-architecture.md).

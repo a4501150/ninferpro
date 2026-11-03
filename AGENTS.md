@@ -10,8 +10,12 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
 `NOTICE` when a change is large enough to list.
 
 - `main` is the only long-lived branch and the one production builds from. Feature work goes on
-  short `feat/*` or `fix/*` branches (worktrees under `~/src/ninferpro-wt/` when parallel), lands
-  on `main` by fast-forward, and is pushed to `origin`.
+  short `feat/*` or `fix/*` branches (worktrees under `~/src/ninferpro-wt/` when parallel). Before
+  it lands, squash the branch into one commit per independent change (usually one): the subject
+  says what changed, the body lists what it includes and names any upstream commit it ports. It
+  then lands on `main` by fast-forward and is pushed to `origin`. A small self-contained change
+  may be committed on `main` directly. Never rewrite `main` once pushed; a commit hash a doc or
+  comment cites must stay reachable.
 - There is no shared history with Infernix. To take an upstream change, diff it against `7dbe99a`
   (or the upstream commit last ported, recorded in the commit message) and port it as its own
   commit. Drop a local change when upstream ships an equivalent.
@@ -343,6 +347,6 @@ unique prompt prefixes so the prefix cache does not hide prefill, and every spee
 server's `req#N done` log lines rather than client timing. Report the per-tier expert counts and the
 process VRAM (experts / KV / other) with every speed table.
 
-Commit and push to `origin` as work completes; do not wait to be asked. Use Conventional Commit
-subjects with concise lowercase types such as `feat`, `fix`, `perf`, `bench`, `test`, `build`,
-`refactor`, `docs`, or `chore`. Keep scratch notes (handoffs, plans) out of commits.
+Commit as work completes and push to `origin` once it is on `main`; do not wait to be asked. Use
+Conventional Commit subjects with concise lowercase types such as `feat`, `fix`, `perf`, `bench`,
+`test`, `build`, `refactor`, `docs`, or `chore`. Keep scratch notes (handoffs, plans) out of commits.
