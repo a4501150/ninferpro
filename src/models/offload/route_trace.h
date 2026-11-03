@@ -4,7 +4,7 @@
 // route trace): every round's routed experts per layer, with its kind, columns, rows,
 // live mask and the promotion budget the expert cache applied, appended to a binary file for the
 // two-level replay tools/expert_cache_replay/host_tier.py; and every CUDA graph executable the
-// Program instantiates, with device free memory around it (measurement RM0d). It only reads the
+// Program instantiates, with device free memory around it. It only reads the
 // route log that the expert cache already downloads with each round and queries free device
 // memory outside graph capture, so it never changes execution.
 //

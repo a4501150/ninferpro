@@ -428,9 +428,9 @@ probe has run for this model on either machine; M0 runs the DeepSeek probes.
 | Host RAM | 89 GB | AGENTS.md |
 | OS | Linux (Ubuntu 26.04, kernel 7.0); no WDDM budget or pin room — `mlock`/`cudaHostRegister` can pin as much as the ledger leaves (MoE §4.10) | AGENTS.md |
 | Storage | one **Gen5 NVMe (T710)** holding the models; the system has its own boot device | AGENTS.md |
-| Whole-record NVMe reads | 0.553 ms p50 at queue depth 1 (4.68 GB/s), 6.71 GB/s at depth 8 — measured on Flash-Next records from a 990 PRO artifact, not on this machine's T710; the T710's rate for 17.95 MiB records is **unmeasured** (R0) | MoE §8.2 |
+| Whole-record NVMe reads | T710, Flash-Next's 2.76 MB records: 6.36 GB/s at queue depth 1 (0.43 ms p50), 13.35 GB/s at depth 8 (measured 2026-11-02); the rate for this model's 17.95 MiB records is **unmeasured** (R0) and expected near the same bandwidth (model: ≈ 700 records/s) | MoE §8.2 |
 | Link H2D | ≈ 50 GB/s on a Gen5 x16 link | MoE §4.11 |
-| Host CPU | not recorded in the repository; the startup probes (MoE §5.5) measure whatever host is present, and M0 runs the MX8 probes on it | — |
+| Host CPU | AMD Ryzen 9 9950X3D2, 16 cores / 32 threads, AVX-512 (VNNI, BF16), 192 MiB L3 (`lscpu`, 2026-11-02); its MX8 expert rate is **unmeasured** — the startup probes (MoE §5.5) measure it, and M0 runs the MX8 probes on it | `lscpu` |
 
 What this decides: the 6000's frame pool holds ≈ 4,800 experts (§19.1) and its RAM tier ≈ 4,400
 slots; the SSD tier is the artifact (and the Engram volume) read in place on the T710, one volume
@@ -614,7 +614,7 @@ from RAM, over the 240 routed experts of a token.
 |---|---|---|---:|
 | GPU HBM: dense FP8/BF16 weights, mHC, windows, KV | 8.5 GB | ~1.55 TB/s sustained (RTX 5090; the 6000 is faster) | ≈ 5.5 ms (§9.3: ≈ 6.3 ms with launches and Engram) |
 | GPU HBM: hit experts | 240 h_v × 18.8 MB | same | 2.9 h_v ms |
-| CPU lane: RAM- and SSD-served experts it computes | 0.35 / 0.45 / 0.60 ms per expert on the i9-13900K (§12.2; the 6000's host is unmeasured) | 8 P-cores (+ E-cores) | |
+| CPU lane: RAM- and SSD-served experts it computes | 0.35 / 0.45 / 0.60 ms per expert on the i9-13900K (§12.2; the 6000's Ryzen 9 9950X3D2 is unmeasured) | 8 P-cores (+ E-cores) | |
 | PCIe H2D: staged misses | 18.8 MB each | 27.6 GB/s (5090 machine, x8); ≈ 50 GB/s (6000, x16) | 0.68 / 0.38 ms each |
 | SSD: 240 h_s records, striped over the volumes where the machine has them | 240 h_s × 18.8 MB | 14.15 GB/s (5090 machine, three volumes); 6.7-10 GB/s (6000, one NVMe; unmeasured, MoE §8.2's 990 PRO rates as the floor) | 319 h_s ms (5090 machine) |
 | Host DRAM: landings, CPU reads, DMA source | ≈ (2 h_s + h_r) × 240 × 18.8 MB | ~80 GB/s, shared | not binding (≈ 35 GB/s at the central case) |
@@ -677,8 +677,9 @@ expert: 0.30 ms → 13.2, 0.45 → 12.8, 0.60 → 12.3, 0.80 → 11.9. **The SSD
 kernel matters little** (unlike GLM, where it was worth a drive), because the SSD term dominates and
 the CPU's cost is near its DRAM floor.
 
-RTX PRO 6000, one NVMe volume (model; the T710's record rate and the host CPU's MX8 rate are
-unmeasured — R0, §23 M0):
+RTX PRO 6000, one NVMe volume (model; the T710 measured 13.35 GB/s at depth 8 on Flash-Next's
+2.76 MB records, above both single-volume columns, so the 10 GB/s column is the conservative
+bound until R0 measures this model's records; the host CPU's MX8 rate is unmeasured — §23 M0):
 
 | Scenario | One volume at 6.7 GB/s | One volume at 10 GB/s | With a second drive striped or as an expert stripe (≈ 2×) |
 |---|---:|---:|---:|
@@ -1427,8 +1428,8 @@ two options M5 A/Bs there (§5.6). The conversion planner (§7.6) reads the free
 GLM §11.7-§11.8 carry over: a startup read of 64 units per volume at QD 1 and QD 8, the
 physical-disk and root-port topology check with warnings, a retry then a recoverable round failure on
 read errors, header and sampled-CRC checks at startup, a full offline check in `verify_artifact`,
-no per-read hashing. On the 6000 the same calibration runs against its NVMe (the T710's rates are
-unmeasured today, §3.1).
+no per-read hashing. On the 6000 the same calibration runs against its NVMe (the T710's rate for
+this model's records is unmeasured, §3.1).
 
 ---
 
@@ -1459,7 +1460,7 @@ vector µops per 32 weights, ≈ 0.44 per weight (estimated).
 ports ≈ 1 ms of one P-core, ≈ 0.13 ms over 8 P-cores; the 18.8 MB record takes ≈ 0.31 ms at 60 GB/s
 of DRAM. **The CPU lane is DRAM-bound**, as Flash-Next's was (52-55 µs per 2.76 MB expert at 8
 workers, MoE §5.1), so §5 carries 0.35 / 0.45 / 0.60 ms with overheads; a second column adds only
-products (≈ 20 %). The RTX PRO 6000's host CPU is unmeasured; the startup probes (MoE §5.5) measure
+products (≈ 20 %). The RTX PRO 6000's host CPU (Ryzen 9 9950X3D2, AVX-512, §3.1) is unmeasured for MX8; the startup probes (MoE §5.5) measure
 it, and M0 runs the MX8 probe on both machines.
 
 ### 12.3 Execution
@@ -2146,7 +2147,7 @@ then removed.
 |---|---|---|
 | §5's model is optimistic, as GLM's was by 15-45 % against strata-glm (GLM §4.3) | decode ≈ 9-11 tok/s central | M4's first numbers refit the overhead terms; M6 attributes one token with nsys |
 | Hit rates below central (JigSawPT's 59-66 % VRAM hits came with a 125.7 GiB host) | decode toward 10 tok/s on the RTX 5090 machine | M1 first; the policy candidates; the RAM lever of §5.6 in the guide |
-| The RTX PRO 6000's NVMe record rate and host CPU are unmeasured | the 6000's §5.3 row could miss either way | M0's probes on the machine itself |
+| The RTX PRO 6000's rate for 17.95 MiB records and its host CPU's MX8 rate are unmeasured | the 6000's §5.3 row could miss either way | M0's probes on the machine itself |
 | `G:` short of space when the conversion runs | slower weighting (+6 % record time) or a fourth volume | the planner (§7.6) |
 | The 6000's models NVMe short of the ≈ 517 GB the outputs need | no default artifact there until space is freed or the MXFP4 Engram volume is used | the planner's refusal names the shortfall; option O4 |
 | Other sessions holding RAM on the RTX 5090 machine | a smaller tier, more SSD reads | the startup ledger; the guide states it |

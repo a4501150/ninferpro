@@ -397,7 +397,7 @@ void test_spill() {
 constexpr std::uint64_t kChunk = 64 * kMiB;
 
 // A card where this process has `pool` bytes of frames and `other` bytes of everything else, the OS
-// budget is 31,419 MiB and free memory is budget - usage (as RM0a measured on the RTX 5090).
+// budget is 31,419 MiB and free memory is budget - usage (as measured on the RTX 5090).
 VramSnapshot wddm(std::uint64_t pool, std::uint64_t other, DisplayState display = DisplayState::Headless,
                   std::uint64_t budget = 31'419 * kMiB) {
     VramSnapshot s;

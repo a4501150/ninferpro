@@ -25,7 +25,7 @@ constexpr std::uint64_t kPrefillRunTag = 3; // index: a run of prefill entries
 // Records that follow each other in a file are read as one scatter read (Strata 0.1.41's batched
 // file-tier reads): on this machine's NVMe drive (Samsung 990 PRO), unbuffered 33 MB reads of
 // neighbouring records reached 7.1 GB/s, against 6.7 GB/s for separate 2.6 MB record reads at
-// depth 8 (RM0e). The startup fill takes long runs; a fetch request's runs stay short, so its
+// depth 8 (infernix_expert_read_probe). The startup fill takes long runs; a fetch request's runs stay short, so its
 // first record lands soon.
 constexpr std::size_t kFillRunBytes  = std::size_t{32} << 20;
 constexpr std::size_t kFetchRunBytes = std::size_t{12} << 20;

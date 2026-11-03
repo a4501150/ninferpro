@@ -1,7 +1,7 @@
 #pragma once
 
-// Host side of the SSD expert tier's RAM level (docs/maintainer/moe-offload-design.md §4.6; plan
-// local/workdirs/fn/plans/memory-tiers.md §4.3, §4.7, §4.8): the decayed-LFU ranking
+// Host side of the SSD expert tier's RAM level (docs/maintainer/moe-offload-design.md §4.6): the
+// decayed-LFU ranking
 // of every expert key, the pinned host slots with their states, pins and load serials, the landing
 // lists (demand ring, prefetch list, demotion list), the admission and demotion gates, and the keys
 // held outside the slots (resident pageable records past the page-locking limit). Pure

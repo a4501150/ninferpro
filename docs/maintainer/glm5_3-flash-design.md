@@ -333,10 +333,11 @@ Consequences, before any mechanism is chosen:
 
 **Production machine** (the machine this repository builds and serves on; AGENTS.md): one RTX PRO
 6000 Blackwell, `sm_120a`, 96 GB, 188 SMs, DRAM 1.79 TB/s (measured, Flash-Next, FN §8.3), PCIe
-Gen5 x16; 89 GB of host RAM; one Gen5 NVMe (T710) holding the models. The host CPU is not recorded
-in the repository — unverified; M0 measures the E3A16 expert cost on it before any constant
-depends on it. The T710's rate at this family's 9 MiB records is unmeasured; M0's probe (§23)
-measures it. The shared tier's placement matrix measured on this card (Flash-Next, 2026-10-30) is
+Gen5 x16; 89 GB of host RAM; an AMD Ryzen 9 9950X3D2 host (16 cores / 32 threads, AVX-512 with
+VNNI and BF16, `lscpu` 2026-11-02), whose E3A16 expert cost M0 measures before any constant
+depends on it; one Gen5 NVMe (T710) holding the models, measured at 6.36 GB/s at queue depth 1 and
+13.35 GB/s at depth 8 on Flash-Next's 2.76 MB records (2026-11-02, MoE §8.2). Its rate at this
+family's 9 MiB records is unmeasured; M0's probe (§23) measures it. The shared tier's placement matrix measured on this card (Flash-Next, 2026-10-30) is
 MoE §8.2's: half the experts in RAM decode at 263 tok/s, half on SSD at 68, against 380
 all-VRAM, one request each.
 
@@ -549,7 +550,7 @@ from SSD, over the 336 routed experts of a token.
 |---|---|---|---:|
 | GPU HBM: dense EXL3 + KDA state + KV + mHC | 5.45 + 0.29 + ~0.05 GB | ≈ 1.5 TB/s (5090, estimate, FN §8.10) / 1.79 TB/s (production, measured, FN §8.3) | ~3.7 ms (5090; §9.3's budget is 4.1 ms with launches) / ~3.2 ms (production, model) |
 | GPU HBM: hit experts | 336 h_v × 9.47 MB | same | 2.1 h_v ms (5090) |
-| CPU lane: RAM- and SSD-served experts it computes | 0.2-0.4 ms per expert (E3A16 decode-bound, §12.2) | 6-8 P-cores (+ E-cores) on the 5090 machine; unmeasured on the production machine | |
+| CPU lane: RAM- and SSD-served experts it computes | 0.2-0.4 ms per expert (E3A16 decode-bound, §12.2) | 6-8 P-cores (+ E-cores) on the 5090 machine; unmeasured on the production machine's Ryzen 9 9950X3D2 | |
 | PCIe H2D: DMA'd misses (≈ 1/2 of RAM misses, §9.6) and SSD landings sent to the GPU | 9.47 MB each | 27.6 GB/s (5090 machine, measured) / 50 GB/s (production, model) | 0.34 / 0.19 ms each |
 | Host DRAM: CPU reads + DMA source + SSD landings | ≈ 336 (h_r + h_s) × 9.44 MB | ~80 GB/s on the 5090 machine (measured), shared | not binding at the central case |
 | SSD: 336 h_s records | 336 h_s × 9.44 MB | 12.7 GB/s (`D:` + `G:`, measured) on the 5090 machine; none at the production machine's default placement | 250 h_s ms (5090 machine) |

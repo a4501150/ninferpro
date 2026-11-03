@@ -1,6 +1,6 @@
 """Two-level replay of the Qwen3.8-Flash-Next routed-expert tiers: VRAM frames, pinned host (RAM)
-slots, and the artifact on SSD read in place (memory track, docs/maintainer/qwen3_8-flash-next-design.md
-section 9, measurement RM0f). Python 3.11+ with numpy.
+slots, and the artifact on SSD read in place (docs/maintainer/moe-offload-design.md
+section 4). Python 3.11+ with numpy.
 
 Input: route traces written by the engine's internal route trace (ProgramOptions::route_trace; the
 format is documented in src/models/offload/route_trace.h), captured with

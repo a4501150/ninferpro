@@ -1,5 +1,5 @@
-# Machine probes of the memory track (design §18.1, measurements RM0a, the read half of RM0c,
-# RM0e and RM0g). They measure the GPU, the driver and the artifact's drive and are run by hand, so
+# Machine probes of the memory track (docs/maintainer/moe-offload-design.md §4.9 and
+# §8.2). They measure the GPU, the driver and the artifact's drive and are run by hand, so
 # they are built beside the tests but are not CTest tests.
 
 add_executable(infernix_vram_probe

@@ -1,5 +1,5 @@
-// VRAM facts for the memory track (design §9.7, measurements RM0a and the read half of RM0c;
-// memory-tiers.md §3). Run alone on an otherwise idle GPU:
+// VRAM facts for the memory track (docs/maintainer/moe-offload-design.md §4.9;
+// qwen3_8-flash-next-design.md §9.7). Run alone on an otherwise idle GPU:
 //
 //   infernix_vram_probe [--parity-gib N] [--chunks N] [--only malloc,vmm,query,unmap,parity]
 //
@@ -9,9 +9,9 @@
 //      usage and Demoted bytes, and the local memory segments' commit/resident bytes; NVML (loaded
 //      with LoadLibrary/dlopen) memory, DisplayMode and DisplayActive; the OS budget slack against
 //      device free (Q2) and the display state by the §3.1 rule;
-//   2. whether a 1 GiB cudaMalloc shows up in DXGI CurrentUsage and D3DKMT Usage (RM0a);
+//   2. whether a 1 GiB cudaMalloc shows up in DXGI CurrentUsage and D3DKMT Usage;
 //   3. VMM: N x 64 MiB cuMemCreate + cuMemMap + cuMemSetAccess timed, the snapshot after mapping,
-//      then cuMemUnmap + cuMemRelease timed and whether device free returns at once (RM0a);
+//      then cuMemUnmap + cuMemRelease timed and whether device free returns at once;
 //   4. the cost of each query (cudaMemGetInfo, DXGI, D3DKMT, NVML) from a second thread, alone and
 //      while the first thread launches a stream of short kernels, and how much the queries slow that
 //      launch loop;
@@ -19,7 +19,7 @@
 //      unmap waits for an unrelated kernel already running (implicit device synchronization);
 //   6. read parity: a streaming read and a gather of random 2,764,800-byte records over N GiB of
 //      cudaMalloc memory against the same over N GiB of 64 MiB VMM chunks (an Op-level proxy for
-//      RM0c; RM0c itself is a tg512 A/B with the R2 toggle).
+//      the decode-time cost of VMM frame pools).
 //
 // Nothing here changes driver or system settings.
 
@@ -363,7 +363,8 @@ void print_snapshot(const char* label, const Snapshot& s) {
                     mib(slack), mib(static_cast<long long>(s.cuda_free)),
                     mib(slack - static_cast<long long>(s.cuda_free)));
     }
-    // memory-tiers.md §3.1: attached if outputs > 0 or NVML DisplayActive; headless if no outputs
+    // Display state (moe-offload-design.md §4.9): attached if outputs > 0 or NVML DisplayActive;
+    // headless if no outputs
     // and NVML unavailable or inactive; otherwise unknown (treated as attached on Windows).
     const char* display = (s.outputs > 0 || s.display_active == 1)    ? "attached"
                           : (s.outputs == 0 && s.display_active != 1) ? "headless"
@@ -438,7 +439,7 @@ struct VmmChunks {
 
 // ------------------------------------------------------------------ sections
 void section_malloc(const Probe& probe) {
-    std::printf("\n== RM0a: does a CUDA allocation show up in each source? (1 GiB cudaMalloc + memset)\n");
+    std::printf("\n== does a CUDA allocation show up in each source? (1 GiB cudaMalloc + memset)\n");
     const Snapshot a = probe.snapshot();
     void* p          = nullptr;
     const std::size_t bytes = std::size_t{1} << 30;
@@ -458,7 +459,7 @@ void section_malloc(const Probe& probe) {
 }
 
 void section_vmm(const Probe& probe, std::size_t chunks) {
-    std::printf("\n== RM0a: VMM create/map/access and unmap/release, %zu x 64 MiB\n", chunks);
+    std::printf("\n== VMM create/map/access and unmap/release, %zu x 64 MiB\n", chunks);
     int supported = 0;
     check(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, probe.device),
           "VMM attribute");
@@ -517,7 +518,7 @@ double launch_loop(cudaStream_t stream, int count, long long cycles, std::vector
 }
 
 void section_query_cost(const Probe& probe) {
-    std::printf("\n== RM0a: query cost from a second thread, idle and during a kernel loop\n");
+    std::printf("\n== query cost from a second thread, idle and during a kernel loop\n");
     cudaStream_t stream = nullptr;
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     const long long cycles = 20'000; // ~10 us at ~2 GHz
@@ -601,7 +602,7 @@ void section_query_cost(const Probe& probe) {
 }
 
 void section_unmap_stall(const Probe& probe) {
-    std::printf("\n== RM0a: do VMM map/unmap/release on another thread stall kernel launches?\n");
+    std::printf("\n== do VMM map/unmap/release on another thread stall kernel launches?\n");
     cudaStream_t stream = nullptr;
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     const long long cycles = 20'000;
@@ -708,7 +709,7 @@ double gather_gbs(const void* data, std::size_t bytes, const unsigned* records, 
 }
 
 void section_parity(const Probe& probe, std::size_t gib) {
-    std::printf("\n== RM0c proxy: reads from cudaMalloc against 64 MiB VMM chunks, %zu GiB each\n", gib);
+    std::printf("\n== VMM read parity: reads from cudaMalloc against 64 MiB VMM chunks, %zu GiB each\n", gib);
     const std::size_t bytes  = gib << 30;
     const std::size_t chunks = bytes / kChunk;
     cudaStream_t stream      = nullptr;

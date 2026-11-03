@@ -1,5 +1,6 @@
 // Expert-record reads from the artifact in place, and pinned host allocation time, for the memory
-// track's SSD tier (design §9.5; measurements RM0e and RM0g; memory-tiers.md §4.4-§4.10). Run
+// track's SSD tier (docs/maintainer/moe-offload-design.md §4.6-§4.7,
+// §8.2). Run
 // alone on an otherwise idle machine; it only reads the artifact and never writes a file.
 //
 //   infernix_expert_read_probe ARTIFACT.ninfer [--seconds 5] [--depths 1,2,4,8] [--quarter-depths 1,2,4]
@@ -23,7 +24,7 @@
 //               (§4.9), and the sub-reads' own latency
 //   straddlers  the records split across part files read through their two pieces, compared with a
 //               buffered read of the same logical range
-//   pin         RM0g: cudaHostAlloc(Portable | Mapped) time of N chunks of 512 slots (1.32 GiB)
+//   pin         cudaHostAlloc(Portable | Mapped) time of N chunks of 512 slots (1.32 GiB)
 //               against one block of the same total, chunks / block / chunks, with touch and free
 //               times; skipped unless available RAM covers the block plus 8 GiB
 //   pinlimit    (only when --pin-limit-gib > 0) pins 1.32 GiB chunks until a failure, the cap, or
@@ -205,7 +206,7 @@ public:
 #ifdef _WIN32
         (void)max_in_flight;
         for (std::size_t i = 0; i < paths.size(); ++i) {
-            // Deny writers, as the tier's handles will (memory-tiers.md §4.4).
+            // Deny writers, as the tier's handles will.
             HANDLE file = CreateFileW(paths[i].c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
                                       OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
             if (file == INVALID_HANDLE_VALUE) {
@@ -451,7 +452,7 @@ void report(const char* label, const Stream& s, double elapsed) {
 
 void section_reads(Probe& probe, const Pinned& slots, const std::vector<int>& depths, Stream::Kind kind,
                    const char* name) {
-    std::printf("\n== RM0e: %s reads from the artifact, %.1f s per queue depth (records in flight)\n", name,
+    std::printf("\n== %s reads from the artifact, %.1f s per queue depth (records in flight)\n", name,
                 probe.seconds);
     for (const int depth : depths) {
         Stream s = make_stream(kind, depth, slots.data(), 0);
@@ -516,7 +517,7 @@ private:
 };
 
 void section_load(Probe& probe, const Pinned& slots) {
-    std::printf("\n== RM0e: reads with and without a concurrent H2D stream from pinned memory\n");
+    std::printf("\n== reads with and without a concurrent H2D stream from pinned memory\n");
     {
         H2dLoad load;
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
@@ -547,7 +548,7 @@ void section_load(Probe& probe, const Pinned& slots) {
 }
 
 void section_subread(Probe& probe, const Pinned& slots, const Pinned& sub) {
-    std::printf("\n== RM0e: QD 1 demand reads alone and with one 256 KiB prefetch sub-read always in flight\n");
+    std::printf("\n== QD 1 demand reads alone and with one 256 KiB prefetch sub-read always in flight\n");
     Stream alone = make_stream(Stream::Kind::Whole, 1, slots.data(), 0);
     const double t_alone = run(probe, {&alone});
     report("demand, alone", alone, t_alone);
@@ -592,10 +593,10 @@ void section_straddlers(Probe& probe, const Pinned& slots) {
     }
 }
 
-// RM0g; skipped when the machine has too little available RAM to run it.
+// skipped when the machine has too little available RAM to run it.
 void section_pin(std::uint64_t chunks) {
     const std::uint64_t total = chunks * kChunkBytes;
-    std::printf("\n== RM0g: cudaHostAlloc(Portable | Mapped) of %llu x %.2f GiB chunks against one %.2f GiB block\n",
+    std::printf("\n== cudaHostAlloc(Portable | Mapped) of %llu x %.2f GiB chunks against one %.2f GiB block\n",
                 static_cast<unsigned long long>(chunks), static_cast<double>(kChunkBytes) / kGiB,
                 static_cast<double>(total) / kGiB);
     const std::uint64_t avail = available_ram();

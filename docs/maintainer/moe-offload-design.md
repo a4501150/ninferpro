@@ -403,6 +403,10 @@ thread at ~13 GB/s, while memcpy pageable-to-pinned runs at 20 GB/s on one threa
 use the bounce slots in two halves — the CPU fills one while the link drains the other — and
 the prefill stream has its own bounce beside them.
 
+Linux has no such limit: without a WDDM shared-memory figure the pin room is unlimited, so the
+ledger pins every RAM-tier expert and no unpinned records exist; only `--expert-pin-mib`
+(a family option) caps the pinned share there.
+
 ## 5. CPU expert engine
 
 ### 5.1 Role and limits
@@ -656,9 +660,16 @@ decision.
 RAM is worth far more than SSD for experts that leave VRAM. Qwen3.8-Flash-Next on the RTX
 PRO 6000 (2026-10-30, one request, DFlash2, BF16 n-gram, FP8 KV): half the experts in RAM
 decode at 263 tok/s, half on SSD at 68; the same boot's all-VRAM placement at 380. Whole
-SSD-record reads from an NVMe artifact (990 PRO, Qwen3.8-Flash-Next records): 0.553 ms p50
-at queue depth 1 (4.68 GB/s), 6.71 GB/s at depth 8 (~2,100 experts/s); a fetch of at least 64
-records queues read-aheads of the next layer. A switch round trip costs seconds and leaves
+SSD-record reads of Qwen3.8-Flash-Next's 2,764,800 B records from the artifact
+(`infernix_expert_read_probe --only reads`, unbuffered, machine idle):
+
+| Drive (machine) | QD 1 | p50 at QD 1 | QD 8 |
+|---|---:|---:|---:|
+| Crucial T710, Gen5 (RTX PRO 6000, Linux, 2026-11-02) | 6.36 GB/s | 0.43 ms | 13.35 GB/s (4,830 records/s) |
+| Samsung 990 PRO, Gen4 (RTX 5090 machine) | 4.68 GB/s | 0.55 ms | 6.71 GB/s (~2,100 records/s) |
+
+The T710 saturates by depth 8 (13.11 GB/s at depth 16). A fetch of at least 64 records queues
+read-aheads of the next layer. A switch round trip costs seconds and leaves
 the engine whole.
 
 ### 8.3 How to measure and report
@@ -705,3 +716,10 @@ The checklist, in order:
 8. **Docs**: a family design document citing this document as "MoE §N" for the shared
    machinery and keeping the family's constants, kernels and measurements; a user guide
    (flags, placements, measured speeds) linked from `docs/README.md`.
+9. **Tier extensions**: a family that needs the tier to grow names each addition, where it
+   lands and why it costs the existing families nothing. Two planned families' additions are
+   designed but not built:
+   [GLM-5.3-Flash §8.2](glm5_3-flash-design.md#82-the-shared-offload-tier-and-what-it-gains-here)
+   and [DeepSeek-V4.1-Flash §8.2](deepseek_v4_1-flash-design.md#82-the-shared-offload-tier-what-exists-what-this-family-adds).
+   Both need expert records striped over several drives (more segments per record, one read
+   queue per drive), designed in GLM §11. An addition moves into this document when it is built.

@@ -302,8 +302,9 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 
 ## Local operations
 
-The machine: Ubuntu 26.04, kernel 7.0, one RTX PRO 6000 Blackwell (SM120, 96 GB), 89 GB of RAM,
-CUDA 13.4 at `/usr/local/cuda-13.4`, a Gen5 NVMe (T710) holding the models.
+The machine: Ubuntu 26.04, kernel 7.0, one RTX PRO 6000 Blackwell (SM120, 96 GB), an AMD Ryzen 9
+9950X3D2 (16 cores, AVX-512), 89 GB of RAM, CUDA 13.4 at `/usr/local/cuda-13.4`, a Gen5 NVMe
+(T710) holding the models.
 
 - Builds: one `build/` directory, configured with the `dev` preset (the optimized release build
   plus tests and benchmarks), holds the production server and the tests. Export

@@ -2,7 +2,7 @@
 // prompt list greedily through the public Engine with the internal route trace on, requires the
 // token ids to equal a run with the trace off (the hook is bit-neutral), and checks the trace
 // against the requests. The trace feeds tools/expert_cache_replay/host_tier.py; its graph records
-// give the device memory of each CUDA graph executable (measurement RM0d). Skips (77) unless
+// give the device memory of each CUDA graph executable. Skips (77) unless
 // INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
 //   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram]
@@ -210,7 +210,7 @@ const char* family_name(std::uint32_t family) {
 // Re-reads the trace and checks it against the requests. A prefill chunk at position 0 starts the
 // next request (FIFO order) on its lane; that request's chunks are contiguous over its prompt, and
 // its decode, verification and forced-token rows account for its generated tokens. Graph records
-// are summarized (RM0d): each graph slot must be instantiated at most once.
+// are summarized: each graph slot must be instantiated at most once.
 int check_trace(const std::filesystem::path& path, const std::vector<PromptSpec>& prompts,
                 const std::vector<Outcome>& outcomes, bool speculative) {
     std::ifstream in(path, std::ios::binary);
@@ -363,7 +363,7 @@ int check_trace(const std::filesystem::path& path, const std::vector<PromptSpec>
     std::printf("trace: %llu records, %.1f MiB\n", static_cast<unsigned long long>(records),
                 static_cast<double>(bytes) / (1 << 20));
 
-    // RM0d: device memory per graph executable (device free before its capture minus after its
+    // Device memory per graph executable (device free before its capture minus after its
     // instantiation and first launch).
     std::sort(graphs.begin(), graphs.end(), [](const Graph& a, const Graph& b) {
         return std::tie(a.family, a.batch, a.width) < std::tie(b.family, b.batch, b.width);
