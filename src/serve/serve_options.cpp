@@ -55,6 +55,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
     ServeOptionArity{"--disable-fast-paths", false},
     ServeOptionArity{"--fast-path", true, true},
+    ServeOptionArity{"--no-fast-path", true, true},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
@@ -322,6 +323,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             lists them; docs/serving.md)\n"
            "  --fast-path NAME           also run this fast path, qualified or not\n"
            "                             (qualification and timing runs; repeatable)\n"
+           "  --no-fast-path NAME        run without this fast path even where qualified\n"
+           "                             (attribution runs; repeatable)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +

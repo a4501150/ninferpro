@@ -1115,6 +1115,14 @@ int main() {
             (void)parse({"infernix-serve", "model.ninfer", "--fast-path", "no-such-path"});
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an unknown --fast-path name was accepted");
+        const auto attributed = parse({"infernix-serve", "model.ninfer", "--no-fast-path", "fp8-a8-pair",
+                                       "--no-fast-path", "gdn-compensated"});
+        failures += check(attributed.fast_path_exclusions == std::vector<infernix::FastPath>{
+                                                                 infernix::FastPath::Fp8A8Pair,
+                                                                 infernix::FastPath::GdnCompensated},
+                          "--no-fast-path exclusions were not kept in order");
+        failures += check(serve_usage_text("infernix-serve").find("--no-fast-path") != std::string::npos,
+                          "serve help omits --no-fast-path");
     }
     failures += check(serve_usage_text("infernix-serve").find("prefill-8bit-pv") == std::string::npos,
                       "serve help still lists the removed 8-bit prefill P*V flags");

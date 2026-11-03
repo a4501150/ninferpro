@@ -273,6 +273,8 @@ std::string usage_text(const char* argv0) {
            "                           policy; startup lists them; docs/cli.md)\n"
            "  --fast-path NAME         also run this fast path, qualified or not\n"
            "                           (qualification runs; repeatable)\n"
+           "  --no-fast-path NAME      run without this fast path even where qualified\n"
+           "                           (attribution runs; repeatable)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
