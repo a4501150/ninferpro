@@ -232,7 +232,7 @@ int exercise_reservation_and_mapping(infernix::DeviceContext& context) {
     return failures;
 }
 
-// An elastic pool (design §19.3.11): only pages below the backed limit are handed out, first fit keeps
+// An elastic pool (design §14.4): only pages below the backed limit are handed out, first fit keeps
 // them low, the limit rises freely and falls only over free pages.
 int exercise_backed_limit(infernix::DeviceContext& context) {
     int failures = 0;

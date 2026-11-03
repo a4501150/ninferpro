@@ -5,7 +5,7 @@
 
 Reads ``config.json``, ``hf_quant_config.json`` and the Safetensors headers, plus the FP32 scalar
 scales of every quantized expert matrix (a few hundred KiB); bulk tensor data is never read.
-It answers docs/maintainer/qwen3_8-flash-next-design.md §6.1 and §19 M0:
+It answers docs/maintainer/qwen3_8-flash-next-design.md §6.6:
 
 - the declared quantization (algorithm, group size, exclusions, per-layer overrides);
 - whether every NVFP4 expert matrix has exactly one ``weight_scale_2`` and one ``input_scale``;
@@ -13,7 +13,7 @@ It answers docs/maintainer/qwen3_8-flash-next-design.md §6.1 and §19 M0:
 - how many ``weight_scale_2`` are powers of two (the only case Infernix's divisor ``nvfp4`` is exact);
 - the MTP experts' storage and activation scheme (FP8 blocks with or without ``input_scale``);
 - the PLE n-gram shards' dtype and scale shape;
-- bytes per tensor class and dtype, to check the §4 byte budget.
+- bytes per tensor class and dtype, to check the §2 byte budget.
 """
 
 from __future__ import annotations

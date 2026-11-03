@@ -3,12 +3,12 @@ infernix_add_test(infernix_qwen4_exp_expert_cache_test
   LIBRARIES infernix_offload
   NEEDS_SOURCE_DIR)
 
-# The SSD tier's host level (design §19.3.7, R10 host part): slots, read agent, admission. CPU and disk.
+# The SSD tier's host level (design §9.5, R10 host part): slots, read agent, admission. CPU and disk.
 infernix_add_test(infernix_qwen4_exp_host_expert_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_expert_tier.cpp"
   LIBRARIES infernix_model_runtime)
 
-# The SSD tier's RAM-level controller (design §19.3.7 RT2), host only.
+# The SSD tier's RAM-level controller (design §9.5), host only.
 infernix_add_test(infernix_qwen4_exp_host_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_tier.cpp"
   LIBRARIES infernix_offload)
@@ -74,7 +74,7 @@ infernix_add_test(infernix_qwen4_exp_rope_positions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_positions.cpp"
   LIBRARIES infernix_model_runtime)
 
-# Explicit expert placement (design §19.3.7): the placement file, the counts ranking, the export
+# Explicit expert placement (design §9.6): the placement file, the counts ranking, the export
 # round trip and the LFRU pinning. Host only.
 infernix_add_test(infernix_qwen4_exp_expert_placement_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_placement.cpp"
@@ -152,7 +152,7 @@ infernix_add_test(infernix_qwen4_exp_fast_paths_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
   LIBRARIES infernix_model_runtime)
 
-# VT6c (design §19.3.2): the >2,051-token multimodal wiring oracle. Dumps the prepared prompt's
+# VT6c (design §16.8): the >2,051-token multimodal wiring oracle. Dumps the prepared prompt's
 # ids, positions and Vision patches for the FP64 reference and runs the same prompt's first greedy
 # tokens through the public Engine's exact route; tools/flash_next/vision_oracle.py compares.
 infernix_add_test(infernix_qwen4_exp_vision_oracle_real_test

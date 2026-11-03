@@ -1,4 +1,4 @@
-// Engine-level route trace on the real artifact (memory track step R0, design §19.3.7): runs a
+// Engine-level route trace on the real artifact (memory track step R0, design §18.1): runs a
 // prompt list greedily through the public Engine with the internal route trace on, requires the
 // token ids to equal a run with the trace off (the hook is bit-neutral), and checks the trace
 // against the requests. The trace feeds tools/expert_cache_replay/host_tier.py; its graph records

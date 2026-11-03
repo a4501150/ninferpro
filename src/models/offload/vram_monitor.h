@@ -1,6 +1,6 @@
 #pragma once
 
-// The VRAM monitor of the Qwen4Exp Program (design §19.3.7): one thread that reads the device's
+// The offload tier's VRAM monitor (moe-offload-design.md §4.9): one thread that reads the device's
 // video memory when the OS changes this process's budget, or once a second, keeps the latest
 // snapshot, and hands each to the Program's callback, which wakes an idle engine so it returns
 // idle KV pages to the expert frames and reports pressure below the headroom. It mutates no CUDA

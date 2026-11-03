@@ -1,6 +1,6 @@
 #pragma once
 
-// Host side of the SSD expert tier's fetch channel (design §19.3.7; protocol in fetch_request.h):
+// Host side of the SSD expert tier's fetch channel (moe-offload-design.md §4.7; protocol in fetch_request.h):
 // the mapped request, response, consumed and heartbeat words and the device sequence counter, and
 // the responder's half of the protocol. One responder thread (the tier's agent) calls every
 // method except channel(); the device publishes at most one request at a time.

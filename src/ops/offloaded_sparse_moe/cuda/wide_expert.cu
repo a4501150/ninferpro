@@ -319,7 +319,7 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
     }
 }
 
-// ---------------------------------------------------------- W4A16 residual A4 (design §19.3.23)
+// ---------------------------------------------------------- W4A16 residual A4 (design §13.4)
 
 // A row scale: amax / (6 * 448), so every block's first-term E4M3 scale stays finite. An all-zero row
 // has scale 0 and zero terms; a non-finite row has scale NaN and zero terms, so the epilogues'

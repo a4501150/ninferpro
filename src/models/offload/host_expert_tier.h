@@ -1,6 +1,6 @@
 #pragma once
 
-// The SSD expert tier's host level (docs/maintainer/qwen3_8-flash-next-design.md §19.3.7; plan
+// The SSD expert tier's host level (docs/maintainer/moe-offload-design.md §4.7; plan
 // memory-tiers.md §4.3-§4.6): pinned slots holding expert records read in place from the artifact,
 // the RAM-tier controller that decides which keys they hold (expert_cache::HostTier), and an agent
 // thread that owns the unbuffered read queue. The engine thread drives the controller at round

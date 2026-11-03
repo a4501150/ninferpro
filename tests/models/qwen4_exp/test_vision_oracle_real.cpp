@@ -1,4 +1,4 @@
-// The >2,051-token multimodal wiring oracle (design §19.3.2, test VT6c; AGENTS.md "Verification"):
+// The >2,051-token multimodal wiring oracle (design §16.8, test VT6c; AGENTS.md "Verification"):
 // QSA equals causal attention below 2,051 visible tokens, so a media prompt past that threshold is
 // the only route whose M-RoPE staging, vision scatter and pooled-key selection a short prompt
 // cannot hide. The prompt is ~200 text tokens, a 32 x 32 merged-grid image (1,024 tokens) and ~900

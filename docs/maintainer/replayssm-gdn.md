@@ -22,8 +22,10 @@ causal-conv history, and the space and compute characteristics of the current Qw
 The Record/Fold implementation and contract are in
 [`gdn_replay.h`](../../include/infernix/ops/gdn_replay.h) and
 [`replay.cpp`](../../src/ops/linear_attention/gated_delta_net/replay.cpp). The model config determines the
-layer/head counts, and the Program reserves record capacity for the enabled MTP, DFlash or DFlash2
-window.
+layer/head counts, and the Program sizes the record view for the widest enabled speculative round
+family — MTP, DFlash or DFlash2 chains, n-gram copy rounds and DFlash2 tree rounds all contribute a
+candidate width — with one row per concurrency lane (at most eight) and the width set by the widest
+family's verify window plus one.
 
 ---
 
@@ -286,7 +288,9 @@ When \(m=0\) the state is strictly unchanged. The rejected suffix \(R_{m+1:T}\) 
 
 Within one head there are still up to \(m\) sequential transitions, but different layers, value heads and
 batch rows are independent of one another. Qwen3.6's parallel width comes from 30/48 GDN layers, 32/48
-value heads and multiple active rows, while the per-row token loop has at most 6 or 16 iterations.
+value heads and multiple active rows. The per-row token loop is bounded by the widest captured round
+family: neural chains reach 16 columns (MTP 6), n-gram copy rounds up to 64 and DFlash2 tree rounds
+up to 32.
 
 ### 3.4 Accepted-prefix correctness
 
@@ -634,9 +638,10 @@ Raw-input replay keeps verify's serial recurrence and adds at most \(m\) transit
 | rollback | select the corresponding snapshot | read only the accepted record prefix |
 | persistent numerical path | verify recurrence | closed-loop clone of the verify recurrence |
 
-The token dimension in this scenario is short: MTP has at most \(T=6\), and DFlash/DFlash2 at most
-\(T=16\). Along a single layer, value head and batch row, fold has \(m\) sequential transitions; different
-layers, heads and batch rows are independent of one another.
+The token dimension in this scenario is short: the replay width is the widest captured round family —
+MTP at most \(T=6\), DFlash/DFlash2 chains at most \(T=16\), n-gram copy rounds up to \(T=64\) and DFlash2
+tree rounds up to \(T=32\). Along a single layer, value head and batch row, fold has \(m\) sequential
+transitions; different layers, heads and batch rows are independent of one another.
 The overall compute shape is therefore a large number of mutually independent short recurrences. Fold
 work grows linearly with the accepted length \(m\), record traffic grows linearly with the verify length
 \(T\), and only one committed state is written at the end.

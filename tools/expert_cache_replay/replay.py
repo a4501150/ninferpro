@@ -1,6 +1,6 @@
 """Trace-driven replay of VRAM expert-cache policies for Qwen3.8-Flash-Next decode routing.
 
-Supporting evidence for docs/maintainer/qwen3_8-flash-next-design.md (section 9.4); the starting
+Supporting evidence for docs/maintainer/qwen3_8-flash-next-design.md (section 9.2); the starting
 point of milestone M1. Python 3.11 + numpy.
 
 Input: a directory with warmup-trace.npz, a-trace.npz and b-trace.npz, each holding `ids`

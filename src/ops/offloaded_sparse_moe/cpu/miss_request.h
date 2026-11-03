@@ -1,7 +1,7 @@
 #pragma once
 
 // The mapped-memory request through which the GPU hands a layer call's CPU-served misses to the
-// host expert engine (docs/maintainer/qwen3_8-flash-next-design.md §10.3). Shared by the device
+// host expert engine (docs/maintainer/moe-offload-design.md §5.4). Shared by the device
 // kernels (moe_layer.cu) and the host service (miss_service.h); plain data, no host-only types.
 
 #include <cstdint>

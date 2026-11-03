@@ -1,5 +1,5 @@
 // QSA block selection: multi-CTA scoring and exact radix selection (qsa_select.h,
-// docs/maintainer/qwen3_8-flash-next-design.md §19.3.6 item 2).
+// docs/maintainer/qwen3_8-flash-next-design.md §3.1).
 
 #include "ops/qsa/qsa_select.h"
 
@@ -63,7 +63,7 @@ static_assert(kQsaSelectGroupColumns <= 256, "ScoreTiles stores group-relative c
 
 // Same addressing as qsa.cu's pool and attention kernels: the pooled key of block b fills the R
 // token slots of its block, slot_width = Di / R elements each.
-// A page id's space is resolved (design §19.3.11): the pool's pooled plane or the spaces' array.
+// A page id's space is resolved (design §14.4): the pool's pooled plane or the spaces' array.
 __device__ __forceinline__ const bf16* pooled_element(const bf16* pool, const QsaPageSpaces& spaces,
                                                       const std::int32_t* table, int token, int slot_width, int slot) {
     int page;

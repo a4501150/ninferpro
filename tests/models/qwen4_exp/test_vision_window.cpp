@@ -1,4 +1,4 @@
-// The Vision encode window's planning and visual columns (program/vision_window.h; design §19.3.2,
+// The Vision encode window's planning and visual columns (program/vision_window.h; design §16.4,
 // test VT3's visual cases), host only. The oracle is direct enumeration over the token positions.
 // Checks: a chunk's handoff slice and call-local columns, an image starting exactly at a chunk
 // boundary, a chunk with no image token, the MTP cell mapping (cell c takes token c + 1, so a

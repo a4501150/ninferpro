@@ -1,7 +1,7 @@
 # Weight conversion
 
-Infernix's converter creates `.infernix` artifacts from local weights and a Python recipe; the
-container is the one NInfer named `.ninfer`, and Infernix loads either extension, so the examples
+The engine's converter creates `.infernix` artifacts from local weights and a Python recipe; the
+container is the one NInfer named `.ninfer`, and the engine loads either extension, so the examples
 below that write `.ninfer` work unchanged with `--out <name>.infernix`. A recipe
 can reuse an official conversion, change selected layers or projections, combine sources, or call
 your own conversion method. The artifact contains the resulting configuration, encoded weights,
@@ -12,8 +12,8 @@ Run the commands below from the repository root.
 ## Upgrade an existing v2 artifact
 
 The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
-and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `master` and
-[rebuild Infernix](../README.md#quick-start-windows), then run with Python 3.11:
+and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `main` and
+[rebuild ninferpro](../README.md#build), then run with Python 3.11:
 
 ```bash
 python3 tools/upgrade_ninfer_v2_to_v3.py \
@@ -67,6 +67,10 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter GPTQ layout: imported NVFP4 MLP for layers 0–55, imported FP8 for the last eight layers' MLP and every attention/GDN projection, FP8 embedding and vocabulary weights from BF16 | `quantized` |
 | `qwen3_8_flash_next_nvfp4` | Qwen3.8-Flash-Next recipe A: every tensor as NVIDIA stores it (routed experts as exact `nvfp4_mul` banks, the FP8 n-gram table in its own volume); only the MTP drafter re-quantized (Q8 projections, Q4 experts) ([guide](qwen3_8-flash-next.md)) | None |
 | `qwen3_8_flash_next_nvfp4_dense8` | Recipe B (Dense8): recipe A plus Q8 for the dense projection classes that dominate per-token weight reads (GDN, QSA output, shared experts, hyper-connection mixers, PLE projections, `lm_head`) | None |
+| `qwen3_8_flash_next_nvfp4_orcarouter` | Recipe C (the production artifact): the orcarouter weight-only export bit-exact — `nvfp4_mul` routed experts (W4A16), row-scaled FP8 GDN/QSA and shared-expert projections (W8A16), Q8 mixers, PLE and `lm_head` ([guide](qwen3_8-flash-next.md)) | None |
+| `qwen3_8_flash_next_fp8` | Qwen's official FP8 checkpoint bit-exact: `fp8_e4m3fn_b128` routed experts (E4M3FN codes, BF16 128×128 tile scales, W8A16), BF16/FP32 tensors unchanged, the MTP drafter re-quantized (`q2_g64_fp16` experts) | None |
+| `qwen3_8_flash_next_gsq_rco_iq3s` | ISTA-DASLab's GSQ-RCO IQ3_S GGUF bit-exact: every GGML block format stored verbatim, dense tiled formats in 16-row tiles, routed experts as ggml banks, A16 everywhere | `--gguf` |
+| `qwen3_8_flash_next_dflash2` | The DFlash2 drafter as a companion artifact (`--components dflash2`): `q8_g32_fp16` projections, BF16 dynamic-convolution kernel projections, selector and norms | `dflash2` |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -209,9 +213,10 @@ The converter currently writes these formats:
 | Format | Built-in method for floating-point input | Import of already encoded input |
 |---|---|---|
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
-| `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
+| `q2_g64_fp16`, `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | `nvfp4_absmax`, `nvfp4_mse` | `import_encoded` |
+| `nvfp4_mul`, `fp8_e4m3fn_b128`, the `ggml_*` block formats | — | Imported verbatim by the Flash-Next recipes: expert banks from NVIDIA's, Qwen's FP8 or a GGUF checkpoint ([guide](qwen3_8-flash-next.md#convert)) |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `fp8_row_maxabs` first
 rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.
@@ -542,7 +547,7 @@ and explicit application/request settings.
 The default maximum file size is 32,000,000,000 bytes, including framing. Smaller artifacts remain
 one file. Larger artifacts use an entry such as `models/my_qwen.ninfer` plus
 `my_qwen.ninfer.part-0001`, `my_qwen.ninfer.part-0002`, and so on in the same directory. Pass only the
-entry path to Infernix and keep all its recorded parts together. `--max-file-bytes` changes the limit.
+entry path to the engine and keep all its recorded parts together. `--max-file-bytes` changes the limit.
 
 Conversion writes `models/my_qwen.ninfer.conversion.json` alongside the artifact, recording sources,
 methods, formats, component configs, files and timing. Existing output files are not overwritten.

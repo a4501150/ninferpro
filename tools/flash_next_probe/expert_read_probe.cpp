@@ -1,5 +1,5 @@
 // Expert-record reads from the artifact in place, and pinned host allocation time, for the memory
-// track's SSD tier (design §19.3.7; measurements RM0e and RM0g; memory-tiers.md §4.4-§4.10). Run
+// track's SSD tier (design §9.5; measurements RM0e and RM0g; memory-tiers.md §4.4-§4.10). Run
 // alone on an otherwise idle machine; it only reads the artifact and never writes a file.
 //
 //   infernix_expert_read_probe ARTIFACT.ninfer [--seconds 5] [--depths 1,2,4,8] [--quarter-depths 1,2,4]

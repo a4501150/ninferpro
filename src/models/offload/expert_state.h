@@ -1,6 +1,6 @@
 #pragma once
 
-// The expert cache's saved state (design §19.3.5 S4b, warm start): every expert's LFRU count and the
+// The expert cache's saved state (moe-offload-design.md §4.3, warm start): every expert's LFRU count and the
 // resident experts, highest score first, written at stop and between requests and read at the next
 // start to fill the VRAM frames before the first request. A file is used only when its identity
 // (the artifact and the key count) matches; anything else is ignored with a reason.

@@ -1,4 +1,4 @@
-// Flash-Next M0 host probe (docs/maintainer/qwen3_8-flash-next-design.md §14.2 Stage 1, §19 M0):
+// Flash-Next M0 host probe (docs/maintainer/qwen3_8-flash-next-design.md §18.1 Stage 1):
 // DRAM read bandwidth versus worker threads, and the CPU W4A4 expert kernel's service rate per ISA,
 // column count, worker count, and cold versus cache-warm records. No GPU is needed.
 //

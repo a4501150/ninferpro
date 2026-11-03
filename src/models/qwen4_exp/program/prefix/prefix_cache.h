@@ -2,7 +2,7 @@
 
 // Physical binding of the generic prefix index (runtime/prefix_cache) to Qwen4Exp's KV page pool,
 // lane state, pinned Host slab pool and Disk tier (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.1). The index decides; this class holds what its opaque ids name and moves the bytes its
+// §15.1). The index decides; this class holds what its opaque ids name and moves the bytes its
 // decisions imply.
 //
 // - A block id owns one Device page lease: a cached full block, or a snapshot's Device tail. Lanes

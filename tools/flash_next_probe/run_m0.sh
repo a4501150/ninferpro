@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs every Flash-Next M0 probe and records the outputs (docs/maintainer/qwen3_8-flash-next-design.md §19).
+# Runs every Flash-Next M0 probe and records the outputs (docs/maintainer/qwen3_8-flash-next-design.md §18.1).
 #
 #   tools/flash_next_probe/run_m0.sh CHECKPOINT_DIR NVME_FILE [OUT_DIR]
 #

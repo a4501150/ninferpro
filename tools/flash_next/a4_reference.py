@@ -1,4 +1,4 @@
-"""The A4 activation quantizer of the Flash-Next design (§16.2), checked against ModelOpt's.
+"""The A4 activation quantizer of the Flash-Next design (§17.2), checked against ModelOpt's.
 
     python3 -m tools.flash_next.a4_reference [--activations acts.pt ...] [--json report.json]
 
@@ -9,11 +9,11 @@ Both are evaluated in IEEE FP32 with round-to-nearest-even.
 
 The two rules agree except for one guard in ModelOpt: a dequantized block scale below 1e-5 is
 replaced by 1.0, so a block whose amax is below about 6e-5 quantizes to zeros. TensorRT-LLM's
-deployed FP4 quantizer has no such guard, and neither does §16.2; the report counts the blocks it
+deployed FP4 quantizer has no such guard, and neither does §17.2; the report counts the blocks it
 affects separately from every other mismatch.
 
 With CUDA and ``nvidia-modelopt`` installed, the CLI also launches ModelOpt's own Triton kernel
-and compares it with both ports. That is the M0 check of design §19. The Triton interpreter is not
+and compares it with both ports. That is the check of design §17.2. The Triton interpreter is not
 a substitute: its FP32-to-FP8 cast does not round to nearest even.
 """
 
@@ -59,7 +59,7 @@ def _blocks(v: torch.Tensor) -> torch.Tensor:
 
 
 def a4_quantize(v: torch.Tensor, input_scale: float | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Design §16.2: returns doubled E2M1 values ``c2`` (int8, [..., K]) and E4M3FN scale words."""
+    """Design §17.2: returns doubled E2M1 values ``c2`` (int8, [..., K]) and E4M3FN scale words."""
 
     if v.dtype != torch.bfloat16:
         raise ValueError("A4 quantizes BF16 vectors")
@@ -151,7 +151,7 @@ def synthetic_activations(seed: int = 0) -> list[tuple[str, torch.Tensor, float]
 
 
 def compare(v: torch.Tensor, g: float, reference: torch.Tensor | None = None) -> dict:
-    """Mismatch counts of §16.2 against ModelOpt (its kernel output if given, else its rule)."""
+    """Mismatch counts of §17.2 against ModelOpt (its kernel output if given, else its rule)."""
 
     c2, s = a4_quantize(v, g)
     ours = a4_dequantize(c2, s, g)

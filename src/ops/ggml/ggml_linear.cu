@@ -7,7 +7,7 @@
 // pass of up to kColumns columns and adds their exact terms into one int128 per column; the
 // group's partial sums are added exactly (order cannot matter) and its first lane rounds. (Every
 // rows CTA encoding a decode call's column into shared memory instead of encode_kernel measured
-// 4 % slower end to end: 98.0 -> 94.0 tok/s, design §19.3.25.)
+// 4 % slower end to end: 98.0 -> 94.0 tok/s.)
 //
 // Calls of kMmaMinColumns..kMmaMaxColumns columns (MTP verification) run mma_rows_kernel on tensor
 // cores; calls of kTileMinColumns or more (prefill) first decode each segment's weights once into
@@ -413,7 +413,7 @@ constexpr int kTiledMaxThreads = 256;
 // A 16-byte cp.async with an L2 evict-first policy: the dense weights (about 1.3 GB a token) are
 // read once per call and never reused from L2, so their stream should not push out what other
 // kernels reuse (MTP 4 + n-gram 7 at 4K +0.5 %, both runs ahead, 2026-10-16; the head's evict-first
-// loads +0.3 %, design §19.3.20d).
+// loads +0.3 %, design §8.3).
 __device__ __forceinline__ void cp_async16_evict_first(void* shared, const void* global, std::uint64_t policy) {
     const auto s = static_cast<unsigned>(__cvta_generic_to_shared(shared));
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(s), "l"(global), "l"(policy));

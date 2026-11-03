@@ -1,7 +1,7 @@
 #pragma once
 
 // The Vision encode window of a Qwen4Exp lane (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.2, "The encode window and its memory"): the pure planning the Program and its host tests
+// §16.4, "The encode window"): the pure planning the Program and its host tests
 // share. Items to encode are those ending past the reused prefix; one layer-major pass encodes
 // them all into one token-ordered handoff, BF16 [out, V_encoded], which lives in lent expert
 // frames (or, when the residency lends no frame — every expert resident — a device allocation

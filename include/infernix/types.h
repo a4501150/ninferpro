@@ -305,7 +305,8 @@ struct SpeculativeOptions {
     // (tools.convert --components dflash2), loaded beside the main artifact. Qwen3.5/3.6 artifacts
     // bundle their DFlash and DFlash2 drafters and refuse it.
     std::filesystem::path draft_model;
-    // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
+    // Optional target-verified copy proposals with MTP, DFlash or DFlash2 (Qwen3.8-Flash-Next proposes
+    // on every row of a speculating round).
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
@@ -1221,7 +1222,7 @@ struct PromptPreparationStats {
 
 // ---------------------------------------------------------------------------- expert placement
 // /admin/expert-placement (Qwen3.8-Flash-Next): the runtime switch of the expert placement
-// (design §19.3.7). One of the two forms: `vram_experts` pins that many of the best-ranked experts
+// (design §9.6). One of the two forms: `vram_experts` pins that many of the best-ranked experts
 // in the VRAM cache, or `placement_file` loads a placement file (its vram set pinned, the pool
 // sized to it).
 struct ExpertPlacementSwitch {

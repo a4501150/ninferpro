@@ -1,4 +1,4 @@
-// RoPE staging of a Qwen4Exp lane (program/rope_positions.h; design §19.3.2, test VT3), host only.
+// RoPE staging of a Qwen4Exp lane (program/rope_positions.h; design §16.3, test VT3), host only.
 // The oracle is an independent port of the frontend's position rule (text tokens: their running
 // position on every axis; an image run of h x w merged tokens: (cur, cur + y, cur + x), then cur +=
 // max(h, w); rope_delta = max + 1 - length), never the helpers under test. Checks: prompt tokens of a

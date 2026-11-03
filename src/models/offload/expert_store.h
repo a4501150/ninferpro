@@ -11,8 +11,8 @@
 
 namespace infernix::models::offload {
 
-// The routed experts read in place from the artifact (design §19.3.7, the SSD tier; plan
-// memory-tiers.md §4.4): for every (layer, expert) record, its file segments (one, or two for a
+// The routed experts read in place from the artifact (moe-offload-design.md §3 and §4.7, the SSD
+// tier; plan memory-tiers.md §4.4): for every (layer, expert) record, its file segments (one, or two for a
 // record that straddles part files), each 4 KiB-aligned in file offset and size so it is one
 // unbuffered read; and each layer's expert multipliers (the bank's scale tail), read at load. A
 // GGUF import's banks (ggml_expert_*_v1) have a record stride per layer and no scale tail.

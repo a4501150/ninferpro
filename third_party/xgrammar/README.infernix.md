@@ -1,10 +1,10 @@
-# Infernix XGrammar source base
+# ninferpro XGrammar source base
 
 This implementation originates from [XGrammar](https://github.com/mlc-ai/xgrammar),
 commit [`3641b5c21e70a6c5515ad9eca24fcbee21ee6ad0`](https://github.com/mlc-ai/xgrammar/commit/3641b5c21e70a6c5515ad9eca24fcbee21ee6ad0),
 under the Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-Infernix owns the CMake target and maintains its adaptations here, adopting upstream changes
+ninferpro owns the CMake target and maintains its adaptations here, adopting upstream changes
 selectively. Cold compilation is limited to two concurrent callers per compiler; the adapter
 uses one caller thread per compile, without creating a thread pool. Python/TVM bindings, GPU kernels,
 Web code, upstream tests and build machinery are excluded.
@@ -21,11 +21,11 @@ Pure JSON length bounds use counted repetitions of JSON-encoded Unicode scalars,
 the string rule (NInfer `0a8530d44`). Any terminal repetition body whose byte DFA has prefix-free
 unit boundaries, and whose following byte cannot start a unit, is lowered to one counted repeat edge
 over a body rule shared across bounds; this includes the bounded insignificant-whitespace runs of
-Infernix's JSON adapter. Its token masks are count-independent, including partial UTF-8 and escape
+the engine's JSON adapter. Its token masks are count-independent, including partial UTF-8 and escape
 states, stored as cumulative dense buckets or sparse (count, token) pairs; tokens crossing into a
 parent's continuation retain exact parser matching. Derived repeat masks are rebuilt on
 deserialization (serialization version `v18`) and charged to the compiled grammar's cache budget.
-General schema conjunction reduction and source diagnostics belong to Infernix's text adapter.
+General schema conjunction reduction and source diagnostics belong to the engine's text adapter.
 Positional arrays preserve optional prefix positions and impossible-position length caps.
 Bounded numbers use decimal interval compilation and the product JSON serializer's binary64
 round-trip boundaries, with a separate exact int64 path. The numeric adapter shares the

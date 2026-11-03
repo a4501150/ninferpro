@@ -159,7 +159,7 @@ int run_flash_next_fp8_a16() {
     return failures;
 }
 
-// Speculative verification relies on this for one row (design §11.3): an output column is
+// Speculative verification relies on this for one row (design §11.1): an output column is
 // bit-identical whether it is computed alone or beside other columns, up to 8 columns on every
 // Flash-Next shape (its GEMV and SIMT routes reduce a column identically), and to 48 on the shared
 // expert's down, whose TMA tiles all share one reduction order.

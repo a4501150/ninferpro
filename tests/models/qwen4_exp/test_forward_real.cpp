@@ -372,9 +372,9 @@ std::vector<int> top(const std::vector<float>& v, std::size_t offset, std::size_
 }
 
 // The Program CPU-serves the misses of every call of at most kMaxCpuColumns columns (short prompts,
-// chunk remainders, forced tokens) and, with the prefill assist (design §19.3.1 P7), the thinnest
+// chunk remainders, forced tokens) and, with the prefill assist (design §10.6), the thinnest
 // misses of prefill calls up to 255 columns. A CPU-served expert has at most kMaxCpuColumns columns,
-// so its output is the same bits on the CPU and the GPU (design §16.2), and so are the call's
+// so its output is the same bits on the CPU and the GPU (design §17.2), and so are the call's
 // logits. Two sequences run the same prefix, then the last tokens as calls of 1, 2, 5, 8, 24 and 100
 // columns, through the Program's MoE configuration (64 staging slots, the prefill overlap stream;
 // no resident experts here), one of them with a CPU expert service configured as the Program's

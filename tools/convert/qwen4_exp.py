@@ -201,7 +201,7 @@ def ngram_config(config: dict) -> NgramConfig:
 class ExpertBankSource:
     """One layer's NVFP4 experts; only ``import_expert_bank`` can read it. ``packed`` selects the
     weight-only compressed-tensors export (``weight_packed`` / ``weight_global_scale``, no activation
-    scales: a W4A16 bank, design §16.2.1) instead of ModelOpt's W4A4 one."""
+    scales: a W4A16 bank, design §17.3) instead of ModelOpt's W4A4 one."""
 
     shape: tuple[int, int, int]
     label: str
@@ -226,7 +226,7 @@ _BANK_CHUNK = 32  # experts encoded per step; bounds conversion memory at ~0.4 G
 
 
 def import_expert_bank(request: PrepareRequest) -> PreparedMethod:
-    """Write one layer's experts bit-exactly in ``nvfp4_expert_rg16_v1`` (design §6.2)."""
+    """Write one layer's experts bit-exactly in ``nvfp4_expert_rg16_v1`` (design §6.3)."""
 
     if request.target.format != "nvfp4_mul" or request.target.layout != "nvfp4_expert_rg16_v1":
         raise ValueError("import_expert_bank requires nvfp4_mul in nvfp4_expert_rg16_v1")
@@ -475,7 +475,7 @@ class _Qwen4ExpBuilder(_Builder):
             self.group(*gate_up)
             self.group(*downs)
             return
-        # Qwen's official FP8 export: block-FP8 experts, imported verbatim and run W8A16 (design §19.3.25).
+        # Qwen's official FP8 export: block-FP8 experts, imported verbatim and run W8A16 (design §6.2).
         if not store.has(sp + "experts.0.gate_proj.weight_packed") and \
                 store.describe(sp + "experts.0.gate_proj.weight").dtype == "F8_E4M3":
             bank = Fp8ExpertBankSource((e, h, ir), f"{store.path}:{sp}experts", store, sp + "experts.")
@@ -483,7 +483,7 @@ class _Qwen4ExpBuilder(_Builder):
                                      residency="text"))
             return
         # ModelOpt W4A4 banks carry each matrix's activation scale; a weight-only compressed-tensors
-        # bank (weight_packed) has none and is W4A16 (design §16.2.1).
+        # bank (weight_packed) has none and is W4A16 (design §17.3).
         packed = store.has(sp + "experts.0.gate_proj.weight_packed")
         bank = ExpertBankSource((e, h, ir), f"{store.path}:{sp}experts", store, sp + "experts.", packed=packed)
         self.model.add(Parameter(p + "experts", (e, h, ir), bank, None, (ffn_input,), "nvfp4_mul", residency="text"))

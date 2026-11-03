@@ -1,7 +1,7 @@
 #pragma once
 
 // The prefill call planner of Qwen4Exp's prefix cache (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.1, "Prefill integration"): the calls that prefill a prompt's suffix [F, n), and which exact
+// §15.3, "Prefill integration"): the calls that prefill a prompt's suffix [F, n), and which exact
 // taps split them. Pure: plans depend only on their arguments (not on concurrency or speculation).
 
 #include "runtime/prefix_cache/cost.h"

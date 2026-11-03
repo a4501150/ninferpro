@@ -94,7 +94,7 @@ void test_worker_counts() {
     }
 }
 
-// A16 teams (design §16.2.1): any worker count gives expert_forward_a16's bits.
+// A16 teams (design §17.3): any worker count gives expert_forward_a16's bits.
 void test_worker_counts_a16() {
     std::mt19937 rng(6);
     std::vector<fixtures::Expert> pool;

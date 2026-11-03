@@ -1,7 +1,7 @@
 # HTTP serving
 
 `build/apps/infernix-serve` loads one v3 `.infernix` (or `.ninfer`) artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident Infernix Engine.
+Anthropic-compatible HTTP endpoints over one resident Engine.
 
 ## Start the server
 
@@ -97,8 +97,9 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 
 Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
 `http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
-OpenAI-style base URL requests `/v1/v1/...`; every path above except `/health` also answers under
-that doubled prefix, with the same behavior, errors, and request IDs.
+OpenAI-style base URL requests `/v1/v1/...`; every `/v1` path above also answers under that
+doubled prefix, with the same behavior, errors, and request IDs. `/health` and `/metrics` answer
+only at their exact paths.
 
 `GET /health` returns HTTP 200 with `{"status":"ok"}` while the Engine can accept work. After an
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
@@ -106,13 +107,15 @@ saturation does not make the Engine unavailable. The endpoint remains unauthenti
 
 How failures end:
 
-- An out-of-memory condition or a failed internal check during one unit of work fails the requests
-  that unit involved, logs `worker out of memory: ... - recovering` or `worker recovering from a
-  failed request`, and the Engine carries on with its queue.
-- A failure after eight such recoveries in a row, with no successful unit between them, fails every
-  queued and running request and stops the Engine: `/health` then answers 503 and every request
-  fails until the server is restarted. Any other exception on the worker (`worker crash: ...`)
-  ends the Engine the same way.
+- A recoverable execution error — the oldest resident cannot obtain its legal unit (a capacity
+  contract error; nothing of the unit ran), or an expert record that could not be read — fails
+  the requests holding lanes and the paused requests, discards their state, logs `<what>: failed N
+  running request(s); the Engine keeps serving`, and the Engine carries on with its queue;
+  queued requests keep waiting. Recoveries have no consecutive limit.
+- Any other exception on the worker, or a recovery that cannot complete (a binding or
+  materialization in flight, or the Program's cleanup failing), fails every queued and running
+  request and stops the Engine: `/health` then answers 503 and every request fails until the
+  server is restarted.
 - A CUDA error other than out of memory (an illegal address, a lost device) cannot be recovered
   in-process: the server prints `CUDA_CHECK(...) failed` with the error and exits, without final
   request-log records for the requests in flight.
@@ -127,7 +130,7 @@ connections also use TCP keepalive and a 15-second retransmission limit (`TCP_US
 Linux, `TCP_MAXRTMS` on Windows); together with the heartbeat,
 a dead or unacknowledging peer is normally cancelled within about 20 seconds, including while the
 request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
-cannot be distinguished from a reading application; proxies must close their upstream Infernix
+cannot be distinguished from a reading application; proxies must close their upstream engine
 connection when the downstream client disappears.
 
 ## Models
@@ -145,7 +148,7 @@ the model behind the alias and the running instance:
 | `n_embd` | model embedding width |
 | `n_params` | total logical weight elements over the loaded artifact's distinct weight tensors |
 | `size` | encoded weight payload bytes of the loaded artifact |
-| `ftype` | dominant loaded weights format (the Infernix quantization name, by payload bytes) |
+| `ftype` | dominant loaded weights format (the engine quantization name, by payload bytes) |
 
 `n_ctx` is a property of the running `infernix-serve` instance, so it reflects the `--max-context`
 that this server was started with, not the model's native context. `n_ctx_train` reports the model's
@@ -168,8 +171,8 @@ the model family's own tool-call parser, so the probe does not test a template t
 model another call format. The Qwen templates, including those in `tools/chat_templates`, write each
 declared tool as JSON into the System turn, so they report `true`.
 
-`GET /v1/models/{id}` returns the same object for the single configured alias and a `404` for any
-other id.
+`GET /v1/models/{id}` returns the same object for the public model ID and each configured
+`--served-model-name` alias, and a `404` for any other id.
 
 ## OpenAI Chat Completions
 
@@ -220,7 +223,7 @@ Options whose observable behavior the Engine cannot provide are rejected when th
 behavior. This includes nonzero `logit_bias`, requested log probabilities, audio/file input or
 audio output, explicit low/high image detail, web search, moderation, low/high verbosity, stored
 Chat Completions, and non-empty legacy `functions`.
-Each capability rejection identifies the affected field and the guarantee Infernix cannot provide.
+Each capability rejection identifies the affected field and the guarantee the engine cannot provide.
 
 JSON mode and JSON Schema use the standard protocol fields:
 
@@ -248,7 +251,7 @@ and scientific notation with up to 17 significant digits. Bounds must retain the
 schema is parsed; numbers requiring greater precision receive `unsupported_json_schema`.
 These capabilities also apply to strict tool parameters.
 
-GBNF, choice and regex are available through the Infernix extension `structured_outputs`
+GBNF, choice and regex are available through the engine extension `structured_outputs`
 on Chat Completions, Responses and Anthropic Messages. Supply exactly one member:
 
 ```json
@@ -283,7 +286,7 @@ Output constraints reject custom stops. OpenAI errors use
 legal next token. Anthropic reports these through its `invalid_request_error` envelope.
 The `grammar` and `guided_*` aliases are not accepted.
 
-Constrained responses include a Infernix `constraint` observation. `branch` is `undecided`, `content`,
+Constrained responses include an engine `constraint` observation. `branch` is `undecided`, `content`,
 or `tools`; `complete` means the committed language can end, and `terminated` means it accepted EOS.
 A complete JSON value can therefore have `complete:true`, `terminated:false` and a length finish
 reason. The observation also includes `cache` (`hit`, `built`, `waited`), `mask_positions`,
@@ -314,8 +317,9 @@ server-error codes. Failures in the normalized prompt contract use `invalid_prom
 and availability failures retain their dedicated codes. Internal invariant failures are not
 relabeled as client input errors.
 
-The request `model` must equal the public model ID: the artifact `metadata.name` by default
-(falling back to its architecture name when absent), or the explicit `--model-id` override.
+The request `model` must equal the public model ID — the artifact `metadata.name` by default
+(falling back to its architecture name when absent), or the explicit `--model-id` override — or
+one of the `--served-model-name` aliases.
 Reasoning is returned separately as `reasoning_content`; answer text remains in `content`.
 
 For non-strict tools, a direct top-level tool-parameter
@@ -326,7 +330,7 @@ declared non-string parameter is omitted. Admitted JSON values retain their JSON
 case-insensitive boolean text is normalized to `true` or `false`. A nonempty schema mismatch remains
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
-supported explicit type retain untyped inference. Infernix does not apply defaults, enforce required
+supported explicit type retain untyped inference. The engine does not apply defaults, enforce required
 properties, or perform recursive JSON Schema validation on this route.
 
 On the unconstrained route, string parameters preserve function/tool-call markers and balanced nested
@@ -429,7 +433,7 @@ explicitly disabled (top-level or `chat_template_kwargs` `enable_thinking`, or
 Prompt-bearing JSON objects retain their received member order through request parsing and prompt
 rendering, including tool schemas and historical tool inputs. Canonical model-origin tool arguments
 retain that member order in aggregate and streaming responses, so an unmodified replay reconstructs
-the same ordered tool call. Infernix does not canonicalize semantically equivalent JSON: if a client
+the same ordered tool call. The engine does not canonicalize semantically equivalent JSON: if a client
 reorders members, inserts defaults, or otherwise rewrites a tool object, the changed rendered input
 does not match the model-held endpoint and can reuse only an earlier exact cached prefix.
 Generated token segmentation can also differ from re-encoding the same text, limiting prefix reuse.
@@ -490,7 +494,7 @@ interprets the other standard values (`minimal`, `low`, `medium`, `high`, `xhigh
 Conflicting explicit `enable_thinking` and effort values return `conflicting_template_option`.
 
 Templates accept different subsets of those values: the official Qwen3.8 template raises for
-anything but `low`, `medium` and `xhigh`. Infernix renders each value once when the template loads,
+anything but `low`, `medium` and `xhigh`. The engine renders each value once when the template loads,
 and a request for a value the template rejects renders with the nearest accepted value, a tie
 rounding up: on Qwen3.8, `high` and `max` render as `xhigh` and `minimal` as `low`. This applies to
 every endpoint and to `--reasoning-effort`. The values are tried on a one-message chat; a template
@@ -645,12 +649,12 @@ request to repeat a marker.
 
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
 rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` does not
-affect prefix identity. Valid TTL/retention values are accepted, but Infernix does not promise their
+affect prefix identity. Valid TTL/retention values are accepted, but the engine does not promise their
 wall-clock residency; physical retention follows the prefix cache's eviction.
 
 ## OpenAI Responses Core
 
-Infernix implements the typed-Item and semantic-event core of the OpenAI
+The engine implements the typed-Item and semantic-event core of the OpenAI
 [Responses API](https://developers.openai.com/api/reference/resources/responses/overview). All
 supported model instances use this same adapter and Engine route. It is intentionally not
 advertised as full parity with OpenAI-hosted tools, durable cloud storage, background jobs,
@@ -690,9 +694,9 @@ wire response contains typed `output` Items.
 
 ### Create request fields
 
-| Field | Infernix Responses Core contract |
+| Field | Engine Responses Core contract |
 |---|---|
-| `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
+| `model` | required non-empty string; must equal the artifact-derived public model ID, the explicit `--model-id` override, or one of the `--served-model-name` aliases |
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
@@ -711,7 +715,7 @@ wire response contains typed `output` Items.
 | `tools` | direct function and free-form `custom` definitions, or namespace groups containing them; see below |
 | `tool_choice` | `auto`, `none`, `required`, a named function or `custom` tool, or `allowed_tools` of function and custom entries with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` enforces at most one call |
-| `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; Infernix does not execute hosted tools |
+| `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; the engine does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
@@ -737,7 +741,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
 | `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
-| `input_video` | Infernix extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
+| `input_video` | Engine extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
@@ -800,12 +804,12 @@ They may also be grouped in a Responses namespace:
 }
 ```
 
-Infernix gives each namespace/function pair a distinct internal Engine identity and restores the
+The engine gives each namespace/function pair a distinct internal Engine identity and restores the
 separate `namespace` and `name` fields in aggregate output, SSE events, and replayed Items. The same
 function name may therefore appear in different namespaces. Namespace members remain ordinary
 client-executed functions; this does not add a remote MCP executor.
 
-Infernix renders these definitions in the Qwen prompt and parses model output into separate
+The engine renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Selection and strict argument enforcement follow the common tool contract above.
@@ -825,7 +829,7 @@ exclude direct invocation remain unsupported.
 ### Response object and usage
 
 A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
-`cancelled` in `status`, and a typed `output` array. Infernix may emit:
+`cancelled` in `status`, and a typed `output` array. The engine may emit:
 
 - a `reasoning` item containing raw `reasoning_text`; it returns a placeholder summary if
   `reasoning.summary` is requested;
@@ -987,7 +991,7 @@ needs its `tool_result` in the next User message, so a trailing one is rejected 
 `invalid_tool_history`, as the Anthropic API rejects it.
 
 Claude Code may place its attribution metadata in the first block of a top-level System array. If
-that block is a text block beginning exactly with `x-anthropic-billing-header:`, Infernix consumes the
+that block is a text block beginning exactly with `x-anthropic-billing-header:`, the engine consumes the
 whole block before token counting, prompt preparation, and cache identity construction. The rule is
 positional: a string-form System value, a later array block, or an inline System message with the
 same text remains ordinary prompt content. A `cache_control` marker attached to the consumed block
@@ -1018,7 +1022,7 @@ block keeps its `cache_control` breakpoint, and a block the rewrite leaves empty
 breakpoint to the end of the previous block.
 
 `max_tokens` is optional for local clients and otherwise uses `--default-max-tokens`; a positive
-value is the complete output budget. `max_tokens:0` is rejected because Infernix does not expose a
+value is the complete output budget. `max_tokens:0` is rejected because the engine does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
 `stop_sequences` enter Engine execution. A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
@@ -1041,10 +1045,10 @@ so the reasoning stays out of the visible transcript but comes back with the blo
 echoes. When a replayed Thinking block has empty `thinking` and such a signature, request lowering
 restores the reasoning from it, so the prompt (and its prefix-cache identity) is the one
 `summarized` display would give; non-empty `thinking` text takes precedence, any other signature
-stays non-semantic metadata, and a malformed Infernix signature fails with
+stays non-semantic metadata, and a malformed engine signature fails with
 `invalid_thinking_signature`. The signature is not encrypted or authenticated: this is a local
 trusted server, and the value is the same reasoning text `summarized` display shows. Count Tokens
-ignores `display`. `preserve_thinking` remains a Infernix extension for closed-turn reasoning
+ignores `display`. `preserve_thinking` remains an engine extension for closed-turn reasoning
 history. `output_config.effort` passes its protocol-validated value to the
 selected template, substituting the nearest value the template accepts as described above.
 `output_config.format` accepts JSON Schema output as described above.
@@ -1066,7 +1070,7 @@ breakpoint at the same target and TTL, conflicts at the same target with a diffe
 an available fifth slot when four different explicit targets already exist. TTL must be `5m` or
 `1h`; it is a protocol hint, not a wall-clock residency guarantee.
 
-Infernix maps representable boundaries to exact prompt frontiers and ignores a legal but
+The engine maps representable boundaries to exact prompt frontiers and ignores a legal but
 unrepresentable advisory boundary without changing the prompt. Reuse still requires exact rendered
 identity and can read an existing owner without another `cache_control`. Aggregate usage reports
 verified reused tokens in `cache_read_input_tokens` and leaves cache creation unknown. Streaming
@@ -1229,6 +1233,9 @@ curl http://127.0.0.1:8080/v1/models \
 ## Server options
 
 The table lists executable defaults. The startup example selects a long-context FP8/MTP3 profile.
+The Qwen3.8-Flash-Next expert options — `--experts`, `--expert-swap`, `--expert-placement`,
+`--ngram-volume` — are described in the
+[Flash-Next guide](qwen3_8-flash-next.md#expert-placement).
 
 | Option | Meaning | Default |
 |---|---|---:|
@@ -1254,8 +1261,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--prefill-chunk-beside-decode N` | Qwen3.8-Flash-Next prefill call size, a multiple of 128, while another request decodes. The engine runs one decode round per prefill call (each call but the prompt's last runs inside the round's Forward, a mixed round), so a planned call wider than this is split (on the 16-token grid) and the decoding requests keep streaming between the parts; the prefilling request pays a longer time to first token. At `--prefill-chunk` or above only the mixed round's room beside the decode rows splits | `1024` |
 | `--use-original-int8-prefill-kernel` | prefill INT8-KV prompt attention with the original kernel at the requested `--prefill-chunk`. Without it INT8 KV uses the fast kernel (FP16 per-tile PV accumulation; a chunk whose row blocks alone would leave SMs idle splits its keys across CTAs within `--prefill-split-workspace-mib`) and rounds `--prefill-chunk` down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090: `4096` runs as `3584`); requires `--kv-dtype int8` (startup rejects it with any other KV format) | off |
 | `--use-original-nvfp4-prefill-kernel` | prefill NVFP4-KV prompt attention with the tiled kernel. Without it a chunk that sees more than 768 keys uses the fast kernel (the MX-FP8 tiled kernel with NVFP4 keys), which runs QK on block-scaled FP4 Tensor Cores directly over the stored K codes (Q as two NVFP4 terms), decodes each V tile once per CTA with FP16 per-tile PV accumulation, and splits the chunk's keys across CTAs when that is cheaper than leaving SMs idle (within `--prefill-split-workspace-mib`); shorter chunks keep the tiled kernel. Requires `--kv-dtype nvfp4` (startup rejects it with any other KV format) | off |
-| `--prefill-split-workspace-mib N` | workspace in MiB, `0..16384`, that the FP32 partials of one prompt-attention launch may take when it splits its keys across SMs (the INT8 and NVFP4 fast prompt kernels, FP8 and K8V4 KV, and the VQ2 and K4V2 prompt kernels); a launch that would need more runs fewer splits. Less frees KV cache but slows prompt chunks of about 1-2K tokens over long context, such as follow-up turns. Per attention layer against unlimited, 1024-2048-token chunks take 17-25 % longer at `64` over 32K-128K cached keys, 2-5 % at `128`, and under 1 % from `192`; 3-4K-token chunks over 128K keys take up to 5 % longer below `384`. `0` turns splitting off (short chunks over long context up to 3× slower). With 4096-token chunks the startup workspace is about 515 MiB at the default, 380 MiB at `64` and 810 MiB unlimited (FP8 and K8V4 used no limit before). BF16 KV and the original INT8 and NVFP4 kernels ignore it | `256` |
-| `--disable-fast-paths` | run the exact route. By default every fast path qualified for the loaded artifact's configuration (the kernels it runs and its KV format; artifacts with the same kernels share one) and measured faster there runs: faster kernels (such as 8-bit P×V in prompt attention) whose output is not bit-exact with the exact route but whose measured quality cost stays within Infernix's [numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths). Startup logs the paths selected (`fast paths \| ...`) and `server_start` records them. The exact route is bit-exact from release to release and, on NVFP4 and FP8 dense models, request-invariant: concurrent requests, the prefix cache's contents and KV pressure do not change a response (see [`--disable-fast-paths` in the CLI reference](cli.md) for what it gives up); the [fast-path registry](maintainer/model-quality.md#67-fast-path-registry) lists each path, the configurations it is qualified for, and its measured cost and speedup | fast paths on |
+| `--prefill-split-workspace-mib N` | workspace in MiB, `0..16384`, that the FP32 partials of one prompt-attention launch may take when it splits its keys across SMs (the INT8 and NVFP4 fast prompt kernels, FP8 and K8V4 KV, and the VQ2 and K4V2 prompt kernels); a launch that would need more runs fewer splits. Less frees KV cache but slows prompt chunks of about 1-2K tokens over long context, such as follow-up turns: measured per attention layer on an RTX 5090, 1024-2048-token chunks over 32K-128K cached keys took 17-25 % longer at `64` than unlimited. `0` turns splitting off (short chunks over long context up to 3× slower). BF16 KV and the original INT8 and NVFP4 kernels ignore it | `256` |
+| `--disable-fast-paths` | run the exact route. By default every fast path qualified for the loaded artifact's configuration (the kernels it runs and its KV format; artifacts with the same kernels share one) and measured faster there runs: faster kernels (such as 8-bit P×V in prompt attention) whose output is not bit-exact with the exact route but whose measured quality cost stays within the engine's [numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths). Startup logs the paths selected (`fast paths \| ...`) and `server_start` records them. The exact route is bit-exact from release to release and, on NVFP4 and FP8 dense models, request-invariant: concurrent requests, the prefix cache's contents and KV pressure do not change a response (see [`--disable-fast-paths` in the CLI reference](cli.md) for what it gives up); the [fast-path registry](maintainer/model-quality.md#67-fast-path-registry) lists each path, the configurations it is qualified for, and its measured cost and speedup | fast paths on |
 | `--fast-path NAME` | also run this fast path (a name from the [registry](maintainer/model-quality.md#67-fast-path-registry)), qualified for the configuration or not; repeatable. For qualification and timing runs (with `--disable-fast-paths`, it times one path against the exact route): a path that cannot apply to the loaded model fails startup | none |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
@@ -1278,12 +1285,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--route-trace PATH` | Qwen3.8-Flash-Next only: write the expert-routing trace `tools/expert_cache_replay/host_tier.py` replays — a header, one record per prefill, forced, decode and verify round, and one per CUDA-graph instantiation; no decode-path work when unset | disabled |
-| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage; `vq2` and `k4v2` are the 2-bit and 4-bit-K vector-quantized formats ([CLI](cli.md#context-and-memory)) | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage; `vq2` and `k4v2` are the 2-bit and 4-bit-K vector-quantized formats ([sizes](maintainer/paged-kv-cache.md#43-closed-device-plane-orders)) | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N\|auto` | MTP `1..7` (Qwen3.5/3.6 `1..5`); DFlash/DFlash2 `1..15` (Qwen3.8-Flash-Next DFlash2 `1..7`). `N` drafts and verifies N tokens every round (fewer only near the output limit). `auto` on Qwen3.8-Flash-Next DFlash2: each round drafts 7 and verifies the number its drafts' calibrated probabilities make fastest ([guide](qwen3_8-flash-next.md#run)). `auto` (MTP): each round drafts the length the request's learned acceptance makes fastest, `0..7` on Qwen3.8-Flash-Next (whose one-request rounds also apply the `--spec-min-p` cut, [design §11.3](maintainer/qwen3_8-flash-next-design.md#113-draft-length)); on Qwen3.5/3.6 it is the `adaptive-mtp` fast path (`1..5`) where that is qualified (the NVFP4 Qwen3.8-27B and Qwen3.6-35B-A3B); elsewhere, and with `--disable-fast-paths`, every round drafts the artifact's fastest fixed length (5 on the NVFP4 27B, 3 otherwise), which startup reports | unset |
+| `--draft-tokens N\|auto` | MTP `1..7` (Qwen3.5/3.6 `1..5`); DFlash/DFlash2 `1..15` (Qwen3.8-Flash-Next DFlash2 `1..7`). `N` drafts and verifies N tokens every round (fewer only near the output limit). `auto` on Qwen3.8-Flash-Next DFlash2: each round drafts 7 and verifies the number its drafts' calibrated probabilities make fastest ([guide](qwen3_8-flash-next.md#run)). `auto` (MTP): each round drafts the length the request's learned acceptance makes fastest, `0..7` on Qwen3.8-Flash-Next (whose one-request rounds also apply the `--spec-min-p` cut, [design §11.4](maintainer/qwen3_8-flash-next-design.md#114-draft-length-policy)); on Qwen3.5/3.6 it is the `adaptive-mtp` fast path (`1..5`) where that is qualified (the NVFP4 Qwen3.8-27B and Qwen3.6-35B-A3B); elsewhere, and with `--disable-fast-paths`, every round drafts the artifact's fastest fixed length (5 on the NVFP4 27B, 3 otherwise), which startup reports | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--draft-model FILE` | Qwen3.8-Flash-Next with `--spec dflash2`: the DFlash2 drafter's companion artifact (`tools.convert --components dflash2`); Qwen3.5/3.6 artifacts bundle their drafters and refuse it | unset |
-| `--spec-min-p P` | Qwen3.8-Flash-Next with `--spec mtp` or `--spec dflash2` only (other models refuse it at startup): a one-request round verifies its drafts up to the first whose drafter probability (MTP's draft head, DFlash2's candidate selector) is below `P`, `0..1`; `0` verifies every draft. It changes how many drafts a round verifies, not what is generated: greedy output still equals plain decoding, and sampling keeps its distribution (only the realization of a seeded run may differ). The default was measured on sampled AIME prompts at one lane on an RTX 5090: 0.5 gave 147.2 tok/s against 138.8 with every draft and 142.6 at 0.7 (with the automatic draft length); other workloads may prefer another value | `0.5` with `--draft-tokens auto`, else `0` |
+| `--spec-min-p P` | Qwen3.8-Flash-Next with `--spec mtp` or `--spec dflash2` only (other models refuse it at startup): a one-request round verifies its drafts up to the first whose drafter probability (MTP's draft head, DFlash2's candidate selector) is below `P`, `0..1`; `0` verifies every draft. It changes how many drafts a round verifies, not what is generated: greedy output still equals plain decoding, and sampling keeps its distribution (only the realization of a seeded run may differ). The default `0.5` measured fastest on sampled AIME prompts at one lane on an RTX 5090 (with the automatic draft length); other workloads may prefer another value | `0.5` with `--draft-tokens auto`, else `0` |
 | `--draft-tree-nodes auto\|LIST` | DFlash2 tree verification, each row's tree built on the device from the drafter's candidate lattice; works with every `--kv-dtype`. `auto` (recommended) lets every all-neural round of up to four rows choose the chain or a tree of `draft tokens + 5` or `+ 9` columns from measured round time and acceptance at its batch size and context length; on an artifact whose GDN input projections cannot verify trees it keeps chain verification and logs a warning. A LIST fixes the column count by batch size: entry *c* (anchor included, `draft tokens + 2..32`) applies to rounds of *c* rows, the last entry repeats for larger batches and `0` keeps chain verification; see [tree verification](maintainer/tree-verification.md) | off |
 | `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` | `8` |
 | `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter (Qwen3.8-Flash-Next: also alone, `1..15`), `1..63`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
@@ -1500,7 +1507,7 @@ rate(infernix_spec_decode_accepted_tokens_total[1m])
 
 The handler copies published snapshots and formats them outside the Engine worker. Scraping does
 not reset counters or initiate device work. Detailed per-request records remain available through
-the JSONL log. Monitoring tools with engine-specific metric names need an Infernix adapter.
+the JSONL log. Monitoring tools with engine-specific metric names need an engine adapter.
 
 ## Structured request log
 
@@ -1521,7 +1528,7 @@ because another process holds `FILE` open without delete sharing on Windows, the
 warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
 checked against the model artifact path.
 
-Every line is one `infernix_serve_request_log` schema-v28 JSON object. All events carry
+Every line is one `infernix_serve_request_log` schema-v29 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1771,9 +1778,7 @@ CUDA Graph driver-state allowance reserved against that budget is 64 MiB plus 4 
 decode-graph executable the engine instantiates: one per topology class of each captured family,
 for every batch size up to `--max-concurrency` (DFlash and DFlash2 capture a second family when
 n-gram drafting is enabled). A speculative family is a Forward/Finish pair: MTP's Finish keeps
-the Forward topology classes, a DFlash Finish adds one executable per batch size. Measured on an
-RTX 5090 before that split, an executable took 2.2-2.9 MiB, and up to 4.1 MiB when MTP verified a
-15-wide n-gram window at batch 4-8; DFlash2 with `--max-concurrency 2` now reserves 120 MiB. The
+the Forward topology classes, a DFlash Finish adds one executable per batch size. The
 startup log and `server_start` report both the allowance and the memory the graphs actually
 used, and the log warns when the second exceeds the first.
 Capacity resolves once at startup.
@@ -1817,7 +1822,7 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. Infernix does not execute tools or enforce tool-argument schemas through constrained decoding.
+responses. The engine does not execute tools or enforce tool-argument schemas through constrained decoding.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

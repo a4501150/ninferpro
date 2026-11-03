@@ -1,5 +1,5 @@
-// Flash-Next M0 GPU and PCIe probe (docs/maintainer/qwen3_8-flash-next-design.md §8, §9, §14.2
-// Stage 1, §19 M0). Measures the machine facts the decode pipeline is budgeted on:
+// Flash-Next M0 GPU and PCIe probe (docs/maintainer/qwen3_8-flash-next-design.md §8, §9, §18.1
+// Stage 1). Measures the machine facts the decode pipeline is budgeted on:
 //
 //   inventory      device attributes the design depends on (copy engines, mapped memory, L2, SMs)
 //   copy           H2D and D2H from pinned memory versus size, single-copy latency and streaming rate
@@ -86,7 +86,7 @@ void inventory() {
     std::printf("global memory     %.0f MiB, bus %d bits, memory clock %d kHz (attribute)\n",
                 static_cast<double>(p.totalGlobalMem) / (1 << 20), attr(cudaDevAttrGlobalMemoryBusWidth),
                 attr(cudaDevAttrMemoryClockRate));
-    std::printf("asyncEngineCount  %d   (design §8.6 assumes H2D shares one engine on GeForce)\n",
+    std::printf("asyncEngineCount  %d   (design §8.2 assumes H2D shares one engine on GeForce)\n",
                 attr(cudaDevAttrAsyncEngineCount));
     std::printf("mapped host mem   canMap %d, hostRegister %d, readOnlyRegister %d, pageableViaHostTables %d\n",
                 attr(cudaDevAttrCanMapHostMemory), attr(cudaDevAttrHostRegisterSupported),

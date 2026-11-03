@@ -83,7 +83,7 @@ struct FileSegment {
     std::uint64_t bytes  = 0;
 };
 
-// Where Streamed objects live in the artifact's files, for reading them in place (design §19.3.7):
+// Where Streamed objects live in the artifact's files, for reading them in place (design §6.5):
 // the file paths (the entry and its parts) and each object's segments, kept after the Reader is
 // gone. It opens no file; the reader of the bytes opens its own handles.
 class StreamSource {

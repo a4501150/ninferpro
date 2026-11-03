@@ -1,4 +1,4 @@
-"""The format maps of the Qwen3.8-Flash-Next recipes (design §6.1): recipe A keeps every main-model
+"""The format maps of the Qwen3.8-Flash-Next recipes (design §6.2): recipe A keeps every main-model
 tensor as NVIDIA stores it and re-quantizes only the MTP drafter; recipe B (Dense8) adds q8_g32_fp16 for
 the dense projection classes that dominate per-token weight reads and leaves the rest as recipe A; recipe
 C (weight-only exports) is selected by its W4A16 banks."""

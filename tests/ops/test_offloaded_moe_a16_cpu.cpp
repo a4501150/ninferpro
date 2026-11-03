@@ -1,5 +1,5 @@
 // Canonical W4A16 arithmetic and the CPU narrow route for experts stored without activation scales
-// (docs/maintainer/qwen3_8-flash-next-design.md §16.2.1). Host-only: needs no GPU.
+// (docs/maintainer/qwen3_8-flash-next-design.md §17.3). Host-only: needs no GPU.
 //
 // Oracles:
 //   - the A16 encoding against exact binary64 rounding of v / 2^(emax - 147), for every BF16 value

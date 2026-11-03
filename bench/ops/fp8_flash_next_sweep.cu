@@ -1,11 +1,11 @@
 // Tile sweep for the FP8 row-scaled W8A16 linear problems of Qwen3.8-Flash-Next artifacts whose dense
-// projections are stored in FP8 (recipe C, docs/maintainer/qwen3_8-flash-next-design.md §6.1): the GDN
+// projections are stored in FP8 (recipe C, docs/maintainer/qwen3_8-flash-next-design.md §6.2): the GDN
 // query/key/value/z and output projections, the QSA query/gate/key/value and output projections and the
 // shared experts. The routes are A16 (BF16 activations), as the weight-only checkpoint is served.
 //
 // Decode widths (T = 1..8): every candidate (SIMT of capacity 8, the one-column GEMV, sliced-K and the
 // tensor-core tiles), each checked for column invariance (column 0's bits at every T equal its bits at
-// T = 8, which speculative verification relies on, §11.3) and grouped by the bits it produces, so a
+// T = 8, which speculative verification relies on, §17.4) and grouped by the bits it produces, so a
 // selector only mixes candidates of one family.
 // Verification and prefill widths (T >= 9): sliced-K, MMA and TMA MMA candidates, each first screened
 // against an FP64 host reference on sampled rows at T = 77 and 1000, then timed with cold-L2 CUDA

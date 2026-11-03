@@ -1,6 +1,6 @@
 #pragma once
 
-// Qwen4Exp's DFlash2 draft-length policy (--draft-tokens auto; design §11.3, docs/maintainer/dflash.md).
+// Qwen4Exp's DFlash2 draft-length policy (--draft-tokens auto; design §11.4, docs/maintainer/dflash.md).
 // A proposal drafts its whole block in one pass, so a round's choice is how many of its drafts to
 // verify, made after the proposal from each draft's selector probability (the candidate selector's
 // temperature-1 softmax at the drafted rank): the k that maximizes the expected tokens per round

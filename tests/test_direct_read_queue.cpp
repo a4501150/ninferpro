@@ -1,4 +1,4 @@
-// Core DirectReadQueue (design §19.3.7 RT3b): unbuffered reads of a synthetic file against a
+// Core DirectReadQueue (design §9.5): unbuffered reads of a synthetic file against a
 // closed-form byte oracle, with out-of-order completion, demand-before-prefetch issue order,
 // prefetch sub-reads, transient-error backoff, retry of a hard error, timeouts, short reads,
 // delayed completions, cancel_all and destruction with reads in flight. CPU and disk only.

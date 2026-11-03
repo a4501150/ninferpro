@@ -131,7 +131,7 @@ public:
     // Engine sets none (it learns round costs, observe_cycle); tests use it to fix the costs.
     void set_round_seconds(std::uint32_t k, std::uint32_t batch_size, double seconds);
 
-    // Round-cost learning (as Qwen3.8-Flash-Next's, its design 11.3): the start-to-start time of two
+    // Round-cost learning (as Qwen3.8-Flash-Next's, its design 11.4): the start-to-start time of two
     // consecutive all-neural rounds of batch_size rows, the first of draft length k. Fit per batch
     // size as t = a + b k by exponentially weighted least squares; a draft then costs b / a rounds.
     // A cycle past kCostGapRatio predicted rounds held an idle gap and is skipped.

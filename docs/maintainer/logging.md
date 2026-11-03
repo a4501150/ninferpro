@@ -7,7 +7,7 @@ operational producers follow this contract.
 
 ## 1. Output classes
 
-Infernix has four distinct output classes. A shared destination such as stderr does not make them the
+The engine has four distinct output classes. A shared destination such as stderr does not make them the
 same contract.
 
 | Class | Examples | Owner and representation |
@@ -27,8 +27,8 @@ but neither consumes the other renderer's text.
 
 ## 2. Dependency and ownership
 
-Infernix vendors the compiled spdlog library under `third_party/spdlog`. Configuration never fetches
-network content or selects a system version. The `infernix_product_logging` target is the only Infernix
+The engine vendors the compiled spdlog library under `third_party/spdlog`. Configuration never fetches
+network content or selects a system version. The `infernix_product_logging` target is the only engine
 library that owns logger construction policy.
 
 An application entry point creates one `product::LoggingRuntime` with its executable name and owns
@@ -140,13 +140,13 @@ pretty throughput record.
 
 Engine startup is an inclusive typed hierarchy. `engine-startup` contains CUDA initialization,
 artifact inspection, semantic binding, weight materialization, model/frontend construction,
-runtime resource planning, Program construction and Engine finalization. `weights-staging-pin`
+runtime resource planning, Program construction, prefix-cache loading and Engine finalization. `weights-staging-pin`
 is nested in `weights-materialize`; shared Host context pinning and CUDA Graph preparation are nested in
 `program-initialize`. Nested durations explain
 their parent and must not be added to it. Disabled zero-capacity phases are omitted. Byte progress is
 reported as submitted work, while only a synchronized terminal event reports completed bytes.
 The normal pretty view retains weight materialization, enabled Host pinning, CUDA Graph preparation,
-and the merged Engine-ready summary. Internal staging, planning, frontend, Program aggregate, and
+prefix-cache loading, and the merged Engine-ready summary. Internal staging, planning, frontend, Program aggregate, and
 finalization phases remain `debug`; elapsed time alone does not make an internal milestone useful to
 an operator. Every failed phase remains an error regardless of its ordinary visibility.
 
@@ -166,7 +166,7 @@ explicit emergency cases above remain direct outputs because they are different 
 
 ## 7. Verification policy
 
-Logging tests protect Infernix-owned observable semantics, not private object shape. The request-log
+Logging tests protect engine-owned observable semantics, not private object shape. The request-log
 test covers the consumed JSONL schema, representative request/throughput pretty records, Serve
 failure severity, and exclusion of arbitrary client error text. The pretty-logging test covers the
 observable Service and Tool prefixes. The corpus consumer test protects its exact schema-version

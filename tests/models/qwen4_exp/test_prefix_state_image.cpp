@@ -1,4 +1,4 @@
-// Qwen4Exp prefix-cache state images and page records (design §19.3.1, test X8), on synthetic Device
+// Qwen4Exp prefix-cache state images and page records (design §15.1, test X8), on synthetic Device
 // pools of the real Qwen3.8-Flash-Next geometry with no model: random lane state is captured to
 // packed Device slots and to Host images split over shuffled slabs, restored into other lanes group
 // by group, and must come back byte for byte without touching any other lane. A KV page moved to a
@@ -121,7 +121,7 @@ struct HostSlabs {
 
 void test_layout(const TextConfig& c) {
     const StateImageLayout layout = plan_state_image(state_image_spec(c, true, KvCacheStorage::Int8Group64));
-    // Design §19.3.1: 115,673,088 bytes per image with MTP (124 slabs of a 931,840-byte block).
+    // 115,673,088 bytes per image with MTP (124 slabs of a 931,840-byte block).
     require(layout.image_bytes == 115'673'088ULL, "image bytes " + std::to_string(layout.image_bytes));
     require(layout.groups() == c.num_hidden_layers + 1U, "one group per decoder layer plus MTP");
     require(layout.parts.front().kind == StateImagePart::Kind::Header && layout.parts.front().offset == 0,

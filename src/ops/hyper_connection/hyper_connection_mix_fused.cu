@@ -1,6 +1,6 @@
 // The fused route of hyper_connection_mix: two kernels instead of norm, the down projection,
-// gates, the up projection and collapse (docs/maintainer/qwen3_8-flash-next-design.md §8.3 K1a/K1b,
-// §19.3.3 Phase 1b), for Q8_G32_FP16 RowSplit weights (Dense8) and BF16 contiguous weights (the
+// gates, the up projection and collapse (docs/maintainer/qwen3_8-flash-next-design.md §8.3 K1a/K1b),
+// for Q8_G32_FP16 RowSplit weights (Dense8) and BF16 contiguous weights (the
 // bit-exact artifact). The weight codec only changes how a lane's 8 weights are read; the order of
 // every product and sum is the codec-independent schedule below.
 //

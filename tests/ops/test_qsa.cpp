@@ -1,4 +1,4 @@
-// QSA (include/infernix/ops/qsa.h; docs/maintainer/qwen3_8-flash-next-design.md §8.10) against
+// QSA (include/infernix/ops/qsa.h; docs/maintainer/qwen3_8-flash-next-design.md §14.3) against
 // independent oracles (docs/maintainer/op-development.md §6), at the real Qwen3.8-Flash-Next
 // geometry (24 query heads, 2 KV heads of 256, a 4 x 128 indexer, 64 rotary dimensions, budget
 // 2048 in blocks of 4):
@@ -1328,7 +1328,7 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
         expect(same, tag + ": column-invariant route: every column equals the column alone bit for bit");
     }
 
-    // Page spaces (design §19.3.11): the same KV with every page whose id is 1 mod 3 in a mapped host
+    // Page spaces (design §14.4): the same KV with every page whose id is 1 mod 3 in a mapped host
     // plane and every page 2 mod 3 in a separate device ("lent") plane, their pool copies zeroed so
     // only the translated reads can find them; selection and attention must give the same bits.
     {

@@ -13,7 +13,7 @@ namespace infernix::ops {
 
 /**
  * QSA: block-sparse attention selected by a pooled-key indexer
- * (docs/maintainer/qwen3_8-flash-next-design.md §8.10; upstream Qwen4Exp QSA indexer).
+ * (docs/maintainer/qwen3_8-flash-next-design.md §14; upstream Qwen4Exp QSA indexer).
  *
  * For a query at absolute position p of a sequence, with ratio R and budget B:
  *
@@ -58,7 +58,7 @@ struct QsaGeometry {
     std::int32_t original_positions   = 0;
 };
 
-/// KV pages outside the device pool (docs/maintainer/qwen3_8-flash-next-design.md §19.3.11). Block
+/// KV pages outside the device pool (docs/maintainer/qwen3_8-flash-next-design.md §14.4). Block
 /// tables hold page ids p of one range: p < device_pages is a page of `kv` and `pooled_pages` (as
 /// without spaces); the next host_pages ids are pages p - device_pages of the host planes (pinned,
 /// GPU-mapped memory, read zero-copy); the ids after them are pages of the lent planes (device

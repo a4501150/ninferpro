@@ -1,4 +1,4 @@
-// The SSD tier's RAM-level controller (design §19.3.7, plan memory-tiers.md §4.3, §4.7, §4.8; RT2):
+// The SSD tier's RAM-level controller (design §9.5, plan memory-tiers.md §4.3, §4.7, §4.8; RT2):
 // the decayed LFU against a naive sum of decayed uses, every slot transition T1-T12, and a long
 // randomized run whose victims are checked against a naive scan, with the full audit after every
 // step. Host only.

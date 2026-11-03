@@ -1,5 +1,4 @@
-// hyper_connection_mix against an FP64 oracle (docs/maintainer/qwen3_8-flash-next-design.md §8.3,
-// §19.3.3 Phase 1b), for Q8_G32_FP16 weights (Dense8) and BF16 weights (the bit-exact artifact). The
+// hyper_connection_mix against an FP64 oracle (docs/maintainer/qwen3_8-flash-next-design.md §8.3), for Q8_G32_FP16 weights (Dense8) and BF16 weights (the bit-exact artifact). The
 // oracle evaluates the closed formula in FP64 from the represented BF16 residual and norm weight and
 // the weights decoded independently from their payload:
 //

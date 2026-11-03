@@ -1,9 +1,9 @@
 # Build system
 
-Infernix builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-The supported architecture is `sm_120a`; CUDA 13.1 is the validated development toolkit.
+ninferpro builds from its source tree with CMake 3.28+ and C++/CUDA 20.
+The supported architecture is `sm_120a`; CUDA 13.4 is the validated development toolkit.
 Product commands and prerequisites are in the
-[README](../../README.md#quick-start-windows); test and measurement workflows live in
+[README](../../README.md#build); test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
 
 ## Configuration
@@ -25,7 +25,7 @@ to model media decoding and remains required when apps are disabled. Curl and sp
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-CUDA 13.1 and Python 3.11 describe the maintained environment, not configuration version gates.
+CUDA 13.4 and Python 3.11 describe the maintained environment, not configuration version gates.
 CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
 is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
@@ -102,8 +102,9 @@ with `CMAKE_CURRENT_LIST_DIR`; `include()` does not change `CMAKE_CURRENT_SOURCE
   families in their own manifests. A family also registers its files under `wrapper/`.
 - Linear includes one manifest for each of BF16, FP8, NVFP4, Q4, Q5, Q6 and Q8 covering the shared
   launch templates, the general fallback and the dispatch. The tuned shape instantiations are
-  family-owned: each family's `shapes/<dtype>/` manifest lists its shape filenames and its
-  `<dtype>_shapes.cpp` extern table, and compiles them into `infernix_ops` (the templates and RDC
+  family-owned: each family's one `shapes/sources.cmake` manifest lists every dtype's shape
+  filenames and `<dtype>_shapes.cpp` extern tables — the `shapes/<dtype>/` directories hold only
+  the translation units — and compiles them into `infernix_ops` (the templates and RDC
   live there); the format's dispatch declares the family tables and scans them.
 - Models separate loading, instance, options, execution and Program source lists per family while
   retaining the distinct immutable-loading and mutable-runtime targets; the shared Qwen frontend

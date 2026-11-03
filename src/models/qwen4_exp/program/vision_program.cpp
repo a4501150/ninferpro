@@ -1,5 +1,5 @@
 // The Program side of Qwen4Exp's Vision encode window (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.2): admission plans the window, reserve keeps the media, progress runs the layer-major pass
+// §16.4): admission plans the window, reserve keeps the media, progress runs the layer-major pass
 // in steps, prefill calls scatter the handoff's embeddings, and the handoff returns to the expert
 // cache once the prompt's last call is enqueued (or the lane is released).
 

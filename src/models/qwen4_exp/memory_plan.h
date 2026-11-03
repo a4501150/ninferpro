@@ -1,7 +1,7 @@
 #pragma once
 
 // The startup memory plans of Qwen3.8-Flash-Next (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.7). Host RAM: what the experts may take once a reserve stays free for the system and every
+// §9.7, §9.8). Host RAM: what the experts may take once a reserve stays free for the system and every
 // other allocation the engine will make is planned; one reserve covers every pinned allocation.
 // Device memory: what the expert frames may take once the fixed allocations, a reserve for
 // Infernix's own later allocations and a headroom for the display and other programs are left.
@@ -160,7 +160,7 @@ struct VramSizing {
 // clamp(frame_bytes / frame size, 0, max_frames).
 [[nodiscard]] VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand);
 
-// The frame count the free memory beside the pool supports now, in whole chunks (design §19.3.7's
+// The frame count the free memory beside the pool supports now, in whole chunks (design §9.7's
 // sizing law, without the removed shrink/regrow policy): the frames an elastic pool holds beyond it
 // sit on memory the sizing would not give them, so KV growth spends that allowance before it takes
 // frames. `pool_bytes` are the bytes the pool maps now (the law counts them as reclaimable), and

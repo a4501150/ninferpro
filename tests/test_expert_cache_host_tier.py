@@ -102,7 +102,7 @@ def test_full_mode_never_reads_the_ssd():
 
 
 def test_prompt_seeding_credits_the_prompt_and_promotes_within_its_budget():
-    # The engine's seed_prompt (design §17 H8): at a prompt's end its routed experts gain credit in
+    # The engine's seed_prompt (design §9.2): at a prompt's end its routed experts gain credit in
     # proportion to their uses; with a budget the best credited misses are promoted, which on prompts
     # that predict their answers' topic raises the first decode tokens' VRAM hit rate.
     trace = ht.synthetic_trace(layers=4, experts=64, top_k=4, requests=6, prompt=192, decode=128, chunk=64,

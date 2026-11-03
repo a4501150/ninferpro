@@ -1,4 +1,4 @@
-// The Qwen3.8-Flash-Next startup memory plans (design §19.3.7). RT1, the RAM ledger: the experts
+// The Qwen3.8-Flash-Next startup memory plans (design §9.8). RT1, the RAM ledger: the experts
 // take what the reserve and every planned allocation leave, full mode needs the banks plus the
 // margin, the commit limit and the OS's pin bound limit the experts like physical memory, and the
 // reserve is applied once. RT7, the VRAM sizing: the display headroom by display state, the OS budget without

@@ -315,7 +315,7 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
     const std::size_t admitted = tier_.admit(landings, false);
     stats_.admitted += admitted;
     stats_.discarded += landings.size() - admitted;
-    // The demotion list refills at every boundary (design §19.3.7 §4.8): without it the first 32
+    // The demotion list refills at every boundary (moe-offload-design.md §4.6, plan §4.8): without it the first 32
     // demotions used it up, after which every VRAM victim without a host copy was dropped to the
     // SSD and the eviction gate refused demotion-worthy victims outright (T6).
     tier_.replenish_demotion_list();

@@ -44,7 +44,7 @@ private:
 };
 
 // A reserved virtual range whose chunks are mapped individually, anywhere in it (an elastic pool
-// whose planes each grow at their own end: design §19.3.11). Unmapped chunks must never be
+// whose planes each grow at their own end: design §14.4). Unmapped chunks must never be
 // accessed. Not thread-safe; the owner orders every unmap after the device work that reads it.
 class VmmRange {
 public:

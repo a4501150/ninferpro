@@ -1,7 +1,7 @@
 #pragma once
 
 // Exact integer combination and the one final rounding of the exact expert and dense routes
-// (docs/maintainer/qwen3_8-flash-next-design.md §16.2.2): sums of
+// (docs/maintainer/qwen3_8-flash-next-design.md §17.3): sums of
 // integer products kept exactly in int128, then rounded once. Host and device give identical bits.
 
 #include "ops/common/canonical_math.h"

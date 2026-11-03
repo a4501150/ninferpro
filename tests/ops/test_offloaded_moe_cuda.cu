@@ -1,5 +1,5 @@
 // GPU narrow route of offloaded_sparse_moe against the CPU engine
-// (docs/maintainer/qwen3_8-flash-next-design.md §16.2, §19 M3 "placement invariance").
+// (docs/maintainer/qwen3_8-flash-next-design.md §17.2, "placement invariance").
 //
 // Oracles:
 //   - the pinned golden output hashes that every CPU ISA reproduces (exact);

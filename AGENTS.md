@@ -103,7 +103,7 @@ approval requirements beyond the user's instructions and the actual execution en
 
 ## Product and architecture
 
-The engine (Infernix's, built here as `infernix-*` binaries) is a from-scratch C++/CUDA inference
+The engine (ninferpro's, built here as `infernix-*` binaries) is a from-scratch C++/CUDA inference
 engine for maximum single-GPU performance. It implements
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
 use the same architecture, binding and execution path. It also implements `Qwen4ExpForCausalLM`
@@ -129,7 +129,7 @@ local workflow. Do not derive requirements from a different deployment or trust 
 Keep these ownership boundaries visible when selecting a design:
 
 - The v3 container (`.infernix`, or `.ninfer` from NInfer) is the only C++ product artifact; CLI,
-  serving, and inference benchmarks use the public Engine. Infernix has no Python model-inference
+  serving, and inference benchmarks use the public Engine. The engine has no Python model-inference
   route or installed/exported C++ SDK.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and
   materialization; Ops own closed mathematical and state-transition implementations.
@@ -233,7 +233,7 @@ the memory cap and the GPU lock itself.
 | Tier | Command | What it establishes | Time |
 |---|---|---|---|
 | T0 | `make t0 [R=regex]` | unit, Op and contract tests: CTest without the `real` label | minutes |
-| T1 | `make t1 [SHAPE=6x1,6x2]`, `make t1-exact`, `make t1-kernels [KSHAPE=6x2] [METRICS=1]` | one generation round of each shape on the real artifact through the production Forward and its CUDA Graph (`bench/models/qwen4_exp/round_bench.cpp`), and a mixed shape (`6x2+1024`: the round and a prefill chunk in one call, on the exact route equal to the two calls): device time, commit time, `--sections` per layer half, per-kernel table (with `METRICS=1` also the DRAM bandwidth each kernel leaves unused), and the logits and lane-state hashes against `bench/models/qwen4_exp/round_hashes.txt`; every shape also replays 2 or more times from one state and fails on differing bits (`--determinism N`) | about 10 s |
+| T1 | `make t1 [SHAPE=1x1,6x1,1x4,6x2,6x3,6x2+1024]`, `make t1-exact`, `make t1-kernels [KSHAPE=6x2] [METRICS=1]` | one generation round of each shape on the real artifact through the production Forward and its CUDA Graph (`bench/models/qwen4_exp/round_bench.cpp`), and a mixed shape (`6x2+1024`: the round and a prefill chunk in one call, on the exact route equal to the two calls): device time, commit time, `--sections` per layer half, per-kernel table (with `METRICS=1` also the DRAM bandwidth each kernel leaves unused), and the logits and lane-state hashes against `bench/models/qwen4_exp/round_hashes.txt`; every shape also replays 2 or more times from one state and fails on differing bits (`--determinism N`) | about 10 s |
 | T2 | `make t2`, `make t2-record` | start-up and correctness smoke test (`tests/models/qwen4_exp/test_smoke_real.cpp`): the public Engine in process with production's options on the real artifacts (six concurrent requests, DFlash2 drafting, prefix-cache resume, an expert-placement switch and back), then the exact route's greedy tokens against `tests/models/qwen4_exp/smoke_golden.txt`, alone, six in flight, beside a long prompt's mixed rounds, resumed and after the switch | about a minute |
 | T2 bench | `make t2-bench [ARGS="--repeat 5"]` | aggregate tok/s of six concurrent 256-token requests through the Engine in process (`bench/models/qwen4_exp/engine_bench.cpp`): the DFlash2 policy, host work and the Forward together, without a server boot | about a minute |
 | T3 | `make t3 ARGS=...` | promotion: `bench_infernix.py` and the quality gate against the server build; the only tier for policy behaviour that depends on live timing (the DFlash2 cost fit, placement swaps, scheduling) | many minutes |
@@ -293,6 +293,7 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Execution, model/runtime ownership, scheduling, transactions, graphs | `docs/maintainer/engine-architecture.md` |
 | Scheduling, permits, preemption; prefix cache; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/hybrid-prefix-cache-spec.md`; `docs/maintainer/paged-kv-cache.md` |
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
+| Offloaded MoE families: expert residency, placement, RAM/SSD tiers, CPU expert engine | `docs/maintainer/moe-offload-design.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
 | Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
 | In-tree C++ interface | `include/infernix/engine.h`, `include/infernix/types.h` |

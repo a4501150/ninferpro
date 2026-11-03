@@ -1,7 +1,7 @@
 #pragma once
 
-// RoPE positions of a Qwen4Exp lane (docs/maintainer/qwen3_8-flash-next-design.md §19.3.2, "M-RoPE
-// through the text path"). Every call stages the three-axis RoPE position of each column beside its
+// RoPE positions of a Qwen4Exp lane (docs/maintainer/qwen3_8-flash-next-design.md §16.3, "M-RoPE
+// through every text call"). Every call stages the three-axis RoPE position of each column beside its
 // KV position: prompt tokens of a prompt with media take the frontend's M-RoPE positions, every
 // other token its index plus the prompt's rope delta on all three axes (text-only prompts: the
 // index). Equal axes rotate exactly as the 1-D index, so text lanes are unchanged.

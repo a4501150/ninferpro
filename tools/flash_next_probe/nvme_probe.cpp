@@ -1,4 +1,4 @@
-// Flash-Next M0 NVMe probe (docs/maintainer/qwen3_8-flash-next-design.md §12, §14.2 Stage 1):
+// Flash-Next M0 NVMe probe (docs/maintainer/qwen3_8-flash-next-design.md §12, §18.1 Stage 1):
 // random 4 KiB O_DIRECT reads from a large file, as the PLE n-gram row cache issues them.
 //
 // Build (from the repository root):

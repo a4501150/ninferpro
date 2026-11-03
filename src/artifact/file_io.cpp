@@ -49,7 +49,7 @@ ReadOnlyFile open_read_only(const std::filesystem::path& path) {
 // The Win32 path delegates to the shared read-only file abstraction with nothing mapped and no
 // buffered handle: every read is unbuffered, so neither a mapping nor the system cache holds the
 // file's data and the materializer's direct reads pay no cache-coherency work (a mapped file cut
-// unbuffered read rates by 12 % for 8 MiB reads and 75 % for 4 KiB ones, design §19.3.8 F9). The
+// unbuffered read rates by 12 % for 8 MiB reads and 75 % for 4 KiB ones, design §12.3). The
 // POSIX path keeps positional pread on a raw fd.
 InputFile::InputFile(std::filesystem::path path)
     : path_(std::move(path)), file_(open_read_only(path_)) {

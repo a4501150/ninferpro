@@ -1,7 +1,7 @@
 #pragma once
 
-// Host side of the Qwen3.8-Flash-Next expert cache (docs/maintainer/qwen3_8-flash-next-design.md
-// §9): the LFRU policy, the device residency-entry encoding, and the frame pool with epoch-based
+// Host side of the offload tier's expert cache (docs/maintainer/moe-offload-design.md
+// §4): the LFRU policy, the device residency-entry encoding, and the frame pool with epoch-based
 // reuse. Pure host logic with no CUDA dependency; the transfer agent drives it and turns its
 // decisions into copy-stream commands.
 
@@ -19,7 +19,8 @@ namespace infernix::models::offload::expert_cache {
 
 enum class ResidencyState : std::uint32_t { kAbsent = 0, kLoading = 1, kReady = 2 };
 
-// residency[layer * 512 + expert], one u32 in device memory (design §9.4):
+// residency[layer * 512 + expert], one u32 of the host-side table (the device reads the I32
+// frame table, moe-offload-design.md §4.2):
 //   bits 31-30 state, 29-24 generation (incremented on every state change), 23-0 frame.
 struct ResidencyEntry {
     ResidencyState state = ResidencyState::kAbsent;
@@ -48,7 +49,7 @@ public:
     // Every routed key counts as used either way.
     using Admissible = std::function<bool(std::uint32_t)>;
 
-    // halving_period > 0 halves every count each that many ticks (design §9.3).
+    // halving_period > 0 halves every count each that many ticks (moe-offload-design.md §4.3).
     LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period = 0);
     // Halved counts below this become 0 (they never reach subnormals, which would slow the scan).
     static constexpr double kCountFloor = 1.0 / 1024.0;
@@ -71,7 +72,7 @@ public:
               std::size_t admission_budget = static_cast<std::size_t>(-1), const Admissible* admissible = nullptr,
               const Admissible* evictable = nullptr);
 
-    // Prompt seeding (design §19.3.27): adds amounts[i] to keys[i]'s count and marks it used now,
+    // Prompt seeding (moe-offload-design.md §4.3): adds amounts[i] to keys[i]'s count and marks it used now,
     // with no clock tick (the prompt's prefill calls ticked already) and no admission: the credit
     // ranks later admissions and evictions.
     void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts);
@@ -134,7 +135,7 @@ private:
     std::vector<std::uint32_t> victim_; // scratch: one victim at a time
 };
 
-// What a warm start needs (design §19.3.5 S4b): every key's LFRU count, and the resident keys,
+// What a warm start needs (moe-offload-design.md §4.3): every key's LFRU count, and the resident keys,
 // highest score first.
 struct SavedState {
     std::vector<std::uint32_t> counts;
@@ -144,10 +145,10 @@ struct SavedState {
 // ---------------------------------------------------------------------------- frames
 
 // Frames of the device pool. A frame whose expert was evicted is reusable only once every round
-// that might still read it has finished (design §9.5): the agent samples r_s = round_started
+// that might still read it has finished (moe-offload-design.md §4.4): the agent samples r_s = round_started
 // after the ABSENT write is visible, and the frame returns when round_done >= r_s + D, D being the
 // number of rounds that can be in flight. Frames [0, backed()) have memory; the pool can grow up
-// to `max_frames` and shrink from the top (design §19.3.7).
+// to `max_frames` and shrink from the top (moe-offload-design.md §4.2).
 class FramePool {
 public:
     FramePool(std::uint32_t frames, std::uint32_t rounds_in_flight, std::uint32_t max_frames = 0);
@@ -165,7 +166,7 @@ public:
     // above `frames` free (the controller relocates their experts first).
     void resize(std::uint32_t frames);
     // Lends the free frames [first, first + count) to another user of the memory (design
-    // §19.3.2, "Frame lending"); they are neither acquired nor resized until given back.
+    // §9.4, "Frame leases"); they are neither acquired nor resized until given back.
     void lend(std::uint32_t first, std::uint32_t count);
     void give_back(std::uint32_t first, std::uint32_t count);
     // A retired frame whose expert is being copied out (the SSD tier's demotion) is held: neither
@@ -194,7 +195,7 @@ private:
 // ---------------------------------------------------------------------------- controller
 
 // The transfer agent's bookkeeping: applies LFRU decisions to the residency table and the frames,
-// and emits the copy-stream commands that realize them (design §9.4). An admitted expert with no
+// and emits the copy-stream commands that realize them (moe-offload-design.md §4.4). An admitted expert with no
 // free frame stays queued, CPU-served meanwhile, and is loaded as soon as a frame retires; a queued
 // expert that the policy evicts first is simply dropped from the queue.
 class CacheController {
@@ -223,7 +224,7 @@ public:
                   const LfruPolicy::Admissible* admissible = nullptr, const LfruPolicy::Admissible* evictable = nullptr);
     // A prompt's weighted routes at its end (LfruPolicy::credit); issues no command.
     void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) { policy_.credit(keys, amounts); }
-    // The SSD tier's demotion (design §19.3.7 T4/T7): after on_route evicted an expert and before
+    // The SSD tier's demotion (moe-offload-design.md §4.6): after on_route evicted an expert and before
     // on_quiescent, its retired frame is held while its record is copied to RAM; release_held frees
     // it once the copy completed and loads queued experts into free frames.
     void hold(std::uint32_t frame) { frames_.hold(frame); }
@@ -236,7 +237,7 @@ public:
     // command); growing admits queued experts into the new frames.
     void resize(std::uint32_t frames, std::vector<Command>& out);
 
-    // Frame lending (design §19.3.2): a contiguous run of frames serves another use of the memory
+    // Frame lending (moe-offload-design.md §4.5): a contiguous run of frames serves another use of the memory
     // (the Vision window) and comes back later. choose_run picks the run of `count` frames whose
     // held experts have the minimum summed LFRU score (free frames score 0); lent frames are
     // ineligible, and runs over `busy` frames (targets of loads still in flight) are avoided while a
@@ -253,12 +254,12 @@ public:
     // `admissible` (when given) gates them. Without, the frames stay free for decode's landings.
     void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out, bool refill = true,
                    const LfruPolicy::Admissible* admissible = nullptr);
-    // Warm start (design §19.3.5 S4b): sets every key's count from `counts` (empty: unchanged), then
+    // Warm start (moe-offload-design.md §4.3): sets every key's count from `counts` (empty: unchanged), then
     // loads `keys`, best first, into free frames while the policy has capacity. Before the first
     // round only. Returns the number of keys loaded.
     std::uint32_t seed(std::span<const std::uint32_t> keys, std::span<const std::uint32_t> counts,
                        std::vector<Command>& out);
-    // Fill-phase landing (design §19.3.5 S4). reserve_free pops up to `count` free frames into
+    // Fill-phase landing (moe-offload-design.md §4.4). reserve_free pops up to `count` free frames into
     // `out` while the policy has room for that many more residents (the LFRU state is untouched)
     // and returns how many it reserved. adopt makes `key`, copied into the reserved `frame` during
     // a round, resident there: READY in the table, admitted by the policy (a victim outside

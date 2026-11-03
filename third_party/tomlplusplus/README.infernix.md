@@ -1,6 +1,6 @@
 # Vendored toml++
 
-Infernix vendors the upstream toml++ single-header distribution, the same copy NInfer vendors:
+ninferpro vendors the upstream toml++ single-header distribution, the same copy NInfer vendors:
 
 - upstream: <https://github.com/marzer/tomlplusplus>
 - tag: `v3.4.0`

@@ -106,7 +106,7 @@ struct WeightRowPlanes {
 // address (WeightParent::device).
 [[nodiscard]] Weight device_native_weight(const WeightView& view, float input_divisor = 0.0F);
 
-// A routed-expert bank: nvfp4_expert_rg16_v1 (Qwen3.8-Flash-Next design §6.2), a ggml expert
+// A routed-expert bank: nvfp4_expert_rg16_v1 (Qwen3.8-Flash-Next design §6.3), a ggml expert
 // layout (ggml_expert_*_v1) or fp8_expert_b128_v1 (whose tile scales follow the down rows, at
 // record_bytes - 3 * (hidden / 128) * (intermediate / 128) * 2). Pointers are in the parent's
 // memory space; nothing is dereferenced.

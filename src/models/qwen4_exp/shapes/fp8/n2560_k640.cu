@@ -1,7 +1,7 @@
 // Qwen3.8-Flash-Next shared expert down projection, row-scaled FP8 with BF16 activations (W8A16, recipe C).
 // K = 640 is not a whole number of the SIMT, GEMV or sliced-K tiles, so every width takes the TMA tensor-core
 // tiles; selected by bench/ops/fp8_flash_next_sweep.cu on the RTX 5090. All of them give one column's bits at
-// every width (design §11.3).
+// every width (design §17.4).
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_launch.cuh"
 #include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"

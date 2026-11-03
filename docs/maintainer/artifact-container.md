@@ -15,10 +15,10 @@ relationships.
 
 | Content | Authority |
 |---|---|
-| File header, JSON, objects and references, file sharding, v3 persistent names | This document |
+| File header, JSON, objects and references, file sharding, v3 persistent-name convention | This document |
 | Fixed mathematics, compact config, logical parameter shapes, component inputs | The corresponding architecture's [config](../../src/models/qwen3_5/config.h) and [binding](../../src/models/qwen3_5/load/) |
-| Numerical decoding of a format, valid codes/scales | [Numeric formats](tensor-formats.md); persistent names in section 6 |
-| A layout's planes, packing, internal padding and encoded size | [Storage layouts](storage-layouts.md); persistent names in section 6 |
+| Numerical decoding of a format, valid codes/scales, and the registry of persistent format names | [Numeric formats](tensor-formats.md) section 1 |
+| A layout's planes, packing, internal padding, encoded size, and the registry of persistent layout names | [Storage layouts](storage-layouts.md) section 1 |
 | Native Op parameters, supported range, numerics and scratch | The corresponding Op contract |
 | Residency, state, capacity, CUDA Graphs and result publication | [Engine architecture](engine-architecture.md) and its resource contracts |
 
@@ -368,20 +368,9 @@ directory.
 ### 6.1 Numeric formats
 
 V3 canonical names use lowercase snake_case. Each name refers to a codec in code with a precise meaning;
-the fixed group size, scale type and decoding rules are defined directly by that codec.
-
-| Name | Numerical meaning |
-|---|---|
-| bf16 | Raw Bfloat16 word |
-| fp32 | Raw IEEE binary32 word |
-| int32 | Signed 32-bit integer |
-| q2_g64_fp16 | Signed 2-bit codes, G64, signed FP16 multiplier |
-| q4_g64_fp16 | Signed 4-bit codes, G64, FP16 multiplier |
-| q5_g64_fp16 | Signed 5-bit codes, G64, FP16 multiplier |
-| q6_g64_fp16 | Signed 6-bit codes, G64, FP16 multiplier |
-| q8_g32_fp16 | Codes `[-127,127]`, G32, FP16 multiplier |
-| nvfp4 | E2M1 codes, G16 E4M3FN block scale, FP32 weight divisor |
-| fp8_e4m3fn_row_bf16 | E4M3FN codes, one BF16 multiplier per row |
+the fixed group size, scale type and decoding rules are defined directly by that codec. The closed
+registry of persistent names is owned by [Numeric formats](tensor-formats.md) section 1; a name
+outside that registry is invalid.
 
 The FP16/BF16 at the end of a quantized name denotes the scale type. Activation compute permissions are
 expressed in uses.
@@ -395,15 +384,10 @@ the same, and the generation method is recorded in the recipe/provenance.
 
 ### 6.2 Layouts and resource encodings
 
-| Name | Currently allowed format / shape | Object alignment |
-|---|---|---:|
-| contiguous_le_v1 | bf16/fp32/int32, rank 0..16 | 256 |
-| row_split_k128_v1 | q2_g64_fp16, q4_g64_fp16, q5_g64_fp16, q6_g64_fp16, q8_g32_fp16, positive rank-2 `[N,K]` | 256 |
-| block_scale_k16_m128x4_v1 | nvfp4, `N%128=0`, `K%64=0` | 256 |
-| row_scale_v1 | fp8_e4m3fn_row_bf16, positive rank-2 `[N,K]` | 256 |
-| raw_bytes_v1 | Resource, non-empty byte string | 1 |
-
-Byte packing, planes, internal padding, swizzle and the encoded-size formulas are defined by the
+The closed registry of layout names, their compatible formats and shapes, and the resource
+encoding is owned by [Storage layouts](storage-layouts.md) section 1; a name outside that registry
+is invalid. Object alignment belongs to the layout, and byte packing, planes, internal padding,
+swizzle and the encoded-size formulas are defined by the
 [storage layout contract](storage-layouts.md).
 
 A layout's v1 is the version of the layout itself and is managed separately from container v3. Adding a

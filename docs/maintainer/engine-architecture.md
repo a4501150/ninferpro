@@ -1,4 +1,4 @@
-# Infernix Engine Architecture
+# ninferpro Engine Architecture
 
 This document defines model instances, execution ownership, the request lifecycle and the commit
 relationships across modules.
@@ -439,12 +439,12 @@ no cached prefix that external requests could hit.
 | Engine connection to the prefix cache | `src/runtime/engine/context_cache/` |
 | Model-agnostic prefix index, tap planner and cost model | `src/runtime/prefix_cache/` |
 | Public request, execution and resource contracts | `src/runtime/contract/` |
-| Model config, binding and read-only data | `src/models/qwen3_5/config.*`, `load/`, `model.*` |
-| Native parameters and fixed model calls | `src/models/qwen3_5/execution/` |
-| Program planning, stores, context and model transactions | `src/models/qwen3_5/program/` |
+| Model config, binding and read-only data | `src/models/<family>/config.*`, `load*`, `model.*` |
+| Native parameters and fixed model calls | `src/models/<family>/execution/` |
+| Program planning, stores, context and model transactions | `src/models/<family>/program/` |
 | Shared Qwen frontend, n-gram archive and vision pieces | `src/models/qwen_common/` |
 | Shared expert-offload tier (placement, store, host cache, host and SSD tiers, residency, route trace, VRAM monitor), parameterized by `ExpertBankGeometry` | `src/models/offload/` |
-| Model state layout | `src/models/qwen3_5/state/` |
+| Model state layout | `src/models/<family>/state/` (qwen3_5); qwen4_exp keeps it in `program/` with the state image under `program/prefix/` |
 | Family-owned linear shape tuning, one extern table per family and format beside the Ops dispatch | `src/models/<family>/shapes/` |
 | Tensors, arenas, graphs, physical KV and raw transfers | `src/core/` |
 | Generic artifact framing and materialization | `src/artifact/` |
@@ -452,6 +452,11 @@ no cached prefix that external requests could hit.
 | Input conversion, media acquisition and the HTTP Gateway | `src/product/`, `src/media/decode/`, `src/serve/` |
 | Converter and Python container tools | `tools/convert/`, `tools/artifact/` |
 
-The public C++ interface serves in-repository applications; Infernix does not install or export a C++
+The shared expert-offload tier — the expert cache, residency, tiers, placement and CPU expert
+engine every offloaded MoE family composes — is designed in
+[MoE offload design](moe-offload-design.md); each family's design document keeps its own
+constants and measurements and cites it.
+
+The public C++ interface serves in-repository applications; the engine does not install or export a C++
 SDK. The v3 container (`.infernix`, or `.ninfer` from NInfer) is the only C++ product artifact; the
 CLI, server and inference benchmarks all go through the public Engine, and the converter provides no Python model-inference path.

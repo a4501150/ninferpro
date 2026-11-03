@@ -32,7 +32,9 @@ The binaries keep their Infernix names (`infernix-serve`, `infernix`, `infernix-
   round's Forward (a mixed round), so the stream keeps going; on the exact route the output is bit
   for bit the same.
 - **Tool-call grammar fixes.** A constrained auto tool turn treats a call opener inside Markdown
-  code as text, and may end inside its thinking (non-strict calls written there are recovered).
+  code as text, and a call cannot start inside its thinking: the model must close its thinking
+  before calling, and the turn cannot end there. `--tolerant-tool-calls` recovers a complete call
+  with malformed wrapper markup.
 - `--served-model-name` aliases, and a Linux fix to VRAM spill detection.
 
 ## Measured
@@ -108,15 +110,15 @@ build/apps/infernix-serve Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix 
   --ngram-volume Qwen3.8-Flash-Next-BF16.ngram --kv-dtype fp8 \
   --max-context 262144 --max-concurrency 6 \
   --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix \
-  --draft-tokens auto --lm-head-draft --tolerant-tool-calls \
-  --prefix-cache-disk prefix-cache --prefix-cache-disk-gib 64 \
+  --draft-tokens auto --lm-head-draft --tolerant-tool-calls --vision \
   --served-model-name qwen3.8-flash-next --host 0.0.0.0 --port 8000
 ```
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API
-([serving](docs/serving.md), [CLI](docs/cli.md)). FP8 KV measured within 0.0013 mean KL of INT8
-and enables an 8-bit activation fast path that decodes about 12 % faster; `--kv-dtype int8` is the
-higher-accuracy choice. On this machine the server is started and stopped through
+([serving](docs/serving.md), [CLI](docs/cli.md)). FP8 KV lets recipe C run the `fp8-a8-pair` fast path
+(+5-6 % prefill at 32K-64K); `--kv-dtype int8` has a slightly lower noise floor (6.1e-3 against
+7.5e-3 mean KL in prefill). The prefix cache stays in RAM (`--host-context-mib`, default 8 GiB);
+`--prefix-cache-disk DIR` adds an optional SSD tier. On this machine the server is started and stopped through
 [super-quant](https://github.com/a4501150/super-quant) (`make serve-infernix`, `make stop-infernix`).
 
 ## Expert placement

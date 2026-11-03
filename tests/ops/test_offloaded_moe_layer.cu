@@ -2,15 +2,15 @@
 // engine, with expert records split between device frames and the pinned host bank and misses
 // read zero-copy, staged through 1, 3 or 64 device slots (one or several staging passes), or
 // served by the host expert engine through the CPU miss channel
-// (docs/maintainer/qwen3_8-flash-next-design.md §8.6, §10.3, §16.2), and with SSD-only experts
-// (the SSD tier, §19.3.7) read through a RecordProvider by CPU jobs or fetched through the fetch
+// (docs/maintainer/qwen3_8-flash-next-design.md §8.6, §10.3, §17.2), and with SSD-only experts
+// (the SSD tier, §9.5) read through a RecordProvider by CPU jobs or fetched through the fetch
 // channel from a host responder, including its failure paths (host status, silent host).
 //
 // Oracle: the CPU engine's output of each routed (column, expert) pair of the narrow route, bit
 // for bit; the narrow route's arithmetic is exact. Every output, the wide route's included (its own
 // FP64 qualification is test_offloaded_moe_wide), equals the first configuration's: neither the record's
 // location, nor the staging pass a job falls in, nor a CPU-served share may change an output bit.
-// moe_dispatch has its own exact oracle (test_dispatch). Layers of W4A16 experts (§16.2.1) run the
+// moe_dispatch has its own exact oracle (test_dispatch). Layers of W4A16 experts (§17.3) run the
 // same configurations against expert_forward_a16, which every W4A16 output equals bit for bit (its
 // wide route is exact as well).
 #include "infernix/ops/hyper_connection.h"
@@ -97,7 +97,7 @@ struct CopiedRecords final : moe::RecordProvider {
     void done(std::uint32_t) noexcept override {}
 };
 
-// The SSD tier's agent in miniature (design §19.3.7): answers each fetch request with copies of the
+// The SSD tier's agent in miniature (design §9.5): answers each fetch request with copies of the
 // bank's records written into a ring of mapped slots, landing them in swapped pairs (record i + 1
 // before record i) and reusing a slot only once the device has consumed its previous record.
 // Modes: answer, fail the request at record fail_at (EIO), or stay silent (acknowledge, then
@@ -196,7 +196,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     std::uint8_t* host_device = nullptr;
     cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_device), host, 0), "cudaHostGetDevicePointer");
     // The same records in shuffled host slots, reached through a host-pointer table (the SSD tier's
-    // RAM slots, design §19.3.7 R5): every route must read identical bits through it.
+    // RAM slots, design §9.5): every route must read identical bits through it.
     std::uint8_t* shuffled = nullptr;
     cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&shuffled), stride * experts, cudaHostAllocMapped), "cudaHostAlloc");
     std::vector<int> slot_of(experts);
@@ -298,12 +298,12 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     // Prefill CPU assist (P7): calls of at least 9 columns take up to 256 CPU-served misses.
     moe::CpuMissService service_assist(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
                                                 .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .cpus = {}, .activation = activation});
-    // A prefill call's CPU share (design §19.3.12): calls up to a chunk of 4,096 columns, every narrow
+    // A prefill call's CPU share (design §10.6): calls up to a chunk of 4,096 columns, every narrow
     // miss offered (no PCIe share), up to every expert of the layer.
     moe::CpuMissService service_wide(layers, {.workers = 6, .max_jobs = 8, .max_columns = moe::kMaxCpuCallColumns,
                                               .pcie_divisor = 0, .wide_from = 256, .wide_jobs = moe::kMaxCpuJobs,
                                               .cpus = {}, .activation = activation});
-    // SSD tier (design §19.3.7): services that read SSD-only records through a provider.
+    // SSD tier (design §9.5): services that read SSD-only records through a provider.
     CopiedRecords copied;
     copied.bank   = host;
     copied.stride = stride;
@@ -311,7 +311,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                                  .pcie_divisor = 0, .cpus = {}, .activation = activation, .records = &copied});
     moe::CpuMissService service_ssd8(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation,
                                               .records = &copied});
-    // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - M / divisor) of the misses
+    // The CPU's share of the misses (design §8.6): want = min(cap, M - M / divisor) of the misses
     // with at most max_job_columns columns, so the number served is min(want, eligible misses). The
     // divisor is one_column_divisor (when set) in a one-column call.
     const auto divisor_of = [&](const auto& channel) {
@@ -391,7 +391,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         bool overlap  = false; // passes staged on the overlap stream
         int idle      = 0;     // calls after the service idles 60 ms; 2: wake() before each
     };
-    // Which misses the CPU takes (design §19.3.5 S3): the fewest-column ones first, in job order within a
+    // Which misses the CPU takes (design §8.6): the fewest-column ones first, in job order within a
     // width, want = min(cap, M - M / divisor) of those with at most max_job_columns columns.
     const auto cpu_selection = [&](const moe::CpuMissService* service, const std::vector<std::int32_t>& jobs,
                                    bool streamed) {
@@ -1312,7 +1312,7 @@ int main() {
         test_tail_skip(48, 1, 10, 7, 401);  // decode: one column, Strata's default rank
         test_tail_skip(48, 6, 10, 5, 403);  // MTP verification width: an expert skips only if every column ranks it low
         test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
-        // W4A16 experts (§16.2.1): decode, verification, several columns per expert, many misses, and
+        // W4A16 experts (§17.3): decode, verification, several columns per expert, many misses, and
         // a short prompt's call (experts of more than eight columns on the narrow kernels). Calls of
         // four columns take the one-column kernels and of five or more the multi-column ones.
         constexpr auto kA16 = moe::ExpertActivation::kA16;

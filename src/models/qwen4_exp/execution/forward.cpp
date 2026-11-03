@@ -1053,7 +1053,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // in the order its dense chain reads them. A one-column call (plain decode) warms the chain up to
     // 40 MiB: tg512 plain 121.8 -> 123.3 tok/s against the attention mixer and 16 MiB of input (32 MiB
     // +0.7 %, 48-56 MiB alike, 64-80 MiB less). A wider call keeps that smaller set: under MTP the
-    // wait is shorter and 48-64 MiB measured 0.4-1.4 % slower (design §19.3.20b). A GGUF import's
+    // wait is shorter and 48-64 MiB measured 0.4-1.4 % slower (design §8.6). A GGUF import's
     // projections warm their segments in order.
     if (source.cpu.max_jobs > 0 && layer + 1 < config_.num_hidden_layers) {
         const auto& next = parameters_.layers[layer + 1];
@@ -1118,7 +1118,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
     ExpertStream* const streaming = streamed_chunk ? experts_.stream : nullptr;
     if (streaming != nullptr && streaming->gated()) {
-        // A gated call (design §19.3.12): the layer's routing decides which experts the link copies
+        // A gated call (design §10.6): the layer's routing decides which experts the link copies
         // and which the CPU serves. The CPU takes exactly the experts the stream leaves out: every
         // narrow miss is offered (no PCIe share), capped at the policy's count.
         CUDA_CHECK(cudaMemcpyAsync(split_offsets_.data(), dispatch.offsets, (static_cast<std::size_t>(E) + 1) * sizeof(std::int32_t),

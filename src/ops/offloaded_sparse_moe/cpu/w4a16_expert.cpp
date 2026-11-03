@@ -21,7 +21,7 @@ namespace {
 
 using canon::A16Block;
 
-// Code nibble of row r (0..15) at k (0..15) inside one 144-byte unit (design §6.2).
+// Code nibble of row r (0..15) at k (0..15) inside one 144-byte unit (design §6.3).
 inline unsigned unit_code(const std::uint8_t* unit, int r, int k) {
     const std::uint8_t byte = unit[32 * (k / 4) + 4 * (r % 8) + k % 4];
     return r < 8 ? (byte & 15U) : (byte >> 4);
@@ -36,7 +36,7 @@ void row_sums_scalar(const std::uint8_t* matrix, int blocks, int rg_begin, int r
                 const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg) * blocks + b) * kUnitBytes;
                 const A16Block& a        = acts[c][b];
                 for (int r = 0; r < 16; ++r) {
-                    std::int32_t p = 0; // |P| < 2^31 (design §16.2.1)
+                    std::int32_t p = 0; // |P| < 2^31 (design §17.3)
                     for (int k = 0; k < 16; ++k) { p += canon::e2m1_x2(unit_code(unit, r, k)) * canon::a16_x(a, k); }
                     s[r] += static_cast<std::int64_t>(p) * canon::e4m3_scaled(unit[128 + r]);
                 }
@@ -48,7 +48,8 @@ void row_sums_scalar(const std::uint8_t* matrix, int blocks, int rg_begin, int r
 
 #if defined(INFERNIX_MOE_X86)
 
-// Software prefetch `distance` bytes ahead along the unit stream (design §10.3, §14.2).
+// Software prefetch `distance` bytes ahead along the unit stream (moe-offload-design.md §5.2; the
+// tuned distance is qwen3_8-flash-next-design.md §18.1's).
 inline void prefetch_unit(const std::uint8_t* unit, int distance) {
     if (distance > 0) {
         const char* p = reinterpret_cast<const char*>(unit) + distance;

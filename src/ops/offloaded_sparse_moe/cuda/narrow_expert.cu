@@ -33,7 +33,7 @@ __device__ __forceinline__ int act_quad(const A4Block& a, int q) {
     return *reinterpret_cast<const int*>(&a.c2[4 * q]);
 }
 
-// Exact S = sum_b P_b * Sw_b * Sa_b for row r of row group rg, one column (design §16.2).
+// Exact S = sum_b P_b * Sw_b * Sa_b for row r of row group rg, one column (design §17.2).
 __device__ std::int64_t row_sum(const std::uint8_t* matrix, int blocks, int rg, int r, const A4Block* acts) {
     std::int64_t s = 0;
     for (int b = 0; b < blocks; ++b) {

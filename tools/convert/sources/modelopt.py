@@ -69,7 +69,7 @@ def nvfp4_packed_matrix_words(store: SafetensorsSource, leaf: str, shape: tuple[
     (two per byte, the first element in the low nibble, as ModelOpt packs them) and ``weight_scale``
     E4M3FN block scales, unchanged. The format's ``weight_global_scale`` divides (value = code x
     block scale / global scale); the expert bank stores a multiplier, so weight_scale_2 is its
-    reciprocal rounded once to FP32. There is no activation scale (design §16.2.1)."""
+    reciprocal rounded once to FP32. There is no activation scale (design §17.3)."""
 
     n, k = shape
     if k % 16:

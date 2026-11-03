@@ -1,6 +1,6 @@
-# Infernix Persistent Tensor Numeric Formats
+# ninferpro Persistent Tensor Numeric Formats
 
-This reference defines the twenty persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the twenty-one persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-Infernix has exactly twenty persistent numeric tensor formats in five categories.
+The engine has exactly twenty-one persistent numeric tensor formats in five categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -70,8 +70,9 @@ The registry keeps the following concerns separate.
 
 A **persistent numeric format** defines the logical words needed to recover a numeric tensor from
 an artifact. The closed registry contains direct scalar formats, grouped signed-integer formats,
-the block-scaled `nvfp4` format, and the row-scaled `fp8_e4m3fn_row_bf16` format. It does not
-identify a tensor's model role, physical byte layout, or supported consumer.
+the block-scaled `nvfp4` and `nvfp4_mul` formats, the scaled FP8 weight formats
+`fp8_e4m3fn_row_bf16` and `fp8_e4m3fn_b128`, and the verbatim ggml block formats (Section 1). It
+does not identify a tensor's model role, physical byte layout, or supported consumer.
 
 ### 2.2 Direct scalar format
 
@@ -103,7 +104,7 @@ A **conversion method** produces the words of a selected format from a logical s
 selection, rounding order, calibration, clipping, and error optimization belong here. Methods
 may preserve an already encoded source or quantize floating-point values.
 
-The built-in `grouped_absmax` method implements the reference encoder in Section 7 for all four
+The built-in `grouped_absmax` method implements the reference encoder in Section 7 for all five
 grouped integer formats. `fp8_row_maxabs` rounds source values to BF16 and quantizes each row to
 E4M3FN codes with a BF16 multiplier. `import_encoded` preserves compatible FP8 or NVFP4 codes,
 scales, and, for NVFP4, the matrix weight divisor. `nvfp4_absmax` and `nvfp4_mse` quantize
@@ -139,11 +140,10 @@ among other things:
 - endianness and any layout-specific validation metadata.
 
 One format may have more than one deliberately supported layout, but every layout must decode to
-exactly the same direct words or logical codes and scales. The currently registered layouts are
-`contiguous_le_v1` for direct words, `row_split_k128_v1` for grouped signed-integer formats, and
-`block_scale_k16_m128x4_v1` for `nvfp4`, and `row_scale_v1` for
-`fp8_e4m3fn_row_bf16`. Their byte order, plane packing, padding, swizzle, divisor placement, and
-alignment rules belong to the layout registry, not to these nine numeric formats.
+exactly the same direct words or logical codes and scales. The registered layouts are enumerated
+by [Storage layouts](storage-layouts.md) Section 1. Their byte order, plane packing, padding,
+swizzle, divisor placement, and alignment rules belong to the layout registry, not to any numeric
+format.
 
 ### 2.7 Compute profile and kernel support
 
@@ -356,8 +356,9 @@ llama.cpp's `ggml-common.h` by `tools/artifact/codecs/generate_ggml_tables.py`, 
 writes the C++ and CUDA copies under `src/ops/ggml/`.
 
 The only producers are `import_ggml_rows`, which copies the GGUF rows, and
-`import_ggml_expert_bank`. The layouts are `ggml_rows_v1` (verbatim rows) and the expert-bank
-records `ggml_expert_iq4_nl_v1` and `ggml_expert_q2_0_v1` ([storage layouts §7, §8](storage-layouts.md#7-ggml_rows_v1)).
+`import_ggml_expert_bank`. The layouts are `ggml_rows_v1` (verbatim rows), its tiled form
+`ggml_tiles16_v1`, and the expert-bank records `ggml_expert_iq4_nl_v1` and `ggml_expert_q2_0_v1`
+([storage layouts §7, §8](storage-layouts.md#7-ggml_rows_v1)).
 In these records the format names the gate/up type and the layout names the down type.
 Consumers compute with BF16 activations in the exact arithmetic of
 [`src/ops/ggml/ggml_exact.h`](../../src/ops/ggml/ggml_exact.h) (A16 activations, an exact int128
@@ -392,7 +393,7 @@ in int128 relative to the row's smallest scale exponent, one binary32 rounding.
 
 ### 4.1 Shape and group axis
 
-For the four grouped signed-integer schemes, let a logical quantized weight tensor have rank
+For the five grouped signed-integer schemes, let a logical quantized weight tensor have rank
 `r >= 1`, a positive `K`, and shape:
 
 ```text
@@ -408,7 +409,7 @@ identifies an independent logical row. For a leading coordinate vector `p` and e
 group(p, k) = (p, floor(k / G))
 ```
 
-where `G` is 64 for Q4/Q5/Q6 and 32 for Q8. A group never crosses a row boundary or any leading
+where `G` is 64 for Q2/Q4/Q5/Q6 and 32 for Q8. A group never crosses a row boundary or any leading
 dimension. For a rank-3 expert bank `[E, N, K]`, for example, each `(expert, row)` pair is quantized
 independently; a group cannot cross from one expert to another.
 
@@ -560,7 +561,7 @@ The built-in `grouped_absmax` method uses per-row, per-group maximum absolute va
 implementation is in
 [`groupwise.py`](../../tools/convert/quantization/groupwise.py). The arithmetic below defines its
 exact output, including FP16 scale rounding and reciprocal-multiply code selection. It applies to
-the four grouped integer formats.
+the five grouped integer formats.
 
 The implementation accepts positive rank-two matrices, rejects non-finite source values and
 unrepresentable scales, and supplies zero tail padding for `row_split_k128_v1`.
@@ -604,8 +605,9 @@ else:
         code[i]       = clamp(rounded, qmin, qmax)
 ```
 
-`qmax`, not `abs(qmin)`, is the scale denominator. Thus Q4 uses 7, Q5 uses 15, Q6 uses 31, and Q8
-uses 127. The clamp happens after integral rounding. The Q8 result therefore never emits `-128`.
+`qmax`, not `abs(qmin)`, is the scale denominator. Thus Q2 uses 1, Q4 uses 7, Q5 uses 15, Q6 uses
+31, and Q8 uses 127. The clamp happens after integral rounding. The Q8 result therefore never
+emits `-128`.
 
 The integral rounding examples are:
 

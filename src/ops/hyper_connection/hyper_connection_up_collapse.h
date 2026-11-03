@@ -1,7 +1,7 @@
 #pragma once
 
 // The prefill route of hyper_connection_mix's up projection and collapse for Q8_G32_FP16 RowSplit
-// W_up (docs/maintainer/qwen3_8-flash-next-design.md §19.3.23): one Q8 MMA tile per (16 features x
+// W_up (docs/maintainer/qwen3_8-flash-next-design.md §3.1): one Q8 MMA tile per (16 features x
 // 4 streams, token block) computes u = W_up m and collapses it in the tile's epilogue, so u never
 // reaches global memory. Each u value accumulates over K in the order every Q8 MMA tile uses and is
 // rounded to BF16 before the collapse, as the composed route's linear + collapse do: the result is

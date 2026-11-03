@@ -148,7 +148,7 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix,
     // layouts.
     out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, std::nullopt, experts);
     // A bank whose use allows A4 is W4A4 and carries its activation scales; an A16-only bank is
-    // W4A16 (design §16.2.1) and has none.
+    // W4A16 (design §17.3) and has none.
     if (b.weights.at(out.experts.index).policy != ops::LinearPolicy::A16Only) {
         out.input_scales = b.parameter(p + "expert_input_scales", {e, 3}, {}, QType::FP32, Residency::Values);
     }
@@ -351,7 +351,7 @@ FrontendResources bind_resources(artifact::Binder& binder, const Config& config)
     return out;
 }
 
-// alpha = fl32(weight_scale_2 * input_scale) per matrix, from the stored words (design §6.1).
+// alpha = fl32(weight_scale_2 * input_scale) per matrix, from the stored words (design §6.3).
 std::vector<ops::offloaded_moe::ExpertScales> expert_scales(const ExpertBankPlanes& planes,
                                                            const artifact::HostValues& inputs,
                                                            const std::string& name) {
@@ -374,7 +374,7 @@ std::vector<ops::offloaded_moe::ExpertScales> expert_scales(const ExpertBankPlan
     return out;
 }
 
-// A W4A16 bank's scalars (design §16.2.1): no input scales, alpha = the stored multipliers.
+// A W4A16 bank's scalars (design §17.3): no input scales, alpha = the stored multipliers.
 std::vector<ops::offloaded_moe::ExpertScales> a16_expert_scales(const ExpertBankPlanes& planes, const std::string& name) {
     std::vector<ops::offloaded_moe::ExpertScales> out(planes.experts);
     for (std::uint32_t e = 0; e < planes.experts; ++e) {

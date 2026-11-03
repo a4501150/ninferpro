@@ -1,6 +1,6 @@
 #pragma once
 
-// Records the CPU miss service computes but no host bank holds (design §19.3.7, the SSD expert
+// Records the CPU miss service computes but no host bank holds (moe-offload-design.md §4.7, the SSD expert
 // tier): the service asks for each such expert as soon as it reads a request, computes the others,
 // then waits for these and computes them from the landed bytes. Implemented by the Program's tier.
 

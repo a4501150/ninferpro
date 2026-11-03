@@ -2,7 +2,7 @@
 
 // CPU narrow route of offloaded_sparse_moe: one routed expert of Qwen3.8-Flash-Next computed in
 // place from its host record, with the canonical W4A4 arithmetic of
-// docs/maintainer/qwen3_8-flash-next-design.md §16.2. Every ISA variant returns the same bits,
+// docs/maintainer/qwen3_8-flash-next-design.md §17.2. Every ISA variant returns the same bits,
 // and so does the GPU narrow route.
 
 #include "ops/common/canonical_math.h"
@@ -12,7 +12,7 @@
 
 namespace infernix::ops::offloaded_moe {
 
-// Record layout `nvfp4_expert_rg16_v1` (design §6.2).
+// Record layout `nvfp4_expert_rg16_v1` (design §6.3).
 inline constexpr int kHidden           = 2560;
 inline constexpr int kIntermediate     = 640;
 inline constexpr std::size_t kUnitBytes = 144;
@@ -30,12 +30,12 @@ inline constexpr int kMaxColumns          = 8;                              // n
 
 // Software prefetch distance in bytes along a matrix's unit stream (0 disables it). The best value
 // depends on the host's memory latency and core speed; infernix-calibrate measures it on the target
-// (design §14.2). This default is only a starting point, not a tuned value.
+// (design §18.1). This default is only a starting point, not a tuned value.
 inline constexpr int kDefaultPrefetchBytes = 2048;
 
 static_assert(kRecordBytes == 675 * 4096);
 
-// Per-expert scalars from the checkpoint (design §6.1). alpha = fl32(weight_scale_2 * input_scale)
+// Per-expert scalars from the checkpoint (design §6.3). alpha = fl32(weight_scale_2 * input_scale)
 // is derived once by the loader, so every route reads the same words.
 struct ExpertScales {
     float input_gate;
@@ -47,12 +47,12 @@ struct ExpertScales {
 };
 
 // The activation arithmetic of a layer's experts, fixed by the artifact: W4A4 with each matrix's
-// stored input scale (§16.2), or W4A16 for experts stored without activation scales (§16.2.1,
+// stored input scale (§17.2), or W4A16 for experts stored without activation scales (§17.3,
 // w4a16_expert.h), whose ExpertScales hold zero input scales and the multipliers in alpha_*.
 enum class ExpertActivation : std::uint8_t { kA4, kA16 };
 
-// The wide route of 16-bit-activation experts (design §19.3.23, §19.3.29): kExact, the exact limb
-// arithmetic of §16.2.1 / §16.2.2; kA4Residual (NVFP4 W4A16 banks), a fast path that rounds each x and h
+// The wide route of 16-bit-activation experts (design §13.4, §13.5): kExact, the exact limb
+// arithmetic of §17.3; kA4Residual (NVFP4 W4A16 banks), a fast path that rounds each x and h
 // row to two NVFP4 terms (the row's NVFP4 and the NVFP4 of its remainder, one FP32 row scale) and runs
 // them on the FP4 Tensor Cores, so its outputs depend on that rounding and on the tensor core's FP32
 // order, not only on the weights; kGgmlBf16 (GGUF banks, the ggml-bf16-prefill fast path), BF16 tiles

@@ -1,11 +1,11 @@
 #pragma once
 
 // Exact arithmetic over GGUF (ggml) block formats (docs/maintainer/qwen3_8-flash-next-design.md
-// §16.2.2). Shared by the GPU kernels and the CPU engine: every function returns identical bits on both.
+// §17.3). Shared by the GPU kernels and the CPU engine: every function returns identical bits on both.
 //
 // A weight is kappa * (d * sub * code - dmin * min_sub): an integer code, an integer sub-scale, a
 // binary16 block scale (and a second term for Q4_K/Q5_K) and a power-of-two format constant. An
-// activation column is the A16 encoding of design §16.2.1 (ops::canon::a16_value): integers X with
+// activation column is the A16 encoding of design §17.3 (ops::canon::a16_value): integers X with
 // v = X * 2^(emax - 147). With d = mant * 2^(e - 25) (e >= 1; subnormals take e = 1), one output is
 //
 //   R = sum over 8-element chunks of mant(d) * sub * (sum code * X) * 2^(e(d) - 1)

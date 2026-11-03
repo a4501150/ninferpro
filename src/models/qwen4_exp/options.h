@@ -35,7 +35,7 @@ void validate_draft_backend(const EngineOptions& options);
 void validate_draft_min_p(const EngineOptions& options);
 
 // The family's prefix-cache tier rules and defaults: its snapshots are born in the Host tier, or
-// without one written through to the Disk tier (design §19.3.1); it has no Device snapshot slots,
+// without one written through to the Disk tier (design §15.6); it has no Device snapshot slots,
 // no tool-call holds, and the Disk tier's default capacity (the shared normalize filled nothing
 // it owns here, so this runs at the cache block's family point).
 void resolve_cache(ContextCacheOptions& cache, const EngineOptions& options, std::uint32_t concurrency,

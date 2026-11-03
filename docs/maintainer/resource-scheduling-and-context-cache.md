@@ -1,4 +1,4 @@
-# Infernix Resource Scheduling and Context Cache
+# ninferpro Resource Scheduling and Context Cache
 
 This document explains how Generation coordinates request execution, prefix reuse and preemption
 recovery within limited device memory and Host RAM, and it is the design authority for these
@@ -9,12 +9,14 @@ layout, page tables and consumer constraints are in [Paged KV](paged-kv-cache.md
 
 ## 1. Core idea
 
-Infernix runs on a single GPU with a single resident model and 1–8 execution slots fixed at startup.
+The engine runs on a single GPU with a single resident model and 1–8 execution slots fixed at startup.
 For a Hybrid model to reuse a prefix, it needs the complete recurrent state at that position and
 contiguous KV coverage. KV can be shared page by page, while recurrent state is a complete image of
 one position. The prefix cache therefore keeps content-addressed 64-token KV blocks in one radix
 tree and sparse StateImage snapshots at chosen positions of it, on the Device and in a pinned Host
-tier; an admitted request starts from the deepest snapshot its prompt reaches.
+tier — for Qwen3.8-Flash-Next also a Disk tier
+([spec §17.1](hybrid-prefix-cache-spec.md#171-tiers-vram-ram-and-disk)); an admitted request starts
+from the deepest snapshot its prompt reaches.
 
 Ordinary execution reserves resources incrementally for the next unit. When the working set grows
 beyond what can be resident together, cached blocks are evicted first; then younger requests are
@@ -141,7 +143,8 @@ uses the remaining headroom to try fresh admission.
 It executes the permitted compact Control/Decode set and one Prefill/Replay chunk; rows committed by
 Control reacquire Decode permits in the next cycle. A Program with mixed rounds (Qwen3.8-Flash-Next)
 runs the Prefill chunk inside the Decode round's Forward when it can (`Program::can_mix`: not the
-prompt's last call, a layer walk's, a replay's or an image prompt's, and no context transaction open):
+prompt's last call, a layer walk's, a replay's or an image prompt's, not an MTP or a scoring
+Program, and no context transaction open — under `--spec mtp` no mixed round runs at all):
 one call, whose pending batch holds the decode rows only, then the chunk's progress. Graphs use the actual member count and execution
 profile. With the `idle-wide-prefill` fast path a Prefill permit reserved while no other lane is
 generating covers the startup-planned idle width (a multiple of the chunk) instead of one chunk,

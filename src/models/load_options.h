@@ -19,7 +19,7 @@ struct LoadOptions {
     // Every Use binds A16Only, whatever activation precision the artifact permits.
     bool a16_activations = false;
     // Qwen4Exp: the routed expert banks stay in the artifact and are read in place by the SSD
-    // expert tier (design §19.3.7) instead of being pinned in host memory.
+    // expert tier (design §9.5) instead of being pinned in host memory.
     bool stream_experts = false;
     // Qwen4Exp DFlash2: the companion artifact of the drafter (SpeculativeOptions::draft_model).
     std::filesystem::path draft_model;
@@ -69,7 +69,7 @@ struct LoadOptions {
 }
 
 // --vision-offload auto: on for Qwen4Exp, whose expert cache lends the encode window's device
-// memory (design §19.3.2); off for Qwen3.5, which borrows it from an evictable weight ladder.
+// memory (design §16.5); off for Qwen3.5, which borrows it from an evictable weight ladder.
 [[nodiscard]] constexpr bool resolve_vision_offload(VisionOffload mode, Architecture architecture) noexcept {
     return mode == VisionOffload::On || (mode == VisionOffload::Auto && architecture == Architecture::Qwen4Exp);
 }

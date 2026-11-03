@@ -1,6 +1,6 @@
 """Two-level replay of the Qwen3.8-Flash-Next routed-expert tiers: VRAM frames, pinned host (RAM)
 slots, and the artifact on SSD read in place (memory track, docs/maintainer/qwen3_8-flash-next-design.md
-section 19.3.7, measurement RM0f). Python 3.11+ with numpy.
+section 9, measurement RM0f). Python 3.11+ with numpy.
 
 Input: route traces written by the engine's internal route trace (ProgramOptions::route_trace; the
 format is documented in src/models/offload/route_trace.h), captured with
@@ -76,7 +76,7 @@ PREFILL_CLOCK_MAX = 16
 DEMOTION_FACTOR = 1.25
 PREFETCH_FACTOR = 1.25
 PREFETCH_MAX = 512
-EARLY_TOKENS = 256  # design §17 H8: the hit rate of the first decode tokens after a prompt
+EARLY_TOKENS = 256  # design §18.2: the hit rate of the first decode tokens after a prompt
 UNKNOWN_POSITION = 0xFFFFFFFF
 
 PREFILL, FORCED, DECODE, VERIFY, GRAPH = 0, 1, 2, 3, 4
@@ -476,7 +476,7 @@ class TierSim:
     def _seed_prompt(self, rounds):
         """ExpertResidency::seed_prompt at a prompt's end: each key gains credit x (its counted tokens /
         the counted tokens), used now (no clock tick). The engine seeds credit 256 over every prompt
-        token with no admissions (design §19.3.27); `budget` (full mode only) and `window` are this
+        token with no admissions (design §9.2); `budget` (full mode only) and `window` are this
         replay's alternatives: up to `budget` of each layer's credited misses admitted where they
         outrank the lowest resident outside the layer's credited keys, and only the prompt's last
         `window` tokens counted."""

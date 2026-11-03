@@ -156,7 +156,7 @@ public:
         }
     }
 
-    // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7)
+    // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §9.1)
     // asks for maintain() through a waker; the idle worker runs it under the execution lock.
     static constexpr bool kProgramMaintains = requires(typename Instance::ModelContract::Program& program) {
         program.maintain();

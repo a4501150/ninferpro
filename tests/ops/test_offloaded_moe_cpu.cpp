@@ -1,5 +1,5 @@
 // Canonical W4A4 arithmetic and the CPU narrow route of offloaded_sparse_moe
-// (docs/maintainer/qwen3_8-flash-next-design.md §16.2). Host-only: needs no GPU.
+// (docs/maintainer/qwen3_8-flash-next-design.md §17.2). Host-only: needs no GPU.
 //
 // Oracles:
 //   - E4M3FN / E2M1 encoders against nearest-value enumeration of the code grids;

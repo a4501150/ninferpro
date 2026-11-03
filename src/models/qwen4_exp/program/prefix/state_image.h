@@ -1,7 +1,7 @@
 #pragma once
 
 // The packed state image of one Qwen4Exp lane at a frontier (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.1): every byte of the lane's GDN recurrent and convolution state, PLE convolution history,
+// §15.1): every byte of the lane's GDN recurrent and convolution state, PLE convolution history,
 // QSA raw-key tails and drafter state that its KV pages do not hold. Parts follow the forward pass, so
 // a restore lands each decoder layer's state as one group the forward pass can wait for on its own:
 //

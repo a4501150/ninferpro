@@ -1,13 +1,13 @@
 #pragma once
 
 // GPU narrow route of offloaded_sparse_moe (docs/maintainer/qwen3_8-flash-next-design.md §8.5,
-// §16.2): routed experts with n <= 8 token columns, computed from `nvfp4_expert_rg16_v1` records
+// §17.2): routed experts with n <= 8 token columns, computed from `nvfp4_expert_rg16_v1` records
 // with the canonical W4A4 arithmetic. The output bits equal the CPU engine's
 // (cpu/w4a4_expert.h) for every record, scale and input.
 //
 // This is the first, correctness-first form of K7a/K7b: a quantize kernel, a gate/up kernel with
 // one CTA per 16-intermediate unit and dp4a products, and a down kernel. It has no landing
-// tickets, PDL, persistent scheduling, shared-memory weight ring or combine yet (§8.5 lists them).
+// tickets, PDL, persistent scheduling, shared-memory weight ring or combine yet.
 
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"

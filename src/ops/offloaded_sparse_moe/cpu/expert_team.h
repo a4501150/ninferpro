@@ -1,6 +1,6 @@
 #pragma once
 
-// The CPU expert engine's worker team (docs/maintainer/qwen3_8-flash-next-design.md §10.3).
+// The CPU expert engine's worker team (docs/maintainer/moe-offload-design.md §5.3).
 //
 // A round runs phases separated by barriers, each handing out work through an atomic counter so
 // that faster cores (P-cores on hybrid CPUs) take more of it: A4 quantization (A16 encoding) of every
@@ -51,7 +51,7 @@ public:
         CpuIsa isa          = best_cpu_isa();
         int max_jobs        = 16; // per round
         int spin_iterations = 1 << 16; // pause-loop iterations before parking
-        int prefetch_bytes  = kDefaultPrefetchBytes; // calibrated on the target (§14.2)
+        int prefetch_bytes  = kDefaultPrefetchBytes; // calibrated on the target (§18.1)
         ExpertActivation activation = ExpertActivation::kA4; // of every job's expert
         bool ggml = false; // jobs may be GGUF records (ggml_expert.h; activation kA16)
         std::vector<int> cpus;         // optional: CPU of worker i (worker 0 is the caller, not pinned)

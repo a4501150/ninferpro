@@ -21,7 +21,7 @@ __global__ void spin_kernel(long long cycles, const volatile unsigned* stop) {
 
 // The warm-up's length. Copies alone did not bring the link to its top PCIe generation: probes of a
 // warm-up copy and three timed ones measured 3.0 GB/s (once 12.0, the Gen2 and Gen4 x8 rates) on a
-// Gen5 x8 link in about one IQ3_S startup in seven; with the SMs busy, 0 of 60 (design §19.3.26).
+// Gen5 x8 link in about one IQ3_S startup in seven; with the SMs busy, 0 of 60 (design §10.4).
 constexpr float kWarmMilliseconds = 200.0F;
 
 } // namespace

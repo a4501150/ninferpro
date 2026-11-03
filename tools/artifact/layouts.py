@@ -360,7 +360,7 @@ def expert_bank_geometry(
     """Geometry of a routed-expert bank ``[experts, hidden, intermediate]``.
 
     Each record holds the gate/up matrix (rows interleaved gate_i, up_i) and then the down
-    matrix, as 16-row groups of 144-byte units (design §6.2). Records are padded to 4 KiB so
+    matrix, as 16-row groups of 144-byte units (design §6.3). Records are padded to 4 KiB so
     each one is a single aligned DMA and ``O_DIRECT`` range.
     """
 

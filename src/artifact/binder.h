@@ -11,7 +11,7 @@
 namespace infernix::artifact {
 
 // Streamed: located but never materialized; the runtime reads the object in place from the
-// artifact's files (MaterializedArtifact::stream_source, design §19.3.7 SSD tier).
+// artifact's files (MaterializedArtifact::stream_source, design §9.5 SSD tier).
 enum class Residency { Device, Host, Values, HostPinned, Streamed };
 
 struct ParameterReference {

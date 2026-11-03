@@ -1,13 +1,13 @@
 #pragma once
 
 // Exact W8A16 arithmetic over block-scaled FP8 (fp8_e4m3fn_b128: Qwen's official FP8 experts;
-// docs/maintainer/qwen3_8-flash-next-design.md §16.2.2). Shared by the GPU kernels and the CPU
+// docs/maintainer/qwen3_8-flash-next-design.md §17.3). Shared by the GPU kernels and the CPU
 // engine: every function returns identical bits on both.
 //
 // A weight is e4m3fn(c) * s with one BF16 scale s = mant(s) * 2^(E(s) - 134) per 128 x 128 tile
 // (mant in [128, 255], biased exponent E in [1, 254]; the converter refuses other scales). Every
 // E4M3FN value is w * 2^-9 with an integer |w| <= 14 * 2^14 < 2^18 (fp8_int). An activation column
-// is the A16 encoding of design §16.2.1 (ops::canon::a16_value): integers X, |X| < 2^21, with
+// is the A16 encoding of design §17.3 (ops::canon::a16_value): integers X, |X| < 2^21, with
 // v = X * 2^(emax - 147). For one row, with E_min the smallest scale exponent of its tiles:
 //
 //   P_t = sum over tile t's 128 elements of w * X                 exact int64 (< 2^46)

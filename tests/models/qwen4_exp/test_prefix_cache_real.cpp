@@ -1,4 +1,4 @@
-// Qwen4Exp prefix cache on the real artifact (design §19.3.1). Skips unless INFERNIX_QWEN4_ARTIFACT
+// Qwen4Exp prefix cache on the real artifact (design §15). Skips unless INFERNIX_QWEN4_ARTIFACT
 // names a Qwen4Exp artifact (INFERNIX_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram).
 // INFERNIX_QWEN4_KV selects the KV storage (bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2; default int8).
 // One Engine per drafter mode serves every scenario, so the 64.5 GiB model loads once per mode:

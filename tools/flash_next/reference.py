@@ -9,7 +9,7 @@ artifact or converter:
 
 - every dense and BF16 tensor is widened exactly and every product is formed in binary64;
 - routed experts use NVIDIA's NVFP4 words, decoded exactly, with activations quantized to A4 by the
-  ModelOpt rule (design §16.2) on BF16 inputs with each matrix's own ``input_scale``;
+  ModelOpt rule (design §17.2) on BF16 inputs with each matrix's own ``input_scale``;
 - the PLE n-gram rows are read as stored: BF16 rows (the BF16 PLE) exactly, or NVIDIA's FP8 codes
   times the layer's BF16 scale, rounded to BF16.
 
@@ -108,7 +108,7 @@ def _e2m1_rn(v: torch.Tensor) -> torch.Tensor:
     """FP32 -> E2M1 value, round-to-nearest-even with saturation to 6 (ties to the even code)."""
     a = v.abs()
     grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
-    # Boundaries between grid values with the tie rule of design §16.2 (<= keeps the even code).
+    # Boundaries between grid values with the tie rule of design §17.2 (<= keeps the even code).
     code = torch.zeros_like(a, dtype=torch.int64)
     code = torch.where(a > 0.25, 1, code)
     code = torch.where(a >= 0.75, 2, code)
@@ -121,7 +121,7 @@ def _e2m1_rn(v: torch.Tensor) -> torch.Tensor:
 
 
 def a4_dequantized(x_bf16: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:
-    """ModelOpt NVFP4 activation rule in exact FP32 (design §16.2), returned dequantized in FP64:
+    """ModelOpt NVFP4 activation rule in exact FP32 (design §17.2), returned dequantized in FP64:
     s = e4m3(amax / fl(6 g)); d = fl(e4m3(s) * g); code = e2m1(v / d); value = code * d."""
     g = input_scale.to(torch.float32)
     v = x_bf16.to(torch.float32).reshape(*x_bf16.shape[:-1], -1, 16)
@@ -201,7 +201,7 @@ class Vision:
     The patch layout, the 48x48 position-table bilinear interpolation (align-corners), the
     LayerNorms, the 2-D rope (per-axis theta 1e4 over 36 dims each, dims 0..35 mirroring
     36..71), the per-frame non-causal attention, the 2x2 merger and its exact GELU follow the
-    checkpoint's vision_config and Infernix's contract notes (design §19.3.2), written from
+    checkpoint's vision_config and Infernix's contract notes (design §16), written from
     those definitions, not from Infernix's kernels."""
 
     def __init__(self, weights: Weights, *, bf16_boundaries: bool = True):

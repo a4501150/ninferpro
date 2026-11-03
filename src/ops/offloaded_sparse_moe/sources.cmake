@@ -1,4 +1,5 @@
-# Host side of offloaded_sparse_moe (docs/maintainer/qwen3_8-flash-next-design.md §10, §16.2).
+# Host side of offloaded_sparse_moe (docs/maintainer/moe-offload-design.md §5; the canonical
+# arithmetic is qwen3_8-flash-next-design.md §17.2's).
 # A plain C++ archive: the CPU expert engine needs no CUDA, and its canonical arithmetic must be
 # compiled without floating-point contraction or fast-math on every compiler.
 add_library(infernix_offloaded_moe_cpu STATIC

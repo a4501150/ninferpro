@@ -161,7 +161,7 @@ constexpr std::array kQualified{
     // floor), 256 segments: TV bound 9.3e-4. BF16 KV fails, alone as with gdn-f16-accumulate: there the
     // exact route is the reference (floor 0), and either path alone moves prefill by KL 5.5-5.9e-3 and
     // decode by TV 4.0-4.2e-3 (2026-10-19). Timed on INT8 against the exact route: pp32768 +33 %,
-    // pp65536 +44 % (design §19.3.29); no KV format enters its kernels.
+    // pp65536 +44 % (design §13.5); no KV format enters its kernels.
     Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Nvfp4Group16}},

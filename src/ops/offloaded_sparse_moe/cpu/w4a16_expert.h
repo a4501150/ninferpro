@@ -2,7 +2,7 @@
 
 // CPU narrow route of offloaded_sparse_moe for experts stored without activation scales: one routed
 // expert of Qwen3.8-Flash-Next computed in place from its `nvfp4_expert_rg16_v1` host record with
-// the canonical W4A16 arithmetic of docs/maintainer/qwen3_8-flash-next-design.md §16.2.1. Every ISA
+// the canonical W4A16 arithmetic of docs/maintainer/qwen3_8-flash-next-design.md §17.3. Every ISA
 // variant returns the same bits, and so does the GPU narrow route.
 //
 // The record layout, ISA selection and per-expert scalars are those of the W4A4 route

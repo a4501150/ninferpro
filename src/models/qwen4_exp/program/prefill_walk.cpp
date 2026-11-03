@@ -1,4 +1,4 @@
-// The layer walk of Qwen4Exp's prefill (docs/maintainer/qwen3_8-flash-next-design.md §19.3.8 F4):
+// The layer walk of Qwen4Exp's prefill (docs/maintainer/qwen3_8-flash-next-design.md §13.2):
 // a span of consecutive streamed calls of one prompt runs layer-major, so each decoder layer's
 // non-resident experts cross PCIe once per span instead of once per call. A chunk-major prompt of
 // 4,096-token calls re-streams nearly every non-resident expert for every call (~51 GB at the x8
@@ -491,7 +491,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     // records, ~1.2 s of link per 64K span) and the next span would wait for them. After the
     // prompt they would fill the returned frames with the prompt's experts while the answer's own
     // staged misses land there anyway: 16 per layer and chunk measured slower than none for every
-    // answer length (128K + 512 tokens: 23.16 -> 21.10 s; design §19.3.17).
+    // answer length (128K + 512 tokens: 23.16 -> 21.10 s; design §13.7).
     return prefill_progress(lane, index, begin, width, tokens, last, 0, start);
 }
 

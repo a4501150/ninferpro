@@ -1,6 +1,6 @@
 #pragma once
 
-// QSA block selection (docs/maintainer/qwen3_8-flash-next-design.md §8.10, §19.3.6 item 2): the
+// QSA block selection (docs/maintainer/qwen3_8-flash-next-design.md §14.1, §3.1): the
 // exact top-(budget / ratio) pooled blocks of every column, the internal stage of qsa_attention.
 //
 // Semantics (unchanged by the multi-CTA kernels): column t at absolute position p sees the
@@ -31,7 +31,7 @@
 //      buffer). CTAs split each column, add their histograms into a global one and the last arriving
 //      CTA finishes the column (linear_topk's split-and-merge structure). An 8-CTA cluster per
 //      column exchanging its state through distributed shared memory was measured and dropped
-//      (design §19.3.6 item 2, step Q2: slower at every context).
+//      (design §3.2, step Q2: slower at every context).
 // Every launch is stream-ordered (programmatic dependents when captured) and keeps no state
 // between calls, so it captures into CUDA Graphs and replays with new positions.
 
@@ -58,7 +58,7 @@ struct QsaSelectOutput {
 
 /// index_q: BF16 [Di, index_heads, T] from qsa_index_query; pooled_pages: the layer's BF16 pooled
 /// plane holding every block the columns see; `spaces`: the layer's pages outside the pool, whose
-/// pooled keys live in spaces.pooled (design §19.3.11; none by default).
+/// pooled keys live in spaces.pooled (design §14.4; none by default).
 void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatch& batch,
                 const QsaGeometry& geometry, std::int32_t max_context, void* scratch,
                 std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream,

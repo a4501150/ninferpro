@@ -1,12 +1,12 @@
 #pragma once
 
-// The VRAM expert cache of the Qwen4Exp Program (docs/maintainer/qwen3_8-flash-next-design.md
-// §9): pools of device frames, each frame holding one routed expert's record, the per-layer frame
-// tables the MoE kernels read (frame or -1: read the pinned bank zero-copy), the route log of every
-// round, and the LFRU policy (expert_cache::CacheController) that decides promotions and evictions
-// at round boundaries.
+// The VRAM expert cache the offload tier provides and each family's Program composes
+// (docs/maintainer/moe-offload-design.md §4): pools of device frames, each frame holding one
+// routed expert's record, the per-layer frame tables the MoE kernels read (frame or -1:
+// read the pinned bank zero-copy), the route log of every round, and the LFRU policy
+// (expert_cache::CacheController) that decides promotions and evictions at round boundaries.
 //
-// Pools (size classes; docs/maintainer/qwen3_8-flash-next-design.md §19.3.25). The layers whose
+// Pools (size classes; moe-offload-design.md §4.2). The layers whose
 // records share a stride share a pool: its frames have that pitch, and its own LFRU decides among
 // its layers' experts. An NVFP4 or block-FP8 artifact has one pool; a GGUF import's layers have up
 // to seven record sizes. Frames are sized as average frames (frame_bytes(), the mean of the layers'
@@ -19,9 +19,9 @@
 // before the next round, and the promotions' copies run on a copy stream that first waits for that
 // table update, so no kernel can read a frame while it is overwritten. A promoted expert becomes
 // visible in its table only after its copy has completed. Expert outputs are placement-invariant
-// (design §16.2), so the round a promotion lands in does not change any result.
+// (design §17.2), so the round a promotion lands in does not change any result.
 //
-// SSD tier (design §19.3.7, attach_tier). The banks are not in RAM: a key's record is in a frame, in
+// SSD tier (moe-offload-design.md §4.6-§4.7, attach_tier). The banks are not in RAM: a key's record is in a frame, in
 // a RAM slot of the HostExpertTier, or only in the artifact. The residency then keeps a per-layer
 // table of host record pointers (null: SSD-only) beside the frame table, uploaded with it before
 // each round after the tier's boundary; promotions copy from RAM slots, pinned in the tier while
@@ -33,7 +33,7 @@
 // publishes the slot and frees the frame. Evictions the gate refuses stop that layer's admissions.
 // Lending and resizing finish pending demotions first and drop, not demote, their victims.
 //
-// Size. Each pool's frames live in a VMM arena whose base never moves (design §19.3.7): resize()
+// Size. Each pool's frames live in a VMM arena whose base never moves (moe-offload-design.md §4.2): resize()
 // backs more frames chunk by chunk, or releases the top chunks after evicting the lowest-score
 // experts and moving the survivors below the new top, so kernels and captured graphs keep their
 // addresses. Without VMM the frames are one allocation per pool of the first size.
@@ -74,11 +74,11 @@ public:
         std::uint64_t demotions      = 0; // SSD tier: VRAM victims copied to RAM (T4)
         std::uint64_t unpinned_promotions = 0; // SSD tier: promotions of unpinned records (bounced)
     };
-    // Landing frames per layer and round (design §19.3.5 S4): free frames are reserved before a
+    // Landing frames per layer and round (moe-offload-design.md §4.4): free frames are reserved before a
     // decode or verification round, the round's forked MoE calls copy their first staged misses
     // into them instead of staging slots, and the round's settle adopts them as resident.
     static constexpr std::uint32_t kLandingSlots = 16;
-    // LFRU counts halve every this many ticks (layer calls, ~170 plain rounds; design §9.3): on
+    // LFRU counts halve every this many ticks (layer calls, ~170 plain rounds; moe-offload-design.md §4.3): on
     // greedy decode traces of 14 mixed requests, 9-12 % fewer misses than never halving. A pool
     // ticks once per call of its layers, so its period is this share of its layers.
     static constexpr std::uint32_t kLfruHalvingPeriod = 8192;
@@ -124,7 +124,7 @@ public:
     // refuses or places in system memory (`vram` tells), and fills the new frames from the queue.
     // Without VMM only the first call allocates.
     Resize resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram);
-    // Frame lending (design §19.3.2, "Frame lending"): a contiguous run of one pool's frames serves
+    // Frame lending (moe-offload-design.md §4.5, "Frame leases"): a contiguous run of one pool's frames serves
     // another use of device memory (the prefill stream's ring and areas, the Vision window) and
     // comes back. Lent frames hold no expert and are never resized; decode graphs reach frames
     // through the tables, so lending invalidates none.
@@ -176,7 +176,7 @@ public:
     void quiesce_tier(cudaStream_t compute);
     [[nodiscard]] bool tiered() const noexcept { return tier_ != nullptr; }
 
-    // Resident placement (design §19.3.7; --vram-experts auto / the resident default): the pools
+    // Resident placement (moe-offload-design.md §4.8; --vram-experts auto / the resident default): the pools
     // hold every routed expert and nothing may take a frame -- no lease (the wide workspace falls
     // back to a temporary allocation), no resize (the VRAM monitor is off) and no KV growth from
     // the frames (the KV pool is fully mapped at startup). lend() returns an invalid lease.
@@ -264,11 +264,11 @@ public:
     // round's routes and issues their evictions and promotions. `per_layer_budget` caps the
     // promotions one layer's routes may start. A non-empty `live` (one flag per column) credits
     // only the flagged columns' experts: a verification round's rejected draft columns neither
-    // count as uses nor start promotions (design section 11.3). A layer's landed experts are adopted
+    // count as uses nor start promotions (design section 9.3). A layer's landed experts are adopted
     // first and use up its budget: max(0, per_layer_budget - landed) promotions remain.
     void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
                      std::span<const std::uint8_t> live = {});
-    // At a prompt's end (design §19.3.27): every key with uses[key] > 0 (the prompt's tokens that
+    // At a prompt's end (moe-offload-design.md §4.3): every key with uses[key] > 0 (the prompt's tokens that
     // routed to it, [layers][experts]) gains `scale * uses[key]` of LFRU count, used now. Nothing is
     // copied: the credit ranks the decode's admissions and evictions.
     void seed_prompt(std::span<const std::uint32_t> uses, double scale);

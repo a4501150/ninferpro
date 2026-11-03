@@ -1,4 +1,4 @@
-// NgramVolume::read_rows on a synthetic volume (n-gram step S1, design §19.3.4). The oracle is the
+// NgramVolume::read_rows on a synthetic volume (n-gram step S1, design §12.3). The oracle is the
 // closed-form row contents f(r, k), never the volume: random rows, duplicates and rows sharing a block
 // read each distinct block once (counters), more than 64 distinct blocks wrap the ring, a second
 // call hits the host cache, two rows of one cache slot both return their own bytes, a row past the

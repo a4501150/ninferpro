@@ -8,7 +8,7 @@
 // overlaps and the memory stays bounded. A call with many distinct blocks (a prefill chunk: tens of
 // thousands) splits them over kReadThreads threads with a kParallelInFlight-block ring each: one
 // thread submitting overlapped reads reaches ~220K reads/s on an Optane P5800X, eight threads at
-// depth 16 ~880K (fn/probes/ioring_bench.cpp; the volume must not be mapped, design §19.3.8 F9).
+// depth 16 ~880K (fn/probes/ioring_bench.cpp; the volume must not be mapped, design §12.3).
 
 #include "core/host_memory.h"
 #include "core/read_only_file.h"

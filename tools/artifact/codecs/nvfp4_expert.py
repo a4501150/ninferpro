@@ -3,7 +3,7 @@
 A bank ``[experts, hidden, intermediate]`` stores, per expert, the gate/up matrix with rows
 interleaved (row 2i = gate_i, row 2i+1 = up_i) and then the down matrix. Both are 16-row groups
 of 144-byte units, one per 16-element K block, ordered row group major (design
-docs/maintainer/qwen3_8-flash-next-design.md §6.2):
+docs/maintainer/qwen3_8-flash-next-design.md §6.3):
 
 - 128 code bytes as four 32-byte quads; in quad q, byte j holds row ``j // 4`` (low nibble) and
   row ``8 + j // 4`` (high nibble) at ``k = 16 b + 4 q + j % 4``;

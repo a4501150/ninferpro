@@ -1,6 +1,6 @@
 #pragma once
 
-// Page-id translation of QsaPageSpaces (infernix/ops/qsa.h; design §19.3.11) for QSA's kernels: a
+// Page-id translation of QsaPageSpaces (infernix/ops/qsa.h; design §14.4) for QSA's kernels: a
 // block-table page id names a pool page, a host page or a lent page, and each space has its own
 // planes of the pool's geometry.
 

@@ -255,7 +255,7 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     hyper_connection_gates(z, rank, streams, m, inject, stream);
     if (invariant ? detail::hc_up_collapse_supported(up, hidden, streams)
                   : detail::hc_up_collapse_preferred(up, hidden, streams, T)) {
-        // Q8 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §19.3.23).
+        // Q8 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §3.1).
         detail::hc_up_collapse(m, up, normalized, streams, x, stream);
         return;
     }

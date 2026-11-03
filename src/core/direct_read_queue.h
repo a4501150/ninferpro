@@ -11,7 +11,7 @@
 namespace infernix {
 
 // Asynchronous unbuffered reads of file byte ranges into caller memory, for reading expert records
-// from an artifact in place (design §19.3.7, the SSD expert tier). Files are opened unbuffered and
+// from an artifact in place (design §9.5, the SSD expert tier). Files are opened unbuffered and
 // without write sharing, so an in-place rewrite fails for the writer while a reader holds them.
 //
 // Reads are of two classes: demand reads are issued before prefetch reads, and each class has its

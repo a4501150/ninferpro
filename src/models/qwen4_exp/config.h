@@ -70,7 +70,7 @@ struct MoeConfig {
     std::uint32_t intermediate        = 0;
     std::uint32_t shared_intermediate = 0;
     // The routed experts' arithmetic, from the stored representation (parse_config): W4A16 when the
-    // banks carry no activation scales (design §16.2.1), else W4A4 (§16.2).
+    // banks carry no activation scales (design §17.3), else W4A4 (§17.2).
     bool a16_experts = false;
 };
 
@@ -93,7 +93,7 @@ struct QsaConfig {
 };
 
 // The n-gram table volume written beside the artifact (design §12.2): FP8 E4M3FN rows with one
-// per-tensor scale, a GGUF's IQ4_NL rows (design §12.5), or the unquantized table's BF16 rows (an exact
+// per-tensor scale, a GGUF's IQ4_NL rows (design §12.2), or the unquantized table's BF16 rows (an exact
 // conversion bound to a BF16 volume). Any volume of the model's table, in any of the three formats,
 // may replace the artifact's at run time (resolve_ngram_volume).
 enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16 };
@@ -208,7 +208,7 @@ struct Config {
     std::optional<DFlash2Config> dflash2; // the DFlash2 drafter is bound (--spec dflash2 --draft-model)
     std::uint32_t proposal_rows = 0; // rows of the bound proposal head (--lm-head-draft), else 0
     // The Vision tower (--vision): Qwen3.5's tower except its output width, which the merger's
-    // bound fc2 gives (design §19.3.2).
+    // bound fc2 gives (design §16).
     std::optional<qwen_common::VisionConfig> vision;
 };
 
@@ -220,7 +220,7 @@ struct Config {
 [[nodiscard]] DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const TextConfig& target);
 
 // The offload tier's view of this family's expert banks (models/offload/geometry.h): 48 routed
-// layers of 512 NVFP4 experts, 8 routed per token per layer.
+// layers of 512 NVFP4 experts, 10 routed per token per layer.
 [[nodiscard]] inline offload::ExpertBankGeometry bank_geometry(const TextConfig& config) noexcept {
     return {.banks = config.num_hidden_layers, .experts_per_bank = config.moe.experts,
             .top_k = config.moe.top_k};

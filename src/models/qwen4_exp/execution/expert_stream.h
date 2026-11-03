@@ -1,6 +1,6 @@
 #pragma once
 
-// Prefill expert streaming (docs/maintainer/qwen3_8-flash-next-design.md §19.3.8 F2): the records of a
+// Prefill expert streaming (docs/maintainer/qwen3_8-flash-next-design.md §13.3): the records of a
 // prefill chunk's non-resident experts reach the device by copy-engine DMA, two layers ahead, into a
 // ring of borrowed device memory (F3: frames lent by the expert cache), instead of through the MoE's
 // staging kernel, which reads pinned memory with the SMs at about two thirds of the link rate and
@@ -21,7 +21,7 @@
 // The ring's first bytes hold the chunk's slot tables (I32 [layers][experts]: slot or -1), so the
 // stream owns no device memory of its own.
 //
-// Gated chunks (design §19.3.12, a short prompt's CPU share) copy nothing ahead: once a layer's
+// Gated chunks (design §10.6, a short prompt's CPU share) copy nothing ahead: once a layer's
 // routing is known, plan_layer copies only the experts the call routes that are neither resident
 // nor left to the CPU, and uploads the layer's slot table with them.
 //

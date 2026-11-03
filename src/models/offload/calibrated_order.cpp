@@ -1,6 +1,6 @@
 // The calibrated expert order of Qwen3.8-Flash-Next (48 layers x 512 routed experts): each layer's
 // experts from the highest cache priority to the lowest. A cold start without a saved expert state
-// seeds the VRAM frames and the SSD tier's RAM from it (design §19.3.5 S4b; measured 2026-10-16: first
+// seeds the VRAM frames and the SSD tier's RAM from it (moe-offload-design.md §4.3; measured 2026-10-16: first
 // request decode +9 % on code, +15 % on a math problem, +56 % with the SSD tier, against an empty cache).
 //
 // The table is NInfer's kFlashNextExpertPriority (Neroued/ninfer f8a774f73, "perf(qwen4-exp): apply

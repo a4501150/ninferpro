@@ -13,8 +13,8 @@
 //   staged : every record in the pinned host bank, staged through the slots each call
 //            (the cold-layer case, bound by the staging copy).
 // The FLOP figure counts the wide entries' gate/up and down products only. --activation a16 gives
-// the experts W4A16 arithmetic (no input scales, design §16.2.1); a16x2 runs their wide calls on the
-// two-term A4 fast path (design §19.3.23).
+// the experts W4A16 arithmetic (no input scales, design §17.3); a16x2 runs their wide calls on the
+// two-term A4 fast path (design §13.4).
 //
 //   infernix_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
 //                                   [--activation a4|a16|a16x2] [--cold] [--warmup 3] [--repeat 10] [--seed N]

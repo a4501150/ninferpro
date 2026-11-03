@@ -1,7 +1,7 @@
 #pragma once
 
 // Expert records and activations shared by the CPU and GPU narrow-route tests of
-// offloaded_sparse_moe (docs/maintainer/qwen3_8-flash-next-design.md §16.2).
+// offloaded_sparse_moe (docs/maintainer/qwen3_8-flash-next-design.md §17.2).
 
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -64,7 +64,7 @@ inline std::vector<std::uint16_t> random_activations(std::mt19937& rng, int ncol
     return x;
 }
 
-// An expert stored without activation scales (design §16.2.1): random codes and block scales as
+// An expert stored without activation scales (design §17.3): random codes and block scales as
 // random_expert, no input scales, and multipliers m = fl32(1 / weight global scale).
 inline Expert random_a16_expert(std::mt19937& rng) {
     Expert e = random_expert(rng, false);
@@ -75,7 +75,7 @@ inline Expert random_a16_expert(std::mt19937& rng) {
 
 // Activations with a wide dynamic range per column: most elements near 0.05, a few outliers up to
 // 2^12 and some tiny ones, so the A16 encoding rounds elements more than 2^13 below the column's
-// largest (design §16.2.1).
+// largest (design §17.3).
 inline std::vector<std::uint16_t> wide_range_activations(std::mt19937& rng, int ncols) {
     std::vector<std::uint16_t> x = random_activations(rng, ncols);
     std::uniform_int_distribution<int> pos(0, moe::kHidden - 1);
@@ -134,7 +134,7 @@ inline GoldenCase golden_case(int ncols) {
     return g;
 }
 
-// The golden case as an expert without activation scales (design §16.2.1), and its output hashes:
+// The golden case as an expert without activation scales (design §17.3), and its output hashes:
 // every CPU ISA, compiler and the GPU narrow route must reproduce them.
 inline constexpr std::uint64_t kGoldenA16_1 = 0xb85b350a35f47a1dULL; // ncols = 1
 inline constexpr std::uint64_t kGoldenA16_4 = 0xad57d940d8832ffeULL; // ncols = 4

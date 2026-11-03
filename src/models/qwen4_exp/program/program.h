@@ -7,7 +7,7 @@
 // chat template, design §7).
 //
 // Admission reserves a request's prompt pages plus one round, later rounds grow the lane, and a
-// shortage pauses a younger request (design §19.3.13). With the prefix cache, an admission resumes
+// shortage pauses a younger request (design §15.7). With the prefix cache, an admission resumes
 // from the deepest affordable snapshot and maps the cached blocks below it.
 
 #include "models/qwen_common/frontend/frontend.h"
@@ -160,7 +160,7 @@ struct BindingReservation {
     explicit operator bool() const noexcept { return reserved; }
 };
 
-// A paused request (design §19.3.13): its ledger, frontier and request-level state. The state at
+// A paused request (design §15.7): its ledger, frontier and request-level state. The state at
 // the frontier is not owned: the pause published it to the prefix cache as an evictable snapshot,
 // and the resume binding restores from that snapshot when it is still cached, replaying the ledger
 // from the deepest one otherwise.
@@ -321,7 +321,7 @@ struct ContextProgress {
     SpeculativeStats request_speculative;
 };
 
-// Device memory a Program allocates besides its expert frames (design §19.3.7), from the options
+// Device memory a Program allocates besides its expert frames (design §9.7), from the options
 // and the model's configuration alone, so startup checks it before the weights are read. The
 // constructor allocates exactly these sizes.
 struct ProgramDevicePlan {
@@ -392,7 +392,7 @@ struct ProgramOptions {
     // The whole n-gram table read into pinned RAM at startup (EngineOptions::ngram_residency,
     // resolved by the RAM ledger); rows are then never read from the volume.
     bool ngram_in_ram = false;
-    // The expert cache's saved state (design §19.3.5 S4b): read at startup to fill the frames, written
+    // The expert cache's saved state (design §9.2): read at startup to fill the frames, written
     // at stop and every 10 minutes between requests. Empty: no warm start. The identity names the
     // artifact the state belongs to.
     std::filesystem::path expert_state;
@@ -400,13 +400,13 @@ struct ProgramOptions {
     // The SSD tier reads each record's tail from this expert stripe (EngineOptions::expert_stripe_path).
     std::filesystem::path expert_stripe;
     // Device memory left free for the display and other programs once the fixed allocations and
-    // the expert frames are made (design §19.3.7); empty selects it from the display state.
+    // the expert frames are made (design §9.7); empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;
     bool vram_past_budget = false; // EngineOptions::vram_past_budget
     // EngineOptions::expert_tail_skip (approximate, 0: off): execution::ForwardExperts::tail_skip_rank.
     std::uint32_t expert_tail_skip = 0;
     bool expert_cache = true;
-    // Expert placement (design §19.3.7; --vram-experts / --ram-experts / --expert-placement).
+    // Expert placement (design §9.6; --vram-experts / --ram-experts / --expert-placement).
     // resident_experts holds every routed expert in the frame pool and lets nothing take a frame:
     // the KV pool is fully mapped at startup (kv_elastic off), the wide workspace falls back to a
     // temporary allocation, and the VRAM monitor does not resize the pools. The counts and file
@@ -425,7 +425,7 @@ struct ProgramOptions {
     // --expert-swap off: the per-round policy never promotes or evicts; the pools' content stays
     // what the warm start and the placement switches seeded (misses still read and compute).
     bool expert_swap = true;
-    // SSD expert tier (design §19.3.7): pinned RAM for expert slots when the model's banks are
+    // SSD expert tier (design §9.5): pinned RAM for expert slots when the model's banks are
     // streamed from the artifact (LoadOptions::stream_experts; the RAM ledger's pinned expert
     // share), and resident pageable RAM for unpinned records past the page-locking limit (its
     // pageable share). Ignored in full mode.
@@ -434,7 +434,7 @@ struct ProgramOptions {
     // Pinned allocations the Program makes after the tier (the prefix cache's Host tier and an
     // allowance): when the OS refuses a slot chunk, the tier leaves this much below the limit.
     std::uint64_t later_pinned_bytes = 0;
-    // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
+    // Speculative decoding with n-gram copy proposals (design section 11.7): at most this many
     // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
     // ngram_min_match tokens (4..64) earlier in the request.
     std::uint32_t ngram_draft_tokens = 0;
@@ -447,13 +447,13 @@ struct ProgramOptions {
     // them all, or with auto_draft_length the prefix its draft-length policy chooses. A longer n-gram
     // proposal, when enabled, replaces a round's drafts as it replaces MTP's.
     std::uint32_t dflash2_draft_tokens = 0;
-    // The automatic draft length (--draft-tokens auto, design 11.3): each one-row round drafts the
+    // The automatic draft length (--draft-tokens auto, design 11.4): each one-row round drafts the
     // length in 0..mtp_draft_tokens that maximizes its expected tokens per round time, and a pair
     // round one length in 0..min(mtp_draft_tokens, 2) from both rows' acceptance. False: one-row
     // rounds draft mtp_draft_tokens and pair rounds min(mtp_draft_tokens, 2).
     bool auto_draft_length = false;
     // A one-row round verifies its neural drafts up to the first whose drafter probability is below
-    // this value (design §19.3.5; --spec-min-p): MTP's draft-head probability, DFlash2's
+    // this value (design §11.4; --spec-min-p): MTP's draft-head probability, DFlash2's
     // candidate-selector probability (temperature 1); 0 verifies every draft. 0.5 is the measured MTP
     // value the Engine passes with the automatic draft length, 0 with a fixed one.
     double draft_min_p = 0.5;
@@ -481,8 +481,8 @@ struct ProgramOptions {
     bool sampled_mtp_drafts = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
-    // 0 derives it from the measured link and CPU rates, design §19.3.12).
-    // Defaults measured fastest on the i9-13900K (design sections 19.2 and 19.3.16): 16 jobs pay in
+    // 0 derives it from the measured link and CPU rates, design §10.5).
+    // Defaults measured fastest on the i9-13900K (design §18.1): 16 jobs pay in
     // calls with many misses (C = 4 fill +7 %, cold MTP +3 %) and are neutral elsewhere; 32 is no faster.
     std::uint32_t cpu_expert_workers = 6;
     // The workers for a GGUF import's banks (the ggml CPU route, compute-bound where the NVFP4
@@ -491,17 +491,17 @@ struct ProgramOptions {
     std::uint32_t cpu_ggml_expert_workers = 16;
     std::uint32_t cpu_expert_jobs    = 16;
     std::int32_t cpu_pcie_divisor    = 0;
-    // Prefill CPU assist (design §19.3.1 P7): prefill calls wider than a decode round and narrower
+    // Prefill CPU assist (design §10.6): prefill calls wider than a decode round and narrower
     // than kAssistMaxColumns hand up to this many of each layer's thinnest misses to the CPU (same
     // divisor). 0 disables.
     std::uint32_t cpu_assist_jobs    = 256;
-    // Prefill CPU split (design §19.3.12): a narrow streamed call outside a layer walk copies each
+    // Prefill CPU split (design §10.6): a narrow streamed call outside a layer walk copies each
     // layer's experts only once its routing is known, leaving the thinnest non-resident ones (at
     // most 8 columns, the placement-invariant narrow route) to the CPU while the link carries the
     // rest. The split balances the measured link against the CPU team's rates, measured at startup
     // with the link busy (cpu_rates.cpp): experts per second on one-column jobs and expert columns
     // per second on 8-column jobs, planned at a share of them (ProgramImpl::kSplitRateShare, design
-    // §19.3.12). cpu_split_*_rate are the reference rates used only when the team
+    // §10.6). cpu_split_*_rate are the reference rates used only when the team
     // cannot be timed (the SSD tier: no records in host memory; i9-13900K, 6 workers, from
     // host_probe with the link idle). Gating waits for each layer's
     // routing, an idle link the blind stream does not have: it pays up to cpu_split_columns columns
@@ -511,10 +511,10 @@ struct ProgramOptions {
     double cpu_split_expert_rate     = 21000.0;
     double cpu_split_column_rate     = 66000.0;
     std::uint32_t cpu_split_columns  = 1536;
-    // Prefill expert streaming (design §19.3.8 F2, F3): chunks of at least 256 columns copy each
+    // Prefill expert streaming (design §13.3): chunks of at least 256 columns copy each
     // layer's non-resident experts ahead by DMA into frames lent for the prompt.
     bool prefill_stream              = true;
-    // Prefix cache (design §19.3.1): requests resume from and publish to a shared block tree with
+    // Prefix cache (design §15): requests resume from and publish to a shared block tree with
     // state snapshots in a pinned slab pool of prefix_host_bytes and a Disk tier of
     // prefix_disk_bytes (attach_prefix_cache_disk); one of them is needed.
     bool prefix_cache                = false;
@@ -534,7 +534,7 @@ struct ProgramOptions {
     // The product's control over the shutdown spill to the Disk tier.
     PrefixCacheSaveControl prefix_save;
     DiagnosticObserver diagnostics;
-    // Internal (A/B measurement and tests): the runtime VRAM monitor thread (design §19.3.7): it
+    // Internal (A/B measurement and tests): the runtime VRAM monitor thread (design §9.7): it
     // samples the device's video memory once a second and wakes an idle engine so it returns idle
     // KV pages to the expert frames. The engine does not resize the cache under another program's
     // pressure -- the client owns the placement.
@@ -558,7 +558,7 @@ public:
     // How the expert frames were sized at construction.
     [[nodiscard]] const VramSizing& vram_sizing() const noexcept;
 
-    // ---- expert placement (design §19.3.7; /admin/expert-placement) ----
+    // ---- expert placement (design §9.6; /admin/expert-placement) ----
     // The placement the Program serves now.
     struct ExpertPlacementStatus {
         bool resident = false;      // every routed expert held, nothing takes a frame
@@ -606,7 +606,7 @@ public:
     // format, loadable by --expert-placement). False + `error` when it cannot be written.
     [[nodiscard]] bool export_expert_placement(const std::filesystem::path& path, std::string* error = nullptr);
 
-    // Expert-cache resizing outside rounds (design §19.3.7). The VRAM monitor calls the waker from
+    // Expert-cache resizing outside rounds (design §9.6). The VRAM monitor calls the waker from
     // its own thread when the cache should resize; the engine then calls maintain() from its
     // worker, between rounds and under its execution lock. An empty waker detaches the engine.
     void set_maintenance_waker(std::function<void()> waker);
@@ -659,14 +659,14 @@ public:
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
 
-    // ---- execution units (design §19.3.13): a binding reserves the KV pages of its prompt (or
+    // ---- execution units (design §15.7): a binding reserves the KV pages of its prompt (or
     // replay) plus one round; a decode or control unit grows the lane's pages to its next round, and
     // a shortage the Engine cannot reclaim pauses the youngest resident ----
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
     void release_units(std::span<const SequenceHandle>) noexcept {}
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept { return false; }
 
-    // ---- pause and replay (design §19.3.13) ----
+    // ---- pause and replay (design §15.7) ----
     // Publishes the lane's state at its frontier to the prefix cache, releases the lane and opens a
     // Pause transaction that returns the ResumeState (a lane inside a layer walk's span publishes
     // nothing past the span's start). False while another transaction or a round is open.

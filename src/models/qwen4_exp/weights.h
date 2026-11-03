@@ -107,7 +107,7 @@ struct ProposalWeights {
     WeightId token_ids; // I32 [rows]: each row's token id
 };
 
-// The Vision tower (design §19.3.2): Qwen3.5's tower and parameter names, BF16, pinned host memory
+// The Vision tower (design §16): Qwen3.5's tower and parameter names, BF16, pinned host memory
 // with vision offload, device memory otherwise.
 struct VisionNormWeights {
     WeightId weight, bias;

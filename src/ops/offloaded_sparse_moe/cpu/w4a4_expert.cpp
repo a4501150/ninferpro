@@ -26,7 +26,7 @@ namespace {
 
 using canon::A4Block;
 
-// Code nibble of row r (0..15) at k (0..15) inside one 144-byte unit (design §6.2).
+// Code nibble of row r (0..15) at k (0..15) inside one 144-byte unit (design §6.3).
 inline unsigned unit_code(const std::uint8_t* unit, int r, int k) {
     const std::uint8_t byte = unit[32 * (k / 4) + 4 * (r % 8) + k % 4];
     return r < 8 ? (byte & 15U) : (byte >> 4);
@@ -54,8 +54,8 @@ void row_sums_scalar(const std::uint8_t* matrix, int blocks, int rg_begin, int r
 
 #if defined(INFERNIX_MOE_X86)
 
-// Software prefetch `distance` bytes ahead along the unit stream (design §10.3). The best distance
-// depends on the host's memory latency and core speed, so calibration chooses it (§14.2).
+// Software prefetch `distance` bytes ahead along the unit stream (moe-offload-design.md §5.2). The best distance
+// depends on the host's memory latency and core speed, so calibration chooses it (§18.1).
 inline void prefetch_unit(const std::uint8_t* unit, int distance) {
     if (distance > 0) {
         const char* p = reinterpret_cast<const char*>(unit) + distance;

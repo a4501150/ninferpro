@@ -31,7 +31,7 @@ and the chunk size only picks the scatter. So:
   intended distribution, not whether noise happened to favour the corpus.
 - The best reference for a given weight set is the same artifact with 16-bit activations
   (`EngineOptions::a16_activations`), scored in one pass with BF16 KV.
-- Exact outputs (for example BF16 KV prefill, where no Infernix kernel differs from NInfer) must
+- Exact outputs (for example BF16 KV prefill, where no engine kernel differs from NInfer) must
   still match exactly; noise tolerance applies only to paths whose arithmetic changed.
 
 ## 2. Tools
@@ -51,13 +51,12 @@ same source builds in an NInfer checkout for a like-for-like comparison.
 
 ## 3. Recorded results
 
-Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Gold-Star-Infer at `5fbfc3db` against
-NInfer `68c54356` plus the Windows port (with only a `--prefill-chunk` option added to its
-perplexity tool), official Qwen3.8-27B NVFP4 artifact unless stated. The reference in these runs
-lifted only the 4-bit (MLP) sites to 16-bit activations; sites that run 8-bit activations (FP8
-projections) kept them. `a16_activations` lifts those too, so it is a stricter reference: the KL
-figures in sections 1, 3.1 and 3.4 are against the narrower one, and the decode comparison (3.3)
-was repeated with `a16_activations`.
+Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Infernix against NInfer (a pre-fork
+study; nothing current runs those builds), official Qwen3.8-27B NVFP4 artifact unless stated. The
+reference in these runs lifted only the 4-bit (MLP) sites to 16-bit activations; `a16_activations`
+lifts the 8-bit sites too, so it is a stricter reference. The KL figures in sections 1, 3.1 and
+3.4 are against the narrower one; the decode comparison (3.3) was repeated with
+`a16_activations`.
 
 ### 3.1 Where the activation error comes from
 
@@ -77,35 +76,21 @@ KL to the reference at one pass / 4096-token chunks, with uncached prefill time 
 ### 3.2 Infernix against NInfer, prefill
 
 Perplexity at six chunk sizes (512, 1024, 2048, 3584, 7168 and one 14,336-token pass), paired by
-chunk size:
-
-| KV | Infernix mean | NInfer mean | Infernix - NInfer | By chunk size |
-|---|---|---|---|---|
-| BF16 | 2.33446 | 2.33446 | 0 | identical at all six |
-| INT8 | 2.32850 | 2.33129 | -0.12 % | Infernix lower at 5 of 6; t = -1.4, not significant |
-| NVFP4 | 2.33694 | 2.33643 | +0.02 % | Infernix lower at 3 of 6; spread 0.54 %; worst +0.89 % at 1024 |
-
-Infernix changes no arithmetic shared by every KV format, and its INT8 and NVFP4 prompt-attention
-kernels are as accurate as NInfer's within this resolution.
+chunk size: BF16 KV identical at all six (2.33446 both); INT8 KV −0.12 % (Infernix lower at 5 of
+6; t = −1.4, not significant); NVFP4 KV +0.02 % (spread 0.54 %, worst +0.89 % at 1024).
+Infernix's INT8 and NVFP4 prompt-attention kernels are as accurate as NInfer's within this
+resolution.
 
 ### 3.3 Infernix against NInfer, decode
 
 32 corpus segments of 1,536 tokens, 384 greedy tokens each (12,288 tokens per build), DFlash2 with
-7 drafts and the proposal head, INT8 KV, judged on each build's own prefixes. The same generated
-tokens were judged twice: by the study's reference (4-bit sites at 16 bits) and by the committed
-`infernix_decode_quality_judge` (`a16_activations`, every site at 16 bits):
-
-| Build | Agreement, 4-bit sites lifted | Regret | Agreement, `a16_activations` | Regret |
-|---|---|---|---|---|
-| NInfer | 0.9736 | 0.0080 | 0.9743 | 0.0073 |
-| Infernix | 0.9736 | 0.0086 | 0.9762 | 0.0072 |
-| Infernix with n-gram drafting (15 drafts, min match 12) | 0.9729 | 0.0087 | 0.9764 | 0.0071 |
-
-Greedy decode chooses the reference's top token at least as often as NInfer's under both
-references; the differences are a few tenths of a percent and change order between them, so they
-are within noise. Builds share their first
-54-68 generated tokens on average before rounding noise makes them diverge; Infernix with and
-without n-gram drafting shares 267 of 384.
+7 drafts and the proposal head, INT8 KV, judged on each build's own prefixes by both the study's
+reference (4-bit sites at 16 bits) and `a16_activations`. NInfer, Infernix and Infernix with
+n-gram drafting (15 drafts, min match 12) agree with the reference at 0.9729-0.9764 with regret
+0.0071-0.0087; the differences are a few tenths of a percent and change order between the two
+references, so they are within noise. Builds share their first 54-68 generated tokens on average
+before rounding noise makes them diverge; Infernix with and without n-gram drafting shares 267 of
+384.
 
 ### 3.4 Rejected: adaptive (4 or 6) activation block scaling
 
@@ -125,62 +110,39 @@ not NVFP4's E4M3 scales per 16.
 
 QSA selects the blocks a query attends to by scoring every complete 4-token block against its pooled
 index key, one 128-wide BF16 key per block per QSA layer (256 B per block, 13 planes per lane, 832 B
-per token; [the design record](qwen3_8-flash-next-design.md#96-long-context-qsa-kv-host-tier) owns the
-plane's geometry). A coarser plane would read fewer bytes and return frames to the expert cache if the
-key's low-order bits carried little ranking information. The idea comes from Fathom (arXiv
-2609.17652), which stores a uniform 4-bit key channel-major as bit planes and picks a per-query read
-depth by water-filling; its 1.67x is for an index in pinned **host** memory, and its own
-device-resident control is no faster. This engine's pooled plane is device memory in every page
-space, so only the byte and agreement questions remain. Fedor Suchkov evaluated them on the
-`kido5217/Infernix` fork ([issue #5](https://github.com/kido5217/Infernix/issues/5), map
-[#36](https://github.com/kido5217/Infernix/issues/36)) against the pre-registered bar of
-[#39](https://github.com/kido5217/Infernix/issues/39) — selected-set agreement with the full-BF16
-top-512 selection, per layer per step, must reach a cross-layer mean of 0.95, with no layer below
-0.90 and a best-to-worst layer spread of at most 0.10 — on keys, selections and FP32 scores captured
-from the engine at 16K and 140K contexts on an RTX 5090 (140K is the bar's >= 128K point;
-[#40](https://github.com/kido5217/Infernix/issues/40); prototype and raw per-layer output on that
-fork's unmerged branch `proto/qsa-index-truncation`,
-[#41](https://github.com/kido5217/Infernix/issues/41)):
+per token; [the design record](qwen3_8-flash-next-design.md#141-selection-over-the-pooled-index-key-plane) owns the
+plane's geometry). A coarser plane would read fewer bytes and return frames to the expert cache if
+the key's low-order bits carried little ranking information. Fedor Suchkov evaluated the idea on the
+`kido5217/Infernix` fork ([#5](https://github.com/kido5217/Infernix/issues/5), map
+[#36](https://github.com/kido5217/Infernix/issues/36), prototype branch `proto/qsa-index-truncation`)
+against a bar pre-registered in [#39](https://github.com/kido5217/Infernix/issues/39):
+selected-set agreement with the full-BF16 top-512 selection, per layer per step, must reach a
+cross-layer mean of 0.95, with no layer below 0.90 and a best-to-worst layer spread of at most 0.10,
+on keys, selections and FP32 scores captured from the engine at 16K and 140K contexts (an RTX 5090).
 
-| store per block | bytes | vs BF16 | mean agreement, >= 128K | worst layer |
-|---|---|---|---|---|
-| BF16 leading 12 bits | 192 | 1.33x | 0.9618 | 0.9485 |
-| BF16 leading 10 bits | 160 | 1.6x | 0.8575 | |
-| BF16 leading 8 bits | 128 | 2.0x | 0.5203 | |
-| uniform 4-bit code (3 planes) | 64 | 4.0x | 0.8421 | |
-| uniform 4-bit code (4 planes) | 80 | 3.2x | **0.9213** | **0.8951** |
-| uniform 4-bit code (2 planes) | 48 | 5.3x | 0.6997 | |
-| uniform 4-bit code (1 plane) | 32 | 8.0x | 0.4491 | |
-
-Not adopted. The 4-bit store is the arm the bar gated, and it fails both agreement conditions; the
-only *byte-saving* arm that meets the three numeric conditions is the 12-bit BF16 cut, which saves
-1.33x — about 0.9 % of the expert cache at 256K with four lanes, and far less at shorter contexts —
-while requiring the pooled plane's layout to change and every reader (the pooling writer, the
-Program's plane allocation, selection, attention and prompt) to unpack it. At 16K the 4-bit store
-does clear the bar (0.9536 mean, worst layer 0.9209); the failure is at long context, where the
-saving would matter. Fathom prices bit extraction at one to two integer operations per bit read, four times the per-bit cost of a
-nibble scan, and this engine's own scan curve (2x time over 16x bytes from 8K to 128K) is the
-signature of a latency-dominated scan rather than a bandwidth-bound one — so a smaller plane's byte
-saving is plausible as a time saving but unevidenced, and it was not required to be.
-
-The water-filling read depth that motivated the per-query budget degenerates on this index: the
-budget the bar hands it is the depth rule's own maximum, so the constraint never binds and depth 4
-lands on every channel. That is a measured property of the rule on these keys, not an implementation
-shortcut.
+Not adopted. The arm the bar gated — a uniform 4-bit code, four planes, 80 B per block (3.2x) —
+fails both agreement conditions at >= 128K contexts (mean 0.9213, worst layer 0.8951); it clears
+the bar at 16K (0.9536 mean, worst layer 0.9209), and the failure is at long context, where the
+saving would matter. The only *byte-saving* arm that meets the three numeric conditions is the
+12-bit BF16 cut (192 B, 1.33x, mean 0.9618, worst layer 0.9485) — about 0.9 % of the expert cache
+at 256K with four lanes, far less at shorter contexts — while requiring the pooled plane's layout
+to change and every reader (the pooling writer, the Program's plane allocation, selection,
+attention and prompt) to unpack it. A smaller plane's byte saving is plausible as a time saving
+but was never evidenced (the engine's scan curve is latency-dominated, not bandwidth-bound), and
+the bar did not require it.
 
 Support would require a representation that reaches 0.95 agreement at a materially larger byte
-saving (at least 3x), or index-plane pressure the deployed contexts do not have: the plane is 208 MiB
-per lane at 256K and 832 MiB at 1M, against an expert pool of roughly 8,300 frames ([the design
-record](qwen3_8-flash-next-design.md) §4.2). The bar's numbers come from a CPU-only prototype over
-captures from the fork's engine revision `51601ea2` (2026-10-13, a descendant of this repository's
-`bbc2771c`), not from the GPU measurement the rest of this section describes; scan time was not
-measured and was deliberately non-gating.
+saving (at least 3x), or index-plane pressure the deployed contexts do not have: the plane is
+208 MiB per lane at 256K and 832 MiB at 1M, against an expert pool of roughly 8,300 frames
+([the design record](qwen3_8-flash-next-design.md) §14.4). The bar's numbers come from a CPU-only
+prototype over captures (2026-10-13), not from the GPU measurement the rest of this section
+describes; scan time was not measured and was deliberately non-gating.
 
 ## 4. Qwen3.8-Flash-Next: NVFP4 artifact against the Unsloth UD-Q4_K_XL GGUF
 
 This compares Infernix's Flash-Next artifact, which imports NVIDIA's NVFP4 checkpoint
 (`nvidia/Qwen3.8-Flash-Next-NVFP4`) bit-exactly
-([design §6.1](qwen3_8-flash-next-design.md#61-recipes-qwen3_8_flash_next_nvfp4-a-and-qwen3_8_flash_next_nvfp4_dense8-b)),
+([design §6.2](qwen3_8-flash-next-design.md#62-recipes)),
 with `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q4_K_XL`. That GGUF is the file the Strata engine runs
 on this machine. The quality figures were measured. The speed figures are **estimates, not
 measurements**: no UD-Q4_K_XL support exists in Infernix.
@@ -188,7 +150,7 @@ measurements**: no UD-Q4_K_XL support exists in Infernix.
 ### 4.1 Measured quality
 
 Teacher-forced on identical token ids
-([design §16.5](qwen3_8-flash-next-design.md#165-precision-boundaries-and-measured-quality-2026-10-04-rtx-5090)),
+([design §17.7](qwen3_8-flash-next-design.md#177-precision-boundaries-and-measured-quality)),
 recorded 2026-10-07. Infernix ran recipe B (`e3be72cde`) with INT8 KV; Strata 0.1.40 ran UD-Q4_K_XL
 with INT8 KV. The texts were 2,557 positions of code, a document and a chat transcript, all ≤ 1,024
 tokens.
@@ -246,7 +208,7 @@ the MTP drafter excluded since the GGUF files hold neither):
 - **Quality.** A bit-exact UD-Q4_K_XL artifact in Infernix would likely land near Strata's quality,
   perhaps slightly above it, because Infernix can run every Q8_0 tensor exactly. It would likely
   stay below the NVFP4 artifacts, particularly on chat. This is unmeasured. Before such an
-  artifact could be adopted, it would have to pass the same §16.5 comparison.
+  artifact could be adopted, it would have to pass the same design §17.7 comparison.
 - **Speed** (estimates, against recipe B on the RTX 5090; nothing measured). Offloading narrows
   the gap. The causes are:
   - 13 % more bytes per expert;
@@ -269,33 +231,29 @@ the MTP drafter excluded since the GGUF files hold neither):
 
 ### 4.4 What support would require
 
-Neither path below is built.
+Most of the machinery is built. The GGUF import path exists (`tools/convert/qwen4_exp_gguf.py`):
+the encoded raw-block reader (`sources/gguf_raw.py`, bit-exact import of the stored bytes), the
+`qwen4exp` name map with llama.cpp's export transforms undone and checked, the block formats
+`q2_0`, `q4_k`, `q5_k`, `q6_k`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_xs` and `iq4_nl` with exact
+decode oracles (`src/ops/ggml/ggml_exact.h`), Q8_0 copied into `q8_g32_fp16`, expert records with
+per-layer record bytes and frame slots sized by the largest record, and the MTP head (from the
+`--model` checkpoint) and vision tower (from the GGUF repository's BF16 `mmproj`). The GGML expert
+family in `offloaded_sparse_moe` is built too: a GPU narrow route, a GPU wide route, AVX-VNNI CPU
+miss kernels and the canonical block arithmetic, so placement invariance holds
+([design §17.3](qwen3_8-flash-next-design.md#173-w4a16-and-exact-block-arithmetic),
+[§6.3](qwen3_8-flash-next-design.md#63-expert-banks-and-model-role-tensors)).
 
-- **Converter.**
-  - The existing GGUF source (`tools/convert/sources/gguf.py`) dequantizes to FP32. Using it here
-    would quantize the values a second time, so a bit-exact artifact needs an encoded import of
-    the raw blocks instead.
-  - A `qwen4exp` name map, which must undo llama.cpp's export transforms (for example, `ssm_a`
-    stored as −exp(A_log)). It is verified against the NVIDIA checkpoint's unquantized tensors.
-  - Q8_0 copies into `q8_g32_fp16` exactly, provided no code is −128.
-  - New formats `q4_k`, `q5_k`, `q5_1` and `iq4_nl`, each with an exact decode oracle.
-  - An expert record layout for the mixed formats.
-  - MTP and vision taken from the NVIDIA checkpoint.
-- **Runtime.**
-  - A second implementation family in `offloaded_sparse_moe`, which today is fixed to the NVFP4
-    record (`kRecordBytes`). It needs:
-    - a GPU narrow route;
-    - a GPU wide route (INT8 MMA);
-    - AVX-VNNI CPU miss kernels;
-    - canonical arithmetic (integer A8 block products and a fixed-order epilogue), so placement
-      invariance still holds.
-  - Frame-pool size classes for the three record sizes.
-  - IQ4_NL row decoding in the PLE gather.
-  - About 72.4 GiB of pinned RAM instead of 64.5 GiB. About 77 GiB must be free at startup, or
-    81 GiB with `infernix-serve`. Alternatively, the SSD expert tier.
-  - Rough size of the work: 2-3 weeks, mostly the expert kernels.
-- **Native GGUF loading.**
-  - Loading this one file in place, as Strata does, is feasible. It is an explicit product change:
+What a UD-Q4_K_XL artifact still lacks:
+
+- the `q5_1` format (codec, oracle, kernels), for its down blocks;
+- expert-bank pairs for its Q4_K/Q5_K gate-up and Q5_1/Q8_0 down: the built pairs are IQ gate/up
+  with IQ4_NL or Q2_0 down (`cuda/ggml_expert.cuh`);
+- the artifact: the conversion has not been run. It needs about 72.4 GiB of pinned RAM instead of
+  64.5 GiB — about 77 GiB free at startup, or 81 GiB with `infernix-serve` — or the SSD expert
+  tier.
+
+**Native GGUF loading.**
+- Loading this one file in place, as Strata does, is feasible. It is an explicit product change:
     `.ninfer` is the only artifact, and runtime repacking is forbidden. The 2-byte-aligned 34-byte
     Q8_0 blocks would slow the dense kernels unless repacked.
   - The preferred form is a thin `.ninfer`. It would reference the GGUF's byte ranges for the
@@ -531,11 +489,11 @@ joint gates; this arm decides only what preemption adds.
   such control, since both prefill-pass references share the column-invariant decode's roundings
   (the width-routed prefill tiles mostly are the invariant ones). The control's runs are all
   exact-route runs, which the cache shares (6.5), so it costs runs only when a kernel changes.
-- **Cost, not difference.** Every route scatters around the reference: on the official 27B NVFP4
-  artifact, two chunk sizes differ from each other by more (KL 0.025-0.033, section 1) than either
-  differs from the reference (KL 0.020-0.023). The direct divergence between two routes is mostly
-  noise both carry. A fast path is therefore charged only for its **excess**: how much further
-  from the reference it is than the exact route, in KL divergence and in top-1 disagreement.
+- **Cost, not difference.** Every route scatters around the reference, and two chunk sizes differ
+  from each other by more than either differs from it (section 1 has the numbers). The direct
+  divergence between two routes is mostly noise both carry. A fast path is therefore charged only
+  for its **excess**: how much further from the reference it is than the exact route, in KL
+  divergence and in top-1 disagreement.
 - **The noise floor** of an artifact and KV format is the exact route's own divergence from the
   reference, averaged over the tested chunk sizes. It is the computation noise the configuration
   already carries: **activation quantization** (4-bit activations raise it most), **KV-cache
@@ -686,18 +644,6 @@ Budgets: TV 2.43e-3, top-1 0.227 points, KL and NLL caps 8.5e-3.
 | `decode-split64` with `prompt-pv8` | −1.8e-4 (3.01e-4) | −0.090 (0.017) | −4.6e-4 (3.27e-3) | pass |
 | Control: NVFP4 KV posing as a fast path over INT8 KV (a known loss) | **5.21e-3** (5.68e-3) | **0.49** (0.61) | 2.4e-3 (6.65e-3) | **fail** (also the 512-token bucket) |
 
-Statistics compared on the same runs (bound as a share of its budget; the control must fail):
-
-| Statistic | A/A | `decode-split64` + `prompt-pv8` | NVFP4-KV control |
-|---|---|---|---|
-| Mean KL (the 2026-10-13 criterion) | 52 % | 109 % | 222 % |
-| KL, 10 % trimmed per segment (Yuen) | 0 % | 3 % | **56 %, passes** |
-| Mean total variation (the criterion) | 6 % | 12 % | 234 % |
-| Mean Jensen-Shannon | 24 % | 50 % | 207 % |
-
-On the first protocol (below) total variation gives 2 %, 56 % and 287 %, and trimmed KL fails the
-control (115 %) only because that protocol's KL budget is smaller.
-
 - **The variance sits in a few chaotic long-context segments.** Five 8,192-token segments of the
   Chinese Wikipedia and SGLang parts of the corpus carry about 90 % of the KL variance of every
   comparison, the A/A's included. In them, the whole segment moves by up to 1.8 nats per position
@@ -708,26 +654,11 @@ control (115 %) only because that protocol's KL budget is smaller.
   long-context text is more chaotic than the prefill corpus's (twice the KL floor).
 - **Total variation fixes the resolution without dropping data.** It is bounded by 1 per position,
   so a flipped position counts at most once; the mean stays a mean over every segment. Trimming
-  segments is too blunt: it discards the segments where a fast path's damage could sit, and here
-  it passed the control. Jensen-Shannon is bounded too, but it is dominated by the same flips.
+  segments is too blunt: it discards the segments where a fast path's damage could sit, and
+  trimmed KL passed the control on these runs. Jensen-Shannon is bounded too, but it is dominated
+  by the same flips.
 - **A change confined to decode kernels** was already resolved by KL (`decode-split64` alone,
-  first protocol: bound 6 % of the budget).
-
-The first protocol: 256 segments, cut evenly from the prefill corpus, judged on mean KL. Decode
-floor KL 0.0167, top-1 disagreement 1.96 %, reference top mass 0.964; budgets KL 1.67e-3, top-1
-0.196 points, NLL cap 4.17e-3:
-
-| Candidate | KL excess (95 % bound) | Top-1 excess, points (bound) | NLL excess | Decision |
-|---|---|---|---|---|
-| A/A: the exact route at concurrency 2 | −7e-6 (1.31e-3) | −0.04 (0.05) | −4.1e-4 | pass |
-| `decode-split64` alone | −5.6e-4 (9.6e-5) | −0.006 (0.089) | −3.7e-4 | pass |
-| `decode-split64` with `prompt-pv8` | −1.19e-3 (**3.12e-3**) | 0.22 (**0.42**) | 2.4e-3 | **fail** |
-| Control: NVFP4 KV posing as a fast path over INT8 KV | −4.2e-4 (3.23e-3) | **0.90** (1.13) | **8.0e-3** | **fail** |
-
-Its top-1 bound also fails the pair under the current criteria: 256 segments are too few for
-top-1. Before 2026-10-13 the decode gate bounded the forced tokens' NLL (resolution about ±9e-4
-for a decode-only change). NVFP4 KV's NLL bound was 1.06e-2 and the INT8 pair's 1.19e-2, against a
-1.55e-3 budget.
+  under the earlier KL criterion: bound 6 % of the budget).
 
 ### 6.5 Testing compliance
 
@@ -806,7 +737,7 @@ that could touch default arithmetic.
 
 **Coverage.** Both Engine models score teacher-forced and have the 16-bit-activation reference.
 Qwen3.8-Flash-Next's reference runs every dense linear A16 and every routed expert bank W4A16 (the
-placement-invariant W4A16 arithmetic of its design §16.2.1), so its floor includes what the W4A4
+placement-invariant W4A16 arithmetic of its design §17.3), so its floor includes what the W4A4
 experts' 4-bit activations cost; pass `--ngram-volume` to the gate when the volume is not
 `<artifact>.ngram`. Its Engine scoring is checked against the Forward's own teacher-forced logits
 (`infernix_qwen4_exp_score_real_test`): on 3,000 tokens the perplexity matches, top-1 agrees at
@@ -818,8 +749,7 @@ compensated GDN, hyper-connection sliced-K and index-projection paths (6.7).
 ### 6.6 Calibration and comparison with other engines
 
 **Floors measured on this machine** (RTX 5090, CUDA 13.4, 2026-10-12, full corpus and windows as
-in 6.2; until 2026-10-16 the budgets were 10 % of these, they are now 1.5e-3 KL and 0.5 points of
-top-1 for every configuration, 6.3):
+in 6.2; the budgets are the single ones of 6.3):
 
 | Configuration | Floor: KL / top-1 disagreement |
 |---|---|
@@ -864,28 +794,20 @@ corpora, and recommends total variation for estimating how many decisions change
 ([2610.00694](https://arxiv.org/html/2610.00694)); KL's unboundedness lets low-probability
 mismatches dominate it ([2609.07664](https://arxiv.org/html/2609.07664v1)). llama.cpp reports
 mean KL and "same top p" with per-token Gaussian standard errors, which ignore the correlation
-within a sequence. Infernix's units are whole windows and segments. Robust estimators of a
+within a sequence. The engine's units are whole windows and segments. Robust estimators of a
 heavy-tailed mean exist (trimmed mean, median-of-means, Catoni;
 [Lugosi and Mendelson's survey](https://paperswithcode.com/paper/mean-estimation-and-regression-under-heavy)).
 For decode, a bounded measure keeps the estimand a plain mean and validated better (6.4).
 
-Infernix is stricter than each of these on what a change costs in fidelity to the reference: its
-budget (1.5e-3 excess KL, 0.5 points of top-1, for all of a configuration's fast paths together)
-is about what llama.cpp's q8_0 costs over FP16, a quarter to a third of the 4e-3 and 5.8e-3 Strata
-adopted and a fifth of Fireworks' 7e-3 for a whole deployment, and the decision uses a 95 %
-confidence bound rather than a point estimate. The measures
-differ in one respect: Strata compares the two routes directly, and that direct divergence also
-contains rounding noise both routes carry, while Infernix charges only the excess distance from a
-fixed reference. A fast path that merely reorders arithmetic on a 4-bit artifact can therefore
-differ from the exact route by as much as two chunk sizes do (KL 0.025-0.033 on the 27B NVFP4
-artifact, section 1) while costing no measurable fidelity; Infernix accepts that, because the
-exact route itself carries the same scatter. No engine surveyed publishes a
-per-change KL budget for kernel optimizations. Infernix first scaled its budget with each
-configuration's floor (what a model already loses to quantization sets the scale at which further
-error is visible: llama.cpp's quantization ladder, Unsloth, Helcig et al.); since 2026-10-16 it
-uses one budget, because the floor-relative rule admitted nothing where the exact route is the
-reference itself and judged one kernel differently per KV format, while the measured excess is
-already smaller where a format's own noise absorbs part of it.
+The engine is stricter than each of these on what a change costs in fidelity to the reference: the
+budgets of 6.3 bound all of a configuration's fast paths together, and the decision uses a 95 %
+confidence bound rather than a point estimate. The measures differ in one respect: Strata compares
+the two routes directly, and that direct divergence also contains rounding noise both routes
+carry, while the engine charges only the excess distance from a fixed reference (6.2), so a
+reordering-only change can differ from the exact route as much as two chunk sizes do (section 1)
+while costing no measurable fidelity. No engine surveyed publishes a per-change KL budget for
+kernel optimizations; the floor-relative budgets before 2026-10-16 and the single budgets since
+are 6.3's history.
 
 ### 6.7 Fast-path registry
 
@@ -900,15 +822,11 @@ configuration takes.
 
 **Re-scored under the single budgets (2026-10-16).** Every saved gate run in `profiles/quality`
 was decided again by `fast_path_gate.py` with the budgets of 6.3. Every registered configuration
-still passes, and no failed candidate passes: the bounded criteria of every registered path stay
-within budget (the closest, Flash-Next Dense8's kernel paths with BF16 KV, decode top-1 at 0.92;
-27B prompt-pv8 with decode-split64, decode top-1 0.84), and the failed `batched-a4-decode`,
-`batched-a8-decode` (spec top-1 at 1.11), `q4-w4a8` and the rejected two-term A8 mixes still fail.
-At decode KL and NLL caps of twice the KL budget (3e-3), the 27B request-coupling arms on K8V4
-(plain, cache) and VQ2 (plain, cache, spec) failed on those point estimates alone, inside their
-standard error, which set the caps at 1e-2 (6.3). Spec arms were scored against the exact run of
-their configuration in plain decode, which the request-invariant exact route makes the same
-tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored in their entries.
+still passes, and no failed candidate passes: the closest bounded criteria are Flash-Next Dense8's
+kernel paths with BF16 KV (decode top-1 at 0.92) and 27B `prompt-pv8` with `decode-split64`
+(decode top-1 0.84), and the failed `batched-a4-decode`, `batched-a8-decode` (spec top-1 at 1.11),
+`q4-w4a8` and the rejected two-term A8 mixes still fail. The recipe C gates
+(`expert-a4-residual`, `fp8-a8-pair`) are re-scored in their entries.
 
 The configurations by the artifacts that have them: **NVFP4 27B** (24 heads, 4-bit activations:
 the official, NVIDIA, quasar and uncensored Qwen3.8-27B NVFP4 artifacts), **groupwise 27B** (24
@@ -1050,7 +968,7 @@ the Engine, and each acts only where the artifact can be request-invariant
 - `expert-a4-residual` (Qwen3.8-Flash-Next with W4A16 experts): expert calls of more than eight
   columns (prefill, wide verification) take each x and h row as three terms of the same A4 residual
   profile, with an FP32 row scale of amax / (6 · 448) in place of an input scale (the export has
-  none), on the FP4 Tensor Cores (design §19.3.23). Without it W4A16 experts run the exact integer
+  none), on the FP4 Tensor Cores (design §13.4). Without it W4A16 experts run the exact integer
   limb route. An expert's route depends on its column count in the call, which other requests'
   columns share in batched rounds.
 - `batch-split-attention`: decode attention sizes a row's key partition from the batch.
@@ -1113,6 +1031,14 @@ from a warm request, its whole prompt for shorter ones, so off the chunk grid or
 | Flash-Next, INT8 | plain | 0 (identical: nothing preempted) / 5.0e-3 | 0 / 0.50 | 0 / 2.1e-2 |
 | Flash-Next, INT8 | spec | 6.0e-5 (1.1e-4) / 5.0e-3 | +0.01 (0.01) / 0.50 | 1.0e-4 / 2.1e-2 |
 | Flash-Next, INT8 | cache | 3.4e-4 (1.0e-3) / 5.0e-3 | +0.08 (0.20) / 0.50 | 1.5e-3 / 2.1e-2 |
+
+Every prompt-length bucket and p99.9 KL ratio passes too (largest ratio 1.13, 27B K8V4 spec). The
+closest bound is 27B NVFP4 spec's top-1 at 82 % of its budget. Speed (official 27B, INT8 KV, 2,048
+prompt, 256 output tokens, three rounds; the qualified set against the exact route): plain decode
+81.83 vs 73.17 tok/s at one request (+11.8 %), +11.0 % at two, +6.9 % at four and +0.3 % at eight
+(the 4- and 8-bit activations the old route used there are not qualified); DFlash2 with n-gram
+copies 853 vs 523 tok/s at two requests (+63 %) and 583 vs 329 at four (+77 %). VQ2, BF16 and
+FP8 KV were qualified later (below).
 
 **Preemption** has its own arm, since the four-lane pool never ran short: concurrency 8 with a
 two-lane pool (16,640 tokens), jointly with `batched-decode` and `batch-split-attention`. On the 27B
@@ -1254,14 +1180,6 @@ of single-chunk prompts stay at 16-17 ms and 99.4 % (the tail snapshot now plann
 modes, for fresh one-call spans; hybrid-prefix-cache-spec's Taps entry records the accepted
 multi-call loss); a 5,121-token repeat resumed 5,120 of 5,121 (the opener kept exact at n-1).
 
-Every prompt-length bucket and p99.9 KL ratio passes too (largest ratio 1.13, 27B K8V4 spec). The
-closest bound is 27B NVFP4 spec's top-1 at 82 % of its budget. Speed (official 27B, INT8 KV, 2,048
-prompt, 256 output tokens, three rounds; the qualified set against the exact route): plain decode
-81.83 vs 73.17 tok/s at one request (+11.8 %), +11.0 % at two, +6.9 % at four and +0.3 % at eight
-(the 4- and 8-bit activations the old route used there are not qualified); DFlash2 with n-gram
-copies 853 vs 523 tok/s at two requests (+63 %) and 583 vs 329 at four (+77 %). VQ2, BF16 and
-FP8 KV were qualified later (below).
-
 **`batched-a4-residual-decode`** (2026-10-14, the same artifact, corpus and arms): two NVFP4 terms
 per column, from 9 columns in the MLP. Its op error against the 16-bit oracle is 0.9 % relative L2
 on the [5120, 17408] down projection (one-term A4 6-12 %, A16 0.16 %); the gate/up suite's tiny
@@ -1317,34 +1235,17 @@ and plain decode at eight): the retiled qualified set ran 1,788, 1,288 and 922 t
 (1,787, 1,217, 887 and 70.3 before); with two-term A8 1,915, 1,548 and 1,034 and 70.4, against the
 old route's 1,995, 1,650, 1,286 and 72.6 (-4.0, -6.2, -19.6 and -3.0 %).
 
-**Rejected** (2026-10-15): one-term A4 gate/up beside two-term down, with "four over six" block
-scales (each 16-value block keeps the better of its max-to-6 and max-to-4 encodings). The scale
-choice halves one-term op error (gate/up 9.8 to 5.0 %, down 7-9 to 5-7 % relative L2), and the mix
-ran 1,944, 1,575 and 1,109 tok/s with two-term A8 (+1.5, +1.7 and +7.2 %), but it fails the INT8
-spec arm: TV excess 1.14e-2 (bound 1.20e-2) against 2.4e-3 and top-1 +1.17 points against 0.22,
-about two thirds of what one-term A4 in the whole MLP adds.
-
-**What else was tried for wide rounds** (2026-10-15, the same artifact):
-- Two-term NVFP4 MMA tiles at 65-128 columns with 32x64 warp tiles (one weight fragment feeding
-  both terms of two token fragments), with 128-wide K stages three deep, or with both: none beat
-  the tiles above by more than 2 % (gate/up 129.6-136.4 against 131.7-135.8 us at 97-128 columns,
-  slower at 65-96; down no faster).
-- The warp-specialized TMA route with two activation planes (three 128-K stages over one
-  128-token tile, which the MMA tile's shared memory held one of) takes gate/up at 97-128
-  columns: 101-103 against 128-138 us, with identical op error at every width (the same K order
-  per output). DFlash2 with n-gram copies ran 1,051 against 1,025 tok/s at four requests (+2.5 %,
-  within one run-to-run standard deviation of 28-30) and 1,534 against 1,538 at two.
-- Two-term FP8 input projections take 32x128 tiles at 65-104 columns (attention: 58-62 against
-  78-83 us at 65-96, 89-91 against 105 at 97-104) and at 65-96 (GDN: 87-91 against 91-99), with
-  identical op error at every width. End to end nothing measurable changed at two and four
-  requests (1,551 and 1,037 against 1,548 and 1,034 tok/s; their rounds are rarely that wide).
-- A per-token activation scale for one-term A4 (no clipping, the widest E4M3 range). On real
-  activations (DFlash2 with n-gram copies, four requests) the artifact's static scale leaves no
-  block subnormal and clips 0.046 % of gate/up blocks (all but five by at most 2x) and 0.001 % of
-  down blocks. Removing the clipping with a 4x or 16x wider static range moves one-term A4's INT8
-  spec TV excess from 1.73e-2 to 1.72e-2 and 1.68e-2 and its top-1 excess from +2.02 to +1.92 and
-  +1.86 points, against 2.4e-3 and 0.22: one-term's failure is the 4-bit grid itself, so the
-  per-token scale was not built.
+**Rejected for wide rounds** (2026-10-15, the same artifact; op-level tables in git history):
+one-term A4 gate/up beside two-term down with "four over six" block scales (each block keeps the
+better of its max-to-6 and max-to-4 encodings; halves one-term op error and faster with two-term
+A8, but fails the INT8 spec arm: TV excess 1.14e-2 against 2.4e-3, top-1 +1.17 of 0.22);
+alternative two-term tiles — 32x64 warp tiles and deeper K stages for the NVFP4 MMA, 32x128
+tiles for the FP8 input projections — within 2 % of the shipped tiles, or faster only at Op
+level with nothing measurable end to end; a warp-specialized TMA route with two activation planes
+(faster on the widest gate/up calls, within one run-to-run standard deviation end to end); and a
+per-token activation scale for one-term A4, not built because one-term's failure is the 4-bit
+grid itself (a 4x or 16x wider static range moves its INT8 spec TV excess only from 1.73e-2 to
+1.68e-2, top-1 from +2.02 to +1.86 points).
 
 **VQ2 KV** (2026-10-15, the same artifact, corpus and arms; 1,024 segments): the exact route is
 request-invariant there (96 segments bit-identical at concurrency 8, under DFlash2 with n-gram
@@ -1406,9 +1307,8 @@ and recomputes the previous output) or admission (whole extents held without `pr
   default schedule's single-column cases reach 31 %.
 - **Model-level acceptance** (official 27B NVFP4 artifact, INT8 KV):
   - prefill gate: bit-identical, so it passes trivially;
-  - teacher-forced plain decode (KL gate, 6.4): KL excess −5.6e-4, bound 9.6e-5, against a 1.67e-3
-    budget; top-1 excess −0.006 points, bound 0.089, against 0.196; every other criterion passes.
-    The NLL gate it first passed (excess −3.7e-4, bound 5.6e-4) was superseded.
+  - teacher-forced plain decode passes every criterion under the current protocol (6.4); under the
+    superseded NLL and KL decode gates it passed those too (KL excess −5.6e-4, bound 9.6e-5).
 - **Speed:** plain decode, INT8 KV, three alternating rounds:
 
   | Prompt | Default → fast path | Rounds |
@@ -1437,12 +1337,8 @@ and recomputes the previous output) or admission (whole extents held without `pr
 - **Op qualification:** each form has its own named criterion in the attention suite
   (`attention_criterion` with 8-bit P×V).
 - **History.** Until 2026-10-13 NVFP4, K8V4 and VQ2 KV ran these forms by default, adopted on
-  measurements against a BF16-KV reference on a model with 16-bit activations: NVFP4 and K8V4
-  within 1.1× FP16 P×V's KL at every context length, VQ2 within 1.03×, all three removing 5-7 % of
-  end-to-end long-prompt prefill time (up to a fifth of prompt attention). INT8 doubled FP16's KL
-  at 64K context (up to 5 % faster prefill) and K4V2 raised it 1.09× (1.11× at 32-64K; 5.3-7.2 %
-  faster at 64K-128K), so those stayed FP16. These measurements predate this policy and do not
-  qualify a configuration.
+  pre-policy measurements that qualify nothing; since then the exact route runs FP16 P×V for every
+  KV format (6.1) and these forms are this fast path.
 - **Model-level acceptance** (2026-10-13, RTX 5090, CUDA 13.4; official 27B NVFP4 artifact; the
   full prefill protocol of 6.4: 144 windows, 4.18 million positions per route, chunks of 896,
   1,792, 3,584 and 7,168 tokens). Every prefill criterion passes for every KV format; KL and
@@ -1462,17 +1358,13 @@ and recomputes the previous output) or admission (whole extents held without `pr
 
   NVFP4, K8V4, VQ2 and K4V2 KV select no decode fast path, and prompt-pv8 changes only prompt
   kernels, so the prefill criteria decide them. INT8 KV also runs `decode-split64`, so the pair
-  needs the decode criteria too, and it **fails** them. Under the first, NLL-based decode gate:
-  NLL excess 2.4e-3 with bound 1.19e-2 against a 1.55e-3 budget. Under the KL decode gate (6.4),
-  first protocol: KL excess −1.19e-3 with bound 3.12e-3 against 1.67e-3, and top-1 excess 0.22
-  points with bound 0.42 against 0.196. Under the current protocol (1,024 segments of the decode
-  corpus): KL excess −4.6e-4 with bound 3.27e-3 against 3e-3 (109 %). Under the total-variation
-  decode criterion that replaced KL (6.3), on the same runs, every criterion passes: TV excess
-  −1.8e-4 with bound 3.0e-4 against 2.43e-3, top-1 excess −0.09 points with bound 0.017. The
-  criterion changed after this pair had failed; the A/A and NVFP4-KV controls of 6.4 validate it
-  on two protocols. prompt-pv8 was qualified for INT8 KV on 2026-10-14 on that evidence, by the
-  user's decision, which also weighed how far inside other engines' acceptance criteria the pair
-  sits (6.6): prefill KL excess 1.4 % of the floor (bound 2.8 %), decode TV bound 12 % of its budget.
+  needs the decode criteria too: it failed each superseded decode criterion (NLL, then KL, then
+  the 256-segment KL protocol) and passes the current total-variation criterion on the same runs
+  (TV excess −1.8e-4, bound 3.0e-4, against 2.43e-3; top-1 excess −0.09 points, bound 0.017), the
+  criterion 6.3/6.4 settled after the A/A and NVFP4-KV controls validated it. prompt-pv8 was
+  qualified for INT8 KV on 2026-10-14 on that evidence, by the user's decision, which also weighed
+  how far inside other engines' acceptance criteria the pair sits (6.6): prefill KL excess 1.4 %
+  of the floor (bound 2.8 %), decode TV bound 12 % of its budget.
 - **Speed** (`infernix_bench`, prefill chunk 4,096, three repetitions per run, two runs per route
   in exact / fast / fast / exact order; every fast run beats every exact run):
 
@@ -1661,7 +1553,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
   Those formats' floors were not measured; their KV is lossier than INT8's, so they are taken to
   be at least INT8's.
 - **Speed** (`infernix_bench`, two rounds): plain decode +1.4 %, MTP (four drafts) +3.4 to
-  +4.2 %, prefill +0.3 to +1.0 % (qwen3_8-flash-next-design.md §19.3.22).
+  +4.2 %, prefill +0.3 to +1.0 % (qwen3_8-flash-next-design.md §17.5).
 - **`qsa-prepare-fused` elsewhere** (2026-10-18; it serves every dense format, and Dense8's gates
   cover its kernel): timed alone against the exact route (INT8 KV, ABBA) it is not faster on IQ3_S
   (pp16384 +0.15 %; plain decode after a 2,048-token prompt 122.4 -> 121.8 tok/s, -0.47 %, every
@@ -1679,16 +1571,13 @@ and recomputes the previous output) or admission (whole extents held without `pr
 2026-10-15; three terms since 2026-11-02).**
 - **What changes:** expert calls of more than eight columns on W4A16 experts take x and h as three
   NVFP4 terms of the A4 residual profile with an FP32 row scale, on the FP4 Tensor Cores, instead of
-  the exact limb route (design §19.3.23). Decode rounds at one or two requests stay on the exact
+  the exact limb route (design §13.4). Decode rounds at one or two requests stay on the exact
   narrow route (at most eight columns per expert).
-- **History:** two terms first failed the INT8 prefill gate on mean KL (excess bound 8.92e-4
-  against the then budget of 6.11e-4, four chunk sizes). Three terms on both sides, the only
-  variant of a one-chunk screen within that budget, then passed every gate below except BF16 KV
-  (prefill KL bound 4.24e-4, decode top-1 bound 2.95e-3 of 3.31e-3, pp32768/65536 +25.7/+26.9 %).
-  With the absolute floor, and the single budgets that replaced it (6.3), two terms pass, and they replaced three, which cost 7-8 points of
-  prefill speed. Three terms replaced two again on 2026-11-02 (below): two leave about 0.8 % relative
-  error per activation row (four times BF16 rounding; unbiased, so rounding the last term's scale up
-  only adds error), the largest real carrier of the qualified set's decode excess on FP8 KV.
+- **History:** the term count tracked the budgets: two terms failed the INT8 prefill gate under
+  the floor-relative budgets and three passed; the single budgets (6.3, 2026-10-16) re-admitted
+  two, which cost less prefill speed; 2026-11-02 went back to three, two leaving about 0.8 %
+  relative error per activation row (four times BF16 rounding; unbiased), the largest real carrier
+  of the qualified set's decode excess on FP8 KV.
 - **Op qualification (three terms):** `infernix_offloaded_moe_wide_test` X1 against the exact
   canonical arithmetic: mean relative L2 0.086-0.098 % per case (the BF16 output floor), worst entry
   0.76 % (bounds 2^-9 and 2^-6, which two terms' means of 0.31-0.41 % fail).
@@ -1700,17 +1589,16 @@ and recomputes the previous output) or admission (whole extents held without `pr
   -7.9e-5 (bound 8.08e-4), disagreement bound 1.18e-3. The kernel-switch control passes: prefill
   KL excess 6.2e-5 (bound 1.62e-4), decode TV excess 1.70e-4 (bound 3.59e-4), top-1 bound 1.52e-3.
   Records: `results/quality/gate-2026-11-03`.
-- **Three terms on FP8 KV (2026-11-02, the earlier gate that scored against the column-invariant
-  exact route, each unit averaged over both references):** prefill KL excess 1.32e-4 (bound
-  1.84e-4; two terms 5.24e-4), decode TV excess 3.0e-4 (bound 4.95e-4; two terms 9.09e-4).
-  Free-running regret failed there (1.13e-3, bound 1.84e-3 of 1.5e-3; two terms 2.31e-3), as did the
-  kernel set alone (8.8e-4, bound 1.66e-3): the prefill-pass judge shares the column-invariant
-  decode's roundings (6.2), which led to the width-routed default role. The other formats keep the
-  registration of the earlier gates below, which three terms on both sides passed first. Speed (`infernix_bench`, FP8 KV, chunk 16,384, ABBA): pp4096 / 16384 / 32768 at 12,796 /
-  13,035 / 12,813 tok/s against two terms' 13,818 / 14,036 / 13,773 (-7.0 to -7.4 %) and the exact
-  route's 8,932 / 9,620 / 9,466 (+35 to +43 %); the wide expert call at 1,024 / 4,096 / 16,384
-  columns 1,715 / 2,390-2,510 / 7,050 us against 1,616 / 1,990 / 5,348 (a third MMA per weight
-  tile; three terms still fit two CTAs per SM). Records: `results/quality/gate-2026-11-02`.
+- **Three terms on FP8 KV (2026-11-02, scored against the column-invariant exact route):** prefill
+  KL excess 1.32e-4 (bound 1.84e-4; two terms 5.24e-4), decode TV excess 3.0e-4 (bound 4.95e-4;
+  two terms 9.09e-4). Free-running regret failed there (1.13e-3, bound 1.84e-3 of 1.5e-3; two
+  terms 2.31e-3), as did the kernel set alone (8.8e-4, bound 1.66e-3), which led to 6.2's
+  width-routed default role. The other formats keep the earlier gates' registration below. Speed
+  (`infernix_bench`, FP8 KV, chunk 16,384, ABBA): pp4096 / 16384 / 32768 at 12,796 / 13,035 /
+  12,813 tok/s against two terms' 13,818 / 14,036 / 13,773 (-7.0 to -7.4 %) and the exact route's
+  8,932 / 9,620 / 9,466 (+35 to +43 %); the wide expert call at 1,024 / 4,096 / 16,384 columns
+  1,715 / 2,390-2,510 / 7,050 us against 1,616 / 1,990 / 5,348 (a third MMA per weight tile; three
+  terms still fit two CTAs per SM). Records: `results/quality/gate-2026-11-02`.
 - **Two terms (2026-10-15/16, the record below):** op test mean relative L2 0.31-0.41 % per case,
   worst entry 2.0 % (bounds 2^-7 and 2^-5 then).
 - **Artifact:** orcarouter Qwen3.8-Flash-Next Uncensored NVFP4, converted with recipe C (FP8 dense,
@@ -1791,40 +1679,17 @@ and recomputes the previous output) or admission (whole extents held without `pr
   budget, is the closest margin). Speed beside `expert-a4-residual` was measured on INT8 KV (+5.4 /
   +6.0 % at 32K / 64K above); the other formats were not timed. It is request-coupling: a dense
   call takes the pair route from its problem's admission width, which batched rounds share.
-- **A third h term for `expert-a4-residual` (2 + 3, tried 2026-10-17, not kept).** Recipe C, INT8
-  KV, ABBA: two terms alone 8,736 / 8,997 tok/s (pp32768 / pp65536), 2 + 3 alone 8,548 / 8,801
-  (-2.2 %), 2 + 3 with `fp8-a8-pair` 9,016 / 9,334 (+3.2 % / +3.7 % over two terms alone). Its
-  prefill gate beside `fp8-a8-pair` passes on every format but BF16 with less error (INT8 KL
-  excess 6.8e-4 against 8.7e-4 at 2 + 2), but its INT8 decode gate over 1,024 segments fails more
-  clearly than 2 + 2's: top-1 bound 5.66e-3, p99.9 ratio 1.56 (TV excess 2.6e-3 against 8.2e-4).
-  The decode result runs against the prefill one and is not explained; run-to-run variation of
-  the wide expert route was not measured. Two terms stay.
-- **Model level with max/448 scales (2026-10-15/16):** gated on the orcarouter recipe C artifact jointly with
-  `expert-a4-residual` at three terms (the variant qualified then), the reduced protocol as above.
-  Prefill passes on every format but BF16 (INT8 KL bound 6.61e-4 of 1.0e-3, against 4.24e-4 for
-  three-term `expert-a4-residual` alone). The INT8 decode gate fails on its tail: p99.9 KL ratio
-  1.35 against 1.25 (three terms alone 1.07); TV and top-1 pass (top-1 bound 4.29e-3 of 5.0e-3).
-  Beside two-term `expert-a4-residual` (2026-10-16, INT8 KV): prefill KL excess 1.006e-3 (bound
-  1.14e-3), which failed the 1.0e-3 budget it was gated under and passes the single 1.5e-3 budget,
-  every other criterion passing; decode fails its tail again (p99.9 KL ratio 1.266 against 1.25),
-  TV and top-1 passing. The p99.9 of 256 segments rests on about 16 positions, so the INT8 decode
-  gate was repeated over 1,024 segments (65,536 forced positions per route), its verdict alone
-  counting: it fails three criteria (2026-10-16). Top-1 disagreement excess bound 5.31e-3 against
-  5.0e-3, forced-token NLL excess 1.23e-2 against the 1.0e-2 cap, p99.9 KL ratio 1.261 against
-  1.25; TV excess bound 3.36e-3 of 4.0e-3, KL excess 2.8e-3 of 1.0e-2 and every prompt length pass
-  (floor: KL 2.11e-2, TV 3.91e-2, top-1 3.67 points). The fuller sample confirmed the tail and
-  moved top-1 and NLL past their limits, so it is not a small-sample artifact. Attribution over
-  the same segments (2026-10-16): two-term `expert-a4-residual` alone passes (TV bound 2.38e-3,
-  top-1 bound 4.41e-3, NLL excess 1.2e-3, p99.9 ratio 1.18), and `fp8-a8-pair`'s increment over it
-  passes every criterion but NLL (1.11e-2 against the 1.0e-2 cap, bound 2.0e-2; TV bound 1.98e-3,
-  top-1 bound 2.57e-3, p99.9 ratio 1.07). The joint failure is `fp8-a8-pair`'s NLL shift on top of
-  the top-1 and tail budget `expert-a4-residual` already uses. A bit-exact alternative cannot
-  recover its speed: the exact route's BF16 MMAs run at 227-243 TFLOP/s
-  at 2,048-16,384 columns, the Tensor Core pipe 91.7 % busy (ncu, [16384, 2560] at 4,096), level
-  with the BF16 GEMM of the same shape, so the gain is the FP8 Tensor Core rate (0.69-0.78 of the
-  exact route's time at 4,096 columns). Speed beside two-term
-  `expert-a4-residual` (`infernix_bench`, INT8 KV, chunk 4,096, ABBA): pp32768 8,732 → 9,277 tok/s
-  (+6.2 %), pp65536 9,022 → 9,619 (+6.6 %). The other formats were not gated with these scales.
+- **A third h term for `expert-a4-residual` (2 + 3, tried 2026-10-17, not kept).** Faster beside
+  `fp8-a8-pair` (+3.2 / +3.7 % at pp32768 / pp65536) and no worse in prefill, but its INT8 decode
+  gate over 1,024 segments failed more clearly than 2 + 2's (top-1 bound 5.66e-3, p99.9 ratio
+  1.56, TV excess 2.6e-3 against 8.2e-4), so two terms stayed.
+- **Rejected: max/448 scale pairs (gated 2026-10-15/16, superseded by the power-of-two scales on
+  2026-10-17).** Prefill passed beside `expert-a4-residual`, but the INT8 decode gate failed over
+  1,024 segments (top-1 bound 5.31e-3 of 5.0e-3, NLL excess 1.23e-2 of the 1.0e-2 cap, p99.9 KL
+  ratio 1.261): the pair's NLL shift on top of the top-1 and tail budget `expert-a4-residual`
+  already used. A bit-exact alternative cannot recover the speed — the gain is the FP8 Tensor
+  Core rate (0.69-0.78 of the exact route's time at 4,096 columns, its BF16 MMAs already level
+  with the Tensor Core pipe) — so the scales were made powers of two instead.
 
 **`ggml-bf16-prefill`: BF16 tensor-core tiles in Flash-Next's GGUF prefill (IQ3_S with INT8, FP8,
 NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
@@ -1883,15 +1748,15 @@ NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
 - **`gdn-f16-accumulate` removed from IQ3_S with BF16 KV** (2026-10-19, the owner's decision): alone
   it fails both gates there (above); its registration rested on the 27B's gates (one gate per
   kernel), whose BF16 floors are not 0. IQ3_S with BF16 KV now runs both paths' exact counterparts.
-- **Speed** (`infernix_bench`, INT8 KV, three rotated rounds, design §19.3.29): against the exact
+- **Speed** (`infernix_bench`, INT8 KV, three rotated rounds, design §13.5): against the exact
   route, pp32768 3,839 → 5,113 tok/s (+33.2 %), pp65536 4,809 → 6,924 (+44.0 %), every round ahead;
   the dense tiles alone +20.5 % / +25.9 %. The other formats take INT8's timing (6.1, item 4): the
   path's kernels see no KV format, at the same shapes and widths. Server time to first token,
-  `windows-2026.10.18` against this build (the path together with design §19.3.29's exact items;
+  `windows-2026.10.18` against this build (the path together with design §13.5's exact items;
   the README workload, INT8 KV): 128K 29.3-29.5 → 19.7-19.9 s, 250K 58.8-58.9 →
   39.2-39.4 s, 8K 2.16-2.17 → 1.62-1.65 s. Decode is unchanged: on the same text (the exact route, a
   fixed draft length, ABBA) the branch's second session ran 182.6 tok/s against the release's 182.3
-  and 183.6; its first, right after a build, ran 174.5 (design §19.3.29).
+  and 183.6; its first, right after a build, ran 174.5 (design §13.5).
 - **Not qualified:** BF16 KV (above); other dense families (no kernels).
 
 **`q4-w4a8`: int8 activations in the groupwise Q4 MLP gate/up (fails; not qualified).**

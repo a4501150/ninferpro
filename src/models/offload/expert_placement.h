@@ -1,6 +1,6 @@
 #pragma once
 
-// Explicit expert placement for Qwen3.8-Flash-Next (design §19.3.7): which routed experts the VRAM
+// Explicit expert placement (moe-offload-design.md §4.8): which routed experts the VRAM
 // frame pool pins, which the RAM tier holds, and the placement file that assigns (layer, expert)
 // pairs to tiers. The startup resolution (models/qwen4_exp/instance.cpp) turns a
 // placement into the frame-pool target, the RAM tier's slot count and the pinned key set; the
@@ -63,7 +63,7 @@ struct ExpertPlacementSpec {
                                                std::span<const std::uint32_t> ram_keys,
                                                std::span<const std::uint32_t> counts, std::string* error = nullptr);
 
-// The resident refill's read batch (the Program's placement grow, design §19.3.7): up to `batch`
+// The resident refill's read batch (the Program's placement grow, moe-offload-design.md §4.8): up to `batch`
 // keys of `order` from `at` that are still without a frame (`frame_table`: < 0 not resident),
 // advancing `at` past every key examined. Keys already resident are skipped, not re-read, so a
 // refill that resumes after a partial fill reads only what the new frames still lack.

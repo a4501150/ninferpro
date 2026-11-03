@@ -1,6 +1,6 @@
-# Infernix Paged KV Context Store
+# ninferpro Paged KV Context Store
 
-This document defines the physical storage and consumer contract of Infernix's growing KV. It is the
+This document defines the physical storage and consumer contract of the engine's growing KV. It is the
 maintainer authority for typed KV pools, logical pages, address spaces, reservations, block tables and
 GPU consumer views.
 
@@ -600,16 +600,15 @@ exact for some queries and codes for the rest. For tiles that intersect this ban
 first does an exact pass and then one masked codes pass (at most 127 keys for a 128-row CTA). The prompt
 kernel's key tile is 32 keys (double-buffered INT8 tiles); once the call-visible keys reach 1536 it
 switches to 64-key tiles (one INT8 tile per page, with codes prefetch hiding their reads and exact-row
-tiles read synchronously): measured 6-9 % faster at 32-128K visible keys, while for short chunks most
-tiles are exact rows and 64-key is 3-12 % slower, hence this threshold. The decode/verify kernel instead
+tiles read synchronously); 64-key tiles win on long contexts and lose on short chunks, where most tiles
+are exact rows, hence this threshold (measured on SM120). The decode/verify kernel instead
 lets a row's first few split CTAs process only the sink and recent tiles (the exactly read pairs), and
 the remaining split CTAs process only the pairs read from codes; each (key, query) pair is counted in
 exactly one CTA, and merge combines all splits. The grouped kernel's key tile is 32 or 64 keys: 64 is
 used only for 16-column CTAs and requires one block's shared memory to fit (vq2's 16 columns fit; k4v2
 has 130 B of K code per row, and 16 columns need 103296 B, above this target's 101376 B per-block limit,
-so it is always 32). Measured, the 64-key tile is 7-11 % faster on vq2 16-column calls with ≤8K keys
-(W=16 relative to INT8 drops from 1.89x to 1.71x, B=1, 2K), but 13-44 % slower on 8-column CTAs because
-each SM fits one fewer block, so it is not used for 8 columns. Codes CTAs read only keys earlier than any
+so it is always 32). It is not used for 8-column CTAs because each SM then fits one fewer block
+(measured on SM120). Codes CTAs read only keys earlier than any
 query's window, so they run in parallel with the append as its programmatic dependent, while window
 CTAs first wait for the append to complete. The tag is self-validating, so trim, rollback, rejected
 drafts or leftover old content only fall back to codes and never read the wrong row. Calls of width at
@@ -776,6 +775,7 @@ a replay is in flight.
 | Prefix cache pages, Host slabs and transfers | `src/models/qwen3_5/program/prefix/` |
 | Unit permits and context transactions | `src/models/qwen3_5/program/planning/request_plan.cpp`, `transactions/` |
 | Model pool layout and capacity curve | `src/models/qwen3_5/program/planning/startup.cpp` |
+| Qwen3.8-Flash-Next program side: its own logical pages, address spaces, history, unit permits, pool layout and prefix cache (with the Disk tier and state image) | `src/models/qwen4_exp/program/` (prefix cache under `program/prefix/`; see [Qwen3.8-Flash-Next design](qwen3_8-flash-next-design.md) §15) |
 | Public paged consumer views | `src/core/paged_kv_cache.h` |
 | Growing-cache Ops | `include/infernix/ops/`, `src/ops/` |
 

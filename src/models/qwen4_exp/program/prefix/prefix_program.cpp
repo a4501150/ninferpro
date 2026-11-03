@@ -1,4 +1,4 @@
-// The Program side of Qwen4Exp's prefix cache (docs/maintainer/qwen3_8-flash-next-design.md §19.3.1):
+// The Program side of Qwen4Exp's prefix cache (docs/maintainer/qwen3_8-flash-next-design.md §15):
 // admission against the index, activation with per-layer restores, block publication, Host-born taps
 // and endpoints, and release. The binding (prefix_cache.h) moves the bytes.
 
@@ -176,7 +176,7 @@ void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
 // ---- admission ---------------------------------------------------------------------------------------
 
 // Chooses the resume source for `prompt` in lane `lane`: the deepest affordable snapshot, else the
-// root, or nothing when even the root does not fit now (design §19.3.1, plan §7.1).
+// root, or nothing when even the root does not fit now (design §15, plan §7.1).
 std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen_common::PreparedPromptData& prompt,
                                                                        const BasePlanImpl& base,
                                                                        std::uint32_t lane) {
@@ -231,7 +231,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen_common::Pre
             match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         }
         cached_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
-        // A frontier strictly inside a Vision item would resume half an image (design §19.3.1).
+        // A frontier strictly inside a Vision item would resume half an image (design §16.4).
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
         // Without free cache resume a request resumes only from prefill-computed state on the
         // 16-token grid: a tap, never an endpoint (its state is decode's).
@@ -687,7 +687,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         // MR6: whether the drafter's cell F - 1 holds this prompt's continuation.
         const prefix::StateImageHeader& meta = prefix_->meta(*s.snapshot);
         // The opener of an echo lineage serves only when the endpoint after it did not: the client
-        // did not echo the generated turn exactly (design §19.3.1, "Generation opener").
+        // did not echo the generated turn exactly (design §15.3, "generation opener").
         if (meta.opener && meta.lineage_echo) { ++prefix_->counters().endpoint_mismatch_fallbacks; }
         const bool continues = static_cast<std::size_t>(s.frontier) < lane.history.size() &&
                                meta.mtp_next == lane.history[s.frontier];
@@ -716,7 +716,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
     lane.prefix.taps = s.plan.taps;
 }
 
-// The prompt's prefill calls from `frontier` (design §19.3.1, "Prefill integration"): with `taps`, the
+// The prompt's prefill calls from `frontier` (design §15.3, "Prefill integration"): with `taps`, the
 // prefix taps beyond the frontier (no tap inside a Vision item), exact ones admitted by their cost.
 prefix::CallPlan ProgramImpl::plan_prefill(const qwen_common::PreparedPromptData& prompt, std::uint32_t frontier,
                                            std::span<const std::uint32_t> existing, bool taps,
@@ -857,7 +857,7 @@ std::vector<pc::TapExclusion> ProgramImpl::prefix_exclusions(const qwen_common::
     return out;
 }
 
-// ---- pause and replay (design §19.3.13) --------------------------------------------------------------
+// ---- pause and replay (design §15.7) --------------------------------------------------------------
 
 // The resumed request's ledger as a prompt: its tokens through the next input, their RoPE positions,
 // and its lookup keys (the prompt's, chained over the output blocks as prefix_publish chains them);
@@ -1000,7 +1000,7 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
     c.meta.draft_frontier = std::min(lane.dflash_frontier, F);
     // The request's first capture supersedes the snapshot it resumed from, which then serves only
     // requests diverging before this one. Its own earlier captures stay retained: its ladder taps and
-    // its system-block boundary are where edits and side calls over the history diverge (§19.3.1).
+    // its system-block boundary are where edits and side calls over the history diverge (§15.1).
     if (!lane.prefix.captured && lane.prefix.resume) {
         c.supersedes = *lane.prefix.resume;
         if (prefix_->index().valid(*lane.prefix.resume)) {

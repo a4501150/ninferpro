@@ -1,4 +1,4 @@
-// The SSD tier's host level (design §19.3.7, R10 host part): HostExpertTier over a synthetic two-file
+// The SSD tier's host level (design §9.5, R10 host part): HostExpertTier over a synthetic two-file
 // "artifact" with a record straddling the files, plain aligned memory as slots. Checks against a
 // closed-form byte oracle: the startup pre-fill, demand reads from another thread (the CPU
 // service's role) including a straddling record, a resident key served without a read, duplicate

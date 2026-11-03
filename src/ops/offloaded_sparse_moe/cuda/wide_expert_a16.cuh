@@ -1,6 +1,6 @@
 #pragma once
 
-// The wide route of W4A16 experts (wide_expert.h, design §16.2.1): the grouped, persistent,
+// The wide route of W4A16 experts (wide_expert.h, design §17.3): the grouped, persistent,
 // warp-specialized pipeline of wide_expert.cuh on integer tensor cores, with the narrow route's
 // exact arithmetic.
 //   - A operand, activations: the canonical X (|X| < 2^21) of the routed entries' x (by token,

@@ -1,4 +1,4 @@
-// VRAM facts for the memory track (design §19.3.7, measurements RM0a and the read half of RM0c;
+// VRAM facts for the memory track (design §9.7, measurements RM0a and the read half of RM0c;
 // memory-tiers.md §3). Run alone on an otherwise idle GPU:
 //
 //   infernix_vram_probe [--parity-gib N] [--chunks N] [--only malloc,vmm,query,unmap,parity]

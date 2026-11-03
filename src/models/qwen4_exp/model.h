@@ -32,9 +32,9 @@ struct InstanceInfo {
 };
 
 // The routed experts of one MoE layer: the pinned host bank, its arithmetic and each expert's
-// scalars. W4A4 (design §16.2): alpha is derived once here from the stored words, alpha =
+// scalars. W4A4 (design §17.2): alpha is derived once here from the stored words, alpha =
 // fl32(weight_scale_2 * input_scale), so every route (GPU frame, GPU staging, CPU) reads the same
-// values. W4A16 (§16.2.1): no input scales; alpha holds the stored multipliers themselves.
+// values. W4A16 (§17.3): no input scales; alpha holds the stored multipliers themselves.
 struct ExpertBank {
     ExpertBankPlanes planes;
     ops::offloaded_moe::ExpertActivation activation = ops::offloaded_moe::ExpertActivation::kA4;
@@ -75,7 +75,7 @@ public:
         return backing_.stats();
     }
     // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
-    // window borrows device memory from the expert cache, design §19.3.2).
+    // window borrows device memory from the expert cache, design §16.5).
     [[nodiscard]] const std::optional<qwen_common::VisionOverlayAssets>& overlay_vision() const noexcept {
         return overlay_vision_;
     }

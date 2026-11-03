@@ -105,7 +105,7 @@ void CpuExpertTeam::barrier() {
     while (barrier_generation_.load(std::memory_order_acquire) == generation) { cpu_relax(); }
 }
 
-// The A16 round (design §16.2.1): the same item scheme as the A4 round, with x encoded under each
+// The A16 round (design §17.3): the same item scheme as the A4 round, with x encoded under each
 // column's exponent, h kept in BF16 by Phase A and encoded under its own column exponent in Phase
 // A' (that exponent spans all 40 units of a column), then Phase B on the encoded h.
 void CpuExpertTeam::work_a16(int w) {

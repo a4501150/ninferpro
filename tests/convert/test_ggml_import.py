@@ -1,4 +1,4 @@
-"""Exact GGUF block import (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25).
+"""Exact GGUF block import (docs/maintainer/qwen3_8-flash-next-design.md §6.1).
 
 The codec's decoder is checked against gguf-py's reference dequantizer on random blocks (every byte
 pattern is a valid encoding once the binary16 scales are finite), the raw reader against a written

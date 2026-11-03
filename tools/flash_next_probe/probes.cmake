@@ -1,4 +1,4 @@
-# Machine probes of the memory track (design §19.3.7, measurements RM0a, the read half of RM0c,
+# Machine probes of the memory track (design §18.1, measurements RM0a, the read half of RM0c,
 # RM0e and RM0g). They measure the GPU, the driver and the artifact's drive and are run by hand, so
 # they are built beside the tests but are not CTest tests.
 

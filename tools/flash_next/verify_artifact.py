@@ -1,4 +1,4 @@
-"""Word-equality qualification of a Qwen3.8-Flash-Next artifact against its checkpoint (design §6.1, §16.3).
+"""Word-equality qualification of a Qwen3.8-Flash-Next artifact against its checkpoint (design §6.2, §6.6).
 
     python -m tools.flash_next.verify_artifact --model CHECKPOINT --artifact OUT.infernix \
         [--ngram OUT.ngram] [--ngram-rows all|N]

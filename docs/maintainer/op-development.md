@@ -1,7 +1,7 @@
-# Infernix Op Development Rules
+# ninferpro Op Development Rules
 
 This document defines the repository-wide rules for admitting, specifying, owning, implementing,
-qualifying, and measuring Infernix Ops. An **Op** is a semantic execution contract. A CUDA
+qualifying, and measuring engine Ops. An **Op** is a semantic execution contract. A CUDA
 **kernel** is one implementation, or one stage of an implementation, of an Op.
 
 Repository-wide product scope and engineering policies are defined in [`AGENTS.md`](../../AGENTS.md).

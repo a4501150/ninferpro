@@ -1,6 +1,6 @@
-# Third-party notices: Infernix Windows release
+# Third-party notices: ninferpro Windows release
 
-Infernix is licensed under the Apache License 2.0 (`LICENSE`). The release package also contains or
+ninferpro is licensed under the Apache License 2.0 (`LICENSE`). The release package also contains or
 is built from the components below. Each one's licence text is in the `licenses` folder of the
 package, under the file name given here.
 
@@ -27,8 +27,8 @@ package, under the file name given here.
 | `libcurl.dll` | [curl](https://curl.se) (TLS through Windows Schannel) | curl licence (MIT-style) | `curl-LICENSE.txt` |
 | `z.dll` | [zlib](https://zlib.net) | zlib licence | `zlib-LICENSE.txt` |
 
-FFmpeg is used only through its DLLs, unmodified by Infernix, so it can be replaced by another build
-of the same FFmpeg major versions. Its corresponding source is published next to the Infernix
+FFmpeg is used only through its DLLs, unmodified by ninferpro, so it can be replaced by another build
+of the same FFmpeg major versions. Its corresponding source is published next to the ninferpro
 release as `ffmpeg-<version>-source.zip`: the FFmpeg source release and the vcpkg port (build
 script and patches) that built these DLLs. The FFmpeg source is also available from
 [ffmpeg.org](https://ffmpeg.org/download.html).
@@ -37,7 +37,7 @@ script and patches) that built these DLLs. The FFmpeg source is also available f
 
 | Files | Component | Licence | Licence file |
 |---|---|---|---|
-| `chat_templates\qwen3_6.jinja`, `chat_templates\qwen3_8.jinja` | Chat templates derived from Qwen's ([Qwen](https://huggingface.co/Qwen)), with Infernix changes | Apache-2.0 | `chat_templates\LICENSE` |
+| `chat_templates\qwen3_6.jinja`, `chat_templates\qwen3_8.jinja` | Chat templates derived from Qwen's ([Qwen](https://huggingface.co/Qwen)), with ninferpro changes | Apache-2.0 | `chat_templates\LICENSE` |
 
 ## Not included
 

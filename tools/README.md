@@ -1,4 +1,4 @@
-# Infernix tools
+# ninferpro tools
 
 `tools/` contains artifact conversion and inspection, benchmark orchestration, and serving smoke
 checks. To download and run an existing artifact, start with the [project README](../README.md).

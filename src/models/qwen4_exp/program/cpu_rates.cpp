@@ -1,4 +1,4 @@
-// The CPU expert team's rates (docs/maintainer/qwen3_8-flash-next-design.md §19.3.12): measured once at
+// The CPU expert team's rates (docs/maintainer/qwen3_8-flash-next-design.md §10.4): measured once at
 // startup, for the configured workers, so the decode miss split and the prefill CPU split follow the
 // machine's CPU as they follow its link. A temporary team of the service's size computes rounds of jobs
 // on real records from the pinned banks, or the SSD tier's RAM copies (across layers, past the
@@ -13,7 +13,7 @@
 // is repeated after a pause, for up to kRetryBudget, and the best rates of the attempts stand. With
 // every core loaded by another program the team reads about half its rate (i9-13900K, 6 workers:
 // ~10,500 against ~19,500 experts/s on synthetic records), which turned the decode divisor from 3
-// to 2 and slowed decode by a fifth for the whole session (design §19.3.28).
+// to 2 and slowed decode by a fifth for the whole session (design §10.4).
 
 #include "models/qwen4_exp/program/program_impl.h"
 

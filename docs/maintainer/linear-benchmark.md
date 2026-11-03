@@ -355,10 +355,11 @@ from the launcher column tile.
 
 `1792 GB/s` remains the fixed hardware specification, used for the existing `DRAM_%` and the fixed-spec
 roofline. The additional `READ_%` uses `1674.5 GB/s`, the result of the 4 GiB `uint4` pure-read run of
-`tools/hbm_bandwidth_probe.cu` on the RTX 5090, which is the read-only limit this machine has been
-measured to sustain. It only provides an actually achievable utilization for read-dominated Linear; it
-does not replace the fixed-spec metric or change the `model_bytes` basis of one logical weight read. The
-copy probe reads and writes at the same time and is not the applicable limit for this kind of GEMV.
+`tools/hbm_bandwidth_probe.cu` on the RTX 5090, which is the read-only limit that reference card has
+been measured to sustain; the benchmark prints it as the `reference_gpu` constant wherever it runs. It
+only provides an actually achievable utilization for read-dominated Linear; it does not replace the
+fixed-spec metric or change the `model_bytes` basis of one logical weight read. The copy probe reads and
+writes at the same time and is not the applicable limit for this kind of GEMV.
 
 ## 5. Mathematical work and route-neutral metrics
 
@@ -404,11 +405,14 @@ added; the doubled cold/warm work must not be made the default behavior of every
 The console header always prints:
 
 ```text
-gpu=RTX 5090
-dram_spec=1792 GB/s
-sustained_read=1674.5 GB/s
-cache=cold
+# execution=<eager|graph> graph_calls=<N> cuda_runtime=<NNNNN>
+# actual_gpu=<device> sm=<major><minor> reference_gpu=RTX_5090
+# dram_spec_gbs=1792.0 sustained_read_gbs=1674.5 cache=<cold|cold-before-graph-bundle>
 ```
+
+`actual_gpu` is the device the benchmark runs on; `reference_gpu=RTX_5090` marks the two bandwidth
+constants' origin. The header also prints the dense FP8 and BF16 Tensor Core peak lines the
+`tensor_peak_pct` metric uses.
 
 A single-row result keeps:
 
@@ -486,43 +490,28 @@ A policy is only a permission, and the long-term benchmark does not pass off the
 low-precision execution. All current preset suites explicitly use `A16Only`; NVFP4 AllowA4 is kept as
 explicit points of numeric geometry.
 
-## 9. Recorded verification and measurements
+## 9. Reference measurements
 
-The completed verification and RTX 5090 measurement records are kept below, with the timing conditions
-listed with each item:
+Reference measurements from the benchmark's bring-up (RTX 5090, CUDA 13.1, cold cache), kept as the
+evidence for the metrics above:
 
-1. the `infernix_linear_bench` Release target builds;
-2. the 49 points of the 27B suite and the 37 points of the 35B-A3B suite all execute through the public
-   Linear;
-3. `all` merges into 68 unique points, and shared Vision exact points execute only once;
-4. the Text `T=1..3` sweep and the Vision `T=4,8` step-4 sweep both output continuous results;
-5. NCU `--profile-from-start off --launch-count 1` captures only the `q4_rowsplit_gemv_kernel` instance
-   produced by one public Linear call;
-6. the weight-byte result of Q4 `[4096,5120], T=1` is `11141120`, equal to
-   `4096*5120*(4/8+2/64)`; the console and CSV use the same computation;
-7. the BF16 exact point above executes through the public Linear; the median of 500 cold-cache samples
-   was `95.520–97.536 us` across repeated runs, i.e. `1505.5–1537.3 GB/s`;
-8. relative to the `1674.5 GB/s` pure-read probe, this range is `89.91%–91.80%` of the actually
-   achievable read bandwidth;
-9. the DRAM read of the final single NCU capture is `146825728` bytes, while one logical read of the
-   weight plus activation is `146810880` bytes; the extra read is only `14848` bytes, with no weight
-   replay;
-10. the output keeps route-neutral useful TFLOP/s and memory-floor metrics and does not infer the actual
-    activation-compute profile from AllowA4;
-11. the A4 Linear of all five NVFP4 exact problems passes the same exact-decode/naive-FP64 oracle directly
-    at `T=17`, a representative cp.async point and the main `T=1024` TMA point;
-12. on RTX 5090, CUDA 13.1, cold cache, the complete quantization + GEMM results of the five NVFP4 A4
-    `T=1024` problems are:
+- the BF16 `[14336,5120]`, `T=1` point measured `1505.5–1537.3 GB/s` effective across repeated
+  500-sample runs — `89.91–91.80 %` of the `1674.5 GB/s` pure-read probe, so `READ_%` near the
+  memory floor is reachable;
+- one NCU capture of the BF16 `[14336,5120]`, `T=1` point read `146825728` DRAM bytes against the
+  logical `146810880` of one read of the weight plus input activation (`+14848` bytes): a single
+  public Linear call adds no weight replay over `model_bytes`.
 
-    | `[N,K]` | Median | Useful throughput | Dense FP4 peak |
-    |---:|---:|---:|---:|
-    | `[14336,5120]` | `152.576 us` | `985.24 TFLOP/s` | `58.79%` |
-    | `[16384,5120]` | `174.784 us` | `982.92 TFLOP/s` | `58.65%` |
-    | `[34816,5120]` | `390.112 us` | `935.81 TFLOP/s` | `55.84%` |
-    | `[5120,6144]` | `72.992 us` | `882.62 TFLOP/s` | `52.66%` |
-    | `[5120,17408]` | `197.888 us` | `922.42 TFLOP/s` | `55.04%` |
+The five NVFP4 A4 `T=1024` development problems measured, with quantization and GEMM inside one
+timed `linear()` (`[34816,5120]` 5 warmups/40 samples, the other four 5/30):
 
-    `[34816,5120]` uses 5 warmups and 40 samples; the other four rows use 5 warmups and 30 samples.
+| `[N,K]` | Median | Useful throughput | Dense FP4 peak |
+|---:|---:|---:|---:|
+| `[14336,5120]` | `152.576 us` | `985.24 TFLOP/s` | `58.79%` |
+| `[16384,5120]` | `174.784 us` | `982.92 TFLOP/s` | `58.65%` |
+| `[34816,5120]` | `390.112 us` | `935.81 TFLOP/s` | `55.84%` |
+| `[5120,6144]` | `72.992 us` | `882.62 TFLOP/s` | `52.66%` |
+| `[5120,17408]` | `197.888 us` | `922.42 TFLOP/s` | `55.04%` |
 
 The benchmark does not take responsibility for numerical correctness; each weight/activation-compute
 profile remains the responsibility of the public Linear conformance suite and the unified CPU FP64 GEMM

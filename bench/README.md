@@ -267,7 +267,7 @@ The generator runs INT8 KV unless `kv=NAME` selects another format (`bf16`, `fp8
 `vq2`, `k4v2`); the judge scores against the BF16-KV reference whatever the run used.
 
 Use the same artifact and corpus for every build. The generator uses only Engine API that NInfer
-also has, so for an Infernix-versus-NInfer comparison copy `decode_quality_gen.cpp` into an
+also has, so for a ninferpro-versus-NInfer comparison copy `decode_quality_gen.cpp` into an
 NInfer checkout and build it there with `INFERNIX_DECODE_QUALITY_NINFER` defined (it removes the
 n-gram option), linked to `infernix_engine` like any benchmark. Rounding noise makes builds diverge
 after a few dozen tokens, which is why each build is judged on its own prefixes. Treat agreement
@@ -1337,7 +1337,7 @@ closed.
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 20 records the public value objects directly:
+statistics. JSON schema version 23 records the public value objects directly:
 
 - `config`: constraint type, source/file, literal choices and mixed-request selection, alongside execution settings;
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,

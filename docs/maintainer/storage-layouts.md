@@ -1,4 +1,4 @@
-# Infernix Persistent Storage Layouts
+# ninferpro Persistent Storage Layouts
 
 This reference records the persistent tensor layouts and resource encoding used by current
 `.ninfer` artifacts, including alignment, byte order, padding, encoded-size rules, and logical
@@ -341,7 +341,7 @@ requantize either plane.
 H and intermediate size I. Each expert has a gate and an up matrix `[I,H]` and a down matrix `[H,I]`
 of `nvfp4_mul` words, plus one FP32 multiplier per matrix. The layout makes every expert one
 contiguous, aligned record that CPU and GPU expert kernels read in place and that one DMA or one
-`O_DIRECT` read moves (Qwen3.8-Flash-Next design §6.2).
+`O_DIRECT` read moves (Qwen3.8-Flash-Next design §6.3).
 
 ```text
 gate_up_row_groups = 2 * I / 16          gate_up_blocks = H / 16
@@ -428,7 +428,7 @@ Record e begins at `e * record_stride`; the up rows at `I * gate_row` within it 
 ## 9. `fp8_expert_b128_v1`
 
 `fp8_expert_b128_v1` stores one MoE layer's routed experts `[E,H,I]` of `fp8_e4m3fn_b128` words
-([Qwen3.8-Flash-Next design](qwen3_8-flash-next-design.md) §19.3.25). Each expert is one record: its gate rows, its up rows (`[I,H]`
+([Qwen3.8-Flash-Next design](qwen3_8-flash-next-design.md) §6.3). Each expert is one record: its gate rows, its up rows (`[I,H]`
 each) and its down rows (`[H,I]`), one E4M3FN code byte per weight in row-major order, then the
 scale plane: the gate's, the up's and the down's BF16 tile scales, each row-major
 `[rows / 128][K / 128]` (little-endian words):

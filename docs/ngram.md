@@ -25,12 +25,12 @@ Keep the artifact, context capacity, KV format and other residency options appro
 your GPU. Wider target verification needs additional graph, replay and workspace memory.
 This example is not a memory-sizing recommendation.
 
-| Selected backend | Neural draft tokens | Ngram draft tokens (C=1) | Ngram draft tokens (C>1) |
+| Selected backend | Neural draft tokens | Ngram draft tokens (Qwen3.5 family) | Ngram draft tokens (Qwen3.8-Flash-Next) |
 |---|---:|---:|---:|
 | MTP | 1..7 (Qwen3.5/3.6 1..5) | 1..63 | 1..15 |
-| DFlash | 1..15 | 1..63 | 1..15 |
-| DFlash2 | 1..15 | 1..63 | 1..15 |
-| none (Qwen3.8-Flash-Next only) | — | 1..15 | 1..15 |
+| DFlash | 1..15 | 1..63 | — |
+| DFlash2 | 1..15 (Qwen3.8-Flash-Next 1..7) | 1..63 | 1..15 |
+| none (Qwen3.8-Flash-Next only) | — | — | 1..15 |
 
 Qwen3.8-Flash-Next verifies copy proposals without a neural drafter. Each verified column routes its
 own experts, so wide rounds pay off only at high acceptance (repeated code or text).
@@ -41,7 +41,7 @@ Ngram does not convert one drafter into another. `--ngram-draft-tokens 0` disabl
 feature; the minimum match defaults to 12 and its supported enabled range is 4..64.
 
 At `--max-concurrency > 1` each round is a batch of up to `--max-concurrency` active requests,
-and every width up to 63 is available at any concurrency. A copy round verifies every row of the
+and every width the model family allows is available at any concurrency. A copy round verifies every row of the
 batch at its family's width, so a wide family costs each row of the round, including rows
 without a copy; the narrower copy families below keep short copies cheap. ReplaySSM records
 grow with the widest window times `--max-concurrency`.

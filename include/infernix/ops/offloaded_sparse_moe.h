@@ -15,13 +15,13 @@ namespace infernix::ops {
 
 /**
  * Routed experts of one MoE layer with experts held outside device memory
- * (docs/maintainer/qwen3_8-flash-next-design.md §8.4-8.5, §16.2). For each column t:
+ * (docs/maintainer/qwen3_8-flash-next-design.md §8.4-8.5, §17.2). For each column t:
  *
  *   logits     = FP32 [router; shared gate] x[:, t]             -> projection_fp32
  *   p          = softmax(router logits[0:E, t]);  ids = top-k of p (lower id wins exact ties)
  *   w_i        = p[ids_i] / sum_j p[ids_j]                      -> moe_route
  *   s          = sigmoid(logits[E, t])  (the shared-expert gate)  -> moe_route
- *   y_i        = expert ids_i applied to x[:, t] with the W4A4 arithmetic of design §16.2
+ *   y_i        = expert ids_i applied to x[:, t] with the W4A4 arithmetic of design §17.2
  *   y[:, t]    = bf16(sum_i w_i * y_i + s * y_shared[:, t])       -> moe_combine
  *
  * Expert placement is an execution resource, not a semantic input: an expert's record is read
@@ -32,7 +32,7 @@ namespace infernix::ops {
  * the same bits. An expert with more columns (and one shared gate/up input scale) takes the wide
  * route: the same A4 activations and BF16 boundaries, with the block products summed by FP32
  * tensor cores (qualified against FP64; design §8.5, §13). Both routes depend only on the column
- * count and the stored scales, never on placement. W4A16 experts (§16.2.1) are exact on every
+ * count and the stored scales, never on placement. W4A16 experts (§17.3) are exact on every
  * route, the wide one included (integer tensor cores), so their bits depend on neither placement
  * nor column count. Router logits stay FP32, as in
  * the Qwen3.5 sparse MoE: rounding them to BF16 would turn experts within one BF16 step of the
@@ -81,7 +81,7 @@ void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& ro
 /// Non-resident records are first copied to `staging_slots` device slots (staging_base + i *
 /// record_stride) by a few CTAs that keep their reads within a compact address window, then read
 /// from there: pinned memory read by many CTAs at scattered offsets, as the expert kernels would,
-/// runs at under half the copy rate on the RTX 5090 (design section 8.6). The jobs run in passes
+/// runs at under half the copy rate on the RTX 5090 (design section 8.5). The jobs run in passes
 /// of staging_slots jobs, so every miss is staged; staging_slots == 0 reads misses zero-copy.
 /// The staging slots are scratch of this call and are shared by every layer.
 /// CPU-served misses (design section 10.3). When enabled for a call (max_jobs > 0 and the call
@@ -119,14 +119,14 @@ struct MoeCpuChannel {
     std::int32_t one_column_divisor     = 0;
     const std::int32_t* one_column_divisor_device = nullptr;
     std::int32_t max_job_columns        = offloaded_moe::kMaxCpuColumns; // 1..kMaxCpuColumns
-    // Prefill CPU assist (design §19.3.1 P7): calls of at least wide_from columns (0: none) take up
+    // Prefill CPU assist (design §10.6): calls of at least wide_from columns (0: none) take up
     // to wide_jobs <= kMaxCpuJobs CPU-served misses.
     std::int32_t wide_from              = 0;
     std::int32_t wide_jobs              = 0;
 };
 
-/// Device memory a call warms into L2 while it waits for its CPU-served misses (design §19.3.3
-/// Phase 2): typically the next layer's first weights. Spans start 16-byte aligned; a span's bytes
+/// Device memory a call warms into L2 while it waits for its CPU-served misses (design §8.6):
+/// typically the next layer's first weights. Spans start 16-byte aligned; a span's bytes
 /// are rounded down to 16. Warming changes no result.
 struct MoeL2Warm {
     static constexpr int kSpans = 12;
@@ -134,7 +134,7 @@ struct MoeL2Warm {
     std::size_t bytes[kSpans] = {};
 };
 
-/// The SSD expert tier's fetch channel (design §19.3.7; protocol in
+/// The SSD expert tier's fetch channel (design §9.5; protocol in
 /// ops/offloaded_sparse_moe/cpu/fetch_request.h). With a host table, a call's SSD-only experts that
 /// no CPU job takes (and no F2 stream holds) are fetch-served: the call moves them to the end of
 /// dispatch.jobs (a stable partition; outputs are indexed by entry, so no bit changes), publishes
@@ -151,7 +151,7 @@ struct MoeFetchChannel {
 };
 
 /// The record geometry of an exact-arithmetic expert bank: a GGUF (ggml) bank
-/// (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25, storage layouts §8: gate rows, up rows in gate_up_format, then
+/// (docs/maintainer/qwen3_8-flash-next-design.md §6.3, storage layouts §8: gate rows, up rows in gate_up_format, then
 /// down rows in down_format, every row verbatim ggml blocks) or a block-FP8 bank (fp8_expert_b128_v1,
 /// both formats FP8_E4M3FN_B128: the rows, one byte per weight, then their BF16 tile scales;
 /// storage layouts §9). gate_up_format == NVFP4_MUL selects the NVFP4 record and its
@@ -169,7 +169,7 @@ struct MoeExpertSource {
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]
     // A non-resident expert's host record: host_table[e] when host_table is set (device [E] of
-    // host pointers, the SSD tier's RAM slots, design §19.3.7; a null entry is an SSD-only expert:
+    // host pointers, the SSD tier's RAM slots, design §9.1; a null entry is an SSD-only expert:
     // CPU jobs take those first and read them through the service's RecordProvider, and the fetch
     // channel serves the rest), else host_records + e *
     // record_stride. A record is read from a frame, a host pointer or a landing; its bits are
@@ -186,11 +186,11 @@ struct MoeExpertSource {
     std::uint64_t heartbeat_timeout_ns = offloaded_moe::kHeartbeatTimeoutNs;
     std::uint64_t record_stride      = 0;
     const offloaded_moe::ExpertScales* scales = nullptr;
-    // The layer's expert arithmetic: W4A4 with stored input scales (§16.2), or W4A16 for experts
-    // stored without activation scales (§16.2.1; scales then hold the multipliers in alpha_*). The
+    // The layer's expert arithmetic: W4A4 with stored input scales (§17.2), or W4A16 for experts
+    // stored without activation scales (§17.3; scales then hold the multipliers in alpha_*). The
     // CPU channel's service must compute with the same arithmetic.
     offloaded_moe::ExpertActivation activation = offloaded_moe::ExpertActivation::kA4;
-    // W4A16 experts' wide route: exact (default) or the two-term A4 fast path (design §19.3.23); the
+    // W4A16 experts' wide route: exact (default) or the two-term A4 fast path (design §13.4); the
     // workspace must be sized for the same choice. Narrow routes and W4A4 experts ignore it.
     offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact;
     std::uint8_t* staging_base  = nullptr;
@@ -210,7 +210,7 @@ struct MoeExpertSource {
     // (fork, join) are caller-owned; the stream is otherwise idle.
     cudaStream_t fork_stream = nullptr;
     cudaEvent_t fork_events[2] = {};
-    // Optional landing for forked calls (design §19.3.5 S4; ignored by every other route): the n-th
+    // Optional landing for forked calls (design §9.3; ignored by every other route): the n-th
     // staged miss in job order (CPU-served misses excluded) is copied into frame landing[n]
     // (frame_base + landing[n] * record_stride) instead of a staging slot when n < landing_slots
     // and landing[n] >= 0, and stage block 0 writes landed[n] = its expert; other entries of
@@ -223,7 +223,7 @@ struct MoeExpertSource {
     // Prefetched into L2 by extra CTAs of the CPU wait while the host computes this call's misses
     // (only when a request was published).
     MoeL2Warm l2_warm;
-    // Optional streamed records (design §19.3.8 F2): prefetched (device [E]) gives, for a
+    // Optional streamed records (design §13.3): prefetched (device [E]) gives, for a
     // non-resident expert, the slot whose record the caller has already copied to prefetch_base +
     // slot * prefetch_stride (ordered before this call), or -1. Such an expert is read there like a
     // resident one: never staged and never CPU-served (the CPU takes misses the stream left out).

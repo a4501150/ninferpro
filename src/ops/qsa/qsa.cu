@@ -1,5 +1,5 @@
 // QSA indexer, pooled keys, block selection and block-sparse attention
-// (docs/maintainer/qwen3_8-flash-next-design.md §8.10). KV storages: bf16 and int8 (INT8-G64 with
+// (docs/maintainer/qwen3_8-flash-next-design.md §14.3). KV storages: bf16 and int8 (INT8-G64 with
 // Hadamard-rotated keys, as written by kv_cache_append).
 
 #include "infernix/ops/qsa.h"
@@ -887,7 +887,7 @@ constexpr int kSmallCallColumns = 8;
 //   this costs ~2 us at W = 5 and ~10 us at W = 8 per call, under 0.2 % of a round; W = 1-2 are equal.
 // - Wider calls: one wave of the decode kernel's CTAs (one 512-thread CTA per SM), at most 48 and at
 //   least 4 once split. A call that fills half the SMs unsplit takes the prompt route. Against the
-//   earlier 340-CTA / 33-split rule: 42-73 % faster at 43-85 columns (design §19.3.15).
+//   earlier 340-CTA / 33-split rule: 42-73 % faster at 43-85 columns (design §14.2).
 int attention_splits(int columns, const QsaGeometry& g) {
     const int attended = g.budget + g.ratio - 1;
     if (columns <= kSmallCallColumns) { return (attended + kTokenTile - 1) / kTokenTile; }

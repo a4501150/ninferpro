@@ -46,7 +46,7 @@ struct ForwardKV {
     Tensor block_tables;                 // I32 [pages per row, rows]
 };
 
-// The CPU's share of a gated prefill call's experts (design §19.3.12): from the call's columns per
+// The CPU's share of a gated prefill call's experts (design §10.6): from the call's columns per
 // expert in one layer, marks in `cpu` the experts the CPU serves, which must be non-resident and
 // have at most ops::offloaded_moe::kMaxCpuColumns columns (the narrow route, placement-invariant),
 // and returns their number. Owned by the Program, which knows the link and the CPU's rates.
@@ -75,7 +75,7 @@ struct ForwardExperts {
     std::int32_t staging_slots  = 0;
     // Per layer: the channel to the host expert engine for CPU-served misses (empty disables).
     std::vector<ops::MoeCpuChannel> cpu;
-    // SSD tier (design §19.3.7; empty in full mode): per layer, the device table of host record
+    // SSD tier (design §9.1; empty in full mode): per layer, the device table of host record
     // pointers (null: SSD-only; replaces the pinned bank) and the fetch channel its SSD-only
     // experts without a CPU job are read through.
     std::vector<const std::uint8_t* const*> host_tables;
@@ -90,16 +90,16 @@ struct ForwardExperts {
     // input, joined before the combine) while the routed experts compute. Null: in order.
     cudaStream_t shared_stream = nullptr;
     std::array<cudaEvent_t, 2> shared_events{};
-    // Landing frames of decode and verification calls (design §19.3.5 S4; see
+    // Landing frames of decode and verification calls (design §9.3; see
     // ops::MoeExpertSource::landing): layer l uses landing + l * landing_slots and landed + l *
     // landing_slots. Null disables.
     const std::int32_t* landing = nullptr;
     std::int32_t* landed        = nullptr;
     std::int32_t landing_slots  = 0;
-    // Prefill chunks read the experts this stream copied ahead while it is active (design §19.3.8
-    // F2; owned by the Program, which starts it per chunk).
+    // Prefill chunks read the experts this stream copied ahead while it is active (design §13.3;
+    // owned by the Program, which starts it per chunk).
     ExpertStream* stream = nullptr;
-    // A gated stream's split of each layer's experts between the link and the CPU (§19.3.12).
+    // A gated stream's split of each layer's experts between the link and the CPU (§10.6).
     const CpuSplitPolicy* split = nullptr;
     // --expert-tail-skip (approximate, 0: off): the generation rounds' ops::MoeExpertSource::
     // tail_skip_rank.
@@ -121,7 +121,7 @@ struct ForwardVerify {
     Tensor qsa_keys;      // BF16 [Di, W, B, attention layers]: the raw index keys
 };
 
-// Visual embeddings of a call's image columns (design §19.3.2): they replace those columns' token
+// Visual embeddings of a call's image columns (design §16.4): they replace those columns' token
 // embeddings before the stream expand (transformers' masked_scatter precedes repeat).
 struct VisionInput {
     Tensor embeddings; // BF16 [H, m]: the columns' embeddings, in column order
@@ -148,7 +148,7 @@ struct MtpChunk {
     const VisionInput* vision = nullptr;
 };
 
-// A call whose n-gram rows the host writes after the launch (design §12.3, n-gram S2): before
+// A call whose n-gram rows the host writes after the launch (design §12.4, n-gram S2): before
 // ple_embed, the rows are copied from `pinned_rows` into ForwardBatch::ngram_rows once the pinned
 // `ready` word equals the device word `expected` (core upload_pinned_when).
 struct NgramRowGate {
@@ -291,7 +291,7 @@ public:
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
-    // The steps run() composes, for a layer walk over a prefill span (design §19.3.8 F4): the
+    // The steps run() composes, for a layer walk over a prefill span (design §13.2): the
     // same chunks executed layer-major instead of chunk-major. Each step of a chunk starts with
     // begin_call (it resets the workspace); `residual` (BF16 [S*H, T]) lives outside the
     // workspace. embed writes the chunk's expanded embedding into it; layer runs one decoder

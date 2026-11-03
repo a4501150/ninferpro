@@ -1,6 +1,6 @@
 # Constrained decoding design
 
-This document defines the architecture, functional semantics and execution contract of Infernix's
+This document defines the architecture, functional semantics and execution contract of the engine's
 constrained decoding. GBNF, JSON object, JSON Schema, choice, regex and tool constraints are
 implemented across ordinary decoding, MTP, DFlash and DFlash2 (Qwen3.5) and ordinary decoding, MTP
 and n-gram copy drafting (Qwen3.8-Flash-Next). Content constraints are used through
@@ -9,7 +9,7 @@ Prompt and the call policy to `RequestOptions::tool_choice`.
 
 The goal is one token-constraint mechanism shared by GBNF, JSON, JSON Schema and tool calls, plugged
 into the existing ordinary sampling, MTP, DFlash, DFlash2, thinking, streaming output and
-preemption/recovery. Infernix keeps one GPU, fixed resident lanes and native C++/CUDA execution.
+preemption/recovery. The engine keeps one GPU, fixed resident lanes and native C++/CUDA execution.
 
 Overall choices: vendor XGrammar's CPU core; the Frontend builds grammars that match the model's
 output semantics; the request owns the matcher; the Program manages the bitmask buffers and the
@@ -77,7 +77,7 @@ same per-token target distribution as ordinary constrained sampling.
 ### 2.1 Vendored XGrammar
 
 The source lives in `third_party/xgrammar/` and is maintained like `third_party/llama-jinja/`: a fixed
-source version, its provenance and licence kept, the needed changes maintained by Infernix and upstream
+source version, its provenance and licence kept, the needed changes maintained by the engine and upstream
 changes taken as needed.
 
 It starts from the CPU core and its dependencies: grammar parsing and compilation, JSON Schema/regex
@@ -87,7 +87,7 @@ and unrelated build branches do not enter the product target.
 
 The product build uses an explicit source list and its own CMake target. Small dependencies the core
 needs (picojson, DLPack) are managed inside that boundary; DLPack only adapts the library's CPU tensor
-views and does not enter Infernix's public API or the CUDA Op contracts.
+views and does not enter the engine's public API or the CUDA Op contracts.
 
 Direct customization is allowed for:
 
@@ -98,14 +98,14 @@ Direct customization is allowed for:
 - vocabulary handling, temporary state and compile caching tuned for real workloads.
 
 Trimming keeps the complete dependencies of the chosen CPU features. The library's internal types need
-not become Infernix's public contract.
+not become the engine's public contract.
 
 ### 2.2 Responsibilities
 
 | Owner | Responsible for |
 |---|---|
 | Third-party CPU core | grammar, tokenizer-aware compilation, matcher, legal sets and rollback |
-| Infernix public request contract | user constraint types, content constraints, tool choice and strict intent; no third-party types |
+| Engine public request contract | user constraint types, content constraints, tool choice and strict intent; no third-party types |
 | Generic text-constraint adapter | schema validation and composition reduction, source locations, shared compiled resources, CPU bitmasks and temporary matcher operations |
 | Model Frontend | raw vocabulary and control tokens; thinking/content/tool framing; continuation prefixes; tool value representation |
 | Request OutputSession | the mutable matcher, output parsing, preview and commit |
@@ -188,7 +188,7 @@ token domain matches the sampling ops. The vocabulary is adapted once:
   corresponding model rules;
 - an ordinary token spelling and a special token with the same visible string are handled separately.
 
-Infernix supplies these classes explicitly; upstream `TokenizerInfo`'s default special-token guess does
+The engine supplies these classes explicitly; upstream `TokenizerInfo`'s default special-token guess does
 not replace the Frontend's facts. The adapter may pass explicit classes through the vendor interface;
 it does not infer semantics by treating every control token as an ordinary string.
 
@@ -232,7 +232,7 @@ classes, sequences, alternatives, repetition and recursion. Syntax errors carry 
 
 The first public grammar contract is the language constraint itself. Library extensions that would
 change temperature, add a token budget or otherwise change generation are not implicit run parameters;
-those stay under Infernix's sampling and budget contracts. Token-level terminals are checked against
+those stay under the engine's sampling and budget contracts. Token-level terminals are checked against
 the model's token domain and control-token rules.
 
 Token terminals use the vendor's `Token(id, ...)` / `ExcludeToken(id, ...)` forms. The GBNF entry does
@@ -584,7 +584,7 @@ At the end of a request its matcher and references are released; the compile cac
 compiled grammar. Ordinary prefix caches keep only model state, never mutable matchers.
 
 XGrammar's current Earley implementation keeps parse history, so `max_rollback_tokens` no longer bounds
-memory. Infernix asks only for bounded lookahead/preview rollback but does not claim O(K) matcher
+memory. The engine asks only for bounded lookahead/preview rollback but does not claim O(K) matcher
 memory: active parse state grows with output length and grammar complexity. History is not forked each
 round, and old charts still referenced by parse state are not dropped.
 
@@ -651,10 +651,10 @@ the CPU never ends the whole request directly.
 
 Logits are read over the vocabulary with the existing presence/frequency penalties. The Engine resolves a
 content-constrained request without the model's registered penalties (`runtime::resolve_sampling`): the
-language repeats its structure by construction, and Qwen's non-thinking presence penalty of 1.5 on those
-repeated tokens made 14 of 20 sampled schema answers start a string value with a comma, through legal
-merged tokens such as `",` (0 of 20 without the penalty; Qwen3.8-Flash-Next, 2026-10-08; the 27B shares the preset).
-Penalties the caller sets still apply. Illegal tokens take
+language repeats its structure by construction, and a presence penalty on those repeated tokens corrupts
+schema output (Qwen's non-thinking penalty of 1.5 made 14 of 20 sampled answers start a string value with
+a comma through legal merged tokens such as `",`, against 0 of 20 without it; Qwen3.8-Flash-Next,
+2026-10-08; the 27B shares the preset). Penalties the caller sets still apply. Illegal tokens take
 no part in argmax, top-k or later normalization; legal candidates follow the existing temperature,
 min-p, top-p, tie-break and counter-based RNG contracts.
 
@@ -712,7 +712,7 @@ for i in 0..K:
 rollback to mark
 ```
 
-Lookahead advances only along the proposal's actual chain. Requests look ahead independently; Infernix's
+Lookahead advances only along the proposal's actual chain. Requests look ahead independently; the engine's
 backends use bounded chains, with no general tree planner.
 
 One constrained token step includes the reasoning/content/tool rules: rolling back only the innermost
@@ -911,10 +911,10 @@ exposed to users.
 | OpenAI Chat | `response_format` json_object/json_schema; tool strict and tool_choice |
 | OpenAI Responses | `text.format` json_object/json_schema; tool strict and tool_choice |
 | Anthropic Messages | `output_config.format` JSON Schema; tool definitions, strict and tool_choice through the shared tool contract |
-| Infernix HTTP extension | grammar, regex and choice in `structured_outputs`, for direct language constraints without a standard protocol field |
+| Engine HTTP extension | grammar, regex and choice in `structured_outputs`, for direct language constraints without a standard protocol field |
 
-A content constraint has one source; a standard response format together with the Infernix extension
-is an error. The HTTP extension is explicitly Infernix's own contract, not claimed as an OpenAI or
+A content constraint has one source; a standard response format together with the engine extension
+is an error. The HTTP extension is explicitly the engine's own contract, not claimed as an OpenAI or
 Anthropic standard field, with no duplicate guided_* aliases.
 
 An explicit JSON Schema response request enforces its supported assertions; a protocol strict flag is
@@ -935,8 +935,10 @@ One bitmask copy holds:
 B × (K+1) × ceil(V/32) × 4 bytes
 ```
 
-With V=262144 that is 32 KiB per row position; B=8, K=15 gives 4 MiB, on both Host and Device, plus
-small per-position state and draft ids. This is a capacity estimate, not transfer time.
+With V the public token count, about 248,077 (the mask's vocabulary dimension is not the logits'
+262,144 padding width, §7.1), that is about 30.3 KiB per row position; B=8, K=15 gives about 3.8 MiB, on
+both Host and Device, plus small per-position state and draft ids. This is a capacity estimate, not
+transfer time.
 
 The main optimizations: vocabulary and compile reuse; matchers advanced per request; no per-round
 replay of the whole output; preallocated mask buffers; bitmasks consumed directly on the GPU;

@@ -328,10 +328,6 @@ widely; ms per round is stable to about 0.5 %. INT8 KV, four seed sets:
 | 4 | chain (8) | 686.5 | | 3.02 | 17.61 |
 | 4 | 9 | 679.7 | -0.9 % (-4.4..+1.6) | 3.17 | 18.68 |
 
-An earlier pair of passes on seed set 0 alone measured 12 columns at +5.5 % with two requests; its
-chain sample (380 tok/s) was the slowest of the five two-request chain samples, so the table above
-replaces it.
-
 **Same-text estimate.** A chain round on the tree run's own text would have emitted its correction
 where the accepted path left the main chain, so `tree_side_accepted_tokens` is exactly what the
 tree added to its rounds. The acceptance gain g = (A+R)/(A-S+R) (A accepted drafts, R rounds, S side
@@ -425,11 +421,9 @@ spend about one round in 32 on the widest width and take narrower trees or the c
 estimates are close (at three requests the acceptance gain is +9.7 % against the fixed 12
 columns' +12.7 %). At four requests they break even, as the fixed tables do.
 
-These runs predate the tree walk and the 64-column sliced-K LM head. A later pair of passes (seed
-sets 0 and 1, the same suite and flags) measured automatic widths against chain verification with
-the build before and after both: at three requests the same-text estimate rose from +1.9 and +2.0 %
-to +2.5 and +3.2 %, and at four from +0.1 and +0.4 % to +3.3 and +2.2 %, where automatic widths now
-verify trees in 95-99 % of the rounds instead of 14-56 %.
+With the tree walk and the 64-column sliced-K LM head since those runs, automatic widths verify
+trees in 95-99 % of the rounds at three and four requests, and their same-text estimates rise to
++2.5-3.2 % and +2.2-3.3 % respectively.
 
 **Automatic widths at long context.** One request, sampled (thinking on, the model's default
 sampling), 3072 output tokens after a 32K, 64K or 128K-token document (`long_niah` haystacks with a

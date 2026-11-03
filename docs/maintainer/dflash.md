@@ -2,7 +2,7 @@
 
 DFlash backends propose several tokens with one masked-block forward, conditioned on committed
 target hidden features. The target verifies the proposal causally and remains the output authority.
-Infernix implements DFlash and DFlash2 as optional components of the
+The engine implements DFlash and DFlash2 as optional components of the
 [Qwen3.5 model](qwen3_5-model.md), and DFlash2 for Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) as a
 companion artifact loaded beside the main one ([Qwen3.8-Flash-Next](#qwen38-flash-next)). Their
 private config and bindings select the stored weights; startup chooses one backend, draft width
@@ -326,9 +326,11 @@ has the 27B drafter's mathematics at the geometry above; the fused Ops register 
   prefix cache's state image (the drafter group), with its frontier in the image header; a tap
   inside a layer walk copies the ring as it stood before the span, which only costs acceptance after
   a resume from it.
-- **Rounds.** One-row rounds speculate (two-row rounds only with the `adaptive-speculation` fast
-  path, which applies to MTP today). The drafter always proposes its configured block of K + 1
-  columns (one CUDA Graph per batch size) and the round verifies a prefix of its drafts. K is at
+- **Rounds.** Rounds of any size speculate: one-row rounds always draft, and batched DFlash2
+  drafting runs at any round size ≥ 2 under the `adaptive-speculation` fast path, one shared draft
+  length chosen by an online cost fit (plain rounds where the fit says so). The drafter always
+  proposes its configured block of K + 1 columns (one CUDA Graph per batch size) and the round
+  verifies a prefix of its drafts. K is at
   most 7, the block the drafter was trained with and the widest column-invariant verification.
 - **Draft length.** The selector also writes each draft's temperature-1 probability at its
   selected rank (`candidate_selector_path`'s optional `confidence`), read back with the drafts.
@@ -337,12 +339,11 @@ has the 27B drafter's mathematics at the geometry above; the fused Ops register 
   calibrated acceptances) / (1 + 0.1 + 0.31 k) plain rounds, each draft's acceptance read from its
   probability's decile and learned per request, one draft more every 8 rounds
   ([`draft_length.h`](../../src/models/qwen4_exp/program/draft_length.h)). Measured on the 5090
-  (Dense8 and IQ3_S, 2026-10-20): verifying all seven was 18-24 % slower than MTP `auto`, a fixed
-  cut at 0.6 3-15 % faster, the calibrated length 8-11 % faster on code, docs and sampled docs
-  (26 % on sampled code; the means of every run, Dense8 code from four runs against eight);
-  the same policy with the online round-cost fit of MTP's chose shorter lengths and was 6 % slower
-  on code. A round with a sampled row
-  verifies by sparse rejection sampling with the selector's laws (one-hot for its greedy rows and
+  (Dense8 and IQ3_S, 2026-10-20), the calibrated length beat every fixed length and MTP's policy on
+  this workload: verifying all seven drafts was 18-24 % slower than MTP `auto`, a fixed cut at 0.6
+  recovered 3-15 %, the calibrated length gained 8-11 % (26 % on sampled code), and the same policy
+  with MTP's online round-cost fit chose shorter lengths and was 6 % slower on code. A round with a
+  sampled row verifies by sparse rejection sampling with the selector's laws (one-hot for its greedy rows and
   at an n-gram row's copies); a round of greedy rows, whose drafts are deterministic, takes the
   greedy acceptance. Greedy output equals plain decoding either way.
 - **Implementation.** [`execution/dflash2.cpp`](../../src/models/qwen4_exp/execution/dflash2.cpp)

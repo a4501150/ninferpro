@@ -1,4 +1,4 @@
-// ReadOnlyFile::read_direct_blocks (n-gram step S1, design §19.3.4): unbuffered 4 KiB block reads
+// ReadOnlyFile::read_direct_blocks (n-gram step S1, design §12.3): unbuffered 4 KiB block reads
 // through a ring of 1, 4 or 64 blocks, offsets in random order with repeats; every index is
 // consumed exactly once with its own block's bytes, and a read past the end throws after the reads
 // in flight have drained, as does a consumer's exception. Calls from several threads on one file

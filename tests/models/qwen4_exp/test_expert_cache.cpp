@@ -1,7 +1,7 @@
 // Host expert cache of Qwen3.8-Flash-Next (docs/maintainer/qwen3_8-flash-next-design.md §9):
 // LFRU decisions equal tools/expert_cache_replay step for step, residency words round-trip,
 // frames are never reused while a round that may read them is in flight, and a resized pool (design
-// §19.3.7, RT8) evicts the lowest-score experts wherever they sit, moves the survivors below the new
+// §9.1, RT8) evicts the lowest-score experts wherever they sit, moves the survivors below the new
 // top and never names a frame above it.
 
 #include "test_temp_path.h"
@@ -278,7 +278,7 @@ void test_controller_resize() {
 // An agent-and-device simulation. Each round reads the frames named by READY entries; the agent
 // applies the route log while that round runs and its commands become visible to later rounds.
 // Invariants: a READY entry's frame holds its expert, and a frame is overwritten only after every
-// round that read its previous expert has finished (design §9.5).
+// round that read its previous expert has finished (design §9.3).
 void test_agent_simulation() {
     const std::uint32_t keys = 6 * 64, frames = 120;
     // Slack covers peak admissions per round times (D + 1): ~27 per round here, held one extra round.
@@ -333,7 +333,7 @@ void test_agent_simulation() {
 
 } // namespace
 
-// The ABA case of load publication (design §19.3.2, "Frame lending and the two expert-cache fixes"):
+// The ABA case of load publication (design §9.3, "Round boundaries"):
 // K loads into the only frame (serial s1); K2 evicts it and loads into the same frame; K re-enters it
 // (serial s2) while s1's copy could still be in flight. Only the newest copy of a key in its frame
 // may be published: complete_load(K, f, s1) is false, (K, f, s2) true, and K2's copy is stale too.
@@ -379,7 +379,7 @@ void test_load_serials() {
     check(!cache.complete_load(K2, other->frame, other->serial), "the evicted K2's copy does not publish");
 }
 
-// Frame lending (design §19.3.2, VT4): choose_run picks the run of held experts with the minimum
+// Frame lending (design §9.4, VT4): choose_run picks the run of held experts with the minimum
 // summed LFRU score, never a lent frame, and avoids busy frames while a run without them exists;
 // lend shrinks the capacity by the run, which evicts the lowest-score experts wherever they are
 // (ABSENT), relocates the run's other experts into frames outside it (no frame maps into the run)
@@ -510,7 +510,7 @@ void test_lending() {
     check(threw, "a frame is given back only while lent");
 }
 
-// Warm start (design §19.3.5 S4b): seed sets the counts, then loads the ranked keys best first into
+// Warm start (design §9.2): seed sets the counts, then loads the ranked keys best first into
 // free frames while the policy has capacity (frames - slack), skipping keys already resident or out
 // of range; each loaded key issues one copy into a distinct frame and publishes when that copy lands.
 void test_seed() {
@@ -539,7 +539,7 @@ void test_seed() {
     check(cache.seed(ranked, {}, cmds) == 0 && cmds.empty(), "a full cache seeds nothing more");
 }
 
-// Prompt seeding (design §19.3.27): credit adds weighted uses, marked used now, with no clock tick
+// Prompt seeding (design §9.2): credit adds weighted uses, marked used now, with no clock tick
 // and no admission; the credit then ranks the next budgeted admission and its victim.
 void test_prompt_credit() {
     LfruPolicy policy(64, 4);
@@ -634,7 +634,7 @@ void test_calibrated_order() {
           "layer 0's first experts are NInfer's");
 }
 
-// Fill-phase landing (design §19.3.5 S4): reserve_free pops free frames only while the policy has
+// Fill-phase landing (design §9.3): reserve_free pops free frames only while the policy has
 // room; adopt makes a landed key READY and resident in its frame, drops its queued load (no second
 // copy), refuses a key loading elsewhere, and release returns unused frames.
 void test_landing() {
@@ -665,7 +665,7 @@ void test_landing() {
     for (const auto f : reserved) { cache.release(f); }
 }
 
-// The SSD tier's pieces (design §19.3.7): the admission filter and the eviction gate of the LFRU step,
+// The SSD tier's pieces (design §9.5): the admission filter and the eviction gate of the LFRU step,
 // and a demoted expert's frame held past quiescence until its copy completes.
 void test_tier_gates() {
     LfruPolicy policy(16, 2);

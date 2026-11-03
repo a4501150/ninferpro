@@ -1,7 +1,7 @@
 #pragma once
 
 // The Vision tower's mathematics, shared by Qwen3.5 and Qwen4Exp
-// (docs/maintainer/qwen3_8-flash-next-design.md §19.3.2, "Ownership and the shared tower"). The
+// (docs/maintainer/qwen3_8-flash-next-design.md §16, "Ownership and the shared tower"). The
 // stages hold the op sequence of one item and nothing about where its buffers live: Qwen3.5's
 // VisionContext binds them to its workspace plan, VisionTowerPass to a layer-major multi-item
 // pass. Program-free: no Program types, no media acquisition.
@@ -94,7 +94,7 @@ struct VisionPassLayout {
 [[nodiscard]] VisionPassLayout plan_vision_pass(const VisionConfig& config, const VisionParameters& parameters,
                                                 std::span<const std::size_t> item_patches);
 
-// A resumable, layer-major encode of several items (design §19.3.2): stage 0 embeds every item,
+// A resumable, layer-major encode of several items (design §16.4): stage 0 embeds every item,
 // stage 1 + l runs layer l for every item, stage depth + 1 merges every item into its output.
 // Every Op runs per item with its own T = P_i, so an item's embedding is bitwise the same alone
 // or with other items, while each layer's weights are read once for all items. With a weight

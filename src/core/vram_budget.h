@@ -2,7 +2,7 @@
 
 // Physical facts about one CUDA device's video memory: device-wide free memory, this process's OS
 // budget (Windows WDDM, through DXGI) and whether the device drives a display. No policy: sizing
-// decisions live with their owners (docs/maintainer/qwen3_8-flash-next-design.md §19.3.7).
+// decisions live with their owners (docs/maintainer/qwen3_8-flash-next-design.md §9.7).
 
 #include <cstddef>
 #include <cstdint>
@@ -54,7 +54,7 @@ public:
 //
 // `past_budget` (--vram-past-budget): WDDM's per-process budget withholds part of the physical
 // VRAM that is allocatable at device speed (RTX 5090: budget 31,419 MiB against 32,187 MiB of
-// physical memory less the driver's reserve; 640 MiB more allocated, design §19.3.8 VRAM item 2).
+// physical memory less the driver's reserve; 640 MiB more allocated).
 // The source then measures once, at open, allowance = NVML physical (total - reserved) - the
 // budget - kPastBudgetMargin, and reports budget + allowance as the budget and free memory derived
 // from it, as cudaMemGetInfo derives it (budget - usage). A later budget cut by the OS lowers the

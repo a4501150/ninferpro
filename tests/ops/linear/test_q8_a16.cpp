@@ -119,7 +119,7 @@ int q8_a16_conformance() {
     return failures;
 }
 
-// Speculative verification relies on this for one row (design §11.3): an output column is
+// Speculative verification relies on this for one row (design §11.1): an output column is
 // bit-identical whether it is computed alone or beside other columns, up to 8 columns on every route
 // (the register-streamed and SIMT routes reduce a column identically, so a shape may mix them by
 // width), and as far as each Flash-Next shape keeps the register-streamed route beyond 8 (passes,

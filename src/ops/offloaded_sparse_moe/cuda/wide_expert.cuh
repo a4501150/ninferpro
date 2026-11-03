@@ -12,7 +12,7 @@
 //     weight is repacked in memory.
 //   - Work: a device-built list of (job, 64-column tile) pairs times the matrix's 128-row blocks,
 //     walked by a persistent grid, so the pipeline runs on across tiles and experts.
-//   - Epilogues receive FP32 accumulators and apply the canonical boundaries of §16.2.
+//   - Epilogues receive FP32 accumulators and apply the canonical boundaries of §17.2.
 
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 

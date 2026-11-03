@@ -1,22 +1,28 @@
-# DeepSeek-V4.1-Flash-1017 on one RTX 5090: design
+# DeepSeek-V4.1-Flash on the RTX PRO 6000 and RTX 5090: design
 
 **Status: design proposal, not implemented.** Nothing in this document is built. It is a temporary
 planning document for adding `DeepseekV41ForCausalLM` (DeepSeek-V4.1-Flash, model type
-`deepseek_v41`) to Infernix, with the NVFP4 build as the artifact. When the implementation lands,
+`deepseek_v41`) to the engine, with the MXFP4 build as the artifact. When the implementation lands,
 its stable content moves into the active authorities named in
-[§24](#24-documentation-and-authority-changes) and this file is removed. The design reuses the
-Qwen3.8-Flash-Next work and the GLM-5.3-Flash design wherever they transfer; they are cited as
-**FN §x** ([qwen3_8-flash-next-design.md](qwen3_8-flash-next-design.md)) and **GLM §x**
-([glm5_3-flash-design.md](glm5_3-flash-design.md)). DwarfStar (`antirez/ds4`), the local engine
-whose V4.1 implementation this design studied most closely, is cited as **DS4** (§4.1).
+[§24](#24-documentation-and-authority-changes) and this file is removed.
 
-Labels used for numbers: **measured** (on this machine, with the method named), **upstream** (read
-from the reference code, config, checkpoint headers or another project's published record),
+The offload tier this family composes — the VRAM expert cache, residency, placement, the RAM and
+SSD tiers, the CPU expert engine — is designed once for every offloaded MoE family and lives in
+[MoE offload design](moe-offload-design.md), cited below as **MoE §N**. This document keeps
+DeepSeek-V4.1-Flash's constants, kernels, recipes and models of its own speed, and points to the
+MoE document for the shared machinery. The one implemented family,
+[Qwen3.8-Flash-Next](qwen3_8-flash-next-design.md), is cited as **FN §x** (its superseded content
+remains in git at base commit `0af2a9b`); the parallel [GLM-5.3-Flash design](glm5_3-flash-design.md)
+is cited as **GLM §x**. DwarfStar (`antirez/ds4`), the local engine whose V4.1 implementation this
+design studied most closely, is cited as **DS4** (§4.1).
+
+Labels used for numbers: **measured** (on the named machine, with the method named), **upstream**
+(read from the reference code, config, checkpoint headers or another project's published record),
 **model** (derived from measured or upstream inputs by the stated arithmetic), **estimated**
 (judgement; uncertain by the stated range). A milestone named in brackets replaces each model or
 estimate with a measurement.
 
-**The artifact.** "NVFP4 DeepSeek-V4.1-Flash" names one set of expert values, whichever file it
+**The artifact.** "MXFP4 DeepSeek-V4.1-Flash" names one set of expert values, whichever file it
 comes from:
 
 - DeepSeek trained and released the routed experts as **MXFP4** (E2M1 codes, one UE8M0 scale per
@@ -25,23 +31,27 @@ comes from:
   weight blocks passed lossless conversion" (its card). The values are identical; only the block
   scale layout differs (§7.1).
 - The October update [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
-  changes weights only (§2.6). No NVFP4 export of it exists yet (§4.2). Infernix's recipe imports
+  changes weights only (§2.6). No NVFP4 export of it exists yet (§4.2). The engine's recipe imports
   either source, so a 1017 NVFP4 artifact needs no NVIDIA export: the expert values of the 1017
-  release are the NVFP4 build's values by construction.
+  release are the MXFP4 build's values by construction.
 - Per the owner's decision (c) the artifact stores those values in their original MXFP4 form, 5.6 %
   smaller than NVFP4 records, unless M3 finds the MXFP4 kernels slower (§7.3, §9.6).
 
 **Default artifact:** `DeepSeek-V4.1-Flash-1017-Infernix`, converted from the official 1017
-release: MXFP4 expert records striped over three NVMe volumes, the FP8 Engram volume, and every
-dense tensor as stored (FP8 with 32 × 32 block scales, BF16, FP32). The September NVFP4 export is
-the second supported source and the reference for the NVFP4 path.
+release: MXFP4 expert records striped over NVMe volumes, the FP8 Engram volume, and every dense
+tensor as stored (FP8 with 32 × 32 block scales, BF16, FP32). The September NVFP4 export is the
+second supported source and the reference for the NVFP4 path.
 
-The target machine is the one measured for the GLM design (GLM §3):
+Two target machines, both first class (§3):
 
-- one RTX 5090 (32 GB) on a **PCIe 5.0 x8** link, fixed (the other x8 lanes serve a network card);
-- an i9-13900K (8 P-cores, 16 E-cores, AVX-VNNI, no AVX-512) with 96 GB of DDR5-5800;
-- Windows 11;
-- four NVMe drives (three Samsung 990 PRO and an Optane P5800X), three of them behind the chipset.
+- the **RTX PRO 6000 Blackwell** (96 GB, PCIe Gen5 x16, Linux, 89 GB of host RAM, the Gen5 NVMe
+  that holds the models) — the production machine. The routed bank (288.8 GB) and the Engram
+  tables (202.8 GB) do not fit in its memory either, so this family is offloaded on both cards; a
+  placement names any ratio of VRAM:RAM:SSD (MoE §4.8) and is switchable at runtime. §19 states the
+  memory plans for both cards, §5 the expected speed for both.
+- the **RTX 5090** (32 GB, PCIe Gen5 x8, Windows 11) with an i9-13900K host, 96 GB of DDR5-5800 and
+  four NVMe drives (three Samsung 990 PRO and an Optane P5800X), three of them behind the chipset:
+  the machine the platform and storage facts below were measured on (GLM §3).
 
 ---
 
@@ -54,7 +64,7 @@ The target machine is the one measured for the GLM design (GLM §3):
 5. [Performance model](#5-performance-model)
 6. [Design overview](#6-design-overview)
 7. [Artifacts, records, volumes and conversion](#7-artifacts-records-volumes-and-conversion)
-8. [Ownership in Infernix](#8-ownership-in-infernix)
+8. [Ownership in the engine](#8-ownership-in-the-engine)
 9. [Decode pipeline and canonical arithmetic](#9-decode-pipeline-and-canonical-arithmetic)
 10. [Expert residency: VRAM, RAM and SSD](#10-expert-residency-vram-ram-and-ssd)
 11. [Multi-SSD expert streaming](#11-multi-ssd-expert-streaming)
@@ -92,8 +102,10 @@ The product supports `DeepseekV41ForCausalLM` through the public Engine, `infern
 - the hybrid prefix cache in `infernix-serve` (§18);
 - the DeepSeek encoding: thinking, reasoning effort 1-100, DSML tool calls, tool results and
   reminders in the OpenAI and Anthropic protocol surfaces (§21);
-- routed experts in **three tiers**: a VRAM expert cache, pinned and unpinned host RAM, and expert
-  volumes striped over **one to four NVMe drives** (§10-§11);
+- routed experts in **three tiers** (MoE §4): any ratio of VRAM:RAM:SSD through the placement
+  forms — `--experts vram=…,ram=…[,ssd=…]` or counts, a placement file, byte-level RAM flags —
+  switchable at runtime over the serving API (`POST /admin/expert-placement`), with expert volumes
+  striped over **one to four NVMe drives** where the machine has them (§10-§11);
 - the Engram tables in their own volume, with **FP8 and MXFP4 row formats** selectable like
   Flash-Next's n-gram tables (§14);
 - one recipe for the official DeepSeek release (September or 1017) and NVIDIA's ModelOpt NVFP4
@@ -105,9 +117,9 @@ tensors verbatim, Engram rows verbatim in the chosen format, and routed experts 
 re-encoding that the converter checks block by block. Every FP8 and FP4 linear takes DeepSeek's own
 activation quantization (MXFP8: E4M3 with one power-of-two scale per 32 activations, decision b)
 and computes it with exact integer sums (**MX8**, §9.5), so an expert's output is the same bits from
-a VRAM frame, a staging frame, the CPU or any landing order, and Infernix reproduces the reference
-forward up to the accumulation order the reference leaves to its tensor cores. The deviations from
-`inference/model.py` are listed in §20.4.
+a VRAM frame, a staging frame, the CPU or any landing order (the placement-invariance principle is
+MoE §2's), and the engine reproduces the reference forward up to the accumulation order the
+reference leaves to its tensor cores. The deviations from `inference/model.py` are listed in §20.4.
 
 **Vision** (DeepSeek-ViT, 32 layers) is deferred: the artifact keeps the tower, the binder refuses
 `--vision` for this family until a later track adds it (§23).
@@ -129,39 +141,44 @@ All comparisons run on this machine with the same prompts, output caps and sampl
 | Baseline | What it shows |
 |---|---|
 | **JigSawPT's llama.cpp fork** (`dsv41-porte`) with the same MXFP4 experts streamed from NVMe | **The main baseline**: the only published run on an RTX 5090 with the experts in the same format (§4.2: 5-10 tok/s with 125.7 GiB of RAM). Identical expert bytes, so speed is compared without a quality footnote |
-| **DS4** (`antirez/ds4`, MIT) with its V4.1 Q2 (341 GiB file, 152 GiB of weights) and Q4 (483 / 294 GiB) GGUFs, CUDA, SSD streaming | The local engine studied most closely (§4.1). Its CUDA V4.1 path targets the DGX Spark's unified memory and Linux; on this machine it would run under WSL2 with the GGUF on an ext4 volume, and its discrete-GPU expert cache is an unmerged pull request (DS4 #647). Compared as each engine runs in practice: Q2 has about half the expert bytes of NVFP4 and measurably lower quality (§4.1), so the report gives quality beside speed |
+| **DS4** (`antirez/ds4`, MIT) with its V4.1 Q2 (341 GiB file, 152 GiB of weights) and Q4 (483 / 294 GiB) GGUFs, CUDA, SSD streaming | The local engine studied most closely (§4.1). Its CUDA V4.1 path targets the DGX Spark's unified memory and Linux; on the RTX 5090 machine it would run under WSL2 with the GGUF on an ext4 volume, and its discrete-GPU expert cache is an unmerged pull request (DS4 #647). Compared as each engine runs in practice: Q2 has about half the expert bytes of MXFP4 and measurably lower quality (§4.1), so the report gives quality beside speed |
 | **ik_llama.cpp** and the other engines of §4.2 that run V4.1 with expert offload | Their own numbers in §4.2; run here where they support Windows or WSL2 |
-| **Infernix Flash-Next** on this machine | Not a quality baseline (another model); the reference for what each mechanism achieved here |
+| **The engine's Flash-Next** on this machine | Not a quality baseline (another model); the reference for what each mechanism achieved here |
 | **DeepSeek's reference** (`inference/model.py`) and vLLM/SGLang | Need four or more datacenter GPUs; reference logits only, through §20.2's offline reference forward |
 
 ### 1.4 Targets
 
-Fixed on 2026-10-19 from §5's model; no measurement of this model exists on this machine.
-Primary configuration: the 1017 artifact (MXFP4 records, FP8 Engram volume), three expert volumes
-on `D:` + `E:` + `G:` (§11.4), bounded replay, `--max-context 131072`, C = 1, ≈ 88 GiB of RAM
-available (other programs closed), thinking at the encoding's default effort, 4K prompt, 512 output
-tokens.
+Fixed on 2026-10-19 from §5's model; no measurement of this model exists on either machine.
+Primary configuration: the 1017 artifact (MXFP4 records, FP8 Engram volume), bounded replay,
+`--max-context 131072`, C = 1, thinking at the encoding's default effort, 4K prompt, 512 output
+tokens. On the RTX 5090 machine: three expert volumes on `D:` + `E:` + `G:` (§11.4) and ≈ 88 GiB of
+RAM available (other programs closed); on the RTX PRO 6000: the placement of §19.1 (≈ 29 % VRAM,
+≈ 29 % RAM) and the models volume on its NVMe (§11.4).
 
 | Metric | Must | Stretch | Model (§5), central (range) |
 |---|---:|---:|---:|
-| Plain decode, warm cache, C = 1, non-repeating session (§20.5) | ≥ 9 tok/s | ≥ 15 | 12.8 (9.7-16.9) |
+| Plain decode, RTX 5090 machine, three volumes, warm cache, C = 1, non-repeating session (§20.5) | ≥ 9 tok/s | ≥ 15 | 12.8 (9.7-16.9) |
+| Plain decode, RTX PRO 6000, the §19.1 placement | ≥ 9 tok/s | ≥ 15 | 11.5 (9.4-13.6 at the unmeasured NVMe rate; 19.3 with a second drive, §5.3) |
 | Best speculative mode, same corpus | ≥ plain, never slower beyond noise | ≥ 17 | 13.6-16.2 with DSpark K = 1 at the measured acceptance (§5.4) |
-| Decode, three volumes relative to one | ≥ 1.8× | ≥ 2.0× | 2.0× |
-| Fresh 32K prompt | ≥ 2,000 tok/s | ≥ 3,500 | 2,800 |
-| Time to first token, fresh 4K prompt | ≤ 15 s | ≤ 9 s | 11.7 s |
+| Decode, three volumes relative to one (RTX 5090 machine) | ≥ 1.8× | ≥ 2.0× | 2.0× |
+| Fresh 32K prompt, RTX 5090 machine | ≥ 2,000 tok/s | ≥ 3,500 | 2,800 |
+| Fresh 32K prompt, RTX PRO 6000 | ≥ 1,400 tok/s | ≥ 2,000 | 1,700 (1,400-2,000, estimated, §5.5) |
+| Time to first token, fresh 4K prompt, RTX 5090 machine | ≤ 15 s | ≤ 9 s | 11.7 s |
 | Time to first token, 50-token append to a cached conversation | ≤ 6 s | ≤ 3.5 s | 4.7 s |
 | Decode at 128K actual context, relative to 4K | ≥ 90 % | ≥ 97 % | ≈ 98 % |
 | Execution fidelity against the reference forward (§20.3) | within the gate | — | — |
 
 The acceptance report gives the median and range of at least three runs, the worst case, the expert
 service composition (VRAM hits, RAM experts computed by the CPU, RAM experts staged over the link,
-SSD reads and bytes per token, Engram reads), and the device each number came from. A missed target
-is reported as missed; targets are not changed after measuring.
+SSD reads and bytes per token, Engram reads), the placement of every row (the tier counts from `GET
+/admin/expert-placement`, MoE §8.3) and the machine each number came from. A missed target is
+reported as missed; targets are not changed after measuring.
 
-These targets are far below the GLM design's (25 tok/s) because this model reads 4.5 GB of routed
-experts per decode token (GLM's EXL3 build: 3.2 GB) from a bank of 289 GB (GLM: 115 GB), and this
-machine holds about 37 % of it in memory (GLM: 87-96 %). That is a property of the model on this
-hardware; §5.6 lists the hardware changes that move it.
+These targets sit far below the GLM design's (25 tok/s) because this model reads 4.5 GB of routed
+experts per decode token (GLM's EXL3 build: 3.2 GB) from a bank of 289 GB (GLM: 115 GB), and the RTX
+5090 machine holds about 37 % of it in memory (GLM: 87-96 %); the RTX PRO 6000 holds about 60 %
+(§19). That is a property of the model on this hardware; §5.6 lists the hardware changes that move
+it.
 
 ### 1.5 Non-goals
 
@@ -170,12 +187,14 @@ hardware; §5.6 lists the hardware changes that move it.
   configuration; the one exception is the opt-in, labelled approximate mode (§9.8).
 - Requantizing the experts to fewer bits in the default artifact. DS4's Q2 recipe shows what that
   costs on this model (§4.1); smaller recipes are options with their own gates (§25.3).
-- DeepSeek's encoder SWA bounded replay for cache restores: Infernix restores the encoder exactly
+- DeepSeek's encoder SWA bounded replay for cache restores: the engine restores the encoder exactly
   from bounded snapshots (§18.2).
-- Writing the expert or Engram volumes at runtime (read-only, FN §19.3.7 U3).
+- Writing the expert or Engram volumes at runtime (read-only).
 - The vision tower in this track.
-- A generic model graph or plugin layer. Shared offload components are extracted only because
-  explicit families use them (§8.2).
+- A generic model graph or plugin layer. The offload tier is shared exactly as
+  [MoE offload design](moe-offload-design.md) states it — plain structs and constructor
+  arguments, no base classes, no virtual model interfaces (MoE §2) — and stays specialized to
+  routed-expert MoE families.
 
 ---
 
@@ -334,7 +353,7 @@ last 128 positions, built from its own input.
   decoder windows at the prompt's end, hence in every token decoded after a prompt of more than 128
   tokens. For a prompt of at most 128 tokens following nothing cached they coincide.
 
-Infernix runs bounded replay by default and the full model on request (decision a, §16).
+The engine runs bounded replay by default and the full model on request (decision a, §16).
 
 ### 2.4 Parameters and bytes (upstream sizes from the safetensors headers; model elsewhere)
 
@@ -363,10 +382,13 @@ Engram tables of its current revision (MXFP4 since 2026-10-14; FP8 at revision `
 
 - **Dense weights are the larger part of a token's GPU reads**: 8.5 GB against 4.5 GB of routed
   experts. With every expert in VRAM a token would take ≈ 8.4 ms (≈ 120 tok/s); the GPU is not
-  where this model is limited on this machine.
-- **About 7.5 % of the experts fit in VRAM and about 29 % in RAM** (§19), so ≈ 63 % live only on
-  the SSDs. At the central hit rate (§5.2) a token reads ≈ 43 experts, ≈ 0.8 GB, from the volumes.
-- **A miss moves 18.8 MB**: 0.68 ms over the x8 link, ≈ 1.33 ms from three striped volumes.
+  where this model is limited on either card.
+- **On the RTX 5090 machine about 7.5 % of the experts fit in VRAM and about 29 % in RAM** (§19),
+  so ≈ 63 % live only on the SSDs; **on the RTX PRO 6000 about 29 % fit in VRAM and 29 % in RAM**
+  (§19), so ≈ 42 % do. At the central hit rate (§5.2) a token reads ≈ 43 experts, ≈ 0.8 GB, from
+  the volumes on the 5090 machine, and ≈ 34 (model, §5.2) on the 6000.
+- **A miss moves 18.8 MB**: 0.68 ms over the 5090 machine's x8 link, ≈ 0.38 ms over the 6000's
+  Gen5 x16 (≈ 50 GB/s, MoE §4.11), ≈ 1.33 ms from three striped volumes on the 5090 machine.
 - **The KV cache is negligible**: 890 B per token of compressed entries and index keys (the
   report's figure, which §13.5 reproduces), 117 MB at 128K and 0.89 GB at 1M, plus 2.9 MB of
   windows per sequence. Long context does not compete with the expert cache.
@@ -392,23 +414,45 @@ community `chat_template.jinja` the September one gained (§21). DeepSeek report
 
 ## 3. Machine facts
 
-The platform and storage were measured for the GLM design on 2026-10-10 (GLM §3.1-§3.3) and the
-pinning ceiling for Flash-Next on 2026-10-14 (FN §19.3.7); free space and RAM were read again on
-2026-10-18. No new probe was run for this design.
+Two machines, both first class. The RTX PRO 6000 is the production machine (the platform facts are
+the repository's own, [AGENTS.md](../../AGENTS.md)); the RTX 5090 machine is the one the platform
+and storage probes measured for the GLM design on 2026-10-10 (GLM §3) and the pinning ceiling for
+Flash-Next on 2026-10-14 (MoE §4.11); free space and RAM there were read again on 2026-10-18. No
+probe has run for this model on either machine; M0 runs the DeepSeek probes.
+
+### 3.1 RTX PRO 6000 (production, Linux)
 
 | Item | Value | Source |
 |---|---|---|
-| GPU link | PCIe 5.0 x8, fixed; copy-engine H2D 27.6 GB/s | GLM §3.1 |
+| GPU | RTX PRO 6000 Blackwell, 96 GB, `sm_120a`, PCIe **Gen5 x16**; also drives the desktop (benchmark rows can measure disturbed) | AGENTS.md |
+| Host RAM | 89 GB | AGENTS.md |
+| OS | Linux (Ubuntu 26.04, kernel 7.0); no WDDM budget or pin room — `mlock`/`cudaHostRegister` can pin as much as the ledger leaves (MoE §4.10) | AGENTS.md |
+| Storage | one **Gen5 NVMe (T710)** holding the models; the system has its own boot device | AGENTS.md |
+| Whole-record NVMe reads | 0.553 ms p50 at queue depth 1 (4.68 GB/s), 6.71 GB/s at depth 8 — measured on Flash-Next records from a 990 PRO artifact, not on this machine's T710; the T710's rate for 17.95 MiB records is **unmeasured** (R0) | MoE §8.2 |
+| Link H2D | ≈ 50 GB/s on a Gen5 x16 link | MoE §4.11 |
+| Host CPU | not recorded in the repository; the startup probes (MoE §5.5) measure whatever host is present, and M0 runs the MX8 probes on it | — |
+
+What this decides: the 6000's frame pool holds ≈ 4,800 experts (§19.1) and its RAM tier ≈ 4,400
+slots; the SSD tier is the artifact (and the Engram volume) read in place on the T710, one volume
+or — if a second drive has room — an expert stripe that halves each record's read (MoE §3, §4.7);
+the per-volume striping of §11 can use any further drives the machine gains at runtime through a
+restripe (§7.4).
+
+### 3.2 RTX 5090 machine (Windows 11)
+
+| Item | Value | Source |
+|---|---|---|
+| GPU link | PCIe 5.0 x8, fixed (the other x8 lanes serve a network card); copy-engine H2D 27.6 GB/s | GLM §3.1 |
 | VRAM | 32,607 MiB; Windows budget 31,419 MiB with no display on the card | GLM §3.1 |
 | Host DRAM | 2 × 48 GB DDR5-5800, 82-85 GB/s read | GLM §3.1 |
 | CPU | i9-13900K, 8 P + 16 E cores, AVX-VNNI, no AVX-512 | GLM §3.1 |
 | RAM visible / available | 95.8 GiB; 24.2 GiB free on 2026-10-18 with other sessions running, ≈ 88 GiB with them closed (the plans below assume the latter and print both) | `Win32_OperatingSystem` |
-| Pin room | 75.2-76.1 GiB: Windows page-locks at most the adapter's `SharedSystemMemory` (76.61 GiB); experts past it live as unpinned, locked records | FN §19.3.7 |
+| Pin room | 75.2-76.1 GiB: Windows page-locks at most the adapter's `SharedSystemMemory` (76.61 GiB); experts past it live as unpinned, locked records | MoE §4.11 |
 | Free disk (2026-10-18) | `C:` 80.5 GB (system, CPU lanes), `D:` 300.4, `E:` 405.6 (repository and builds), `G:` 108.7 (Optane, holds Flash-Next's n-gram volumes) | `Get-PSDrive` |
 | One drive, large reads | 990 PRO 5.7-6.0 GB/s; Optane 7.0-7.1 GB/s; 1 MiB reads saturate at QD 4, 2 MiB at QD 2 | GLM §3.3 |
 | Drive sets | `D:` + `G:` 12.73 GB/s; `D:` + `E:` + `G:` **14.15** (the chipset's DMI link binds); `C:` + `D:` + `E:` + `G:` **19.27** | GLM §3.3 |
-| Random 4 KiB reads | ≈ 4.3-4.8 µs each from one issuer (Flash-Next n-gram reads); deeper rings measured faster | FN §12.4, §19.3.8 F7 |
-| Windows power throttling | must be exempted (37.6 → 98.7 tok/s on Flash-Next) | FN §19.3.19 |
+| Random 4 KiB reads | ≈ 4.3-4.8 µs each from one issuer (Flash-Next n-gram reads); deeper rings measured faster | FN §12.3 |
+| Windows power throttling | must be exempted (37.6 → 98.7 tok/s on Flash-Next) | FN §8.1 |
 
 What this decides:
 
@@ -419,7 +463,7 @@ What this decides:
   of GLM §3.3), so a record striped as 12 units keeps every drive busy (§11).
 - **The pin room, not RAM, bounds the pinned tier**: about 72 GiB of experts can be pinned; the rest
   of the tier is unpinned locked records, served by the CPU in place and bounced through pinned slots
-  for DMA (FN §19.3.7).
+  for DMA (MoE §4.11).
 - **RAM shared with other sessions changes the plan at every startup**; the ledger reads it then
   (§19.2).
 
@@ -471,8 +515,8 @@ written around the Spark's unified memory (`cudaDevAttrIntegrated` branches in `
 For V4 Flash a user measured 0.74-0.84 tok/s on an RTX 5090 with SSD streaming because the CUDA
 expert cache was a no-op stub (issue #639, 2026-08-03); the open PR #647 adds a device LRU (GB10:
 1.03 → 2.96 tok/s at an 81 % hit rate). Issue #477 measured +52 % decode on a discrete card from
-keeping the model in the page cache when RAM exceeds the model. DS4 is Linux/macOS; on this machine
-it would run under WSL2 with the GGUF on an ext4 volume.
+keeping the model in the page cache when RAM exceeds the model. DS4 is Linux/macOS; on the RTX 5090
+machine it would run under WSL2 with the GGUF on an ext4 volume.
 
 **Mechanisms, and what this design does with them:**
 
@@ -482,8 +526,8 @@ it would run under WSL2 with the GGUF on an ext4 volume.
 | Engram rows read with `pread` from a region past the mapped weights, never mapped; a thread prefetches layer 1's rows before a prefill sweep and layer 14's while layers 2-13 run | `ds4_engram.c`, `ds4.c` | **Adopted** through Flash-Next's n-gram machinery (§14), which already reads rows through a deep ring of direct 4 KiB reads |
 | Requantized Q2/Q4 experts and Q8_0 dense | above | **Not the default** (decision c and §1.5); a DS4-GGUF import is option O6 (§25.3) |
 | Read-ahead for prefill with two 8 MiB staging buffers, from 2K tokens; "below 2K, unused expert reads outweigh the overlap"; short appends below 256 tokens in exact 2-8-row chunks through the cache | `QA_BEFORE_RELEASES.md` §17 | §16: the walk reads only the experts a prompt touches; read-ahead only for experts a chunk certainly needs |
-| Scalar, batched and tensor-parallel execution "are not numerically identical" | `docs/MODELS.md` | Infernix keeps every route bit-identical (MX8, §9.5) |
-| Static profile ("hotlist") first, recency as tie-break in the Metal expert cache; issue #636 (2026-07-31) measured on other models that LRU beat the best static policy by 8 points (MiniMax) and recency beat static pinning 62 % to 34 % (Kimi-K3) | `ds4_streaming_hotlist.inc`, issue #636 | Consistent with FN L4: LFRU, no static hot set by default (§10.2) |
+| Scalar, batched and tensor-parallel execution "are not numerically identical" | `docs/MODELS.md` | The engine keeps every route bit-identical (MX8, §9.5; the principle is MoE §2's) |
+| Static profile ("hotlist") first, recency as tie-break in the Metal expert cache; issue #636 (2026-07-31) measured on other models that LRU beat the best static policy by 8 points (MiniMax) and recency beat static pinning 62 % to 34 % (Kimi-K3) | `ds4_streaming_hotlist.inc`, issue #636 | Consistent with the shared tier's LFRU and its replay evidence (MoE §4.3): no static hot set by default (§10.2) |
 | DSpark for V4 Flash with a confidence threshold (0.4 on one Spark) and a scheduler that backs off | `docs/SPECULATIVE_DECODING.md` | The confidence head feeds §17's cost model |
 
 ### 4.2 Other engines and artifacts
@@ -519,7 +563,7 @@ What transfers:
 - **The NVFP4 export's expert values are the original's, but its served form is not.** diffbot's
   table puts vLLM's W4A4 + MXFP4-Engram serving at KL 0.035 against a run-to-run floor of 0.016.
   The excess comes from 4-bit activations and the lossy Engram tables, not the weights. Decision b
-  (8-bit activations) and the FP8 Engram default keep Infernix at the original's arithmetic; the
+  (8-bit activations) and the FP8 Engram default keep the engine at the original's arithmetic; the
   W4A4 activation path is only a fast-path candidate (§9.5, §25.3).
 - **The closest measured run is JigSawPT's**: the same card and expert format, decode SSD-bound
   (54 % of a remap waiting on NVMe, the disk at 43 % of its rate), a VRAM hit rate of 59-66 % at
@@ -527,32 +571,32 @@ What transfers:
 - **Speculation pays only at short drafts here**: every verify column adds the union of its experts
   (JigSawPT −4 % at draft length 2 cold; ik_llama +41 % at n_max 3 with experts on a big CPU, a
   different regime). §17 chooses the draft length per round from the confidence head and the
-  measured union.
+  measured union (the shared rules a family's speculation follows are MoE §6.3's).
 - **Lookahead prefetch lost** on this model family wherever measured (JigSawPT, hipfire, Maya on
-  GLM): off by default (§11.3).
+  GLM): off by default (§11.3). The shared tier never built it either (MoE §6.3).
 - **Bounded replay costs little** on GSM8K (−0.005, within one standard error) and is what DeepSeek
   and both datacenter engines serve: the default (decision a).
 - **Engram is random row reads from disk everywhere** (DS4, JigSawPT, Xolotl, OpensourceWTF) or
   pinned host memory where RAM allows (vLLM); no engine found it a bottleneck.
 - **Other engines are not reproducible across their own execution modes** (DS4 scalar vs batched,
-  JigSawPT with more than one I/O thread). Infernix's placement invariance (FN §16.2) is the
+  JigSawPT with more than one I/O thread). The engine's placement invariance (MoE §2) is the
   difference this design keeps.
 
 ### 4.3 Lessons from Flash-Next and the GLM design
 
-GLM §4.2 lists the 22 Flash-Next lessons (L1-L22) measured on this machine. They hold here; these
-change weight:
+The Flash-Next lessons that transfer are the shared tier's rules (MoE §2, §4-§7) and Flash-Next's
+standing lessons (FN §3.4). They hold here; these change weight:
 
-| Lesson | Consequence here |
-|---|---|
-| L2: misses are a host-DRAM bandwidth problem | The SSD set binds first (≈ 0.8 GB of SSD reads per token at the central rate, §5.3); DRAM carries landings, CPU reads and DMA (≈ 30-40 GB/s, §5.1) |
-| L5, L6: promotions cost a miss's bytes; none after prefill | A promotion is 18.8 MB (6.8× Flash-Next's); the interval is recalibrated (§10.2) |
-| L7: next-layer prediction recall is modest | Confirmed for this family by JigSawPT and hipfire; lookahead off by default (§11.3) |
-| L8: verify windows add misses only for rejected drafts | Here every verify column also adds its own experts' union (§5.4); the draft length is priced per round (§17.3) |
-| L13: placement invariance needs exact arithmetic | MX8 on every route (§9.5) |
-| L16: short prompts pay a whole expert pass | Worse: a 200-token append reads ≈ 155 GB from the volumes (§5.5); the prefix cache and append-only processing are first-class (§16, §18) |
-| L19: the divisor rule beats cost models for the CPU/link split | Kept, fed by measured costs per 18.8 MB expert (§9.7) |
-| Pin room (FN §19.3.7, 2026-10-14) | The RAM tier is pinned up to ≈ 72 GiB and unpinned past it (§10.4) |
+| Lesson | Where it lives | Consequence here |
+|---|---|---|
+| A miss is a host-DRAM bandwidth problem, not PCIe-versus-CPU | MoE §5.1, §8.1 | The SSD set binds first on the RTX 5090 machine (≈ 0.8 GB of SSD reads per token at the central rate, §5.3); DRAM carries landings, CPU reads and DMA (≈ 30-40 GB/s, §5.1) |
+| Promotions cost a miss's bytes; none after prefill | MoE §4.3, §7.3 | A promotion moves 18.8 MB (6.8× Flash-Next's); the interval is recalibrated (§10.2) |
+| Next-layer prediction recall is modest | MoE §6.3 (never built) | Confirmed for this family by JigSawPT and hipfire; lookahead off by default (§11.3) |
+| Verify windows add misses only for rejected drafts | MoE §6.3 | Here every verify column also adds its own experts' union (§5.4); the draft length is priced per round (§17.3) |
+| Placement invariance needs exact arithmetic | MoE §2 | MX8 on every route (§9.5) |
+| The decode miss divisor beats cost models | MoE §5.6 | Kept, fed by measured costs per 18.8 MB expert (§9.7) |
+| Short prompts pay a whole expert pass | MoE §7 | Worse: a 200-token append reads ≈ 155 GB from the volumes (§5.5); the prefix cache and append-only processing are first-class (§16, §18) |
+| The Windows pin room, not RAM, bounds the pinned tier | MoE §4.11 | The RTX 5090 machine's RAM tier is pinned up to ≈ 72 GiB and unpinned past it (§10.4); the 6000 (Linux) pins what the ledger leaves |
 
 ---
 
@@ -568,11 +612,11 @@ from RAM, over the 240 routed experts of a token.
 
 | Resource | Work per token | Rate | Time |
 |---|---|---|---:|
-| GPU HBM: dense FP8/BF16 weights, mHC, windows, KV | 8.5 GB | ~1.55 TB/s sustained | ≈ 5.5 ms (§9.3: ≈ 6.3 ms with launches and Engram) |
+| GPU HBM: dense FP8/BF16 weights, mHC, windows, KV | 8.5 GB | ~1.55 TB/s sustained (RTX 5090; the 6000 is faster) | ≈ 5.5 ms (§9.3: ≈ 6.3 ms with launches and Engram) |
 | GPU HBM: hit experts | 240 h_v × 18.8 MB | same | 2.9 h_v ms |
-| CPU lane: RAM- and SSD-served experts it computes | 0.35 / 0.45 / 0.60 ms per expert (§12.2) | 8 P-cores (+ E-cores) | |
-| PCIe H2D: staged misses | 18.8 MB each | 27.6 GB/s | 0.68 ms each |
-| SSD: 240 h_s records, each striped over the volumes | 240 h_s × 18.8 MB | 14.15 GB/s (three volumes) | 319 h_s ms |
+| CPU lane: RAM- and SSD-served experts it computes | 0.35 / 0.45 / 0.60 ms per expert on the i9-13900K (§12.2; the 6000's host is unmeasured) | 8 P-cores (+ E-cores) | |
+| PCIe H2D: staged misses | 18.8 MB each | 27.6 GB/s (5090 machine, x8); ≈ 50 GB/s (6000, x16) | 0.68 / 0.38 ms each |
+| SSD: 240 h_s records, striped over the volumes where the machine has them | 240 h_s × 18.8 MB | 14.15 GB/s (5090 machine, three volumes); 6.7-10 GB/s (6000, one NVMe; unmeasured, MoE §8.2's 990 PRO rates as the floor) | 319 h_s ms (5090 machine) |
 | Host DRAM: landings, CPU reads, DMA source | ≈ (2 h_s + h_r) × 240 × 18.8 MB | ~80 GB/s, shared | not binding (≈ 35 GB/s at the central case) |
 
 Per MoE layer the critical path is
@@ -585,23 +629,26 @@ t_token = Σ_l t_layer + t_head + t_engram + t_boundary
 
 with the layer's n_r RAM misses and k SSD misses multinomial over its 6 experts (exact expectation),
 n_c RAM misses computed by the CPU and the rest staged, and SSD records consumed unit by unit as
-they land (§11.1, GLM §11.4), so only one unit's CPU work trails the last read. t_pre ≈ 0.10 ms (attention,
-mHC and router weights, 134 MB, before routing); t_record = 1.33 ms on three volumes.
+they land (§11.1, GLM §11.4), so only one unit's CPU work trails the last read. t_pre ≈ 0.10 ms
+(attention, mHC and router weights, 134 MB, before routing); t_record = 1.33 ms on three volumes
+(5090 machine).
 
 ### 5.2 Hit-rate model
 
 No routing traces of this model are recorded here; M1 records them. The evidence:
 
 | Source | Model | Capacity | Hit rate |
-|---|---|---:|---:|
+|---|---|---:|---|
 | JigSawPT (§4.2), RTX 5090, VRAM cache | V4.1-Flash MXFP4 | 13 / 18 / 22 GiB of 269 GiB (4.8 / 6.7 / 8.2 %) | 59 / 62.7 / 66 % |
 | FreeToken (§4.2), global LRU | V4-Flash | 11 % | 61 % |
 | hipfire (§4.2) | V4-Flash MQ2 | ≈ 5.6 / 11 / 22 / 45 % (4-32 GiB of ≈ 72 GiB, estimated) | 40.5 / 59.4 / 74.4 / 86.5 % |
 | DS4 PR #647, LRU | V4-Flash IQ2 | ≈ 27 % / 100 % (20 / 100 GB) | 51.5 % (220 tokens from cold) / 81 % short, 96-98 % long |
 
-This family shows **much stronger locality than GLM-5.3-Flash** at equal capacity (GLM §5.2: ≈ 35-56 %
-at 11 %). This machine's capacities (§19): VRAM ≈ 1,160 frames (7.5 %), RAM ≈ 4,490 slots (29.2 %)
-with 88 GiB available, 37 % together (33.8 % with 79 GiB).
+This family shows **much stronger locality than GLM-5.3-Flash** at equal capacity (GLM §5.2:
+≈ 35-56 % at 11 %). The machines' capacities (§19): the RTX 5090 machine holds VRAM ≈ 1,160 frames
+(7.5 %) and RAM ≈ 4,490 slots (29.2 %) with 88 GiB available, 37 % together (33.8 % with 79 GiB);
+the RTX PRO 6000 holds VRAM ≈ 4,500 frames (29.3 %) and RAM ≈ 4,390 slots (28.6 %), ≈ 58 % together
+(model, from §19's plans).
 
 | Scenario | h_v | h_r | h_s | SSD reads per token | SSD bytes per token |
 |---|---:|---:|---:|---:|---:|
@@ -609,9 +656,14 @@ with 88 GiB available, 37 % together (33.8 % with 79 GiB).
 | Central | 0.48 | 0.34 | 0.18 | 43 | 0.81 GB |
 | Pessimistic | 0.40 | 0.34 | 0.26 | 62 | 1.17 GB |
 
+For the RTX PRO 6000 (estimated, at ≈ 58 % memory and the §5.1 rates): h_v ≈ 0.62, h_r ≈ 0.24,
+h_s ≈ 0.14, ≈ 34 SSD reads and ≈ 0.63 GB per token — between the central and pessimistic rows in
+SSD share despite the larger memory, because the single NVMe serves what three volumes serve on the
+other machine.
+
 ### 5.3 Decode projection
 
-Plain decode, tok/s (model), MXFP4 records:
+Plain decode, tok/s (model), MXFP4 records, RTX 5090 machine:
 
 | Scenario | One volume (`D:`) | Two (`D:` + `G:`) | **Three (`D:` + `E:` + `G:`)** | Four (with `C:`) | Whole bank in memory |
 |---|---:|---:|---:|---:|---:|
@@ -625,20 +677,29 @@ expert: 0.30 ms → 13.2, 0.45 → 12.8, 0.60 → 12.3, 0.80 → 11.9. **The SSD
 kernel matters little** (unlike GLM, where it was worth a drive), because the SSD term dominates and
 the CPU's cost is near its DRAM floor.
 
+RTX PRO 6000, one NVMe volume (model; the T710's record rate and the host CPU's MX8 rate are
+unmeasured — R0, §23 M0):
+
+| Scenario | One volume at 6.7 GB/s | One volume at 10 GB/s | With a second drive striped or as an expert stripe (≈ 2×) |
+|---|---:|---:|---:|
+| Optimistic (h_s 0.10) | 11.7 | 15.5 | 22.4 |
+| Central (h_s 0.14) | 9.4 | 13.6 | 19.3 |
+| Pessimistic (h_s 0.20) | 7.0 | 10.6 | 15.1 |
+
 **Calibration.** JigSawPT's one-card run measured 8.3 tok/s with a 72 GiB pinned tier and
-125.7 GiB of RAM; this model gives 6.3 for one volume with 96 GB. The model is therefore not
-optimistic for one drive; the projected gain comes from striping (2.0× from one volume to three),
-record-unit consumption, the CPU lane and the smaller MXFP4 records. GLM's model was 15-45 %
-optimistic against strata-glm's measured run (GLM §4.4); §25.1 carries the same risk here, and M4's
-first end-to-end numbers refit the overhead terms.
+125.7 GiB of RAM on this model; the model above gives 6.3 for one volume with 96 GB. The model is
+therefore not optimistic for one drive; the projected gain comes from striping (2.0× from one
+volume to three), record-unit consumption, the CPU lane and the smaller MXFP4 records. GLM's model
+was 15-45 % optimistic against strata-glm's measured run (GLM §4.3); §25.1 carries the same risk
+here, and M4's first end-to-end numbers refit the overhead terms.
 
 ### 5.4 Speculation
 
 A verify round of W = K + 1 columns reads the union of its columns' experts per layer,
 U(W) = 6 (1 + σ (W − 1)), where σ is the share of a further column's experts not already in the
 round: 0.58 measured on MiniMax-M2.5 (DS4 #636), ≈ 0.875 on GLM-5.3-Flash (Maya: consecutive tokens
-share ~1 of 8, GLM §4.3). It yields τ(K) = 1 + Σ_{i≤K} survival_i tokens. With vLLM's measured DSpark
-survival (§4.2) and the central case, three volumes (tok/s; plain 12.8):
+share ~1 of 8, GLM §4.2). It yields τ(K) = 1 + Σ_{i≤K} survival_i tokens. With vLLM's measured DSpark
+survival (§4.2) and the central case, three volumes on the RTX 5090 machine (tok/s; plain 12.8):
 
 | σ | K = 1 | K = 2 | K = 3 | K = 5 |
 |---:|---:|---:|---:|---:|
@@ -656,11 +717,14 @@ fits σ near 1 in this model, with one drive and an idle queue (an inference, no
 A prompt of T new tokens touches 1 − e^(−6T/384) of each encoder layer's experts, and of each decoder
 layer's experts over the positions the decoder evaluates (128 under bounded replay; the exact
 suffix under the full rule). Each touched expert is read once per walk span (§16.2): SSD-resident
-ones cross the volumes, every expert not in VRAM crosses the link or is computed by the CPU (thin
-experts only), and the GPU computes the rest at the exact routes' rates: experts ≈ 65 TFLOP/s (FN
-§16.2.1's measured exact W4A16 wide route, whose two-MMA limb form MX8 shares), dense ≈ 130 TFLOP/s
-(estimated from FN §19.3.8 F10's 96-169 TFLOP/s for 8-bit dense prompt routes). Popular experts are
-the resident ones, so short prompts find more of theirs in memory.
+ones cross the volumes (or the one NVMe on the 6000), every expert not in VRAM crosses the link or
+is computed by the CPU (thin experts only), and the GPU computes the rest at the exact routes'
+rates: experts ≈ 65 TFLOP/s (measured on Flash-Next's exact W4A16 wide route, RTX 5090, recorded in
+the Flash-Next design at base commit `0af2a9b`; MXFP4 shares its two-MMA limb form), dense ≈ 130
+TFLOP/s (estimated from 96-169 TFLOP/s measured there for 8-bit dense prompt routes; the 6000 is
+faster). Popular experts are the resident ones, so short prompts find more of theirs in memory.
+
+RTX 5090 machine, three volumes (model):
 
 | New tokens T | Experts touched | SSD bytes | Three volumes: TTFT | Four volumes: TTFT | Full rule, three volumes |
 |---:|---:|---:|---:|---:|---:|
@@ -671,15 +735,19 @@ the resident ones, so short prompts find more of theirs in memory.
 | 500 - 32,768 | 14,320 (93 %) | 161 GB | 11.7 s | 8.6-9.3 s | 13.0 s |
 | 131,072 | 14,320 | 161 GB | ≈ 25 s (compute) | ≈ 25 s | ≈ 25 s |
 
-- A fresh 32K prompt: ≈ 11.7 s, **≈ 2,800 tok/s** (compute ≈ 6 s, hidden under the bank pass);
-  128K in one walk span: ≈ 25 s, ≈ 5,200 tok/s, compute-bound by the experts' exact wide route. At
-  1M, eight 128K spans and the indexer's O(T²) scoring: ≈ 3.5 minutes (estimated). The W4A4 fast
-  path (§25.3 O2) would cut the expert compute about fourfold (FN §16.2.1: 1.65 against 6.24 ms per
-  call) where a prompt is compute-bound.
-- **Any fresh prompt above ~200 tokens costs a bank pass, ≈ 11-12 s on three volumes**, and the
-  link (≈ 9 s for the non-VRAM experts) is the next floor. Short appends cost 2-9 s. DS4 measured
-  2.9 / 5.4 / 8.7 s for 16 / 43 / 114-token appends with full GLM-5.3 IQ2 streamed on an M5 Max
-  (`docs/SSD_STREAMING.md`), the same shape.
+RTX PRO 6000 (estimated): the same 161 GB from one NVMe at 6.7-10 GB/s gives ≈ 16-24 s for a fresh
+32K prompt (≈ 1,400-2,000 tok/s); at 1M, eight 128K spans and the indexer's O(T²) scoring: ≈ 3.5-4.5
+minutes.
+
+- A fresh 32K prompt on the RTX 5090 machine: ≈ 11.7 s, **≈ 2,800 tok/s** (compute ≈ 6 s, hidden
+  under the bank pass); 128K in one walk span: ≈ 25 s, ≈ 5,200 tok/s, compute-bound by the experts'
+  exact wide route. The W4A4 fast path (§25.3 O2) would cut the expert compute about fourfold
+  (1.65 against 6.24 ms per call, measured on Flash-Next's W4A4 route, RTX 5090, base commit
+  `0af2a9b`) where a prompt is compute-bound.
+- **Any fresh prompt above ~200 tokens costs a bank pass** — ≈ 11-12 s on three volumes (RTX 5090
+  machine), ≈ 16-24 s on the 6000's single NVMe — and the link is the next floor. Short appends cost
+  2-9 s (5090 machine). DS4 measured 2.9 / 5.4 / 8.7 s for 16 / 43 / 114-token appends with full
+  GLM-5.3 IQ2 streamed on an M5 Max (`docs/SSD_STREAMING.md`), the same shape.
 - The full rule adds ≈ 1.3 s from 200 tokens: the exact suffix touches ≈ 1,000 more decoder experts
   than bounded replay.
 
@@ -687,37 +755,39 @@ the resident ones, so short prompts find more of theirs in memory.
 
 | Lever | Effect (model, central) |
 |---|---|
-| **More RAM**: 192 GB (≈ 170 GiB of tier, ≈ 71 % of the bank with VRAM) | h_s ≈ 0.08: decode 12.8 → ≈ 17.5 tok/s; fresh-prompt TTFT ≈ 5-6 s |
+| **More RAM on the RTX 5090 machine**: 192 GB (≈ 170 GiB of tier, ≈ 71 % of the bank with VRAM) | h_s ≈ 0.08: decode 12.8 → ≈ 17.5 tok/s; fresh-prompt TTFT ≈ 5-6 s |
 | 256 GB (the whole bank in memory) | Decode ≈ 21.6 tok/s (CPU lane and link bound); TTFT link-bound ≈ 9 s |
-| **`C:` as a fourth volume** (the only drive off the chipset; 80 GB free today) | Decode +21 % (15.5); TTFT −20-25 % |
-| More drives behind the chipset | Nothing beyond three: DMI binds at 14.15 GB/s (§3) |
+| **`C:` as a fourth volume** (the only drive off the chipset; 80 GB free on 2026-10-18) | Decode +21 % (15.5); TTFT −20-25 % |
+| More drives behind the chipset | Nothing beyond three: DMI binds at 14.15 GB/s (§3.2) |
+| **A second drive on the RTX PRO 6000** (an expert stripe, MoE §3, or a restripe to two volumes, §7.4) | ≈ 2× the SSD rate: central 13.6 → ≈ 19.3 tok/s (model) |
 | A CPU with AVX-512 or more cores | +3 % (the CPU is near its DRAM floor) |
 | Smaller experts (requantized, lossy; DS4 Q2 halves the bytes) | +60-80 % decode, at DS4's measured +0.12-0.19 nats NLL; option O6 only |
 
-The link width is fixed; nothing here is tuned to a different link.
+The link width is fixed on both machines; nothing here is tuned to a different link.
 
 ---
 
 ## 6. Design overview
 
 ```text
- ┌───────────────────────────────────── RTX 5090, 32 GB ─────────────────────────────────────┐
- │ dense FP8 / BF16 8.0 GiB · windows 2.9 MB/lane · compressed KV + index keys 890 B/token   │
- │ decode workspace · mailboxes · residency[43 × 384] · land_seq[frame]                      │
- │ ┌── frame pool: ~1,160 × 17.95 MiB MXFP4 records (≈ 20.3 GiB), elastic ──────────────┐   │
- │ │ cached experts │ staging │ DSpark experts (bounded) │ KV pages + loans │ walk lease  │   │
- │ └────────────────────────────────────────────────────────────────────────────────────┘   │
- └──────▲───────────────────────▲─────────────────────────▲───────────────────────────────────┘
+ ┌────────── one GPU: RTX PRO 6000 96 GB (or RTX 5090 32 GB) ──────────────┐
+ │ dense FP8 / BF16 8.0 GiB · windows 2.9 MB/lane · compressed KV + index keys 890 B/token
+ │ decode workspace · mailboxes · residency[43 × 384] · land_seq[frame]
+ │ ┌── frame pool: the placement's VRAM share (≈ 1,160 frames on the 5090
+ │ │  machine, ≈ 4,500 on the 6000) of 17.95 MiB MXFP4 records, elastic ──┐
+ │ │ cached experts │ staging │ DSpark experts (bounded) │ KV pages + loans │ walk lease
+ │ └──────────────────────────────────────────────────────────────────────┘
+ └──────▲───────────────────────▲─────────────────────────▲───────────────────────────────┘
         │ copy engine           │ mapped mailboxes        │ copy engine (landed records)
  ┌──────┴───────────────────────┴─────────────────────────┴─────────┐   ┌──────────────────────┐
- │ 96 GB host                                                        │   │ expert volume 0 (D:) │
- │  RAM tier: ~4,000 pinned slots (≈ 72 GiB) + unpinned records      │◄──┤ expert volume 1 (E:) │
- │  embedding (pinned) · Engram row cache · landing ring             │   │ expert volume 2 (G:) │
- │  transfer agent: VRAM policy, promotions, staging DMA             │   │  12 units per record │
- │  SSD agent: per-volume IOCP queues; Engram reader ring            │◄──┤ Engram volume (E:)   │
- │  CPU expert team: MX8 exact, from RAM slots or landing slots      │   │  FP8 or MXFP4 rows   │
- │  engine worker: tokens, Engram hashes, rounds                     │   └──────────────────────┘
- └───────────────────────────────────────────────────────────────────┘
+ │ host RAM (89 GB on the 6000; 96 GB on the 5090 machine)           │   │ expert volumes (1-4)  │
+ │  RAM tier: the placement's RAM share, pinned (past the pin room    │◄──┤  12 units per record │
+ │  on Windows: unpinned locked records) + the landing ring          │   │ Engram volume        │
+ │  embedding (pinned) · Engram row cache                             │   │  FP8 or MXFP4 rows   │
+ │  read agent: per-volume queues (IOCP / io_uring); Engram reader    │◄──┤  on the 6000: the    │
+ │  CPU expert team: MX8 exact, from RAM slots or landing slots        │   │  artifact's NVMe     │
+ │  engine worker: tokens, Engram hashes, rounds                      │   └──────────────────────┘
+ └────────────────────────────────────────────────────────────────────┘
 ```
 
 One decode round at C = 1:
@@ -739,14 +809,15 @@ head: collapse with the last pre → norm → head (FP32 logits) → sample → 
 
 The ideas that carry the design:
 
-- **Exact arithmetic makes placement free** (FN §5, L13): every FP4 and FP8 linear computes
-  DeepSeek's MXFP8 product exactly, so a VRAM frame, a staging frame, the CPU from a RAM slot or a
-  landing slot give the same bits, and policy may move work anywhere (§9.5).
+- **Exact arithmetic makes placement free** (MoE §2): every FP4 and FP8 linear computes DeepSeek's
+  MXFP8 product exactly, so a VRAM frame, a staging frame, the CPU from a RAM slot or a landing slot
+  give the same bits, and policy may move work anywhere (§9.5).
 - **The SSDs are the bottleneck; everything is sized to read fewer, smaller, fuller records**:
-  MXFP4 records (−5.6 % bytes), three volumes striped at 1.5 MiB units (§11), units consumed as they
-  land, LFRU with a 37 % memory share, the prefix cache, short drafts only (§17).
-- **Three tiers, exclusive, one policy owner per boundary** (GLM §6): the transfer agent owns
-  VRAM↔RAM, the SSD agent RAM↔SSD; the device reads residency words.
+  MXFP4 records (−5.6 % bytes), striped volumes at 1.5 MiB units where the machine has drives (§11),
+  units consumed as they land, LFRU within the placement's counts (MoE §4.3), the prefix cache,
+  short drafts only (§17).
+- **Three tiers, exclusive, one policy owner per boundary** (MoE §4): the device reads residency
+  words; the host owns every movement decision at round boundaries.
 - **The model's own compressed KV is tiny**, so long context costs almost nothing and prefix
   snapshots are a few MB: the prefix cache can keep whole conversations (§18).
 - **Prompt rule as a declared model mode**: DeepSeek's bounded replay by default, the exact full
@@ -786,7 +857,7 @@ One recipe, `deepseek_v4_1_flash`, imports any of these sources; M0 pins each re
 
 ### 7.2 Tensor classes
 
-| Tensor class | Stored (official) | Bytes | Infernix form |
+| Tensor class | Stored (official) | Bytes | Engine form |
 |---|---|---:|---|
 | Routed experts, 40 × 384 (`w1` gate, `w3` up, `w2` down) | MXFP4: packed I8 codes [2,304 × 2,560] / [5,120 × 1,152], E8M0 scales [2,304 × 160] / [5,120 × 72] | 288.8 GB | `mxfp4_expert_v1` records (§7.3) in the expert volumes (§7.4) |
 | DSpark experts, 3 × 128 | MXFP4 (in every source) | 7.22 GB | same records, DSpark bank |
@@ -806,8 +877,8 @@ finite power of two, NaN codes, and a config that differs from the pinned one in
 ### 7.3 Expert records
 
 **`mxfp4_expert_v1`** (to be defined byte-exactly in [storage layouts](storage-layouts.md)). Both
-processors read a record in place (FN §6.2's principle): the GPU from a frame or a staging slot, the
-CPU from a RAM slot, a landing slot or an unpinned record.
+processors read a record in place (the one-record principle is MoE §3's): the GPU from a frame or a
+staging slot, the CPU from a RAM slot, a landing slot or an unpinned record.
 
 - **Matrices**: gate/up first, rows interleaved by groups of 16 (16 gate rows, then the same 16
   channels' up rows), then down.
@@ -815,7 +886,8 @@ CPU from a RAM slot, a landing slot or an unpinned record.
   of codes (16 rows × 32 nibbles), then 16 bytes of UE8M0 scales (row i at byte i). Tiles are
   g-major, then b ascending. The intra-tile code order is chosen in M3 so a warp's loads land in
   `mma.sync.m16n8k32` operand order and a CPU vector load covers one row group's 32 weights
-  (FN §6.2's quad scheme at 32-element blocks); no tensor-core layout leaks into the record.
+  (the quad scheme of Flash-Next's `nvfp4_expert_rg16_v1`, FN §6.3, at 32-element blocks); no
+  tensor-core layout leaks into the record.
 - **Sizes**: gate/up 288 row groups × 160 blocks × 272 B = 12,533,760 B; down 320 × 72 × 272 B =
   6,266,880 B; **18,800,640 B per record**, the official bytes rearranged.
 - **Stripe units**: 12 per record, 8 for gate/up (each 36 row groups: 288 channels' gate and up rows)
@@ -824,7 +896,7 @@ CPU from a RAM slot, a landing slot or an unpinned record.
   record**, +0.13 %. RAM slots and VRAM frames hold the padded record, so a landed record becomes a
   slot without moving bytes.
 
-**`nvfp4_expert_rg16_v1`** (FN §6.2, generalized to H = 5,120, I = 2,304) is the fallback: 144-byte
+**`nvfp4_expert_rg16_v1`** (FN §6.3, generalized to H = 5,120, I = 2,304) is the fallback: 144-byte
 units of 16 rows × 16 K with E4M3 scales, 19,906,560 B per record (4,860 × 4 KiB), 12 units of
 1,658,880 B; the matrices' `weight_scale_2` multipliers sit in the record's tail as in FN.
 
@@ -839,8 +911,8 @@ NVFP4 records and §25.2 records why.
 ### 7.4 Expert volumes
 
 The routed banks live outside the `.infernix` file set, in **N expert volumes**
-(`<name>.xv-<i>-of-<N>`, 1 ≤ N ≤ 4), each a plain file for its own drive, exactly as GLM §7.3
-defines them: a 4 KiB header (magic, artifact id, volume index and count, weight vector, banks with
+(`<name>.xv-<i>-of-<N>`, 1 ≤ N ≤ 4), each a plain file for its own drive, as the GLM design defines
+them (GLM §7.3): a 4 KiB header (magic, artifact id, volume index and count, weight vector, banks with
 record bytes, unit size and record count, CRC32C), weighted placement of unit j of record r on
 volume P[(j + r) mod 12], computable offsets and no per-record table.
 
@@ -851,11 +923,23 @@ volume P[(j + r) mod 12], computable offsets and no per-record table.
 - **Writers**: the converter (§7.6) and `python -m tools.artifact.restripe` (GLM §7.3), which
   re-stripes existing volumes for another N or weight vector without the source. Runtime never
   writes a volume.
+- **Where the shared tier meets them**: `ExpertStore` (`src/models/offload/expert_store.h`)
+  describes every record as file segments — for a striped record, its 12 units across up to 4
+  volume files, each 4 KiB-aligned so a tier read is one unbuffered operation per unit (MoE §3).
+  Its `kMaxSegments` is 3 today (a record straddling part files plus an expert-stripe tail); this
+  family raises it to 12 (§8.2).
+
+On the RTX PRO 6000, the same artifact runs with the volumes on one NVMe (N = 1) or split across
+whatever drives the machine offers; `restripe` changes N without re-downloading the source. The
+alternative one-file form is the shared tier's expert stripe (MoE §3, §4.7): the record tails on a
+second drive, read concurrently without a second copy of the experts — the cheaper second-drive
+option where free space allows only ~10 % more bytes, and the default recommendation there until
+striping measurably wins (§25.2, question 11).
 
 ### 7.5 Engram volumes
 
 The Engram tables live in their own volume, `<name>.engram`, in the role Flash-Next's `.ngram`
-volume has (FN §6.3, §12.2):
+volume has (FN §12.1-12.2):
 
 | Row format | Row | Rows per 4 KiB block | Volume | Source |
 |---|---:|---:|---:|---|
@@ -871,16 +955,18 @@ volume has (FN §6.3, §12.2):
   NVIDIA's rows of the September table, which must match byte for byte).
 - **Sharing**: if M0 finds the 1017 Engram tables equal to September's (sampled rows by range read),
   one FP8 volume serves every artifact of either checkpoint, bound with `--engram-reuse` as
-  Flash-Next's derivatives bind NVIDIA's n-gram volume.
+  Flash-Next's derivatives bind NVIDIA's n-gram volume (FN §12.2).
 - Runtime selection follows decision d (§14.5).
 
 ### 7.6 Conversion under the disk limits (decision e)
 
 The official source is 510.3 GB in 48 shards of at most 7.41 GB; NVIDIA's is 429.0 GB. The default
 outputs are ≈ 11 GB of main artifact (dense 8.5, embedding 1.3, DSpark dense 0.7, vision 1.0),
-296.4 GB of expert volumes and 209.7 GB of FP8 Engram volume: **≈ 517 GB**. On 2026-10-18 the four
-drives had ≈ 895 GB free in all, so the source and the outputs cannot coexist. The conversion route
-is therefore **shard by shard**, and its plan is computed from the free space at the time it runs.
+296.4 GB of expert volumes and 209.7 GB of FP8 Engram volume: **≈ 517 GB**. On 2026-10-18 the RTX
+5090 machine's four drives had ≈ 895 GB free in all; the RTX PRO 6000's models NVMe must be checked
+when the conversion runs there (the 517 GB must fit beside the existing models, or the MXFP4 Engram
+volume saves 105 GB, §25.3 O4). The conversion route is therefore **shard by shard**, and its plan
+is computed from the free space at the time it runs.
 
 1. **Plan.** Read the index and every shard header by HTTP range requests (≈ 15 MB of metadata);
    compute every output offset (expert units to volume offsets by §7.4, Engram rows to blocks,
@@ -901,8 +987,8 @@ is therefore **shard by shard**, and its plan is computed from the free space at
 5. **Verify**: `tools.deepseek_v41.verify_artifact` checks headers, sizes, the journal's CRC32Cs on
    every unit and, with the source reachable again, sampled tensors by range read.
 
-**Disk plan on this machine** (2026-10-18 free space; recomputed by step 1 when the conversion
-runs):
+**Disk plan on the RTX 5090 machine** (2026-10-18 free space; recomputed by step 1 when the
+conversion runs):
 
 | Item | Size | Drive |
 |---|---:|---|
@@ -924,59 +1010,78 @@ needs the owner's go-ahead when the conversion is scheduled; it takes ≈ 70 min
   records as their official counterparts (§7.1) and bring MXFP4 Engram tables; an FP8 volume made
   from the official release can replace those (§14.5).
 - **DS4's Q2 and Q4 GGUFs** are a different, requantized model: option O6 (§25.3) imports them with
-  Infernix's exact GGUF arithmetic (FN §16.2.2) where its block formats cover them (Q2_K, Q4_K; IQ2_XXS
+  the engine's exact GGUF arithmetic (FN §17.3) where its block formats cover them (Q2_K, Q4_K; IQ2_XXS
   is not built), at DS4's measured quality.
 - **EXL3 builds** (diffbot 3 bpw, KL 0.0545 neutral) would need the GLM design's EXL3 kernels; not
   planned.
 
 ---
 
-## 8. Ownership in Infernix
+## 8. Ownership in the engine
 
 ### 8.1 New family
 
 This is an **explicit product change**: a new mathematical architecture (`DeepseekV41ForCausalLM`,
-model type `deepseek_v41`).
+model type `deepseek_v41`). The family directory follows the layout the existing families use
+(`src/models/qwen4_exp/`, `src/models/qwen3_5/`), and the engine grows one `Architecture` value
+(`src/models/registry.h`, today `Qwen3_5`, `Qwen3_5Moe`, `Qwen4Exp`) and one `EngineCore` arm in
+`src/runtime/engine/engine.cpp` (the per-family instantiation beside today's
+`runtime::Qwen4ExpInstance`).
 
 | Component | Owner | Location |
 |---|---|---|
-| Config interpretation (exact key set, refusals), mathematics, binding, block order, the two prompt rules, DSpark alignment | Model | `src/models/deepseek_v41/` (`config`, `weights`, `load`, `execution/forward`, `execution/parameters`) |
-| Program: lanes, windows and compressed planes, Engram rows, prefix-cache binding, DSpark drafter, graphs, expert-offload composition | Program | `src/models/deepseek_v41/program/` |
-| Engine instance | Model | `src/models/deepseek_v41/instance.{h,cpp}`; a new `Architecture` value in `src/models/registry.cpp`; an `EngineCore` arm |
+| Config interpretation (exact key set, refusals), mathematics, binding, block order, the two prompt rules, DSpark alignment | Model | `src/models/deepseek_v41/` (`config.*`, `load.*`, `model.h`, `execution/` forward and parameters, `shapes/`) |
+| Program: lanes, windows and compressed planes, Engram rows, prefix-cache binding, DSpark drafter, graphs, the offload-tier composition and its round boundaries | Program | `src/models/deepseek_v41/program/` |
+| Engine instance and the memory plans | Model | `src/models/deepseek_v41/instance.{h,cpp}`, `memory_plan.{h,cpp}` (mirroring `src/models/qwen4_exp/instance.*`, `memory_plan.*`); startup options `src/models/deepseek_v41/options.*` |
 | MX8 activation codec and exact block combination | Ops (common) | `src/ops/common/mx8.h`, beside `exact_combine.h`; the scalar form is the exact oracle |
-| Tokenizer pre-tokenizer, DeepSeek encoding, DSML tool-call and reasoning parsing | Frontend | §21 |
+| Tokenizer pre-tokenizer, DeepSeek encoding, DSML tool-call and reasoning parsing | Frontend | `src/models/deepseek_v41/frontend/` (§21) |
 | Recipe, streaming conversion, MX recovery, expert and Engram volume writers, verification, reference forward | Converter / tools | `tools/convert/deepseek_v41.py`, `official_recipes.py`, `tools/artifact/expert_volume.py`, `tools/artifact/restripe.py`, `tools/deepseek_v41/` |
 
 DeepSeek's reference code and DS4 are MIT-licensed; any code ported from them keeps its notice.
 
-### 8.2 Shared components
+### 8.2 The shared offload tier: what exists, what this family adds
 
-Three explicit families now need host-offloaded experts: Qwen4Exp (built), GLM-5.3-Flash (designed)
-and this one. The shared pieces are already extracted into `src/models/offload/`, as GLM §8.2
-describes, with no base class, virtual model interface or registry:
+The shared tier exists today in `src/models/offload/` (geometry, residency, cache, placement,
+store, tiers, state, calibrated order, route trace, monitor) with its MoE ops in
+`src/ops/offloaded_sparse_moe/` — the [MoE offload design](moe-offload-design.md) §1 table names
+every file, and MoE §9 is the adding-a-family checklist this design follows. A family's Program
+constructs the tier's pieces directly, hands each its `ExpertBankGeometry` and record strides, and
+drives them at its own round boundaries; there is no base class, no virtual model interface, no
+plugin discovery and no string-driven execution (MoE §2) — the model registry
+(`src/models/registry.h`) is a plain enum, not a registration mechanism.
 
-- **`src/models/offload/`**: expert cache, residency controller, RAM tier with pinned and unpinned
-  records, expert store, state file, ledger terms, route trace, VRAM monitor, parameterized by an
-  `ExpertBankGeometry` (banks, experts per bank, record format, record and unit bytes, H, I).
-  Qwen4Exp keeps every decision bit for bit (M2's exit criterion, GLM §23).
-- **Expert volumes and the striped reader** (GLM §7.3, §11.3), shared with GLM.
-- **The `mhc` Op** (GLM §15) with a *pre source* input: same sublayer (GLM) or the previous one
-  (this model, §15).
-- **The radix top-k select** moves to `ops/common` (GLM §13.3) and serves `qsa`, GLM's indexer and
-  this model's indexer.
-- **The row-volume reader** behind Flash-Next's n-gram table (`NgramVolume`, `ReadOnlyFile`'s ring,
-  the gated upload) serves the Engram volume (§14); the PLE Op itself is not shared.
+**This family's `ExpertBankGeometry`** (MoE §3): the main bank composes banks = 40,
+experts_per_bank = 384, top_k = 6; the DSpark bank composes its own instance (banks = 3,
+experts_per_bank = 128, top_k = 3) with its own small pool (§10.6) — two compositions of the same
+plain structs, no change to the struct.
+
+**What the shared tier lacks and this family adds** (each stays zero-cost for `qwen4_exp`):
+
+| Addition | Where | Why zero-cost for Qwen4Exp |
+|---|---|---|
+| The **`mxfp4` record trait**: exact MXFP4 decode (E2M1 codes, UE8M0 exponent per 32 weights) beside `nvfp4_mul`, `fp8_e4m3fn_b128` and the ggml blocks, in `src/ops/common/canonical_math.h` and the expert kernels `src/ops/offloaded_sparse_moe/{cuda,cpu}/mxfp4_expert.*` | Ops | A new format trait and its kernels sit beside the existing ones (MoE §3: a new stored format adds a trait, not a new engine); Qwen4Exp's banks never take the trait |
+| The **MX8 activation class** beside today's A4 and A16: per-32-block activation scales, exact integer sums (§9.5), in the same expert kernels and `src/ops/offloaded_sparse_moe/cpu/mx8_expert.cpp` | Ops | A distinct activation class selected at compile time by the bank's format; no existing route branches on it |
+| The **`sqrtsoftplus_bias_topk_scaled` routing** beside the softmax route (`src/ops/offloaded_sparse_moe/`): score √softplus, a second bias for image-span tokens, weights ×1.5, the routing weight applied to h before the down projection | Ops | A separate routing function the family's Program calls; the softmax route Qwen4Exp uses is untouched |
+| **`ExpertStore::kMaxSegments` 3 → 12**: a striped record's 12 units across up to 4 volume files (`src/models/offload/expert_store.h`) | Offload tier | A larger fixed-size array in a cold, immutable description built once at load; no table, kernel or boundary change |
+| **Per-volume read queues with priorities** in the SSD tier's read agent (`src/models/offload/host_expert_tier.*`): one unbuffered queue per volume file, demand before prompt-stream before background, row reads ahead of expert units (§11.2, §14.7) | Offload tier | Host-side queue lists; Qwen4Exp's single artifact file keeps one queue and one priority class, its reads unchanged |
+| **Unit-level landing consumption**: jobs keyed to a record's stripe units, consuming units as they land (with GLM §11.4's landing masks) | Ops | An extension of the CPU channel's request shape; whole-record jobs (Qwen4Exp's) are the unit count 1 case |
+| **A core row-volume reader generalized from Flash-Next's `NgramVolume`** (unmapped volume, ring of direct 4 KiB reads, dedup per block, `upload_pinned_when` gate — FN §12.3-12.4, §13.6): the reader moves beside `src/ops/rows/` and serves both the n-gram and Engram volumes; the PLE Op itself is not shared | Core / Ops | A move of existing code both families call; Qwen4Exp's own paths are byte-identical |
+| **The striped record reader** (`Core`'s `StripedRecordReader`, GLM §11.3): per-volume queues (IOCP on Windows, `io_uring`/`pread` on Linux), weighted unit placement, fault seams | Core | A new Core class this family and GLM's construct; Qwen4Exp's single-file reads never go through it |
+
+The GLM track (implemented first) is expected to land the striped reader, the row-volume reader and
+the unit-level landing; this design counts them as shared pieces and states its own additions. If
+GLM lands them differently, M2 reconciles rather than duplicating.
 
 ### 8.3 Op changes
 
 | Op | Change |
 |---|---|
 | New Linear format **`fp8_e4m3fn_b32_e8m0`** | MX8 activations (§9.5); decode route (T ≤ 8, CUDA-core integer) and prompt route (int8 tensor cores), bit-identical; grouped application for `wo_a`; generalizes `fp8_block/fp8_exact.h` (128 × 128 BF16 scales) to 32 × 32 power-of-two scales |
-| `offloaded_sparse_moe` | Expert formats `mxfp4` and `nvfp4` with the **MX8 activation class** (beside today's A4 and A16); geometry from the bank; routing function `sqrtsoftplus_bias_topk_scaled` with a second bias for image tokens; the routing weight applied to h before the down projection; SwiGLU clamp 10; ungated shared expert in FP8; landing-aware jobs and partial records (GLM §11.4); a second bank for DSpark (128 experts, top-3) |
+| `offloaded_sparse_moe` | Expert formats `mxfp4` and `nvfp4` with the **MX8 activation class** (beside today's A4 and A16); geometry from the bank; routing `sqrtsoftplus_bias_topk_scaled` with a second bias for image tokens; the routing weight applied to h before the down projection; SwiGLU clamp 10; ungated shared expert in FP8; landing-aware jobs and partial records (GLM §11.4); a second bank for DSpark (128 experts, top-3) |
 | New **`csa_attention`** | Window ring plus selected compressed entries, one shared 512-wide key/value, per-head sink, inverse RoPE on the output; decode and prompt kernels (§13.3, §13.6) |
 | New **`csa_compressor`** | Ratio-2 gated pooling and ratio-1 projection, norm, RoPE, FP4 packing, index keys (§13.2) |
 | New **`csa_indexer`** | MXFP4 query/key scores, head weights, top-512, layer 20's block candidates, Reindex masks (§13.4) |
-| `mhc` (shared with GLM) | Single-pass variant (§15) |
+| `mhc` (shared with GLM §15) | Single-pass variant (§15) |
 | New **`engram`** | Row decode (FP8 or MXFP4 to BF16), the `wkv` projection, per-stream gates and the stream update (§14.6) |
 | New DSpark Ops | Attention over the main-feature window and the bidirectional block; Markov and confidence heads (§17) |
 | Core | `StripedRecordReader` (GLM §11.3); the row-volume reader generalized from `NgramVolume` |
@@ -987,25 +1092,27 @@ describes, with no base class, virtual model interface or registry:
 
 ### 9.1 Execution agents
 
-As GLM §9.1: the compute stream with one captured graph per (batch B, width W); a transfer agent
-(VRAM policy, promotions, staged DMA of RAM misses and landed records); an SSD agent (one IOCP queue
-per volume, demand and prompt reads, landing ring, refills); the CPU expert team (service thread plus
-calibrated workers); and the engine worker, which also hashes Engram rows and reads them through the
-row-volume ring (FN §12.3). Host agents spin only while a request is active; the process is exempt
-from power throttling (L11).
+As Flash-Next runs it (FN §8.1): the engine thread (worker) staging io, replaying the round's
+graph, synchronizing and settling; the CPU miss service with its worker team (MoE §5.3); the SSD
+tier's read agent answering fetch and demand reads while a tier round is open (MoE §4.7); the VRAM
+monitor waking an idle engine (MoE §4.9). This family adds: the read agent owns **one queue per
+expert volume** plus the Engram reader ring (§11.2, §14.4); on Windows the process is exempted from
+power throttling once at Engine construction (FN §8.1). Host agents spin only while a request is
+active.
 
 ### 9.2 Host-device protocol
 
-Flash-Next's mapped-memory protocol (FN §8.2) with GLM §9.2's additions (`landing[slot]` masks and
-sequence words). New: the Engram rows of a round arrive through the gated upload of FN §12.3 S2
-(`upload_pinned_when`), read by the `engram` kernel of layer 1 and layer 14.
+Flash-Next's mapped-memory protocol and its channels (FN §8.2), the miss-service sequence and
+heartbeat discipline of MoE §5.4, and the fetch channel of MoE §4.7. New: the Engram rows of a round
+arrive through the gated upload `upload_pinned_when` (FN §12.4), read by the `engram` kernel of
+layer 1 and layer 14.
 
 ### 9.3 Per-layer kernel sequence and budget (T = 1)
 
-Budget = bytes at 1.5 TB/s + 0.5 µs ramp under PDL, as in FN §8.3. "Pre" = before routing.
+Budget = bytes at 1.5 TB/s + 0.5 µs ramp under PDL (FN §8.3). "Pre" = before routing.
 
 | # | Kernel | Reads | Budget |
-|---|---|---:|---:|
+|---|---|---:|---|
 | K1 | Mixes from the stream entering the sublayer (24 dot products over 20,480, Sinkhorn): **concurrent**, off the critical path, because this sublayer's collapse uses the pre it received (§15) | 2.0 MB | (2 µs) |
 | K2 | Collapse with the received pre and `attn_norm` (partial sums from the producer's epilogue); MX8 of x; `wq_a` [1,280 × 5,120] and `wkv` [512 × 5,120] FP8 in one launch | 9.2 MB | 6.6 µs |
 | K3 | `q_norm`, MX8, `wq_b` [32,768 × 1,280] FP8; epilogue: RoPE on q; window entry (`kv_norm`, RoPE, MX8 → ring) | 41.9 MB | 28 µs |
@@ -1026,15 +1133,15 @@ gates and the stream update. The head (BF16 [129,280 × 5,120], 1.32 GB) takes �
 
 **Rules**, from FN §8.3: PDL with pre-dependency weight prefetch at ≤ 2 CTAs per SM; evict-first
 weight streams, evict-last activations, windows and next-layer routers; deterministic fixed-order
-reductions; grids in multiples of 170 SMs; no grid barriers. **Stall-time warming** (GLM §9.3)
+reductions; grids in multiples of the SM count; no grid barriers. **Stall-time warming** (FN §8.6)
 matters more here: a layer waits ≈ 1-3 ms on SSD records (§5.3), and while K9 waits, idle CTAs pull
-the next layer's K2-K3 weights (≈ 51 MB) into the 96 MB L2. Estimated saving ≈ 30-40 µs per layer,
+the next layer's K2-K3 weights (≈ 51 MB) into L2. Estimated saving ≈ 30-40 µs per layer,
 ≈ 1.4 ms per token (≈ 2 % of a ~78 ms token; M6 measures).
 
 ### 9.4 Router (K7)
 
 Phase 1: warp-per-row FP32 logits of the 384 router rows: x (BF16) and the BF16 weights give exact
-products, summed exactly and rounded once to FP32 (FN §16.5: FP32 logits avoid BF16 ties). Phase 2
+products, summed exactly and rounded once to FP32 (FN §17.7: FP32 logits avoid BF16 ties). Phase 2
 (last CTA by arrival counter), per column:
 
 1. s_e = √softplus(z_e) with the canonical `exp`/`log1p` of `ops/common/canonical_math.h` and
@@ -1042,9 +1149,10 @@ products, summed exactly and rounded once to FP32 (FN §16.5: FP32 logits avoid 
    (commit `0719a0ba`), so M3's oracle covers z ≤ −20 exhaustively over BF16-representable sums.
 2. top-6 of s_e + bias_e (bias_vl_e on image-span tokens), lower id winning exact ties;
    w_i = 1.5 · s_i / (Σ s + 1e-20) in FP32.
-3. Union over the T columns; classification from the residency word and tier tables, as GLM §9.4:
-   `READY` frame → GPU job; RAM slot → CPU or DMA job (§9.7); unpinned record → CPU job; landing
-   slot → CPU job per unit; absent everywhere → demand read, then a landing-slot job.
+3. Union over the T columns; classification from the residency word and tier tables: `READY` frame →
+   GPU job; RAM slot → CPU or DMA job (§9.7); unpinned record → CPU job; landing slot → CPU job per
+   unit; absent everywhere → demand read, then a landing-slot job (the classification machinery is
+   the op's, MoE §6.1).
 4. Outputs: GPU job list, `miss_req[l]`, the route log with the scores of ranks 7-16 (near misses,
    §10.2).
 5. Prediction (lookahead, off by default, §11.3): layer l + 1's router applied to this layer's MoE
@@ -1055,7 +1163,7 @@ products, summed exactly and rounded once to FP32 (FN §16.5: FP32 logits avoid 
 **Requirement.** Every FP8 and FP4 linear computes DeepSeek's MXFP8 product (decision b), and its
 BF16 output is bit-identical on every route and processor: GPU narrow and wide routes, CPU on every
 ISA, from a frame, a staging slot, a RAM slot, an unpinned record or a landing slot in any unit
-order (FN §16.2's requirement, extended to dense layers as FN §16.2.2 did).
+order (the placement-invariance requirement is MoE §2's, extended to dense layers).
 
 **Activation encoding** of a BF16 column x of K elements, per 32-element block b (the reference's
 `act_quant`, §2.2):
@@ -1068,7 +1176,7 @@ X_k  = q_k · 2^9 ∈ ℤ, |X_k| ≤ 229,376 < 2^18;  x̂_k = X_k · 2^(e_b − 
 ```
 
 **Weights.** MXFP4: c2 = 2 · e2m1(code) ∈ {0, ±1, ±2, ±3, ±4, ±6, ±8, ±12} with a UE8M0 exponent u per
-32 weights along K. NVFP4: c2 with Ŝ (E4M3 · 2^9) per 16 and the matrix multiplier (FN §16.2.1).
+32 weights along K. NVFP4: c2 with Ŝ (E4M3 · 2^9) per 16 and the matrix multiplier (FN §17.3).
 Dense FP8: W = e4m3 · 2^9 ∈ ℤ (|W| < 2^18) with a UE8M0 exponent per 32 × 32 block.
 
 **Row product**, for one output row r:
@@ -1077,21 +1185,21 @@ Dense FP8: W = e4m3 · 2^9 ∈ ℤ (|W| < 2^18) with a UE8M0 exponent per 32 × 
 MXFP4:  P_b = Σ_{k∈b} c2_rk · X_k             |P_b| ≤ 32 · 12 · 229,376 < 2^27, exact int32
 FP8:    P_b = Σ_{k∈b} W_rk · X_k              |P_b| < 2^41, exact int64
 S       = Σ_b P_b · 2^(E_b − E_min)           E_b = u_b + e_b (+ format constants); exact, int128 where the
-                                              spread needs it (exact::add_shifted, FN §16.2.2)
+                                              spread needs it (exact::add_shifted, FN §17.3)
 y       = bf16_rn( fl32_rn(S · 2^(E_min − κ)) )        κ: the format's fixed power of two; one rounding to FP32,
                                                         one to BF16 (FP32 output where the reference keeps FP32)
 ```
 
 Integer steps are exact; the two roundings at the end are fixed. The result depends only on the
 stored words and x, so **any split of K, rows or columns, any order and any processor give the same
-bits**. NVFP4 records use FN §16.2.1's form with the MX8 encoding in place of A16; the result equals
+bits**. NVFP4 records use FN §17.3's form with the MX8 encoding in place of A16; the result equals
 the MXFP4 record's bit for bit (the values are identical and both sums are exact), which M3 tests.
 
 **The expert chain** (semantic boundaries as in the reference):
 
 ```text
 x (BF16) → MX8 → gate, up (BF16 outputs) → FP32: g ← min(g, 10), u ← clamp(u, ±10)
-  → h = bf16( w_i · silu_c(g) · u )   (FP32, canonical exp of FN §16.2; shared expert: w = 1)
+  → h = bf16( w_i · silu_c(g) · u )   (FP32, canonical exp; shared expert: w = 1)
   → MX8 → down → BF16 y_i → combine: bf16( Σ_i y_i [FP32, ascending id] + y_shared )
 ```
 
@@ -1101,13 +1209,13 @@ by the reference's own accumulation error (relative ≲ 2^−24 per block added)
 an FP64 evaluation of the same quantized operands.
 
 **Why exactness is cheap here**: per-block products fit int32 for FP4 weights; the GPU narrow route
-uses `dp4a` with X as three byte limbs (FN §16.2.1's narrow form); the wide route uses two
-`mma.m16n8k32` per 32-block with FN §16.2.1's limb split (X has 18 bits instead of 21); the CPU uses
-two int16 limbs with `vpdpwssd` (FN §16.2.2's CPU GGUF form). Dense FP8 rows take FN §16.2.2's
-base-64 digit planes on the tensor cores. Rejected, as FN §16.2.2 rejected them: FP8 or FP4 tensor
+uses `dp4a` with X as three byte limbs (FN §17.3's narrow form); the wide route uses two
+`mma.m16n8k32` per 32-block with FN §17.3's limb split (X has 18 bits instead of 21); the CPU uses
+two int16 limbs with `vpdpwssd` (FN §17.3's CPU GGUF form). Dense FP8 rows take FN §17.3's
+base-64 digit planes on the tensor cores. Rejected, as FN §17.3 rejected them: FP8 or FP4 tensor
 cores with FP32 accumulation (undocumented order on `sm_120`, not reproducible on the CPU).
 
-**Compiler and instruction rules** are FN §16.2's: `-ffp-contract=off -fno-fast-math`, explicit
+**Compiler and instruction rules** are FN §17.2's: `-ffp-contract=off -fno-fast-math`, explicit
 `__fmaf_rn` / `__fmul_rn` / `__fadd_rn`, and `cvt.rn.satfinite.e4m3x2.f32` checked exhaustively
 against the CPU's integer E4M3 rounding.
 
@@ -1124,17 +1232,25 @@ rounded to BF16 (`apply_rotary_emb` writes back to BF16); attention, indexer, mH
 | Wide (GPU) | n > 8 (prompts, wide verify) | int8 tensor cores, two k32 MMAs per block; codes decoded once per tile and reused over the CTA's token tile |
 | CPU | RAM, unpinned and landed records | AVX2 + AVX-VNNI (§12) and a scalar form (the oracle) |
 
-All three return the same bits (§9.5); the route depends only on n, never on placement.
+All three return the same bits (§9.5); the route depends only on n, never on placement. The
+column limits of every route are the shared ones (MoE §6.2); this family's batch and draft widths
+stay inside them.
 
 ### 9.7 Miss arbitration
 
-- **RAM misses**: the divisor rule (L19) fed by the measured pair: the CPU team's ≈ 0.35-0.45 ms per
-  expert against the link's 0.68 ms, so the CPU takes about 60 % (d ≈ 2.5, from a per-count split
-  table calibrated at start and kept across starts, GLM §12.3).
+The arbitration rules — SSD-only misses first, host-memory misses fewest columns first in job order
+up to the call's cap, the host share `misses − misses / divisor` — and the fetch channel for what no
+CPU job takes are MoE §6.1's. This family's inputs:
+
+- **RAM misses**: the divisor rule (MoE §5.6) fed by the measured pair — on the RTX 5090 machine's
+  i9-13900K the CPU team's ≈ 0.35-0.45 ms per expert against the link's 0.68 ms, so the CPU takes
+  about 60 % (d ≈ 2.5, from a per-count split table calibrated at start and kept across starts,
+  GLM §12.3). On the 6000 the pair is 0.38 ms of link against an unmeasured CPU cost; the startup
+  probes derive it (MoE §5.5).
 - **SSD misses**: CPU jobs first, consuming units as they land; staged DMA after landing only beyond
-  the CPU cap (16 jobs per call, FN §19.3.16).
-- **Unpinned records** (past the pin room): CPU jobs in place; DMA only through bounce slots
-  (FN §19.3.7).
+  the CPU cap (16 jobs per call, as Flash-Next measured its optimum, FN §10.5).
+- **Unpinned records** (past the Windows pin room, MoE §4.11): CPU jobs in place; DMA only through
+  bounce slots.
 - **Multi-column experts** (verify windows): the CPU decodes codes once for all columns; beyond the
   calibrated column count the expert goes to DMA.
 
@@ -1155,85 +1271,115 @@ What differs here:
   11.4 % block error from dropping one of eight sigmoid-routed experts on MiniMax-M2.5. M7a measures
   the band sensitivity on this model before any preset ships.
 - **Gates** are GLM §9.8's (mean KL ≤ 0.02 to the exact model, p99 ≤ 0.3, top-1 ≥ 95 %, the
-  long-answer loop test), with replayed residency at this machine's capacities.
+  long-answer loop test), with replayed residency at the machines' capacities.
 
 ---
 
 ## 10. Expert residency: VRAM, RAM and SSD
 
-### 10.1 Tiers
+The machinery of this section — the tier model, frame pools and device tables, the LFRU, landing and
+safe frame reuse, frame leases, the RAM and SSD tiers, placement and the two memory laws — is shared
+by every offloaded MoE family and is designed once in [MoE offload design](moe-offload-design.md) §4
+("MoE §4" below). This section keeps what is specific to DeepSeek-V4.1-Flash: its geometry and pool
+structure, its constants, its placements on both machines and what it still must measure. Code the
+family composes: `src/models/offload/` (MoE §1's table), driven by `src/models/deepseek_v41/program/`.
 
-| Tier | Capacity on this machine | Holds | Policy owner |
-|---|---|---|---|
-| VRAM frames (17.95 MiB) | ≈ 1,160 (7.5 %), elastic with KV, DSpark pool and the walk lease | Hot experts; staging; loans | Transfer agent |
-| Pinned RAM slots | ≈ 4,000 (≈ 72 GiB, the pin room) | Warm experts; the landing ring; the demotion list | SSD agent (admission), transfer agent (promotion source) |
-| Unpinned records | ≈ 450 (≈ 8 GiB) at 88 GiB available | The coldest RAM experts, CPU-served in place | SSD agent |
-| Expert volumes | all 15,744 records, read-only | Everything | — |
+### 10.1 Tiers and geometry
 
-Residency is **exclusive with shadows** (FN §19.3.7; GLM §10.1): a VRAM resident keeps its RAM copy
-only as a shadow, the first RAM victim; demotions are capped at 32 per decode boundary.
+The subject is 15,360 routed keys (40 banks × 384 experts, top-6), plus the DSpark bank's 384 (§10.6).
+One record size (17.95 MiB MXFP4, or 18.95 MiB NVFP4 in a fallback bank) means **one frame pool**
+with one LFRU (MoE §4.2: the layers whose records share a stride share one pool).
+
+| Tier | RTX 5090 machine | RTX PRO 6000 | Holds | Policy owner |
+|---|---|---|---|---|
+| VRAM frames (17.95 MiB) | ≈ 1,160 (7.5 %), elastic with KV, the DSpark pool and the walk lease | ≈ 4,500 (29.3 %), elastic the same | Hot experts; staging; loans | The tier (LFRU within the placement's counts) |
+| Pinned RAM slots | ≈ 4,000 (≈ 72 GiB, the Windows pin room, MoE §4.11) | ≈ 4,400 (28.6 %; Linux pins what the ledger leaves) | Warm experts; the landing ring; the demotion list | The RAM tier (decayed LFU, MoE §4.6) |
+| Unpinned records | ≈ 450 (≈ 8 GiB) at 88 GiB available | none (Linux has no pin room) | The coldest RAM experts, CPU-served in place | The RAM tier (MoE §4.11) |
+| Expert volumes / artifact | all 15,744 records, read-only | the same | Everything | — |
+
+Residency is **exclusive with shadows** (MoE §4.1): a VRAM resident keeps its RAM copy only as a
+shadow, the first RAM victim; demotions are capped at 32 per decode boundary.
 
 ### 10.2 VRAM policy
 
-**Baseline: LFRU over one global pool** (FN §9.3). M1 replays the GLM §10.2 candidates on this
-model's traces and adopts one only if it beats LFRU by ≥ 5 % fewer misses per token overall and is
-not worse by more than 2 % on any trace category: LRU; LFRU with near-miss credit (ranks 7-16 at
-c ∈ {0.1, 0.25, 0.5}); protection of depth-1 predictions; aged LFU; soft per-layer shares from
-routing counts; a static hot set with an LRU remainder. Static profiles start behind recency on
-this family (DS4 #636, §4.1).
+**Baseline: LFRU over one global pool** (MoE §4.3 — the score law, the halving, the admission budget,
+pins, warm start, prompt credit). This family's constants:
+
+- **Halving period**: 8,192 ticks as Flash-Next measured its optimum (FN §9.2), re-swept in M1 on
+  this model's traces ({4k, 8k, 16k, 32k}); a pool's period is scaled by its share of layers (MoE §4.3).
+- **Admission budget** (MoE §4.3): one promotion per layer call per decode round, the interval
+  scaled to the measured link — a promotion moves 18.8 MB, 6.8× Flash-Next's 2.76 MB, so the pace
+  is re-swept in M5 ({1, 2, 4, 8} per layer call until the frames fill, then every N tokens), with
+  GLM §10.2's admission threshold (m ∈ {0, 2, 4, 6} aged routes) and free-frame refill after a
+  prompt. No promotions after a walked prompt (MoE §7.3).
+- M1 replays the GLM §10.2 candidates on this model's traces and adopts one only if it beats LFRU
+  by ≥ 5 % fewer misses per token overall and is not worse by more than 2 % on any trace category:
+  LRU; LFRU with near-miss credit (ranks 7-16 at c ∈ {0.1, 0.25, 0.5}); protection of depth-1
+  predictions; aged LFU; soft per-layer shares from routing counts; a static hot set with an LRU
+  remainder. Static profiles start behind recency on this family (DS4 #636, §4.1).
 
 **Promotions** come from CPU-served misses that outrank the victim and from landed records (copied
-from the landing slot). A promotion moves 18.8 MB, 6.8× Flash-Next's, so the pace is re-swept in M5
-({1, 2, 4, 8} per layer call until the frames fill, then every N tokens), with GLM §10.2's admission
-threshold (m ∈ {0, 2, 4, 6} aged routes) and free-frame refill after a prompt. No promotions after a
-walked prompt (L6).
+from the landing slot). The route log's ranks 7-16 (near misses) feed the replay tool
+(`tools/expert_cache_replay`, MoE §4.3).
 
 ### 10.3 Epochs, staging and loans
 
-Unchanged from FN §9.2-§9.5 (frame epochs, slack frames, KV loans, the elastic VMM pool, display
-headroom). Staging slots are frames with a staging role, at most 32 (0.56 GiB).
+Frame epochs, staging slots (at most 32, 0.56 GiB), KV loans, the elastic VMM pool and display
+headroom are the shared machinery (MoE §4.2, §4.5, §4.9); Flash-Next's measurements of them are
+FN §9's. This family sets `D` (rounds in flight) to 1 — a synchronous Program, like Flash-Next's —
+so slack frames are 0 (MoE §4.4).
 
 ### 10.4 RAM tier
 
-- **Sizing**: FN §19.3.7's ledger: available RAM at startup − `--ram-headroom-mib` (2 GiB) −
-  embedding (1.23 GiB pinned) − Engram row cache (0.26 GiB) − prefix Host tier (§18) − Program
-  buffers − 1 GiB growth − 1.5 GiB of process memory. The expert share is pinned up to the pin room
-  (shared system memory − NON_LOCAL usage − 1 GiB, ≈ 72 GiB of experts) and unpinned past it; the
-  landing ring (64 slots, 1.12 GiB) and 32 bounce slots come out of the pinned part.
-- **At 88 GiB available**: ≈ 79.8 GiB of experts → ≈ 4,000 pinned slots and ≈ 450 unpinned records
-  (29.2 % of the bank with the ring excluded). **At 79 GiB**: ≈ 26 %. **With other sessions holding
-  RAM** (24 GiB free on 2026-10-18) the tier shrinks to what is left above the headroom, or startup
-  refuses below FN's minimum, naming the cause.
-- **Commit charge** (GLM §10.4): the ledger plans against the commit limit as well; the 200 GB page
-  file on `G:` covers it.
-- **Policy**: decayed LFU (FN §19.3.7) as baseline; M1 replays LRU, CLOCK and LFRU on the two-level
+- **Sizing**: the host RAM ledger (MoE §4.10) with this family's terms (§19.2): available RAM at
+  startup − `--ram-headroom-mib` (2 GiB) − embedding (1.23 GiB pinned) − Engram row cache (0.26 GiB)
+  − prefix Host tier (§18) − Program buffers − 1 GiB growth − 1.5 GiB of process memory. The expert
+  share is pinned up to the pin room on Windows (MoE §4.11) and split nowhere on Linux; the landing
+  ring (64 slots, 1.12 GiB) and 32 bounce slots come out of the pinned part.
+- **At 88 GiB available on the RTX 5090 machine**: ≈ 79.8 GiB of experts → ≈ 4,000 pinned slots and
+  ≈ 450 unpinned records (29.2 % of the bank with the ring excluded). **At 79 GiB**: ≈ 26 %. **With
+  other sessions holding RAM** (24 GiB free on 2026-10-18) the tier shrinks to what is left above
+  the headroom, or startup refuses below the tier's floor, naming the cause. **On the RTX PRO 6000
+  (89 GB)**: ≈ 77 GiB of experts → ≈ 4,390 slots (28.6 %), all pinned.
+- **Commit charge** (Windows; GLM §10.4): the ledger plans against the commit limit as well; the
+  200 GB page file on `G:` covers it.
+- **Policy**: decayed LFU as built (MoE §4.6); M1 replays LRU, CLOCK and LFRU on the two-level
   simulation and adopts the one with the fewest SSD reads per token on held-out traces.
 - **Admission**: a landed record is admitted when it outranks the RAM victim; demotions of VRAM
-  victims without a host copy follow FN.
+  victims without a host copy follow MoE §4.6.
 
 ### 10.5 Warm start, prompt seeding and refill
 
-As GLM §10.5: the expert state file (VRAM and RAM rankings, use counts) saved at shutdown and every
-10 minutes between requests; startup fills VRAM then RAM in ranking order with coalesced reads at full
-striped bandwidth (≈ 106 GB in ≈ 7.5 s at 14.15 GB/s, overlapped with pinning); prompt routes seed
-both policies with a weight M1 fits; the prompt landing reserve is off by default (Maya, GLM §4.3);
-idle refill at full bandwidth.
+The warm start, the saved state and the prompt credit are the shared machinery (MoE §4.3); this
+family ships **no calibrated order** (no routing traces exist yet; M1 may add one). The expert
+state file (VRAM and RAM rankings, use counts) is saved at shutdown and every 10 minutes between
+requests; startup fills VRAM then RAM in ranking order with coalesced reads at full striped
+bandwidth (≈ 106 GB in ≈ 7.5 s at 14.15 GB/s on the RTX 5090 machine, overlapped with pinning);
+prompt routes seed both policies with a weight M1 fits; the prompt landing reserve is off by
+default (Maya, GLM §4.2); idle refill at full bandwidth.
 
 ### 10.6 DSpark experts
 
-The 384 DSpark records form their own bank. The drafter never waits for them (§17.2): a bounded VRAM
-pool (default 96 frames, 1.68 GiB, carved from the frame pool; M7 sweeps 0-192) ranked by LFRU
-weighted by acceptance, and a RAM pool (default 192 slots, 3.4 GiB, taken from the tier only while
-DSpark is on).
+The 384 DSpark records form their own bank with their own geometry (§8.2) and their own small tier
+instances — a second composition of the same structs, not a change to the shared tier. The drafter
+never waits for them (MoE §6.3): a bounded VRAM pool (default 96 frames, 1.68 GiB, carved from the
+frame pool; M7 sweeps 0-192) ranked by LFRU weighted by acceptance, and a RAM pool (default 192
+slots, 3.4 GiB, taken from the tier only while DSpark is on). On the RTX PRO 6000 the whole DSpark
+bank (6.7 GiB) fits beside the main pool; M7 also measures it fully resident there (Flash-Next's
+drafter kept its experts resident and never built the bounded pool, FN §11.2 — the cheaper option
+where the card allows it).
 
 ---
 
 ## 11. Multi-SSD expert streaming
 
-GLM §11 applies in full: one to four volumes, read-only, every record read uses every volume, demand
-reads never queue behind more than ≈ 0.3 ms of other reads per drive, failed reads fail only the
-rounds that need them, IOCP on Windows and `io_uring` or a `pread` pool on Linux behind Core's
-`StripedRecordReader` with one `DirectReadQueue` per volume. What changes:
+The SSD tier's design — read in place, unbuffered, the read agent and its tickets, the fetch
+channel, retry and backoff, the rejected alternatives (mapped files, an SSD cache, inclusive
+residency) — is MoE §4.7's. On top of it this family stripes each record over 1-4 volumes, as the
+GLM design does (GLM §11): read-only volumes, every record read uses every volume, demand reads
+never queue behind more than ≈ 0.3 ms of other reads per drive, failed reads fail only the rounds
+that need them, IOCP on Windows and `io_uring` or a `pread` pool on Linux behind Core's
+`StripedRecordReader` with one queue per volume (§8.2).
 
 ### 11.1 Reading a record
 
@@ -1254,72 +1400,93 @@ start on them while the down units are in flight (GLM §11.4).
 ### 11.3 Lookahead
 
 Off by default (`--ssd-lookahead off`): every measurement on this family lost (JigSawPT −7 to −19 %,
-hipfire 0.86-0.93×; §4.2), as Maya's did on GLM. With SSD-bound decode the drives are busy ≈ 90 % of
-a token, so lookahead can only use the remaining ≈ 10 % (t_pre gaps between layers) and costs
+hipfire 0.86-0.93×; §4.2), as Maya's did on GLM. With SSD-bound decode the drives are busy ≈ 90 %
+of a token, so lookahead can only use the remaining ≈ 10 % (t_pre gaps between layers) and costs
 bandwidth when wrong. GLM §11.5's budgeted design is built in M5 and measured on three volumes; it is
-enabled only if it gains.
+enabled only if it gains. (The shared tier's own rejection of router lookahead is MoE §6.3's.)
 
-### 11.4 Placement on this machine
+### 11.4 Placement on the machines
 
-| Configuration | Bandwidth (§3) | Record time | Free space needed per drive | Advice |
+RTX 5090 machine:
+
+| Configuration | Bandwidth (§3.2) | Record time | Free space needed per drive | Advice |
 |---|---:|---:|---:|---|
 | **`D:` + `E:` + `G:`, w = (4, 4, 4)** | 14.15 GB/s | 1.33 ms | 98.8 GB | **Default.** `E:` also holds the Engram volume and the repository (builds can add tail latency; §11.5 warns) |
 | `D:` + `E:` + `G:`, w = (5, 4, 3) | 14.15 | 1.41 ms (+6 %) | 123.5 / 98.8 / 74.1 GB | When `G:` is short of space |
 | `D:` + `G:`, w = (6, 6) or (7, 5) | 12.73 | 1.56-1.73 ms | 148-173 GB on `D:` | `G:` cannot hold half the bank (108.7 GB free); (7, 5) needs 123.5 GB on `G:` |
-| `C:` + `D:` + `E:` + `G:`, w = (3, 3, 3, 3) | 19.27 | 1.03 ms (−23 %) | 74.1 GB | Fastest; needs 74 GB on the system drive (80.5 GB free today): opt-in only after freeing space there |
+| `C:` + `D:` + `E:` + `G:`, w = (3, 3, 3, 3) | 19.27 | 1.03 ms (−23 %) | 74.1 GB | Fastest; needs 74 GB on the system drive (80.5 GB free on 2026-10-18): opt-in only after freeing space there |
 | One volume | 5.9-7.0 | 2.7-3.2 ms | 296.4 GB | Supported; ≈ half of three-volume decode |
+
+RTX PRO 6000: the models NVMe holds the volumes (N = 1) and the Engram volume beside the existing
+models; a second drive, where the machine has one with room, is an **expert stripe** (MoE §3: record
+tails on the second drive, ≈ 2× the read rate at ≈ 10 % more bytes) or a restripe to N = 2 — the
+two options M5 A/Bs there (§5.6). The conversion planner (§7.6) reads the free space and proposes.
 
 ### 11.5 Calibration, failures and integrity
 
-GLM §11.7-§11.8 unchanged: a startup read of 64 units per volume at QD 1 and QD 8, the physical-disk
-and root-port topology check with warnings, a retry then a recoverable round failure on read errors,
-header and sampled-CRC checks at startup, a full offline check in `verify_artifact`, no per-read
-hashing.
+GLM §11.7-§11.8 carry over: a startup read of 64 units per volume at QD 1 and QD 8, the
+physical-disk and root-port topology check with warnings, a retry then a recoverable round failure on
+read errors, header and sampled-CRC checks at startup, a full offline check in `verify_artifact`,
+no per-read hashing. On the 6000 the same calibration runs against its NVMe (the T710's rates are
+unmeasured today, §3.1).
 
 ---
 
 ## 12. CPU expert engine
 
+The engine's design — role and limits, the ISA variants, the worker team's scheduling, the
+miss-service protocol, the startup rate probes, the decode divisor and the prefill split — is shared
+by every offloaded MoE family and is designed once in [MoE offload design](moe-offload-design.md) §5
+("MoE §5" below). This section keeps this family's kernel, its costs and its constants. Code:
+`src/ops/offloaded_sparse_moe/cpu/` (the team and service) plus this family's
+`cpu/mx8_expert.cpp` (§8.2).
+
 ### 12.1 Role
 
-The CPU computes about 60 % of the RAM misses, every unpinned record's expert, and every SSD miss
-within the job cap, in place, with MX8: the same bits as the GPU.
+The engine computes a call's non-resident routed experts on the CPU, in place from their host
+records (MoE §5.1) — here: about 60 % of the RAM misses (the §9.7 divisor), every unpinned record's
+expert, and every SSD miss within the job cap — with MX8: the same bits as the GPU.
 
 ### 12.2 Kernels and cost on the i9-13900K
 
 `cpu/mx8_expert.cpp`: an AVX2 + AVX-VNNI kernel and a scalar form (the exact oracle, shared with
 `ops/common/mx8.h`). Per 32 weights of one row and one column: the 16 code bytes decoded to int16 c2
-values by `vpshufb` and widening, two `vpdpwssd` per limb against X's two int16 limbs (X = 512 · hi +
-lo), and one shift-add of the block sum into the row's int64 accumulator: ≈ 14 vector µops per 32
-weights, ≈ 0.44 per weight (estimated).
+values by `vpshufb` and widening, two `vpdpwssd` per limb against X's two int16 limbs
+(X = 512 · hi + lo), and one shift-add of the block sum into the row's int64 accumulator: ≈ 14
+vector µops per 32 weights, ≈ 0.44 per weight (estimated).
 
 **Estimate** (model, M0 measures): 35.4 M weights × ≈ 0.15 cycles per weight on a P-core's vector
-ports ≈ 1 ms of one P-core, ≈ 0.13 ms over 8 P-cores; the 18.8 MB record takes ≈ 0.31 ms at 60 GB/s of
-DRAM. **The CPU lane is DRAM-bound**, as Flash-Next's was (≈ 61 GB/s on its FP8 route), so §5 carries
-0.35 / 0.45 / 0.60 ms with overheads; a second column adds only products (≈ 20 %).
+ports ≈ 1 ms of one P-core, ≈ 0.13 ms over 8 P-cores; the 18.8 MB record takes ≈ 0.31 ms at 60 GB/s
+of DRAM. **The CPU lane is DRAM-bound**, as Flash-Next's was (52-55 µs per 2.76 MB expert at 8
+workers, MoE §5.1), so §5 carries 0.35 / 0.45 / 0.60 ms with overheads; a second column adds only
+products (≈ 20 %). The RTX PRO 6000's host CPU is unmeasured; the startup probes (MoE §5.5) measure
+it, and M0 runs the MX8 probe on both machines.
 
 ### 12.3 Execution
 
-GLM §12.3 unchanged: atomic item counters, phase A (gate/up and h), one barrier, phase B (down);
-landing-aware items that skip units not yet landed; ~48 pieces per call claimed in turn; workers on
-physical cores only (never SMT siblings); P-cores first, E-cores swept 0-16 in M5; a per-count split
-table calibrated at start and kept across starts.
+The worker team and its scheduling are MoE §5.3's; the limits it composes (`max_jobs` 16,
+`max_columns`, `wide_jobs` for the prefill assist) are this family's constants. Landing-aware items
+skip units not yet landed; workers on physical cores only (never SMT siblings); P-cores first,
+E-cores swept 0-16 in M5; a per-count split table calibrated at start and kept across starts
+(GLM §12.3). On the 6000's unnamed host the worker count is measured, not assumed (MoE §5.5's busy
+host halves the rate).
 
 ### 12.4 Prompt CPU assist
 
-Prompt experts the CPU computes cheaper than the link can deliver them: the thin ones. Under bounded
-replay every decoder expert sees ≈ 2 of the 128 replayed tokens (6 · 128 / 384), so **the CPU computes
-the decoder replay's non-VRAM experts from RAM and landing slots**, layer by layer, while the GPU runs
-the replay's dense work, taking most of ≈ 6,600 expert transfers per prompt off the link (§16.4). Any
-column count is allowed, since every MX8 route is exact (GLM §12.4's argument); the cut per layer
-comes from the calibrated cost per expert-row.
+The shared prefill CPU split — copies gated on each layer's routing, the thinnest non-resident
+experts left to the CPU, the plan at a share of the measured rates — is MoE §5.7's. This family's
+use of it is unusually large: under bounded replay every decoder expert sees ≈ 2 of the 128 replayed
+tokens (6 · 128 / 384), so **the CPU computes the decoder replay's non-VRAM experts from RAM and
+landing slots**, layer by layer, while the GPU runs the replay's dense work, taking most of ≈ 6,600
+expert transfers per prompt off the link (§16.4). Any column count is allowed, since every MX8
+route is exact; the cut per layer comes from the calibrated cost per expert-row.
 
 ---
 
 ## 13. CSA2 attention and the hierarchical indexer
 
 No `sm_120` kernels exist for either: FlashMLA's sparse kernels are SM90/SM100 only and vLLM's
-`sm_120` route has open blockers for V4.1's shapes (§4.2). Both are new Infernix Ops.
+`sm_120` route has open blockers for V4.1's shapes (§4.2). Both are new engine Ops.
 
 ### 13.1 Per-sequence state
 
@@ -1352,7 +1519,7 @@ compressed entries (≤ 512), each one 512-vector used as key and value.
 - Entries decoded to BF16 in the tile loader (E4M3 · 2^k and E2M1 · E4M3 values are exact in BF16).
 - Scores q · e in FP32 with a fixed reduction order, × 512^−½; an online softmax in FP32 with the
   canonical exp and the sink's exp(sink_h − m) in the denominator; P × V with P in FP16 and FP32
-  accumulation, Infernix's exact attention convention (model-quality §6.1; the reference casts P to
+  accumulation, the engine's exact attention convention (model-quality §6.1; the reference casts P to
   BF16, §20.4).
 - ≤ 640 entries per query: one CTA per group of heads with a fixed merge order; ≈ 84 MFLOP and
   0.2 MB per layer and token.
@@ -1367,23 +1534,23 @@ compressed entries (≤ 512), each one 512-vector used as key and value.
 | q_h = MXFP4(RoPE(W_qb_idx c_q)), w_h = (W_w x)_h · 128^−½ · 32^−½ | FP8 linear with MX8 input; BF16 `weights_proj` as the reference |
 | q_h · k_p per head and position | **exact**: E2M1 × E2M1 products, integer sums per 32-block, power-of-two scales |
 | score_p = Σ_h w_h · relu(q_h · k_p) | FP32, heads in ascending order |
-| Ratio-2 Full layers: top-512 of the visible positions | exact radix select, lower position on ties, re-sorted by position |
+| Ratio-2 Full layers: top-512 of the visible positions | exact radix select (moved to `ops/common`, GLM §13.3), lower position on ties, re-sorted by position |
 | Layer 20: block maximum over 8 positions, the newest block pinned, top-2,048 blocks, then top-512 inside | same |
 | Reindex: its own scores inside the candidates, top-512 | same |
 
 - **Deviation.** `model.py` computes q · k with a BF16 einsum, the weighted product and the head sum
-  in BF16, which rounds scores into ties that `torch.topk` breaks arbitrarily. Infernix keeps FP32
+  in BF16, which rounds scores into ties that `torch.topk` breaks arbitrarily. The engine keeps FP32
   logits, as the training-time indexer kernels do (DeepGEMM's indexer returns FP32 logits), and
   reports selection agreement against the reference's BF16 scores (§20.1).
 - **Decode cost**: layer 20 scans every position (68 B each: 8.9 MB at 128K, 68 MB at 1M), the
   ratio-2 Full layers half of them, the Reindex layers 16,384 candidates (1.1 MB).
-- Selections depend only on the stored keys and the query (FN §8.10's rule).
+- Selections depend only on the stored keys and the query (FN §14.1's rule).
 
 ### 13.5 KV formats
 
 The model defines and was trained with its KV formats (report §2.4.4): FP8 window entries (528 B),
 FP4 compressed entries (288 B, an E4M3 scale per 16, no global scale), MXFP4 index keys (68 B).
-Infernix stores exactly these codes. `--kv-dtype` accepts only `model` for this family; any other
+The engine stores exactly these codes. `--kv-dtype` accepts only `model` for this family; any other
 value is refused at startup. KV at 128K: 117 MB; at 1M: 0.89 GB; windows: 2.9 MB per sequence.
 
 ### 13.6 Prompt kernels
@@ -1391,7 +1558,7 @@ value is refused at startup. KV at 128K: 117 MB; at 1M: 0.89 GB; windows: 2.9 MB
 - **Window attention**: per query the last 128 positions (causal in the chunk plus the ring), query
   tiles of 64 sharing their windows.
 - **Compressed attention**: each query's own 512 selections; a tile of 64 queries processes the union
-  of its selections with a per-query mask (FN §19.3.8 F5's QSA prompt kernel).
+  of its selections with a per-query mask (the QSA prompt kernel's union scheme, FN §14.2).
 - **Indexer scoring**: a register-tiled exact int8 MMA over queries × positions per head, query
   sub-chunks of 2,048 (GLM §13.3) and a streaming top-k, never materializing the score matrix. At
   128K the three ratio-2 layers score ≈ 17 T multiply-adds each (≈ 0.1 s on int8 tensor cores,
@@ -1402,8 +1569,8 @@ value is refused at startup. KV at 128K: 117 MB; at 1M: 0.89 GB; windows: 2.9 MB
 ### 13.7 Long context
 
 Default `--max-context 131072`, up to 1,048,576. At 1M the compressed planes take 0.89 GB of VRAM
-and the windows are unchanged: no host KV tier is needed (unlike GLM §13.6). The decode indexer scan
-grows to ≈ 170 MB per token at 1M (≈ 0.11 ms); prompts grow quadratically in the indexer (§5.5).
+and the windows are unchanged: no host KV tier is needed. The decode indexer scan grows to
+≈ 170 MB per token at 1M (≈ 0.11 ms); prompts grow quadratically in the indexer (§5.5).
 
 ---
 
@@ -1414,7 +1581,8 @@ grows to ≈ 170 MB per token at 1M (≈ 0.11 ms); prompts grow quadratically in
 - 24 rows per Engram layer and token (orders 2-4 × 8 heads), 256 values each; the two layers use
   the same history with different multipliers and primes.
 - Rows are **token-determined**: known as soon as a token is sampled (decode) or tokenized
-  (prompts).
+  (prompts) — the property Flash-Next's PLE shares (FN §12.1) and the reason rows read off the
+  critical path.
 - Image-span tokens are dead: they join no n-gram and receive no contribution.
 - The tables stay off the page cache; RAM is fully budgeted.
 
@@ -1424,7 +1592,7 @@ grows to ≈ 170 MB per token at 1M (≈ 0.11 ms); prompts grow quadratically in
   with the reference normalizer (NFKC, NFD, accents stripped, lowercase, whitespace collapsed, the
   single-space sentinel) and stored in the artifact, checked against `engram_compressed_vocab_size`.
 - The **multipliers** are `numpy.random.default_rng(10007 · layer_id)` draws; the converter stores
-  them, so Infernix never reimplements NumPy's generator. Primes and offsets are stored and checked
+  them, so the engine never reimplements NumPy's generator. Primes and offsets are stored and checked
   against `engram_num_embeddings` (each table's 24 primes sum to its row count).
 - Per position: the compressed ids of the token and its 3 predecessors (the pad id where the history
   is shorter or crosses a dead token); a rolling XOR of id × multiplier in int64 (overflow-free by the
@@ -1439,27 +1607,30 @@ grows to ≈ 170 MB per token at 1M (≈ 0.11 ms); prompts grow quadratically in
 
 ### 14.4 Reads
 
-Flash-Next's row machinery (FN §12.3, §19.3.4, §19.3.8 F7 and F9) carries over: a direct-mapped host
-row cache (2^20 rows: 264 MB for FP8 rows, 136 MB for MXFP4), misses read as 4 KiB direct reads
-through the 64-deep polled ring with per-block deduplication, and a volume that is never mapped.
+Flash-Next's row machinery carries over (FN §12.3-12.4, generalized as §8.2's row-volume reader): a
+direct-mapped host row cache (2^20 rows: 264 MB for FP8 rows, 136 MB for MXFP4), misses read as 4 KiB
+direct reads through the 64-deep polled ring with per-block deduplication, and a volume that is
+never mapped.
 
 - **Decode**: the engine hashes and reads the sampled token's 48 rows right after sampling. Layer 1's
   rows are needed after layer 0 (≥ 0.13 ms of GPU work plus layer 0's host-served experts, ≈ 1-3 ms
-  here); layer 14's after 13 more layers. The gated upload (FN §12.3 S2) lets the round's graph launch
+  here); layer 14's after 13 more layers. The gated upload (FN §12.4) lets the round's graph launch
   before the rows land; the `engram` kernel waits on the gate word. Expected exposure: none.
-- **Verification**: draft tokens' rows are read while the drafter runs (FN S2).
-- **Prompts**: every row of a chunk is hashed and read at staging, deduplicated per block (FN measured
-  −20 to −50 % reads from deduplication on its table) and issued from several threads (F7); layer 1
-  needs the first chunk's rows before the walk reaches it, layer 14's rows have layers 1-13 of time.
-- **Placement**: the Engram volume shares `E:` with an expert volume; its 4 KiB reads go ahead of
-  queued expert units (§11.2).
+- **Verification**: draft tokens' rows are read while the drafter runs (FN §12.4).
+- **Prompts**: every row of a chunk is hashed and read at staging, deduplicated per block (FN
+  measured −20 to −50 % reads from deduplication on its table) and issued from several threads (FN
+  §13.6); layer 1 needs the first chunk's rows before the walk reaches it, layer 14's rows have
+  layers 1-13 of time.
+- **Placement**: the Engram volume shares `E:` with an expert volume on the RTX 5090 machine; its
+  4 KiB reads go ahead of queued expert units (§11.2). On the RTX PRO 6000 it shares the models NVMe
+  the same way.
 
 ### 14.5 Formats and runtime choice (decision d)
 
 - The artifact's `engram_table.format` records its own table: `fp8_e4m3_e8m0_32` (official sources)
   or `mxfp4_e8m0_32` (NVIDIA's current revision, LibertAIDAI).
 - **`--engram-volume PATH` replaces the table at run time with a volume of either format**, as
-  `--ngram-volume` does for Flash-Next (FN §12.5): an FP8 volume in place of an MXFP4 table restores
+  `--ngram-volume` does for Flash-Next (FN §12.2): an FP8 volume in place of an MXFP4 table restores
   DeepSeek's own table; an MXFP4 volume in place of an FP8 table halves the volume, a lossy change
   that the startup line and the request log label.
 - `--engram-reuse PATH` binds an existing volume at conversion after checking sampled rows (equal FP8
@@ -1468,9 +1639,9 @@ through the 64-deep polled ring with per-block deduplication, and a volume that 
 - Row decode on the device: FP8 rows bf16(e4m3 · 2^(u−127)), MXFP4 rows bf16(e2m1 · 2^(u−127)), both
   exact.
 - `--engram-residency auto|ram|volume`: `ram` only when the whole table fits beside the planned
-  expert tier, which never happens on this machine (97-195 GiB), so `auto` reads the volume.
+  expert tier, which never happens on either machine (97-195 GiB), so `auto` reads the volume.
 - The prefix cache's fingerprint names the table format, so blocks computed with one table are never
-  reused with the other (FN §12.5).
+  reused with the other (FN §12.2).
 
 ### 14.6 The `engram` kernel
 
@@ -1483,9 +1654,10 @@ memory-bound on `wkv`.
 
 - **Decode**: 48 rows per token, ≈ 196 KB of 4 KiB reads (≈ 2.5 MB/s at 13 tok/s): no bandwidth to
   speak of; the latency is hidden (§14.4) as long as Engram reads never wait behind expert units,
-  hence their priority.
+  hence their priority (§11.2).
 - **Prompts**: ≤ 1.57 M reads per 32K before deduplication; at an estimated 0.5-1 M random reads per
-  second from one 990 PRO (R0 measures the Windows ring at QD 64), ≈ 1-3 s, overlapping the bank pass.
+  second from one 990 PRO (R0 measures the Windows ring at QD 64; the 6000's NVMe likewise), ≈ 1-3 s,
+  overlapping the bank pass.
 
 ---
 
@@ -1537,20 +1709,26 @@ memory-bound on `wkv`.
 
 ### 16.2 The encoder walk
 
-- Layer-major **walk spans** (FN §19.3.8 F4) over layers 0-19, plus layer 20's prefix work for every
-  prompt token: the collapse, `attn_norm`, the compressor and the index keys, which are the decoder's
-  KV (SGLang #42901 trims the rest of layer 20 the same way).
+The walk-span machinery — layer-major spans, one MoE group over consecutive chunks, taps captured
+inside the span, the lent walk area — is Flash-Next's (FN §13.2); the expert-supply rules it composes
+(wide calls stream their experts, a layer's copies two layers ahead of compute, records read once per
+span, no promotions during a walk) are MoE §7's. This family's composition:
+
+- Layer-major **walk spans** over layers 0-19, plus layer 20's prefix work for every prompt token:
+  the collapse, `attn_norm`, the compressor and the index keys, which are the decoder's KV
+  (SGLang #42901 trims the rest of layer 20 the same way).
 - **Spans up to 128K tokens** (Flash-Next's `kWalkMaxTokens` is 65,536; this family's KV is small
   enough to double it): the walk's stream state is 40 KB per token (4 × 5,120 BF16), 5.2 GB at 128K,
-  lent from frames (FN F4's lease); the decoder and the head run after the span that holds the
-  prompt's end.
-- **MoE groups** of up to 16,384 columns (FN F4) and **expert groups** of G experts in ascending id
-  (GLM §17.2) with an FP32 accumulator per token: bit-identical to whole-layer processing, with
-  ≈ 0.85 GiB of staging instead of a whole layer's experts.
-- **Expert supply**: route-aware, only the experts the span touches; SSD-resident records read once
-  per span at full striped bandwidth into a deep landing ring (GLM §17.2: 64-96 records); the next
-  layer's SSD records read ahead (a prompt touches nearly every expert, so these reads are not
-  guesses); RAM records prestaged while attention runs.
+  lent from frames (the stream lease's walk area, FN §13.2); the decoder and the head run after the
+  span that holds the prompt's end.
+- **MoE groups** of up to 16,384 columns (half Flash-Next's `kWalkMoeColumns`, which its
+  layers' 2.76 MB records allow at 32,768; FN §13.2) with an FP32 accumulator
+  per token: bit-identical to whole-layer processing, with ≈ 0.85 GiB of staging instead of a whole
+  layer's experts.
+- **Expert supply**: route-aware, only the experts the span touches (MoE §7.1); SSD-resident records
+  read once per span at full striped bandwidth into a deep landing ring (GLM §17.2: 64-96 records);
+  the next layer's SSD records read ahead (a prompt touches nearly every expert, so these reads are
+  not guesses); RAM records prestaged while attention runs.
 - **Engram rows** read at staging (§14.4).
 - **Chunk grid**: fixed absolute boundaries, for the exact route's request invariance (engine
   architecture §3.1).
@@ -1575,16 +1753,23 @@ memory-bound on `wkv`.
 An append of T tokens to a cached conversation runs the same walk over T tokens; only the experts
 those tokens touch are read (54 % of the bank at 50 tokens, §5.5), the narrow routes serve experts
 with n ≤ 8 columns, and the CPU takes thin non-resident ones. The guide states the cost plainly:
-2-9 s for 16-100 tokens on three volumes (model).
+2-9 s for 16-100 tokens on three volumes on the RTX 5090 machine (model); 3-13 s on the 6000's
+single NVMe (estimated).
 
 ### 16.5 After prefill
 
-No promotions after a walked prompt (L6); the prompt's routes seed both policies; when the walk
-returns its lent frames, the free-frame refill (§10.2) fills them with the hottest RAM experts.
+No promotions after a walked prompt (MoE §7.3); the prompt's routes seed both policies (the prompt
+credit, MoE §4.3); when the walk returns its lent frames, the free-frame refill fills them with the
+hottest RAM experts (`give_back`, MoE §4.5).
 
 ---
 
 ## 17. Speculative decoding: DSpark
+
+The rules the shared tier gives a family's speculation — promotions follow the tokens a round
+advances, the drafter never waits on the host, the cost fits are placement-scoped and reset on a
+placement switch — are MoE §6.3's. Flash-Next's draft-length machinery (the online cost fits, the
+width prior, K = 0 always a candidate) is FN §11's; this section keeps DSpark.
 
 ### 17.1 Expected value
 
@@ -1598,27 +1783,29 @@ returns its lent frames, the free-frame refill (§10.2) fills them with the hott
 
 - Structure §2.2. Its window of main-feature entries (3 layers × 128 × 528 B) is appended once per
   committed token and seeded by the prompt's decoder positions.
-- **Draft experts**: residency-bounded routing (FN §11.2, GLM §10.6): top-3 among the DSpark experts
-  in the VRAM pool, plus the best-scored missing one computed by the CPU from the RAM pool (Maya's
-  `MTP_KEEP`, GLM §4.3). This changes acceptance only, never verified output.
+- **Draft experts**: the bounded two-pool design of §10.6 — top-3 among the DSpark experts in the
+  VRAM pool, plus the best-scored missing one computed by the CPU from the RAM pool (Maya's
+  `MTP_KEEP`, GLM §4.2). This changes acceptance only, never verified output (Flash-Next instead
+  kept its drafter's experts resident, FN §11.2 — the cheaper option on a card with room; M7
+  measures the resident form on the 6000).
 - **Markov head**: draft i adds head_m(embed_m(draft_{i−1})) in order (≈ 66 MB of BF16 per step);
-  drafts are argmax on greedy rounds and use Infernix's sampled-draft path otherwise.
+  drafts are argmax on greedy rounds and use the engine's sampled-draft path otherwise.
 - **Cost per draft round**: three layers' attention and shared experts (≈ 0.5 GB of FP8), the head over
   5 positions (1.32 GB, once) and the Markov steps: ≈ 1.5 ms (model).
 
 ### 17.3 Draft length
 
-FN §11.3's policy maximizes E[tokens(K)] / E[t_round(K)] with t_round(K) = t_gpu(K + 1) +
+FN §11.4's policy shape maximizes E[tokens(K)] / E[t_round(K)] with t_round(K) = t_gpu(K + 1) +
 t_host(U_{K+1}) + t_ssd(U_{K+1}) + t_draft(K): U from the online union measurement (σ, §5.4), each
 position's acceptance from the confidence head, calibrated online against observed outcomes (DSpark's
 sequential temperature scaling); K ∈ {0, …, 5} with K = 0 always a candidate; experts used only by
-rejected columns are not credited to the caches. Expected: K ∈ {0, 1, 2}, more on verbatim text and
-code edits.
+rejected columns are not credited to the caches (MoE §6.3). Expected: K ∈ {0, 1, 2}, more on verbatim
+text and code edits. The fits reset on a placement switch (MoE §6.3).
 
 ### 17.4 N-gram copy proposals
 
-`--ngram-draft-tokens` through the same cost model; they need no drafter or DSpark frames.
-JigSawPT measured 97 % acceptance on verbatim text.
+`--ngram-draft-tokens` through the same cost model (FN §11.7); they need no drafter or DSpark
+frames. JigSawPT measured 97 % acceptance on verbatim text.
 
 ### 17.5 Default
 
@@ -1629,6 +1816,9 @@ default.
 ---
 
 ## 18. Prefix cache, preemption and invariance
+
+[Hybrid prefix cache](hybrid-prefix-cache-spec.md) owns the cache; this section states only the
+family's binding and snapshots.
 
 ### 18.1 Blocks
 
@@ -1668,50 +1858,55 @@ fast path (Replay recovery) is not registered for this family.
 ### 18.5 Tiers
 
 Host tier default 2 GiB (`--host-context-mib`; ≈ 160 default-rule snapshots per GiB), and the file
-tier as the spec defines it. DeepSeek keeps persistent KV on SSD for at least 72 hours (report
-§3.2.1); at 29 MB per 32K conversation the file tier can keep many agent sessions for days.
+tier as the spec defines it (Linux, cuFile — the RTX PRO 6000's tier; the RTX 5090 machine's Windows
+host tier stays RAM-only). DeepSeek keeps persistent KV on SSD for at least 72 hours (report §3.2.1);
+at 29 MB per 32K conversation the file tier can keep many agent sessions for days.
 
 ---
 
 ## 19. Memory plans
 
-### 19.1 VRAM (32,607 MiB card, no display, C = 1)
+Both cards, C = 1. The plans are models from §2.4's bytes; M4 replaces them with the startup
+ledgers' prints (MoE §4.9-§4.10).
 
-| Item | Default, GiB | With DSpark, GiB |
+### 19.1 VRAM
+
+| Item | RTX 5090 machine (32,607 MiB), GiB | RTX PRO 6000 (96 GB), GiB |
 |---|---:|---:|
 | In use before loading (context, libraries) | 0.55 | 0.55 |
 | Dense text: attention 4.72, shared experts 1.32, head 1.23, routers and mHC 0.29, Engram `wkv` 0.29, compressors and indexers 0.08 | **7.94** | 7.94 |
-| DSpark dense | — | 0.65 |
 | Compressed entries and index keys, 128K (elastic) | 0.11 | 0.11 |
-| Windows (40 layers, + 3 DSpark) | < 0.01 | < 0.01 |
+| Windows (40 layers) | < 0.01 | < 0.01 |
 | Decode workspace, mailboxes, residency tables, io | 0.70 | 0.70 |
 | Staging (32 slots) | 0.56 | 0.56 |
-| CUDA graph reserve; headroom | 0.25; 0.25 | 0.25; 0.25 |
-| DSpark expert pool (96 frames, §10.6) | — | 1.68 |
-| **Frame pool** (of the 30.68 GiB budget) | **20.32** | 17.99 |
-| Frames of 17.95 MiB | **1,159** (7.5 % of 15,360) | 1,026 |
+| CUDA graph reserve; headroom | 0.25; 0.25 | 0.25; 0.5-1.5 (the card also drives the desktop, MoE §4.9) |
+| **Frame pool** | **20.32** of the 30.68 GiB budget | **78.7-79.7** of the ≈ 90.3 GiB the card measured as a process ceiling (FN §1.3) |
+| Frames of 17.95 MiB | **1,159** (7.5 % of 15,360) | **4,490-4,550** (29.2-29.6 %) |
 
-At 1M actual context the KV takes 0.72 GiB more (−41 frames). A further lane costs its windows and KV
-extent only (≈ 3 MB + 890 B per token): there is no recurrent state.
+With DSpark (both cards): DSpark dense 0.65 and the DSpark expert pool 1.68 GiB (96 frames, §10.6)
+come out of the frame pool — 1,026 frames on the 5090 machine, ≈ 4,400 on the 6000. At 1M actual
+context the KV takes 0.72 GiB more (−41 frames). A further lane costs its windows and KV extent only
+(≈ 3 MB + 890 B per token): there is no recurrent state.
 
-### 19.2 Host RAM (95.8 GiB visible)
+### 19.2 Host RAM
 
-| Item | GiB |
-|---|---:|
-| RAM expert tier: pinned up to the pin room, unpinned past it; includes the 64-slot landing ring (1.12) and 32 bounce slots (0.56) | the rest |
-| Token embedding, pinned | 1.23 |
-| Engram row cache | 0.26 (FP8 rows) / 0.13 (MXFP4) |
-| Prefix Host tier | 2.0 (default) |
-| Program pinned buffers | 0.25 |
-| Process (tokenizer, server, frontend) | 1.5 |
-| Reserve `--ram-headroom-mib`; growth allowance | 2.0; 1.0 |
-| DSpark RAM pool (with DSpark only) | 3.37 |
+| Item | RTX 5090 machine (95.8 GiB visible), GiB | RTX PRO 6000 (89 GB), GiB |
+|---|---:|---:|
+| RAM expert tier: pinned up to the pin room, unpinned past it; includes the 64-slot landing ring (1.12) and 32 bounce slots (0.56) | the rest | the rest |
+| Token embedding, pinned | 1.23 | 1.23 |
+| Engram row cache | 0.26 (FP8 rows) / 0.13 (MXFP4) | 0.26 / 0.13 |
+| Prefix Host tier | 2.0 (default) | 2.0 |
+| Program pinned buffers | 0.25 | 0.25 |
+| Process (tokenizer, server, frontend) | 1.5 | 1.5 |
+| Reserve `--ram-headroom-mib`; growth allowance | 2.0; 1.0 | 2.0; 1.0 |
+| DSpark RAM pool (with DSpark only) | 3.37 | 3.37 |
 
-| Available at startup | Expert tier | Pinned / unpinned | Slots (ring excluded) | Share of 15,360 | With VRAM frames |
-|---:|---:|---:|---:|---:|---:|
-| 88 GiB (other programs closed) | 79.8 GiB | ≈ 72 / 7.8 GiB | 4,485 | 29.2 % | 36.7 % |
-| 79 GiB | 70.8 GiB | 70.8 / 0 | 3,972 | 25.9 % | 33.4 % |
-| 50 GiB (other sessions running) | 41.8 GiB | 41.8 / 0 | 2,318 | 15.1 % | 22.6 % |
+| Available at startup | Machine | Expert tier | Pinned / unpinned | Slots (ring excluded) | Share of 15,360 | With VRAM frames |
+|---:|---|---:|---:|---:|---:|---:|
+| 88 GiB (other programs closed) | 5090 | 79.8 GiB | ≈ 72 / 7.8 GiB | 4,485 | 29.2 % | 36.7 % |
+| 79 GiB | 5090 | 70.8 GiB | 70.8 / 0 | 3,972 | 25.9 % | 33.4 % |
+| 50 GiB (other sessions running) | 5090 | 41.8 GiB | 41.8 / 0 | 2,318 | 15.1 % | 22.6 % |
+| ≈ 77 GiB | 6000 | ≈ 77 GiB | 77 / 0 | ≈ 4,390 | 28.6 % | ≈ 58 % |
 
 Every GiB other programs release becomes ≈ 57 more slots; the startup ledger prints the split.
 
@@ -1719,12 +1914,17 @@ Every GiB other programs release becomes ≈ 57 more slots; the startup ledger p
 
 | Item | Size | Where (default) |
 |---|---:|---|
-| Source shards during conversion | ≤ 2 × 7.4 GB at a time | `D:` (deleted shard by shard, §7.6) |
-| Main artifact | ≈ 11 GB | `E:` |
-| Expert volumes, w = (4, 4, 4) | 3 × 98.8 GB | `D:`, `E:`, `G:` |
-| Engram volume (FP8 / MXFP4) | 209.7 / 104.9 GB | `E:` |
+| Source shards during conversion | ≤ 2 × 7.4 GB at a time | `D:` (5090 machine); the 6000's staging drive (deleted shard by shard, §7.6) |
+| Main artifact | ≈ 11 GB | `E:` (5090 machine); the 6000's models NVMe |
+| Expert volumes, w = (4, 4, 4) | 3 × 98.8 GB | `D:`, `E:`, `G:` (5090 machine); the 6000: one volume on the models NVMe |
+| Engram volume (FP8 / MXFP4) | 209.7 / 104.9 GB | `E:` (5090 machine); the 6000's models NVMe |
 | Expert state file | < 1 MB | beside the artifact |
 | Prefix-cache file tier | 29 MB per 32K conversation | configurable |
+
+On the 6000 the whole set (≈ 517 GB, or ≈ 412 GB with the MXFP4 Engram volume) must fit the models
+NVMe beside the existing models — the conversion planner (§7.6) checks the free space and refuses
+with the shortfall; whether that much room exists there today is an open question for the owner
+(§25.2, question 11).
 
 ---
 
@@ -1774,23 +1974,23 @@ check for the September checkpoint.
 | MXFP4 records against NVFP4 records | each other | bit-identical | | | |
 | Official source against NVIDIA source (September, FP8 Engram) | each other | bit-identical | | | |
 
-The execution gate is tighter than GLM §20.3's because Infernix computes the reference's own
+The execution gate is tighter than GLM §20.3's because the engine computes the reference's own
 quantized arithmetic; what remains is the accumulation order and the indexer's score precision
 (§20.4).
 
 **Reported without a gate** (the owner's choices): replay against full (KL and top-1 on the same texts,
 and the official fixtures' NLL under each); MXFP4 Engram tables against FP8 (KL, top-1, perplexity),
 beside diffbot's 0.035 for vLLM's W4A4 + MXFP4-Engram serving; and, for the September checkpoint,
-Infernix's NLL on the official fixtures beside DS4's Q2 and Q4 references (§4.1).
+the engine's NLL on the official fixtures beside DS4's Q2 and Q4 references (§4.1).
 
 ### 20.4 Deviations from `inference/model.py`
 
-| Point | `model.py` | Infernix | Why |
+| Point | `model.py` | The engine | Why |
 |---|---|---|---|
-| FP8/FP4 linear accumulation | FP32 tensor-core products per 32-block, FP32 block adds | exact sums, one rounding | placement invariance; more precise |
+| FP8/FP4 linear accumulation | FP32 tensor-core products per 32-block, FP32 block adds | exact sums, one rounding | placement invariance (MoE §2); more precise |
 | Indexer scores | BF16 einsum, BF16 product and head sum | exact q · k, FP32 weighted sum | the training kernels' FP32 logits; fewer ties; agreement reported |
 | Top-k ties | `torch.topk` (unspecified) | lower position or lower expert id | determinism |
-| Attention P × V | BF16 P | FP16 P, FP32 accumulation | Infernix's exact attention convention; FP64-qualified |
+| Attention P × V | BF16 P | FP16 P, FP32 accumulation | the engine's exact attention convention; FP64-qualified |
 | softplus, exp, SiLU, sigmoid | torch CUDA | canonical implementations | CPU/GPU identity |
 | mHC sums, norms | torch's order | fixed orders | determinism |
 
@@ -1798,23 +1998,24 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
 
 ### 20.5 Engine and system tests
 
-- **Placement invariance end to end**: greedy ids identical with `--expert-frames 0`, small and full
-  VRAM caches; RAM tier caps of 16, 48 GiB and full; unpinned records forced; one, two and three
-  volumes; lookahead off and on; every CPU ISA; random unit landing order; CPU cap 0 and 16.
+- **Placement invariance end to end**: greedy ids identical across placements — `vram=8%,ram=29%`,
+  small and full VRAM caches; RAM tier caps of 16, 48 GiB and full; unpinned records forced; one, two
+  and three volumes; lookahead off and on; every CPU ISA; random unit landing order; CPU cap 0 and
+  16 — and across a runtime switch and back (MoE §9's checklist).
 - **Record formats**: an MXFP4 and an NVFP4 artifact of one checkpoint give identical ids.
 - **Prompt rules**: replay is identical across chunk sizes and prefix-cache states; the full rule
   matches the reference forward's full-prompt logits within the execution gate; replay matches the
   reference's replay variant.
 - **Prefix cache**: cold against warm resume at every tap point under both rules.
-- **Speculation**: greedy speculative output equals plain greedy output (verify widths ≤ 8 columns are
-  column-invariant, FN §11.3).
+- **Speculation**: greedy speculative output equals plain greedy output (verify widths ≤ 8 columns
+  stay column-invariant, MoE §6.2).
 - **Engram**: a run-time volume swap gives the labelled output; Engram read faults reach the
   recoverable path.
-- **Faults, tier audit and policy conformance** as GLM §20.4 (unit read errors, a stalled or missing
-  volume, a silent CPU service; every expert in exactly one tier; host decisions equal the replay tool
-  step for step).
-- **Speed corpora**: FN's non-repeating session (NRS) for decode, reported by halves; a fixed
-  teacher-forced routing corpus for hit-rate comparisons (L20).
+- **Faults, tier audit and policy conformance** as GLM §20.4 states them (unit read errors, a
+  stalled or missing volume, a silent CPU service; every expert in exactly one tier; host decisions
+  equal the replay tool step for step).
+- **Speed corpora**: a non-repeating session (NRS) for decode, reported by halves; a fixed
+  teacher-forced routing corpus for hit-rate comparisons (M1 records both).
 
 ---
 
@@ -1827,7 +2028,7 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
   and every special token. BOS 0; EOS 1, the only stop token (there is no generation config); pad 2.
 - **Encoding.** `encoding/encoding.py` of the 1017 revision (with its 2026-10-16 fix) is the
   authority; the September repository's community Jinja template (which adds a "medium" alias and
-  predates the fix) is not used. Infernix implements the encoding natively, checked byte for byte
+  predates the fix) is not used. The engine implements the encoding natively, checked byte for byte
   against `encoding/tests` and generated cases:
   - BOS, `<｜System｜>`, `<｜User｜>`, `<｜Assistant｜>`, and the `latest_reminder` role;
   - thinking mode ends the generation prompt with `<｜Assistant｜><think>`, chat mode with
@@ -1851,13 +2052,23 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
 
 ## 22. Configuration surface
 
+The engine-wide and family residency flags follow the shared surface (MoE §4.8; FN §18.3 records
+the implemented forms): `--experts vram=…,ram=…[,ssd=…]` (shares or counts over all 15,360 keys,
+ranked by the saved state, else spread across the layers; `vram=all`/`100%` fails the start here —
+the bank does not fit either card), `--expert-placement FILE` (CSV of `layer,expert,tier` rows),
+`--expert-ram-mib` / `--expert-pin-mib` (byte-level RAM control, not combinable with the counts),
+`--expert-swap off` (freeze the pools at what the seeds placed), `--expert-state FILE|off`,
+`--expert-stripe FILE` (the record tails on a second drive, the 6000's cheaper second-drive option),
+and the runtime switch `POST /admin/expert-placement` with `GET` reporting counts, bytes, KV, free
+memory and the last switch's outcome.
+
+Family flags:
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--prompt-decoder replay\|full` | `replay` | Decision a (§16); **changes output**; `full` equals the reference forward |
 | `--expert-volume PATH` (repeat) | required | The artifact's expert volumes, any order; startup checks ids, sizes and headers |
 | `--engram-volume PATH`, `--engram-residency auto\|ram\|volume` | the artifact's own; auto | Decision d (§14.5); a volume of the other format **changes output** and is labelled |
-| `--expert-ram-mib N\|auto`, `--expert-pin-mib N`, `--ram-headroom-mib N` | auto, auto, 2048 | RAM tier (FN §19.3.7) |
-| `--vram-headroom-mib N\|auto`, `--expert-state FILE\|off` | auto, beside the artifact | As FN |
 | `--ssd-lookahead off\|1\|2\|3` | off | §11.3 |
 | `--cpu-experts auto\|off\|N`, `--cpu-expert-cores p\|pe` | auto, auto | §12.3 |
 | `--spec off\|dspark\|auto`, `--dspark-expert-frames N\|auto`, `--draft-tokens auto\|N` | off until M7 | §17 |
@@ -1866,6 +2077,7 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
 | `--max-context N` | 131072 | Up to 1,048,576 |
 | `--prefill-chunk N`, `--prefill-group N` | auto, 48 | Chunking; experts per prompt group |
 | `--host-context-mib N` | 2048 | Prefix Host tier |
+| `--ram-headroom-mib N`, `--vram-headroom-mib N\|auto` | 2048, auto | The two ledgers' reserves (MoE §4.9-§4.10) |
 | `--reasoning-effort 1..100\|low\|high\|max\|off` | high (75) | Request default; requests may override |
 | `--approx-experts off\|ssd\|vram`, `--approx-keep-map`, `--approx-min-weight θ`, `--approx-experts-rule residency\|static` | off | §9.8; **changes output** |
 
@@ -1875,8 +2087,8 @@ Converter: `--recipe deepseek_v4_1_flash` (or an official entry, §7.1) with `--
 `--engram-format fp8|mxfp4` (default: the source's), `--engram-reuse PATH`;
 `--expert-record mxfp4|nvfp4|auto`; `--staging DIR`; `--plan` (print the disk plan and stop). Tools:
 `tools.artifact.restripe`, `tools.deepseek_v41.verify_artifact`, `tools.deepseek_v41.reference_forward`,
-`tools.deepseek_v41.block_check`, `tools.deepseek_v41.decode_model`; `infernix-calibrate` gains the
-striped-read, Engram-read and CPU MX8 probes.
+`tools.deepseek_v41.block_check`, `tools.deepseek_v41.decode_model`; `tools/deepseek_v41_probe/`
+(R0) gains the striped-read, Engram-read, CPU MX8 and NVMe probes for both machines.
 
 ---
 
@@ -1884,44 +2096,45 @@ striped-read, Engram-read and CPU MX8 probes.
 
 | # | Milestone | Deliverables | Exit criteria |
 |---|---|---|---|
-| **M0** | Facts | September-vs-1017 comparison of tensors and Engram rows (range reads); the official MXFP4 scale rule on sampled blocks; NVFP4 → MXFP4 recovery on sampled NVIDIA blocks; ModelOpt's MXFP4 Engram rule against NVIDIA's rows; Transformers 5.6 `deepseek_v41` against `model.py`; encoding fixtures and tokenizer files; DS4's suffix rule against `model.py`; C++ probes (`tools/deepseek_v41_probe/`): striped 1.5 MiB reads on `D:` + `E:` + `G:` through IOCP, Engram 4 KiB reads on `E:` under concurrent unit reads, CPU MX8 at 18.8 MB per expert on P- and E-cores, the pin room with this plan's buffers | §2, §3, §5 inputs and §7.1's rules confirmed or revised; §5 re-run |
+| **M0** | Facts, both machines | September-vs-1017 comparison of tensors and Engram rows (range reads); the official MXFP4 scale rule on sampled blocks; NVFP4 → MXFP4 recovery on sampled NVIDIA blocks; ModelOpt's MXFP4 Engram rule against NVIDIA's rows; Transformers 5.6 `deepseek_v41` against `model.py`; encoding fixtures and tokenizer files; DS4's suffix rule against `model.py`; C++ probes (`tools/deepseek_v41_probe/`): striped 1.5 MiB reads on `D:` + `E:` + `G:` through IOCP, 17.95 MiB record and 4 KiB Engram reads on the RTX PRO 6000's NVMe, Engram 4 KiB reads on `E:` under concurrent unit reads, CPU MX8 at 18.8 MB per expert on P- and E-cores (both machines' hosts), the pin room with this plan's buffers (Windows) | §2, §3, §5 inputs and §7.1's rules confirmed or revised; §5 re-run |
 | **M1** | Traces and policy | Route traces from M4's engine on NRS and a broad corpus (code, chat, CJK, tool use, long context); replay of the §10.2 and §10.4 candidates; the union growth σ and lookahead recall | Policies chosen by the fixed rules; §5.2 replaced by measured hit rates |
-| **M2** | Shared components | `src/models/offload/`, expert volumes, the striped reader and the row-volume reader, unless GLM's track built them first | Qwen4Exp's tests unchanged; greedy ids identical; tg512 within noise |
+| **M2** | Shared additions | What GLM's track has not already landed of §8.2's list: the `mxfp4` trait and the MX8 class, the `sqrtsoftplus` routing, `ExpertStore::kMaxSegments` 12, per-volume queues, the unit-level landing, the striped and row-volume readers — reconciled with GLM's forms, never duplicated | Qwen4Exp's tests unchanged (the zero-cost rule); greedy ids identical; tg512 within noise |
 | **M3** | Ops | MX8 codec; `fp8_e4m3fn_b32_e8m0` Linear; MXFP4 and NVFP4 experts with MX8 on the GPU and the CPU; router; `csa_compressor`, `csa_indexer`, `csa_attention`; `mhc`; `engram`; DSpark Ops; the MXFP4-against-NVFP4 kernel timings (decision c) | Every §20.1 qualification passes; the timing table recorded |
-| **M4** | Artifact and functional model | Recipe and official entries, the streaming converter with its disk planner, MX recovery, volumes, restripe, `verify_artifact`; Engine, CLI, bench and CausalScoring with one volume; both prompt rules; the reference forwards | Every tensor round-trips; §20.2 checks; the execution gates for both rules; the §20.3 reports; first end-to-end numbers |
-| **M5** | Tiers at scale | Three volumes, landing ring, partial records, M1's policies, promotion sweep, CPU sweep, unpinned records, warm start, lookahead A/B, the MXFP4 and NVFP4 artifacts end to end | §20.5 invariance and fault tests; decode Must target; three volumes ≥ 1.8× one |
+| **M4** | Artifact and functional model | Recipe and official entries, the streaming converter with its disk planner, MX recovery, volumes, restripe, `verify_artifact`; Engine, CLI, bench and CausalScoring with one volume; both prompt rules; the reference forwards | Every tensor round-trips; §20.2 checks; the execution gates for both rules; the §20.3 reports; first end-to-end numbers on both machines |
+| **M5** | Tiers at scale | Three volumes (RTX 5090 machine) and the single-NVMe + stripe A/B (RTX PRO 6000), landing ring, partial records, M1's policies, promotion sweep, CPU sweep, unpinned records, warm start, lookahead A/B, the MXFP4 and NVFP4 artifacts end to end | §20.5 invariance and fault tests; decode Must targets on both machines; three volumes ≥ 1.8× one |
 | **M6** | Decode speed | §9.3's kernels and fusions, stall-time warming; nsys attribution of one token | Per-kernel times against the budget; anything > 30 % over gets ncu before M7 |
-| **M7** | Speculation | DSpark drafter (bounded experts, Markov and confidence heads), the cost model with σ and confidence, n-gram proposals | Default chosen by measurement; never slower than plain beyond noise |
+| **M7** | Speculation | DSpark drafter (bounded experts, Markov and confidence heads), the cost model with σ and confidence, n-gram proposals; the resident DSpark-bank form on the RTX PRO 6000 | Default chosen by measurement; never slower than plain beyond noise |
 | **M7a** | Approximate mode | §9.8 | Mode off bit-identical to a build without it; presets meet the gates |
 | **M8** | Prompts and long context | 128K walk spans, prompt kernels, the CPU decoder replay, the full rule's suffix, indexer prompt scoring, 1M context | Prompt Must targets; decode at 128K ≥ 90 % of 4K |
 | **M9** | Frontend and serving | Tokenizer, encoding, DSML parser, protocol schema tests, prefix-cache binding for both rules | Tokenizer and encoding oracles exact; serving schema tests; prefix-cache real tests |
-| **M10** | Report | DS4 under WSL2 and the §4.2 engines that run here, head to head; the §1.4 table filled | Every result reported, favourable or not |
+| **M10** | Report | DS4 under WSL2 and the §4.2 engines that run here, head to head; the §1.4 table filled, both machines | Every result reported, favourable or not |
 
 Critical path: M0 → M2 ∥ M3 → M4 → M1 → M5 → M6, then M7 and M8; M9 can start now (the tokenizer
-and encoding files are read). Rough size: ~30-34k new or moved lines (CSA2 Ops ~5k; MX8 codec, the
-FP8-b32 Linear and the expert routes with the CPU kernel ~6k; Engram ~1.5k; DSpark ~2.5k; mHC ~1k and
-volumes with the reader ~2k, shared with GLM; offload extraction ~3.5k moved; frontend ~2.5k;
-converter and tools including the streaming conversion and the reference forward ~4k; tests ~8k),
-≈ 6-7k fewer if GLM's track builds the shared pieces first, plus the 510 GB download and GPU time for
-the campaigns.
+and encoding files are read). Rough size: ~28-32k new lines (CSA2 Ops ~5k; MX8 codec, the
+FP8-b32 Linear and the expert routes with the CPU kernel ~6k; Engram ~1.5k; DSpark ~2.5k; mHC ~1k
+and volumes with the reader ~2k, shared with GLM; frontend ~2.5k; converter and tools including the
+streaming conversion and the reference forward ~4k; tests ~8k) — the offload tier itself is already
+extracted and costs nothing here. ≈ 5-7k fewer if GLM's track lands the shared pieces first, plus
+the 510 GB download and GPU time for the campaigns.
 
 ---
 
 ## 24. Documentation and authority changes
 
-When the implementation lands: a user guide `docs/deepseek_v4_1-flash.md` (hardware advice, the cost
-of a fresh prompt, the prompt rules, Engram formats); README models and benchmarks; `docs/cli.md` and
-`docs/serving.md` (expert and Engram volumes, `--prompt-decoder`, DSML, reasoning effort); a
-mathematics reference `docs/maintainer/deepseek_v41-model.md` from §2.2-§2.3;
-[storage layouts](storage-layouts.md) (`mxfp4_expert_v1`, `nvfp4_expert_rg16_v1` at this geometry,
-the Engram row formats, `fp8_e4m3fn_b32_e8m0`); [tensor formats](tensor-formats.md) (MXFP4, MX8,
-FP8 with 32 × 32 power-of-two scales); [op development](op-development.md) (MX8 qualification);
-[artifact container](artifact-container.md) (expert and Engram volumes);
-[engine architecture](engine-architecture.md) (the new architecture, prompt rules as a model mode,
-shared offload components); [paged KV](paged-kv-cache.md) (compressed planes and windows);
-[hybrid prefix cache](hybrid-prefix-cache-spec.md) (the binding and its snapshots);
-[model quality](model-quality.md) (§6 for this family's configurations); the conversion guide (the
-streaming conversion). This file is then removed.
+When the implementation lands: a user guide `docs/deepseek_v4_1-flash.md` (hardware advice for both
+machines, the cost of a fresh prompt, the prompt rules, Engram formats); README models and
+benchmarks; `docs/cli.md` and `docs/serving.md` (expert and Engram volumes, `--prompt-decoder`,
+DSML, reasoning effort); a mathematics reference `docs/maintainer/deepseek_v41-model.md` from
+§2.2-§2.3; [storage layouts](storage-layouts.md) (`mxfp4_expert_v1`, `nvfp4_expert_rg16_v1` at this
+geometry, the Engram row formats, `fp8_e4m3fn_b32_e8m0`); [tensor formats](tensor-formats.md)
+(MXFP4, MX8, FP8 with 32 × 32 power-of-two scales); [op development](op-development.md) (MX8
+qualification); [artifact container](artifact-container.md) (expert and Engram volumes);
+[engine architecture](engine-architecture.md) (the new architecture, prompt rules as a model mode);
+[paged KV](paged-kv-cache.md) (compressed planes and windows); [hybrid prefix cache](hybrid-prefix-cache-spec.md)
+(the binding and its snapshots); [model quality](model-quality.md) (§6 for this family's
+configurations); the conversion guide (the streaming conversion). [MoE offload
+design](moe-offload-design.md) gains whatever of §8.2's additions turns out generic. This file is
+then removed.
 
 ---
 
@@ -1931,10 +2144,12 @@ streaming conversion). This file is then removed.
 
 | Risk | Effect | Mitigation |
 |---|---|---|
-| §5's model is optimistic, as GLM's was by 15-45 % against strata-glm | decode ≈ 9-11 tok/s central | M4's first numbers refit the overhead terms; M6 attributes one token with nsys |
-| Hit rates below central (JigSawPT's 59-66 % VRAM hits came with a 125.7 GiB host) | decode toward 10 tok/s | M1 first; the policy candidates; the RAM lever of §5.6 in the guide |
+| §5's model is optimistic, as GLM's was by 15-45 % against strata-glm (GLM §4.3) | decode ≈ 9-11 tok/s central | M4's first numbers refit the overhead terms; M6 attributes one token with nsys |
+| Hit rates below central (JigSawPT's 59-66 % VRAM hits came with a 125.7 GiB host) | decode toward 10 tok/s on the RTX 5090 machine | M1 first; the policy candidates; the RAM lever of §5.6 in the guide |
+| The RTX PRO 6000's NVMe record rate and host CPU are unmeasured | the 6000's §5.3 row could miss either way | M0's probes on the machine itself |
 | `G:` short of space when the conversion runs | slower weighting (+6 % record time) or a fourth volume | the planner (§7.6) |
-| Other sessions holding RAM on this machine | a smaller tier, more SSD reads | the startup ledger; the guide states it |
+| The 6000's models NVMe short of the ≈ 517 GB the outputs need | no default artifact there until space is freed or the MXFP4 Engram volume is used | the planner's refusal names the shortfall; option O4 |
+| Other sessions holding RAM on the RTX 5090 machine | a smaller tier, more SSD reads | the startup ledger; the guide states it |
 | Drive thermal throttling under sustained reads; `E:` busy with builds | stalls | per-volume telemetry and warnings (§11.5) |
 | Engram reads queued behind expert units | layer-1 stalls | read priority (§11.2); measured in M0 |
 | MXFP4 kernels slower than NVFP4 | decision c falls back | M3 and M5 timings; NVFP4 records built anyway |
@@ -1945,7 +2160,7 @@ streaming conversion). This file is then removed.
 | DSpark slower than plain | no speculative gain | off by default; K = 0 in the cost model |
 | Upstream ambiguities (encoding details, Transformers against `model.py`) | wrong frontend or mathematics | M0 oracles against `encoding/tests` and `model.py` |
 
-### 25.2 Open questions for M0
+### 25.2 Open questions
 
 1. Did the 1017 update change the Engram tables and the DSpark weights?
 2. Do DeepSeek's MXFP4 scales follow ⌊log₂ amax⌋ − 2 on every non-zero block, so that recovery is
@@ -1953,14 +2168,18 @@ streaming conversion). This file is then removed.
 3. Does every block of NVIDIA's NVFP4 export recover to MXFP4?
 4. Does Transformers 5.6 implement `deepseek_v41` as `model.py` does (the mHC shift, the indexer)?
 5. The Windows QD-64 4 KiB read rate on `E:` with concurrent 1.5 MiB unit reads.
-6. The CPU MX8 cost per 18.8 MB expert on P- and E-cores.
-7. The pin room and commit limit with this plan's buffers.
+6. The CPU MX8 cost per 18.8 MB expert on P- and E-cores (and on the RTX PRO 6000's host).
+7. The pin room and commit limit with this plan's buffers (Windows).
+8. The RTX PRO 6000's NVMe rate for 17.95 MiB records and 4 KiB Engram reads, and its free space
+   for the ≈ 517 GB of outputs.
 
 Questions for the owner:
 
-8. ~~Prompt rule, activations, records, Engram formats, the disk route~~ — decided 2026-10-19 (§1.2).
-9. Whether to free ≈ 75 GB on `C:` for a fourth expert volume (+21 % decode, model).
-10. When to schedule the 510 GB download and conversion; the converter's RAM and disk use are bounded,
+9. ~~Prompt rule, activations, records, Engram formats, the disk route~~ — decided 2026-10-19 (§1.2).
+10. Whether to free ≈ 75 GB on `C:` for a fourth expert volume (+21 % decode, model).
+11. Whether to free space on the RTX PRO 6000's models NVMe for the artifact, and whether to add a
+    second drive there (the stripe, §5.6) before or after M5.
+12. When to schedule the 510 GB download and conversion; the converter's RAM and disk use are bounded,
     and it checks other sessions' RAM first.
 
 ### 25.3 Options (each behind its own measured gate)
@@ -1975,24 +2194,25 @@ Questions for the owner:
 | O6 | Import DS4's Q2/Q4 GGUFs (requantized experts, about half or the same bytes) with exact GGUF arithmetic | an owner request; quality against the official continuations; IQ2_XXS kernels for Q2 |
 | O7 | Vision (DeepSeek-ViT, 0.97 GB) | a later track |
 | O8 | Lookahead on three volumes | M5 gain |
-| O9 | Linux `io_uring` path for the striped and row readers | Linux users; the same tests |
+| O9 | Linux `io_uring` path for the striped and row readers | Linux users; the same tests (the RTX PRO 6000 runs it) |
 
 ### 25.4 Rejected alternatives
 
 | Alternative | Reason |
 |---|---|
-| FP8 or FP4 tensor cores with FP32 accumulation as the arithmetic | Not reproducible on the CPU or across routes (FN §16.2.2) |
-| BF16 activations (A16) as the exact route | Decision b: DeepSeek's trained MXFP8 forward is the model; Infernix's A16 precedent (FN §16.2.2) was for checkpoints trained in BF16 |
+| FP8 or FP4 tensor cores with FP32 accumulation as the arithmetic | Not reproducible on the CPU or across routes (FN §17.3) |
+| BF16 activations (A16) as the exact route | Decision b: DeepSeek's trained MXFP8 forward is the model; the engine's A16 precedent (FN §17.3) was for checkpoints trained in BF16 |
 | NVIDIA's W4A4 as the exact route | Served that way it measured KL 0.035 against a 0.016 floor (with MXFP4 Engram, §4.2); the 1017 release has no calibrated input scales |
 | Requantizing the experts at import (Q2, Q4, EXL3) in the default | Changes the model; DS4 measured +0.12-0.19 nats NLL for Q2 against Q4 |
 | DeepSeek's encoder SWA bounded replay for cache restores | Snapshots make restores exact for ≈ 1.4 MB of encoder windows |
-| Page-cache or memory-mapped expert tiers | Pinned and locked records measured faster (FN §19.3.7); DS4's page-cache gain (#477) is the gain over O_DIRECT re-reads, which Infernix's RAM tier already has |
+| Page-cache or memory-mapped expert tiers | Measured slower than the read queue with identical flags (Strata; MoE §4.7); DS4's page-cache gain (#477) is the gain over O_DIRECT re-reads, which the RAM tier already has |
 | Keeping the source shards during conversion | Does not fit the disks (§7.6) |
 | Engram tables in RAM | 97-195 GiB do not fit beside the expert tier |
-| A static hot-expert list as the primary cache key | Loses to recency on this family (DS4 #636) |
+| A static hot-expert list as the primary cache key | Loses to recency on this family (DS4 #636; MoE §4.3's replay evidence) |
 | Five-token DSpark drafts by default | The union cost (§5.4); JigSawPT measured losses at two |
 | A host KV tier for long context | The compressed KV is 0.89 GB at 1M |
 | `--kv-dtype` variants | The model defines its KV formats |
+| An expert-volume stripe on the RTX PRO 6000 as the only second-drive option | The shared expert stripe (MoE §3) reaches the same read rate at ≈ 10 % of the bytes; striping stays the option where its unit parallelism measurably wins (M5) |
 
 ---
 
@@ -2033,6 +2253,9 @@ Questions for the owner:
   [OpensourceWTF's streaming repack](https://huggingface.co/OpensourceWTF/DeepSeek-V4.1-Flash-streaming-repack-exl3-3.0bpw);
   [hughmadden/ds41rt-rtx5090](https://github.com/hughmadden/ds41rt-rtx5090);
   [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF).
-- Infernix: the [Flash-Next design](qwen3_8-flash-next-design.md), the [GLM-5.3-Flash design](glm5_3-flash-design.md)
-  (including its storage measurements of 2026-10-10), [model quality](model-quality.md) §6 and
+- ninferpro: the [MoE offload design](moe-offload-design.md) (the shared tier this family
+  composes); the [Flash-Next design](qwen3_8-flash-next-design.md) (its superseded content,
+  which some pre-rewrite measurements here cite, remains in git at base commit `0af2a9b`); the
+  [GLM-5.3-Flash design](glm5_3-flash-design.md) (its storage measurements of 2026-10-10 and the
+  striped-volume, `mhc` and approximate-mode designs); [model quality](model-quality.md) §6 and
   [engine architecture](engine-architecture.md).

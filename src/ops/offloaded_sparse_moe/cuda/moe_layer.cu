@@ -1,5 +1,5 @@
 // offloaded_sparse_moe on the GPU: routing, device-side dispatch, the exact W4A4 expert kernels
-// and the combine (docs/maintainer/qwen3_8-flash-next-design.md §8.4-8.5, §16.2).
+// and the combine (docs/maintainer/qwen3_8-flash-next-design.md §8.4-8.5, §17.2).
 //
 // Expert kernels read each `nvfp4_expert_rg16_v1` record straight from wherever it lives: a device
 // frame, or the pinned host bank over PCIe (zero-copy). A gate/up CTA owns two row groups of one
@@ -708,7 +708,7 @@ __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries
 // same conversion broadcasts them. Every value is a multiple of 1/2 at most 6 in magnitude, so the
 // products are multiples of 1/4 at most 36 and a lane's four-term sum, at most 144, is exact in
 // FP16 (ulp 1/8 below 256). Four times it is the lane's share of the doubled-code product sum
-// P_b of design §16.2, an integer of at most 576: (P_q * Sw) * Sa summed over the four lanes of a
+// P_b of design §17.2, an integer of at most 576: (P_q * Sw) * Sa summed over the four lanes of a
 // row equals (P_b * Sw) * Sa, so the int64 row sums are exactly the CPU engine's.
 
 // One column's A4 block: in byte j of dup[q] the E2M1 code of element
@@ -996,7 +996,7 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
                                     static_cast<const canon::A4Block*>(h_blocks), columns_out, outputs, phase));
 }
 
-// ------------------------------------------------------------------------ A16 narrow route (§16.2.1)
+// ------------------------------------------------------------------------ A16 narrow route (§17.3)
 //
 // Experts stored without activation scales: x and h are encoded per column (canon::a16_value) and
 // every product is three dp4a (signed codes times the unsigned lo and mid bytes and the signed hi
@@ -1143,9 +1143,9 @@ void launch_encode_x_acts(const Tensor& x, const moe::wide::ExpertsWorkspace& la
 // nibbles) and i + 8 (high) at k = 4q .. 4q+3, then the 16 rows' scale bytes. A warp takes four units at a
 // time: lane l = 8 s + i reads rows i and i + 8 of unit s, its four code words and two scale bytes, a
 // batch of units ahead of the one it computes. A row's block product P_b (the doubled E2M1 codes times
-// the 16 X values) is below 2^29 in magnitude (design §16.2.1), so its dp4a partial sums wrap in 32 bits
+// the 16 X values) is below 2^29 in magnitude (design §17.3), so its dp4a partial sums wrap in 32 bits
 // to the exact P_b, which then takes the row's scale once: P_b * Sw is the exact int64 term, and the row
-// sums are the exact sums of §16.2.1 (any order gives the same integers).
+// sums are the exact sums of §17.3 (any order gives the same integers).
 struct UnitRows {
     std::uint32_t codes[4]; // words (q, i), q = 0..3
     std::uint32_t scales;   // byte 0: row i's scale word, byte 1: row i + 8's
@@ -1730,7 +1730,7 @@ __global__ void __launch_bounds__(kDispatchThreads)
 }
 static_assert(kEncodeActsThreads % 32 == 0 && kEncodeActsThreads <= kDispatchThreads);
 
-// CTAs that warm the source's L2 spans after the waiting CTAs (design §19.3.3 Phase 2).
+// CTAs that warm the source's L2 spans after the waiting CTAs (design §8.6).
 constexpr int kWarmCtas  = 8;
 constexpr int kWarmPiece = 16384; // bytes per prefetch instruction
 
@@ -2219,7 +2219,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const bool use_wide = !ggml && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
     // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
     // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
-    // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
+    // design §13.4, "Not with the staging overlap") that serial passes do not; the cause is not identified.
     const bool overlap  = source.overlap_stream != nullptr && half > 0 && max_jobs > half && !use_wide;
     std::optional<moe::wide::Call> wide;
     if (overlap) {

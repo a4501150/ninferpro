@@ -1,7 +1,7 @@
 // Qwen3.8-Flash-Next GDN query/key/value/z projection, row-scaled FP8 with BF16 activations (W8A16, recipe C).
 // Selected by bench/ops/fp8_flash_next_sweep.cu on the RTX 5090. The GEMV at T = 1 and the SIMT tile
 // through T = 8 both reduce a column as 16 values per lane in one accumulator chain, so a column has
-// the same bits at every width (column invariance, design §11.3); the tensor-core tiles beyond.
+// the same bits at every width (column invariance, design §17.4); the tensor-core tiles beyond.
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_launch.cuh"
 #include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"

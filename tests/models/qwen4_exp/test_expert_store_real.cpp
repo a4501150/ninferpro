@@ -1,4 +1,4 @@
-// The SSD tier's in-place expert records on the real artifact (design §19.3.7 RT3/RT4): the expert
+// The SSD tier's in-place expert records on the real artifact (design §9.5): the expert
 // banks bound Streamed give an ExpertStore whose every record is one or two 4 KiB-aligned file
 // segments; records read through DirectReadQueue from those segments equal the bytes the pinned
 // load reads, and so do the multipliers read from the scale tails, for the first and last layers and

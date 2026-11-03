@@ -1,8 +1,8 @@
 #pragma once
 
 // The mapped-memory fetch channel through which the GPU asks the host for the records of a layer
-// call's SSD-only experts that no CPU job serves (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.7, the SSD expert tier: prefill, calls past the CPU cap, CPU serving off). Shared by the
+// call's SSD-only experts that no CPU job serves (docs/maintainer/moe-offload-design.md
+// §4.7, the SSD expert tier: prefill, calls past the CPU cap, CPU serving off). Shared by the
 // device kernels (moe_layer.cu) and the host side (fetch_channel.h); plain data, no host-only types.
 //
 // Protocol. The device writes the request (layer, count, experts in job order), a system-scope

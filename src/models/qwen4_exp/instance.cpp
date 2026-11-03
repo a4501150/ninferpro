@@ -36,7 +36,7 @@ constexpr std::uint64_t kProgramPinnedAllowance = 256ULL << 20;
 // The materializer's upload slots and direct-read bounce buffer during the load.
 constexpr std::uint64_t kLoadStagingBytes = 4ULL * (64ULL << 20) + (8ULL << 20);
 // Below this many expert frames most routed experts miss the VRAM cache and decode slows down
-// markedly (design §19.2).
+// markedly (design §9.7).
 constexpr std::uint32_t kFewFrames = 2048;
 // The RAM-lean default (see construct_qwen4_exp): frames of slack when probing whether the VRAM
 // expert cache holds every routed expert (the probe sizes staging as if there were no tier, so it
@@ -82,7 +82,7 @@ void validate(const EngineOptions& options) {
         throw std::invalid_argument("Qwen3.8-Flash-Next speculates with its MTP drafter, a DFlash2 drafter "
                                     "(--spec dflash2 --draft-model FILE) and n-gram copy proposals");
     }
-    // Verification widths up to 8 keep its dense routes column-invariant (design 11.3); its rounds
+    // Verification widths up to 8 keep its dense routes column-invariant (design 11.1); its rounds
     // verify chains.
     if (options.speculative.backend == SpeculativeBackend::DFlash2 &&
         (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 7)) {
@@ -94,7 +94,7 @@ void validate(const EngineOptions& options) {
         throw std::invalid_argument("Qwen3.8-Flash-Next verifies chains: --draft-tree-nodes is not supported");
     }
     // 16-bit activations run every linear A16 and every expert bank W4A16 (the exact W4A16
-    // arithmetic of design §16.2.1): the quality reference, so causal scoring only, on the exact
+    // arithmetic of design §17.3): the quality reference, so causal scoring only, on the exact
     // route.
     if (options.a16_activations && options.purpose != EnginePurpose::CausalScoring) {
         throw std::invalid_argument(
@@ -146,7 +146,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     inspect.complete();
     auto plan = models::qwen4_exp::plan_load(reader, models::load_options(options, models::Architecture::Qwen4Exp));
-    // The RAM ledger (design §19.3.7): the experts take what the reserve and every other planned
+    // The RAM ledger (design §9.8): the experts take what the reserve and every other planned
     // allocation leave, before anything is pinned or read.
     models::qwen4_exp::HostMemoryDemand demand;
     demand.reserve      = options.ram_headroom_bytes;
@@ -220,7 +220,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     program_options.ngram_volume = volume;
     program_options.ngram_table  = table;
-    // The hybrid prefix cache (design §19.3.1). Host-born snapshots live in the pinned slab pool;
+    // The hybrid prefix cache (design §15). Host-born snapshots live in the pinned slab pool;
     // the cost model ranks resume sources by the measured prefill coefficients.
     const ContextCacheOptions& cache = options.context_cache;
     if (cache.enabled) {
@@ -232,7 +232,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value();
         program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value();
         program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value();
-        // Fitted 2026-10-05 (RTX 5090 at PCIe 5.0 x8, INT8 KV; design §19.4): 1.67 s per layer-walk
+        // Fitted 2026-10-05 (RTX 5090 at PCIe 5.0 x8, INT8 KV; design §15.3): 1.67 s per layer-walk
         // span, 0.16 s per further call, 22 us per token and 1.06 ns per attention pair, within 5 %
         // from 4K to 128K. The span is one pass of the experts over the link: the Program rescales
         // it, and the restore rate, to the link it measures at startup.
@@ -272,7 +272,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The n-gram table in RAM (design §12.5): pinned at Program start, so it is a later pin. Auto keeps it
     // only while every expert stays pinned in RAM with it; Ram keeps it whatever the experts' placement.
     const auto snapshot = host_memory_snapshot();
-    // Expert placement (design §19.3.7; --experts / --expert-placement).
+    // Expert placement (design §9.6; --experts / --expert-placement).
     // One of: Resident -- every routed expert in the frame pool, nothing lends or evicts, the KV
     // pool fully mapped, the RAM tier at its floor; Placed -- an explicit count or file naming the
     // VRAM set (pinned, the pool sized to it) and the RAM set; AutoHeadroom -- an explicit
@@ -463,7 +463,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                  " asks for more Host RAM than is free or pinnable now (" + ledger.describe() +
                                  "); lower it, use auto, or free Host memory");
     }
-    // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
+    // The SSD tier (design §9.5): the banks stay in the artifact; the Program pins RAM slots for
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
     const bool tier = ledger.placement == models::qwen4_exp::ExpertPlacement::Tier;
     if (tier) {
@@ -497,7 +497,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.later_pinned_bytes    = demand.prefix_cache + demand.later_pinned + models::qwen4_exp::kPinRoomMarginBytes;
     }
 
-    // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
+    // The VRAM check (design §9.7), before the weights are read: the dense weights, the
     // Program's fixed allocations, the reserve for graph executables and the display headroom
     // must leave room for the expert cache. Fast paths are selected once the weights are bound, so
     // the check counts sampled-mtp-drafts' draft graphs whenever it could be selected.

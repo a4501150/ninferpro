@@ -1,11 +1,11 @@
 #pragma once
 
 // The wide route of offloaded_sparse_moe (docs/maintainer/qwen3_8-flash-next-design.md §8.5, §13,
-// §16.2, §19.3.7): every routed expert with more than kMaxColumns columns in a call (prefill chunks,
+// §17.2, §9.1): every routed expert with more than kMaxColumns columns in a call (prefill chunks,
 // wide verification batches) is computed by a block-scaled tensor-core grouped GEMM
 // (mma.kind::mxf4nvf4.block_scale) instead of the exact integer narrow route.
 //
-// The arithmetic up to the accumulator is that of §16.2: x quantized to A4 with the expert's own
+// The arithmetic up to the accumulator is that of §17.2: x quantized to A4 with the expert's own
 // gate/up input_scale by the canonical rule, the stored E2M1 codes with their per-16 E4M3 scales,
 // h = bf16(silu_c(y_gate) * y_up) on BF16 y, A4 of h with the down input_scale, and
 // y = bf16_rn(acc * alpha). Only the sum differs: the tensor core accumulates the exact block
@@ -18,7 +18,7 @@
 // produces such experts (24,576 of 24,576 share the scale in Qwen3.8-Flash-Next-NVFP4), and the
 // narrow route computes them exactly.
 //
-// W4A16 experts (§16.2.1) take an exact wide route instead (wide_expert_a16.cuh): the canonical X
+// W4A16 experts (§17.3) take an exact wide route instead (wide_expert_a16.cuh): the canonical X
 // of x and h, split into byte limbs, times the doubled E2M1 codes on integer tensor cores, two MMAs
 // per 16-element block, folded into the exact int64 sum with the block scale. It gives the
 // narrow route's and the CPU engine's bits, so a W4A16 expert's output never depends on how many
@@ -87,7 +87,7 @@ INFERNIX_WIDE_HD constexpr int plane_block(int b) { return (b & ~3) | ((b & 1) <
 // Residual A4 planes of W4A16 experts (WideA16::kA4Residual): a row holds its first term's A4 row
 // (the W4A4 plane layout above), then each further term's, all scaled by one FP32 row scale. Two
 // terms leave about 0.8 % relative error per row, four times BF16 rounding; three bring it below the
-// output's BF16 rounding (design §19.3.23).
+// output's BF16 rounding (design §3.1).
 inline constexpr int kResidualTerms  = 3;
 inline constexpr int kXTermsRowBytes = kResidualTerms * kXRowBytes;
 inline constexpr int kHTermsRowBytes = kResidualTerms * kHRowStride;

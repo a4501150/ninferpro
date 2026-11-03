@@ -81,7 +81,7 @@
 namespace infernix::models::qwen4_exp {
 namespace detail {
 
-// A prompt with media: its items' control plan and the encode window it needs (design §19.3.2).
+// A prompt with media: its items' control plan and the encode window it needs (design §16.4).
 struct VisionAdmission {
     qwen_common::VisionControlPlan control;
     VisionWindowPlan window;
@@ -110,7 +110,7 @@ struct BasePlanImpl {
     std::shared_ptr<const PreparedPrompt> prompt; // the request's prompt, moved in by plan_request
 };
 
-// The copy-on-write source of a resume (design §19.3.1, rule MR6): the snapshot's tail page (the
+// The copy-on-write source of a resume (design §15.2, rule MR6): the snapshot's tail page (the
 // frontier inside a block), the anchor block when its last MTP cell encodes another continuation,
 // or none.
 enum class PrefixCow : std::uint8_t { None, Tail, Anchor };
@@ -172,7 +172,7 @@ struct QuoteImpl {
     std::shared_ptr<const VisionAdmission> vision;
 };
 
-// A media prompt's encode window and handoff (design §19.3.2): filled at reserve, encoded over
+// A media prompt's encode window and handoff (design §16.4): filled at reserve, encoded over
 // admission steps, released once the prompt's last call is enqueued or the lane is released.
 struct LaneVision {
     std::shared_ptr<const VisionAdmission> admission;
@@ -244,7 +244,7 @@ inline std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
 // the RoPE positions and pooled-block starts included, precedes `ngram`. `rope` holds a call's
 // [columns, 3] axis-major RoPE positions, `block_rope` its [batch, 3] block starts; `mtp_rope` and
 // `mtp_block_rope` the MTP chunk's per sub-chunk (execution::MtpChunk). `gate` is the U32 a gated
-// verification round's rows wait for (design §12.3): it precedes `ngram`, so the round uploads it
+// verification round's rows wait for (design §12.4): it precedes `ngram`, so the round uploads it
 // with the prefix and its rows go through the gate instead.
 struct IoLayout {
     std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, slots = 0, rows = 0, columns = 0, gate = 0, divisor = 0,
@@ -294,10 +294,10 @@ struct DFlash2Io {
 };
 
 // Sampled MTP drafts (sampled-mtp-drafts) draw from the draft head's four most probable tokens:
-// measured against 8 and 16 at T 1.0 / top-p 0.95 / top-k 20 (design §19.3.24).
+// measured against 8 and 16 at T 1.0 / top-p 0.95 / top-k 20 (design §3.1).
 inline constexpr std::int32_t kSampledDraftRanks = 4;
 
-// Every fixed device allocation of a Program and the layouts in it (design §19.3.7). One function
+// Every fixed device allocation of a Program and the layouts in it (design §9.7). One function
 // (ProgramImpl::plan_device) computes it from the options and the configuration alone: before the
 // weights are read, for the startup check, and in the constructor, which allocates exactly it.
 struct DeviceLayout {
@@ -323,7 +323,7 @@ struct DeviceLayout {
     // while a prompt runs such calls; zero when the static arena covers every call.
     std::size_t wide_work = 0;
     std::int32_t static_columns = 0;
-    // Elastic KV (design §19.3.11): the backing reserves `kv` bytes of address space and maps the
+    // Elastic KV (design §14.4): the backing reserves `kv` bytes of address space and maps the
     // chunks pages [0, n) of every plane (and the block tables) need; `kv_base_pages` are mapped at
     // startup and counted as fixed, the rest grows from the expert frames when admissions need it.
     bool kv_elastic             = false;
@@ -374,7 +374,7 @@ inline ops::SamplingConfig translate(const ResolvedSamplingParameters& s) {
     return out;
 }
 
-// A paused request (design §19.3.13): what its lane held besides model state. The pause published
+// A paused request (design §15.7): what its lane held besides model state. The pause published
 // the state at `target` to the prefix cache (a request the cache publishes); a resume binds the
 // ledger from the deepest cached state up to `target` and replays the rest without sampling.
 struct ResumeStateImpl {
@@ -413,14 +413,14 @@ public:
         std::uint32_t prompt_tokens = 0;
         std::uint32_t state_tokens  = 0; // positions already in the model state
         // Where the prefill phase ends: the prompt, or a resumed lane's paused frontier, which its
-        // replay reaches without sampling (design §19.3.13).
+        // replay reaches without sampling (design §15.7).
         std::uint32_t prefill_end = 0;
         bool replay               = false;
         std::uint32_t extent      = 0; // the positions the request may ever hold (prompt + output)
-        // The prompt's planned prefill calls (design §19.3.1): exclusive ends, the last prompt_tokens.
+        // The prompt's planned prefill calls (design §15.3): exclusive ends, the last prompt_tokens.
         std::vector<std::uint32_t> calls;
         std::size_t next_call = 0;
-        LaneRope rope;                    // RoPE positions of the lane's tokens (design §19.3.2)
+        LaneRope rope;                    // RoPE positions of the lane's tokens (design §16.3)
         std::unique_ptr<LaneVision> vision; // the encode window and handoff of a media prompt
         double vision_seconds = 0;          // the tower's GPU time
         // The tower's timer when its stop had not completed at release: read later
@@ -449,7 +449,7 @@ public:
         GateTraffic gate;            // its verification rounds' rows read behind the n-gram gate
         std::unique_ptr<qwen_common::detail::NgramProposer> proposer; // copy proposals over history
         SpeculativeStats speculative;
-        // MTP drafter (design 11.2; rule MR1 of 19.3.1): its KV cells [0, mtp_cells) are final. At
+        // MTP drafter (design 11.2; rule MR1 of 15.2): its KV cells [0, mtp_cells) are final. At
         // every settled point the lane's saved column holds the residual of position
         // state_tokens - 1, whose cell is written (mtp_cells == state_tokens) or pending
         // (state_tokens - 1: the next call or round writes it).
@@ -458,7 +458,7 @@ public:
         // DFlash2: the context ring holds every position below this one (state_tokens at every
         // settled point, except after a resume from a tap inside a prefill layer walk).
         std::uint32_t dflash_frontier = 0;
-        // Draft-length policy (design 11.3): conditional acceptance of each draft position.
+        // Draft-length policy (design 11.4): conditional acceptance of each draft position.
         std::array<double, 8> mtp_accept{};
         std::uint64_t mtp_policy_rounds = 0;
         // DFlash2 (--draft-tokens auto): a draft's acceptance (given the earlier ones') by its
@@ -468,7 +468,7 @@ public:
         // position by the proposal's match length (kNgramBuckets).
         std::array<double, 4> ngram_accept{};
         LanePrefix prefix;
-        // Prompt seeding (design §19.3.27): of the prompt's prefilled tokens counted, how many
+        // Prompt seeding (design §9.2): of the prompt's prefilled tokens counted, how many
         // routed to each (layer, expert); [layers][experts], allocated on first use.
         std::vector<std::uint32_t> prompt_uses;
         std::uint32_t prompt_counted = 0;
@@ -496,7 +496,7 @@ public:
         if (config.mtp && (o.mtp_draft_tokens == 0 || o.mtp_draft_tokens > 7)) {
             throw std::invalid_argument("Qwen4Exp: MTP needs 1..7 draft tokens");
         }
-        // Verification widths up to 8 keep the dense routes column-invariant (design 11.3).
+        // Verification widths up to 8 keep the dense routes column-invariant (design 11.1).
         if (config.dflash2 && (o.dflash2_draft_tokens == 0 || o.dflash2_draft_tokens > 7 || config.mtp)) {
             throw std::invalid_argument("Qwen4Exp: DFlash2 needs 1..7 draft tokens and no MTP drafter");
         }
@@ -528,7 +528,7 @@ public:
         const auto kv_tokens = o.kv_capacity_tokens != 0 ? o.kv_capacity_tokens : o.max_context * o.max_concurrency;
         d.kv_pages      = (kv_tokens + kPagedKVPageSize - 1) / kPagedKVPageSize;
         const std::int32_t lanes = d.lanes, W = d.max_width;
-        // One copy-on-write page per lane, so a whole-extent resume always fits (design §19.3.1).
+        // One copy-on-write page per lane, so a whole-extent resume always fits (design §15.4).
         if (o.prefix_cache) { d.kv_pages += static_cast<std::uint32_t>(lanes); }
         const std::size_t width = c.residual_width(), di = c.qsa.index_head_dim, r = c.qsa.compress_ratio;
 
@@ -600,7 +600,7 @@ public:
 
         // The workspace arena (the forward pass, sampling, draft acceptance and the drafter) covers
         // decode, verification and calls of up to kStaticWorkColumns columns; a wider prefill call
-        // swaps in an arena of the chunk's size lent from expert frames (design §19.3.7, VRAM item 1).
+        // swaps in an arena of the chunk's size lent from expert frames (design §13.1, VRAM item 1).
         d.static_columns = std::max(lanes * W, std::min(d.chunk, kStaticWorkColumns));
         d.work           = workspace_bytes(c, o, d, lanes, d.static_columns);
         d.wide_work      = d.chunk > d.static_columns ? workspace_bytes(c, o, d, lanes, d.chunk) : 0;
@@ -703,7 +703,7 @@ public:
             d.dflash_io.words             = take(0);
         }
 
-        // Staging slots for each layer call's misses (design 8.6), one expert record each.
+        // Staging slots for each layer call's misses (design 8.5), one expert record each.
         const std::uint64_t shape[] = {c.moe.experts, c.hidden_size, c.moe.intermediate};
         // The largest record (staging, stream-ring and RAM slots): the NVFP4 record's, or an exact
         // bank's largest per-layer record; and the expert cache's average frame (its sizing unit).
@@ -871,7 +871,7 @@ public:
         }
 
         // Every fixed allocation below is checked against the plan and against device free memory
-        // (an allocation the driver placed in system memory fails startup, design §19.3.7).
+        // (an allocation the driver placed in system memory fails startup, design §9.7).
         vram_ = open_vram_budget_source(device_.device, options_.vram_past_budget);
         SpillGuard guard(*vram_);
         guard.begin();
@@ -1041,7 +1041,7 @@ public:
             const std::uint64_t frames = size_expert_frames(vram_->query(), expert_frame_demand(record_stride)).frames;
             fit_wide_work_to_cache(frames - frames / 4, record_stride);
         }
-        // The SSD expert tier (design §19.3.7): the banks were not pinned; RAM slots hold the
+        // The SSD expert tier (design §9.5): the banks were not pinned; RAM slots hold the
         // records the tier keeps and the rest are read from the artifact when a round needs them.
         if (const auto& store = parameters_.model.expert_store(); store.has_value()) {
             for (std::uint32_t l = 0; l < store->layers(); ++l) {
@@ -1147,14 +1147,14 @@ public:
         }
         // CPU-served misses for decode and verify calls, and for every call of at most
         // kMaxCpuColumns columns (short prompts, chunk remainders, forced tokens), whose experts are
-        // all thin and so give the same bits on either device (design 16.2); wider prefill chunks
+        // all thin and so give the same bits on either device (design 17.2); wider prefill chunks
         // stay on the GPU.
         // A GGUF import's records are computed by the ggml CPU route (ops/offloaded_sparse_moe/cpu/ggml_expert.h).
         const std::uint32_t cpu_workers = this->cpu_workers();
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
         const std::uint32_t assist_jobs = options_.cpu_assist_jobs;
         if (cpu_workers > 0 && cpu_jobs > 0) {
-            // The team's rate sets the decode miss split (design §19.3.12); the SSD tier's is measured
+            // The team's rate sets the decode miss split (design §10.5); the SSD tier's is measured
             // once its RAM is filled (below).
             if (!tier_) { measure_cpu_rate(record_stride); }
             // Decode and verification calls are CPU-served up to decode_columns; prefill calls up to
@@ -1198,7 +1198,7 @@ public:
         create_prefix_cache();
 
         // The VRAM expert cache takes what the fixed allocations, the reserve for graph
-        // executables and the display headroom leave (design §19.3.7). Its frames are the one
+        // executables and the display headroom leave (design §9.7). Its frames are the one
         // elastic allocation: a chunk the driver places in system memory (another program took
         // memory since the reading) is given back and the cache stops growing there.
         if (options_.expert_cache) {
@@ -1335,7 +1335,7 @@ public:
     }
 
     // The positions one round may write past the lane's frontier: a verification's columns and the
-    // MTP drafter's cells (design §19.3.13).
+    // MTP drafter's cells (design §15.7).
     std::uint32_t round_positions() const noexcept {
         return static_cast<std::uint32_t>(std::max(max_width_, mtp_ ? mtp_k_ + 1 : 1)) + 1U;
     }
@@ -1369,7 +1369,7 @@ public:
         SourceCandidate out;
         if (selection) {
             if (selection->snapshot) {
-                // Items inside the reused prefix are not encoded again (design §19.3.2).
+                // Items inside the reused prefix are not encoded again (design §16.4).
                 if (impl->vision && selection->frontier > 0) { impl->vision = plan_vision(data, selection->frontier); }
                 out.reused_tokens = selection->frontier;
                 out.reuse_path    = reuse_path_for(prefix_->index().snapshot(*selection->snapshot).kind);
@@ -1470,7 +1470,7 @@ public:
             lane.prefix.hints  = data.tap_hints.hints;
             lane.prefix.exclusions = prefix_exclusions(data);
             // Make room before reserving: an elastic pool grows only for what eviction cannot free, so
-            // idle cache blocks never hold memory the expert frames could use (design §19.3.11).
+            // idle cache blocks never hold memory the expert frames could use (design §15.6).
             pc_make_room(selection->need);
             if (pool_->available_pages() < selection->need) { (void)grow_kv(selection->need); }
             auto reservation = pool_->reserve(selection->need);
@@ -1563,7 +1563,7 @@ public:
         return out;
     }
 
-    // ---------------------------------------------------------------- pause and replay (design §19.3.13)
+    // ---------------------------------------------------------------- pause and replay (design §15.7)
 
     // The lane's request-level state a pause keeps (everything but the model state and the pages).
     void save_request(const Lane& lane, ResumeStateImpl& r) const {
@@ -1745,7 +1745,7 @@ public:
         CUDA_CHECK(cudaStreamSynchronize(s)); // the host table is read before it goes out of scope
     }
 
-    // Pauses a resident at its committed boundary (design §19.3.13): the prefix cache receives the
+    // Pauses a resident at its committed boundary (design §15.7): the prefix cache receives the
     // lane's blocks and its state at the frontier, exactly as a consistent abort leaves them, the
     // lane is released and a Pause transaction hands the Engine the ResumeState.
     bool start_pause(SequenceHandle sequence) {
@@ -1796,7 +1796,7 @@ public:
         return out;
     }
 
-    // Grows each unit's lane to its next round (design §19.3.13): a decode or control unit needs the
+    // Grows each unit's lane to its next round (design §15.7): a decode or control unit needs the
     // positions it writes, a verification's columns and the drafter's cells, within the request's
     // extent. A shortage cached blocks and the elastic pool cannot cover is reported, and the Engine
     // reclaims or pauses the youngest resident.
@@ -1840,7 +1840,7 @@ public:
         return out;
     }
 
-    // Advances the binding: a media prompt's encode window one step per call (design §19.3.2; other
+    // Advances the binding: a media prompt's encode window one step per call (design §16.4; other
     // lanes run between steps), then the lane is published.
     ContextProgress poll_context(runtime::CancellationFlagView cancellation) {
         if (pause_) {
@@ -1910,7 +1910,7 @@ public:
         // A long prompt's stream ring and wide arena stay lent until its last call, and growth is
         // refused while frames are lent, so a request queued behind it waited out its prefill (issue
         // #24). Between calls they can go back: the prompt's next streamed call lends again from
-        // the smaller cache, or stages its experts (the same bytes either way, design §19.3.8 F3).
+        // the smaller cache, or stages its experts (the same bytes either way, design §13.3).
         // Only when the pool's capacity leaves room for the growth: a return that cannot grow the pool
         // only makes the prompt's next walk span lend again (a full --max-context returned 4,221
         // frames for nothing, 2026-10-16).
@@ -1966,10 +1966,10 @@ public:
         const std::int32_t width = static_cast<std::int32_t>(lane.calls[lane.next_call++] - lane.state_tokens);
         const bool last          = begin + width == static_cast<std::int32_t>(lane.prefill_end);
         // A call the CPU serves (an opener tail, a tiny suffix) promotes at the decode rate (design
-        // §19.3.1). Wider prefill calls promote nothing: the answer's staged misses land in free
+        // §13.7). Wider prefill calls promote nothing: the answer's staged misses land in free
         // frames and pick its experts, while the prompt's would displace them (16 per layer per
         // call measured slower than none in every regime: serve C = 4 fill -4.3 %, warm -5.6 %;
-        // design §19.3.17). Their routes still count toward the cache's scores.
+        // design §13.7). Their routes still count toward the cache's scores.
         const std::size_t promotions =
             width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
         // Host phases of a chunk for nsys attribution (the GPU side is in the CUDA trace).
@@ -1982,7 +1982,7 @@ public:
         }
         const auto chunk = stage_mtp_chunk(lane, index, begin, width);
         // A resumed lane's first call waits per layer for its restore; any call waits per layer for
-        // a copy-out of this lane's state still in flight (design §19.3.1).
+        // a copy-out of this lane's state still in flight (design §15.1).
         next_waits_ = prefix_waits(lane);
         const bool streamed = !walk_.active && stream_chunk(width);
         score_column_       = begin;
@@ -2186,7 +2186,7 @@ public:
         residency_->enqueue_route_download(s, T);
     }
 
-    // Prompt seeding (design §19.3.27): a prefill call's per-token routes, read from the route log
+    // Prompt seeding (design §9.2): a prefill call's per-token routes, read from the route log
     // its after_round is about to apply, add to the lane's prompt uses. A layer walk's span counts
     // its last chunk, the one its route log holds; a mixed round's call starts at column `first`.
     void note_prompt_routes(Lane& lane, std::int32_t width, std::int32_t first = 0) {
@@ -2278,7 +2278,7 @@ public:
         out.capacity_released       = !last && leases_returnable();
         if (last && lane.replay) {
             // A replay ends at its paused frontier, whose next input the ledger already holds: the
-            // lane decodes from there (design §19.3.13).
+            // lane decodes from there (design §15.7).
             {
                 const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
                 device_.synchronize();
@@ -2349,7 +2349,7 @@ public:
         }
         // Proposals: a round verifies 1 + the longest row's drafts; a row may draft at most one token
         // fewer than it may still emit, so every verified position lies in its reservation. A longer
-        // n-gram copy proposal replaces a row's MTP drafts. By round size (design 11.3, 19.3.5):
+        // n-gram copy proposal replaces a row's MTP drafts. By round size (design 11.4, 11.5):
         // - one row: its own draft length, maximizing its expected tokens per round time;
         // - two MTP rows, with the adaptive-speculation fast path: one draft length for both
         //   (choose_pair_draft_length), so no row is padded to the other's; its at most 2 x 3 = 6
@@ -2511,7 +2511,7 @@ public:
         const std::span<const std::uint32_t> round_lanes(lanes.data(), static_cast<std::size_t>(batch));
         const std::span<const std::int32_t> round_positions(positions.data(), static_cast<std::size_t>(batch));
         // A replayed round reads its rows after the launch, while the GPU embeds and runs layer 0,
-        // and releases them to the gate before ple_embed (design §12.3, n-gram S4b); a round that
+        // and releases them to the gate before ple_embed (design §12.4, n-gram S4b); a round that
         // warms or captures its graph reads them first.
         // A round whose rows are all in the host cache reads nothing, so it stages them first.
         // A mixed round reads every row first: its eager Forward uploads them with the io.
@@ -2819,19 +2819,19 @@ public:
     std::uint64_t revision() const noexcept { return revision_; }
 
 private:
-    // Promotions per layer call (design section 19.2): one per decode round measured fastest; a
+    // Promotions per layer call (design section 9.2): one per decode round measured fastest; a
     // promotion moves as many PCIe bytes as serving the expert once zero-copy.
     static constexpr std::size_t kDecodePromotionsPerLayer  = 1;
     // Once the frames are full, decode promotes only every kDecodePromotionInterval-th round on the
     // reference link (promotion_interval scales it to the measured one): a promotion moves as many
     // PCIe bytes as serving its expert once, and fewer of them measured faster at 512 tokens (design
-    // section 19.2). Until then every round promotes, so a cold cache fills at the full rate.
+    // section 9.2). Until then every round promotes, so a cold cache fills at the full rate.
     static constexpr std::uint64_t kDecodePromotionInterval = 4;
     // Misses staged per pass of a layer's experts: every decode and verify call's misses in one
     // pass; a prefill chunk's in several. The least, and with the SSD tier the count (plan_device);
     // the fork route takes at most 512 (ops::moe_experts).
     static constexpr std::int32_t kStagingSlots = 64, kMaxStagingSlots = 512;
-    // The SSD tier's smallest RAM (design §19.3.7 H_min: 1,024 slots, 2.6 GiB).
+    // The SSD tier's smallest RAM (design §9.8: 1,024 slots, 2.6 GiB).
     static constexpr std::uint32_t kMinTierSlots = 1024;
     // RAM slots a layer walk's span borrows for its stream reads (at most 1/8 of the SSD tier's): with
     // reads kReadAhead layers ahead, each layer streams up to 1,280 / 4 = 320 SSD-only experts. 640
@@ -2863,7 +2863,7 @@ private:
         budget_tokens_ %= interval;
         return static_cast<std::size_t>(due) * kDecodePromotionsPerLayer;
     }
-    // The interval at the measured link (design §19.3.12): a promotion's bytes cost less wall time
+    // The interval at the measured link (design §9.2): a promotion's bytes cost less wall time
     // on a faster link, whose rounds leave it more idle, so it promotes proportionally more often
     // (x8 4, x16 2; the x16 value is derived, not measured).
     std::uint64_t promotion_interval() const noexcept {
@@ -2917,7 +2917,7 @@ private:
         apply_vram_target(false);
     }
 
-    // ---------------------------------------------------------------- VRAM monitor (design §19.3.7)
+    // ---------------------------------------------------------------- VRAM monitor (design §9.7)
     void start_vram_monitor(const VramDemand& demand) {
         if (!options_.vram_monitor || options_.expert_frame_ceiling != 0) { return; }
         const VramSnapshot now = vram_->query();
@@ -2962,7 +2962,7 @@ public:
         waker_ = std::move(waker);
     }
 
-    // ---- warm start (design §19.3.5 S4b) ----
+    // ---- warm start (design §9.2) ----
     // Fills the frames from the saved state, before the first request; without one (a first start,
     // or a state of another artifact), from the calibrated expert order when the model has its shape.
     // With the SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies
@@ -3073,7 +3073,7 @@ private:
         SeedSource source    = SeedSource::None;
     };
 
-    // The SSD tier's RAM fill order (design §19.3.7 §4.9): the saved state's ranking (the last
+    // The SSD tier's RAM fill order (design §9.6, plan §4.9): the saved state's ranking (the last
     // session's VRAM residents, best first), then every other key that session used, most used
     // first, then the keys it never used one expert of every layer in turn, so that no layer is left
     // wholly on the SSD (file order filled the first layers and left the last ones on disk).
@@ -3222,7 +3222,7 @@ private:
 
 public:
     // After every synchronization of a round with MoE layers: a call that could not serve an expert
-    // (design §19.3.7: an unreadable record, a host service that stopped answering) left undefined
+    // (design §9.3: an unreadable record, a host service that stopped answering) left undefined
     // outputs, so the round's requests fail and the engine keeps serving. Prefix-cache entries the
     // round may have published are dropped when the lanes are released.
     void check_expert_error() {
@@ -3316,18 +3316,18 @@ private:
     std::uint64_t expert_state_routed_ = 0;
 
 public:
-    // Prefill calls up to this width are CPU-assisted (design §19.3.1 P7); wider chunks route nearly
+    // Prefill calls up to this width are CPU-assisted (design §10.6); wider chunks route nearly
     // every expert, and their misses stream or stage on the GPU.
     static constexpr int kAssistMaxColumns = 255;
 
-    // ---- expert placement (/admin/expert-placement; design §19.3.7) ----
+    // ---- expert placement (/admin/expert-placement; design §9.6) ----
     // A switch requested from any thread (the HTTP handler), applied by the engine thread at the
     // next maintenance boundary, where no round's kernels are in flight.
     mutable std::mutex placement_mutex_;
     offload::ExpertPlacementRequest placement_pending_;
     bool placement_pending_set_ = false;
 
-    // A placement grow's resident refill (design §19.3.7): the switch backs new frames but does
+    // A placement grow's resident refill (design §9.6): the switch backs new frames but does
     // not fill them -- boot's warm start does -- so without a refill the keys arrive one miss at a
     // time from the artifact. The refill walks the usage-rank order in bounded batches between
     // rounds: seed every key the tier holds, free its slots, read the next batch (the boot fill's
@@ -4041,7 +4041,7 @@ public:
     }
 
 private:
-    // Calls this narrow are CPU-served (design §16.2, prefix P0 step 3).
+    // Calls this narrow are CPU-served (design §10.1).
     static constexpr std::int32_t kServedCallColumns = 8;
     // Prefill calls up to this many columns run in the static workspace; wider ones in the wide arena.
     static constexpr std::int32_t kStaticWorkColumns = 512;
@@ -4122,7 +4122,7 @@ private:
     }
 
     // Reports at startup what each lane of --max-concurrency takes from the expert cache, in frames
-    // (design 19.3.5): its KV extent unless --kv-capacity fixes the pool; its recurrent, convolution
+    // (design 9.7): its KV extent unless --kv-capacity fixes the pool; its recurrent, convolution
     // and QSA-tail state; its verification and drafter records (DFlash2: its context ring and round
     // feature columns); its logit columns and penalty counts; and its share of the workspace. Every
     // other allocation is independent of the lane count, so one more lane costs these frames.
@@ -4165,7 +4165,7 @@ private:
         } catch (...) {}
     }
 
-    // Reports the finished request's n-gram row traffic (design 12.4). Every row is read on the host
+    // Reports the finished request's n-gram row traffic (design 12.3). Every row is read on the host
     // before the call that consumes it is launched.
     void report_ngram(const Lane& lane) noexcept {
         try {
@@ -4629,7 +4629,7 @@ private:
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this call
         residency_->before_round(s);
         // The ring's copies queue on the copy engine behind the io upload above. A call the CPU can
-        // share (design §19.3.12) gates the stream on each layer's routing.
+        // share (design §10.6) gates the stream on each layer's routing.
         split_call_ = streamed && split_policy_ && batch * width <= split_columns();
         if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_); }
         const WideWork wide(*this, batch * width);
@@ -4648,14 +4648,14 @@ private:
         residency_->enqueue_route_download(s, batch * width);
     }
 
-    // ---- prefill expert streaming (design §19.3.8 F2, F3) ----
+    // ---- prefill expert streaming (design §13.3) ----
     // Chunks of at least kStreamMinColumns route nearly every expert of a layer, so all of a layer's
     // non-resident experts are copied ahead; narrower chunks keep the MoE's staging. The ring holds
     // two halves of as many records as the layer with the most non-resident experts has when it is
     // lent (+ one frame for the slot tables), so no streamed layer leaves misses to staging; it is
     // lent by the expert cache for the prompt and returned when no lane is prefilling. Halves of
     // 384 records (a cold cache misses all 512 of a layer) were 9 % slower at pp4096 (design
-    // §19.3.8, F2 ring size).
+    // §13.3, ring size).
     static constexpr std::int32_t kStreamMinColumns = 256;
     static constexpr std::uint32_t kStreamHalfMin   = 16;
 
@@ -4728,7 +4728,7 @@ private:
     DeviceSpan ring_span() const noexcept { return DeviceSpan{stream_lease_.memory.data, stream_ring_bytes_}; }
     std::byte* walk_area() const noexcept { return static_cast<std::byte*>(stream_walk_lease_.memory.data); }
 
-    // ---- the wide workspace (design §19.3.7, VRAM item 1) ----
+    // ---- the wide workspace (design §13.1, VRAM item 1) ----
     // A call wider than the static arena's columns runs in the wide arena: the stream lease's part
     // when it has one, else frames lent for it alone, else (no lendable frames: the VRAM monitor
     // shrank the cache, or there are no frames) a temporary device allocation, with a warning. The
@@ -5135,7 +5135,7 @@ private:
     //
     // The n-gram rows not yet staged (`staged[b]` columns of row b are) are read on the host after
     // the launch, while the GPU embeds and runs layer 0, and released to the round's gate before
-    // ple_embed (design §12.3, n-gram S2). A round that captures or warms its graph reads them
+    // ple_embed (design §12.4, n-gram S2). A round that captures or warms its graph reads them
     // first and releases the gate before the launch. Every call that writes the landing area
     // ends in a stream sync before the next round stages, so a gate never reads it across calls.
     PendingBatch verify(std::span<const SequenceHandle> sequences, std::span<const std::uint32_t> lanes,
@@ -5216,7 +5216,7 @@ private:
         GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
         if (!mixed_.active) { residency_->enqueue_route_download(s, batch * W); }
 
-        // Acceptance on the device, from BF16-rounded logits as in plain decode (design 16.5).
+        // Acceptance on the device, from BF16-rounded logits as in plain decode (design 17.7).
         Tensor wide(logits32_.p, DType::FP32, {vocab_, batch * W});
         Tensor narrow(logits16_.p, DType::BF16, {vocab_, batch * W});
         ops::cast_fp32_to_bf16(wide, narrow, s);
@@ -5531,7 +5531,7 @@ private:
             cells_host[i] = first + i;
             ids[i]        = lane.history[static_cast<std::size_t>(first + i + 1)];
         }
-        // Cell c takes the target's RoPE position of c (design §19.3.2), per sub-chunk.
+        // Cell c takes the target's RoPE position of c (design §16.4), per sub-chunk.
         const std::int32_t subchunks = (cells + execution::kMtpChunkColumns - 1) / execution::kMtpChunkColumns;
         stage_mtp_chunk_rope(lane.rope, static_cast<std::uint32_t>(first), cells, execution::kMtpChunkColumns,
                              static_cast<std::uint32_t>(r_), io_words(io_layout_.mtp_rope, 3ULL * cells),
@@ -5556,10 +5556,10 @@ private:
 
     // MTP drafts for every live lane of a decode round: the pending cell's K/V when unwritten,
     // then mtp_k_ chained full steps from the saved residual and the anchor token.
-    // Draft-length policy (design 11.3): the K in [0, mtp_k_] that maximizes expected tokens per
+    // Draft-length policy (design 11.4): the K in [0, mtp_k_] that maximizes expected tokens per
     // round time. Expected tokens are 1 + the sum of the products of the lane's conditional
     // position acceptances (learned online); a round of K drafts costs 1 + kWidthCost * K plain
-    // rounds, the slope measured on the 5090 (design 19.2), so the plain round time cancels. Every
+    // rounds, the slope measured on the 5090 (design 11.4), so the plain round time cancels. Every
     // kProbeInterval rounds a row drafts one token more than its choice, so the estimate of the
     // next position stays current (K = 0 then probes one draft). A fixed draft length (no
     // auto_draft_length) drafts mtp_k_ every round.
@@ -5584,7 +5584,7 @@ private:
         return best;
     }
 
-    // The cost of one draft in K = 0 rounds (design 11.3), learned online: consecutive one-row MTP
+    // The cost of one draft in K = 0 rounds (design 11.4), learned online: consecutive one-row MTP
     // rounds' start-to-start times (drafting, verification, commit and host work) against their
     // drafter steps K, fit as t = a + b K by exponentially weighted least squares; a draft then costs
     // b / a rounds. The probes (one draft more every kProbeInterval rounds) keep K varied. Until
@@ -5716,7 +5716,7 @@ private:
         last_round_extra_ = -1;  // set by the round once its width is known
     }
 
-    // Two-row rounds (design 19.3.5): the K in [0, kPairMaxDrafts] that maximizes both rows' expected
+    // Two-row rounds (design 11.5): the K in [0, kPairMaxDrafts] that maximizes both rows' expected
     // tokens per round time, where a round of K drafts per row costs 1 + kPairWidthCost * K plain
     // two-row rounds. Every kProbeInterval pair rounds it drafts one token more than its choice, so
     // the rows' estimates of the next position stay current. A fixed draft length drafts the most a
@@ -5944,7 +5944,7 @@ private:
         // draft step runs only while every earlier draft cleared it: the device applies the host's
         // cut (the same binary64 comparison) and skips the steps whose drafts it would discard. A
         // skipped step leaves its draft and confidence words stale, beyond the cut that reads them.
-        // (Design §19.3.27: 34 % of the steps of mixed-topic MTP 4 rounds, decode +2.2 %.)
+        // (Design §11.2: 34 % of the steps of mixed-topic MTP 4 rounds, decode +2.2 %.)
         if (!sampled && batch == 1 && steps > 1 && std::isfinite(draft_min_logprob_)) {
             replay_gated(mtp_gated_graphs_[static_cast<std::size_t>(steps - 1)], steps, draft_step,
                          [&](std::int32_t j, cudaGraphConditionalHandle next) {
@@ -6048,7 +6048,7 @@ private:
         Tensor wide(logits32_.p, DType::FP32, {vocab_, batch});
         Tensor narrow(logits16_.p, DType::BF16, {vocab_, batch});
         // The sampler reads BF16 logits; BF16 and FP32 logits measured equal in perplexity
-        // (design §16.5).
+        // (design §17.7).
         ops::cast_fp32_to_bf16(wide, narrow, s);
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
         auto* sample_positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
@@ -6095,7 +6095,7 @@ private:
     // resizes the KV pool (shrink_kv, grow_kv) with it held, and other callers take it there.
     std::recursive_mutex vram_mutex_;
     std::function<void()> waker_;
-    // The sizing law's inputs for grow_kv's spare allowance (design §19.3.7): set at startup when
+    // The sizing law's inputs for grow_kv's spare allowance (design §9.7): set at startup when
     // the pool is elastic. `usage_at_sizing_` moves with the elastic KV pool's mappings, which are
     // this process's growth but not the pool's.
     VramDemand spare_demand_{};
@@ -6212,11 +6212,11 @@ private:
     DeviceBuffer head_saved_; // the zero-token resume's saved head residual, per lane (!mtp_)
     // The prompt-end capture's fixed staging images (one packed state image each).
     std::vector<DeviceBuffer> prompt_end_staging_;
-    // The vq2/k4v2 exact window (design §19.3.15), every KV layer and lane.
+    // The vq2/k4v2 exact window (design §14.3), every KV layer and lane.
     DeviceBuffer window_backing_;
     prefix::KvWindowGeometry window_geometry_;
 
-    // ---- the host-to-device link (design §19.3.12: bandwidth-dependent choices follow the machine) ----
+    // ---- the host-to-device link (design §10.4: bandwidth-dependent choices follow the machine) ----
     // The rate at which the prefill and prefix cost constants were fitted (RTX 5090 at PCIe 5.0 x8).
     static constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
     double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
@@ -6250,7 +6250,7 @@ private:
         diagnostic(text);
     }
 
-    // ---- the CPU expert team's rates (design §19.3.12) ----
+    // ---- the CPU expert team's rates (design §10.4) ----
     // For cpu_expert_workers workers, measured at startup while the link copies records (the staging's
     // DRAM reads compete with the CPU's): experts per second on one-column jobs (memory-bound, as
     // decode's misses are) and expert columns per second on 8-column jobs (the narrow route's widest).
@@ -6322,7 +6322,7 @@ public:
     [[nodiscard]] double link_bytes_per_second() const noexcept { return link_bytes_per_second_; }
 
 private:
-    // ---- elastic KV (design §19.3.11) ----
+    // ---- elastic KV (design §14.4) ----
     static constexpr std::size_t kKvChunkBytes   = 2ULL << 20;
     static constexpr std::uint32_t kKvBaseTokens = 32768; // backed at startup
     static constexpr std::uint32_t kKvGrowPages  = 64;    // growth unit (4,096 tokens)
@@ -6551,7 +6551,7 @@ private:
     std::unique_ptr<KVExecutionTablePool> tables_;
     std::size_t work_capacity_ = 0;
     std::unique_ptr<WorkspaceArena> work_;
-    // SSD tier mode (design §19.3.7): the fetch channel and the tier outlive everything that reads
+    // SSD tier mode (design §9.5): the fetch channel and the tier outlive everything that reads
     // their memory (the residency's promotion copies, the stream, the CPU service), declared later.
     // With an expert stripe the tier reads through this store, the Model's with each record's tail
     // in the stripe file.
@@ -6574,7 +6574,7 @@ private:
     execution::Forward::SplitStats split_at_lease_;
 
     // ---------------------------------------------------------------- layer walk (prefill_walk.cpp)
-    // Design §19.3.8 F4: a span of consecutive streamed calls of one prompt runs layer-major (every
+    // Design §13.2: a span of consecutive streamed calls of one prompt runs layer-major (every
     // decoder layer over all of the span's chunks, then the next), so each layer's non-resident
     // experts are streamed once per span instead of once per call. The chunk grid, and with it
     // every output bit, is the chunk-major one. The span's residual stream [S*H, tokens] and each
@@ -6628,7 +6628,7 @@ private:
     // A walk's MoE calls take up to this many columns (several chunks'): at 16,384 tokens the
     // experts run 33-50 % more effective TOPS than at 4,096, and at 32,768 a further 7-14 %
     // (infernix_offloaded_moe_ggml_test --bench; IQ3_S prefill +1.4 % at 32K tokens and +2.5 % at
-    // 64K end to end, design §19.3.29).
+    // 64K end to end, design §13.5).
     static constexpr std::int32_t kWalkMoeColumns = 32768;
 
     [[nodiscard]] std::size_t walk_bytes(std::uint32_t tokens, std::size_t chunks) const noexcept;
@@ -6649,7 +6649,7 @@ private:
     std::unique_ptr<offload::RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
 
-    // ---- prefill CPU split (design §19.3.12) ----
+    // ---- prefill CPU split (design §10.6) ----
     // Gives the CPU the thinnest non-resident experts of a layer while the link carries the rest:
     // narrow ones (n <= 8) in order of n, then expert id, as many as minimise the later of the
     // CPU's predicted time and the link's time for the experts left to it.
@@ -6767,7 +6767,7 @@ private:
     std::array<int, kMaximumConcurrency> ngram_bucket_{};
     // Draft-length policy: acceptance prior and EWMA weight, and the cost of each draft column in
     // plain rounds (warm tg512 on the 5090: W = 3, 4, 5 rounds took 1.84, 2.13 and 2.54 plain
-    // rounds, design 19.2; re-measured 2026-10-10 at 1.61-1.79, 1.89-2.11 and 2.42-2.53 between 8 %
+    // rounds, design 11.4; re-measured 2026-10-10 at 1.61-1.79, 1.89-2.11 and 2.42-2.53 between 8 %
     // and 20 % expert misses, where a miss-rate cost gained no more than it lost; W = 5 and 6 then
     // became 9-17 % cheaper with the one-column expert kernels up to 8 columns, not re-fitted here).
     static constexpr double kAcceptancePrior      = 0.75;
@@ -6801,7 +6801,7 @@ private:
     static constexpr double kCostGapRatio  = 3.0;
     // Two-row rounds: at most 2 drafts per row, each costing kPairWidthCost plain two-row rounds
     // (C = 2 decode on the 5090, AIME prompts sampled: K = 1 and 2 rounds took 1.44 and 1.95 plain
-    // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 19.3.5).
+    // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 11.5).
     static constexpr std::int32_t kPairMaxDrafts = 2;
     // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the
     // same bits whatever the call boundaries (request invariance's resume grid).
@@ -6810,11 +6810,11 @@ private:
     // A one-row round verifies its drafts up to the first whose draft-head probability is below
     // ProgramOptions::draft_min_p, held as its log (-inf at 0: every draft). The 0.5 default is
     // Strata's --spec-min-p rule (C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
-    // acceptance 75.6 -> 81.8 %, repeatable to the decimal; 0.7 gave 142.6; design 19.3.5).
+    // acceptance 75.6 -> 81.8 %, repeatable to the decimal; 0.7 gave 142.6; design 11.4).
     double draft_min_logprob_ = 0.0;
     // Prompt seeding (seed_prompt_experts): the LFRU count an expert gains when every token of the
     // prompt routed to it. Mixed-topic Dense8 decode, credit only: 64 -0.9 %, 256 -1.8 % time, and
-    // replayed decode hits +0.34 / +0.59 / +0.54 points at 64 / 256 / 1,024 (design §19.3.27).
+    // replayed decode hits +0.34 / +0.59 / +0.54 points at 64 / 256 / 1,024 (design §9.2).
     static constexpr double kPromptSeedCredit = 256.0;
     // sampled-mtp-drafts (ProgramOptions::sampled_mtp_drafts) on a token domain the sparse
     // acceptance serves: sampled rows draw their drafts and skip the confidence cut.
@@ -6911,7 +6911,7 @@ private:
     GdnReplayRecords records_;
     std::vector<std::optional<ops::GdnReplayFoldPlan>> folds_;
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> drafts_;
-    // The n-gram gate of verification rounds (design §12.3): the pinned ready word, its last
+    // The n-gram gate of verification rounds (design §12.4): the pinned ready word, its last
     // published value (strictly increasing, never 0) and per-lane device wait statistics.
     PinnedHostBuffer gate_host_{64};
     std::uint32_t gate_sequence_ = 0;

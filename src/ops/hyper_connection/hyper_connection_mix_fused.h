@@ -1,7 +1,7 @@
 #pragma once
 
 // The fused route of hyper_connection_mix (docs/maintainer/qwen3_8-flash-next-design.md §8.3
-// K1a/K1b, §19.3.3 Phase 1b) for Q8_G32_FP16 RowSplit and BF16 contiguous weights. Private to the Op.
+// K1a/K1b) for Q8_G32_FP16 RowSplit and BF16 contiguous weights. Private to the Op.
 
 #include "core/tensor.h"
 #include "core/weight.h"

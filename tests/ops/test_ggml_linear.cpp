@@ -1,5 +1,5 @@
 // ggml_linear, ggml_embedding and ple_embed_iq4_nl against an independent exact oracle
-// (docs/maintainer/qwen3_8-flash-next-design.md §16.2.2).
+// (docs/maintainer/qwen3_8-flash-next-design.md §17.3).
 //
 // Weights are random block bytes (every byte pattern is a valid encoding once the binary16 scales
 // are finite) decoded by this file's own transcription of llama.cpp's dequantize_row_* formulas;

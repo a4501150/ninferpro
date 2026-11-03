@@ -1,5 +1,5 @@
 // The wide route of offloaded_sparse_moe (experts with more than eight columns in a call, design
-// §8.5, §13, §16.1 row "wide") against its FP64 W4A4 oracle.
+// §8.5, §13, §17.1 row "wide") against its FP64 W4A4 oracle.
 //
 // Oracles and criteria (fixed before the first run):
 //   C0  quantize_a4_codes against quantize_a4_block: the same scale word and e2m1_x2(code) == c2
@@ -108,7 +108,7 @@ void test_codes_quantizer() {
 
 // ----------------------------------------------------------------------------------- oracles
 
-// Row `row` of a record matrix (§6.2) decoded: doubled E2M1 values and the scaled E4M3 word.
+// Row `row` of a record matrix (§6.3) decoded: doubled E2M1 values and the scaled E4M3 word.
 struct DecodedRow {
     std::int8_t c2[2560];
     std::int32_t scale[160];
@@ -150,7 +150,7 @@ double bf16_value(std::uint16_t h) { return static_cast<double>(canon::bf16_to_f
 
 std::uint16_t bf16_of_double(double v) { return canon::f32_to_bf16_rn(static_cast<float>(v)); }
 
-// The FP64 chain of §16.2 with BF16 at the semantic boundaries; the final output unrounded.
+// The FP64 chain of §17.2 with BF16 at the semantic boundaries; the final output unrounded.
 std::vector<double> fp64_expert(const fixtures::Expert& e, const std::uint16_t* x) {
     const std::uint8_t* gate_up = e.record.data();
     const std::uint8_t* down    = e.record.data() + moe::kGateUpBytes;
@@ -624,14 +624,14 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
 
 // ------------------------------------------------------------------------------ W4A16 layer
 //
-// The W4A16 routes (§16.2.1; wide_expert_a16.cuh for experts of more than eight columns), criteria
+// The W4A16 routes (§17.3; wide_expert_a16.cuh for experts of more than eight columns), criteria
 // fixed before the first run:
 //   A1  Every entry, wide and narrow: equal to the CPU engine (expert_forward_a16, the exact canonical
 //       arithmetic, qualified against FP64 in test_offloaded_moe_a16_cpu) bit for bit. A column with
 //       `nonfinite` set holds an Inf, so its outputs are the canonical NaN on every route.
 //   A2  Placement invariance: outputs bit-identical for every staging layout, the fork stream,
 //       zero-copy records and a rerun.
-// With `a4_residual` the wide experts take the residual A4 fast path, three terms (design §19.3.23):
+// With `a4_residual` the wide experts take the residual A4 fast path, three terms (design §13.4):
 //   X1  Narrow entries as A1. Each wide entry against the exact canonical arithmetic (the CPU engine):
 //       relative L2 error <= 2^-6, and the mean over the wide entries <= 2^-9. Two terms measured
 //       means of 0.31-0.41 %, which the mean bound rejects; one 4-bit term misses by several
@@ -846,13 +846,13 @@ int main() {
         test_layer("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), {}, 31);
         // A verification-width call: 10 columns at top-10 over 12 experts.
         test_layer("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), {}, 37);
-        // W4A16 (§16.2.1): the same prefill mix, the 9- and 65-column boundaries (one with an Inf in
+        // W4A16 (§17.3): the same prefill mix, the 9- and 65-column boundaries (one with an Inf in
         // a column), and a verification width.
         test_layer_a16("prefill mix", 20, 300, 4, popularity, 41);
         test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43);
         test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47, true);
         test_layer_a16("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), 53);
-        // The residual A4 fast path of the W4A16 wide route (§19.3.23): the same cases.
+        // The residual A4 fast path of the W4A16 wide route (§13.4): the same cases.
         test_layer_a16("prefill mix", 20, 300, 4, popularity, 41, false, true);
         test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43, false, true);
         test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47, true, true);

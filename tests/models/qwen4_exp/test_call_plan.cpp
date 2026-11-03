@@ -1,4 +1,4 @@
-// The prefill call planner of Qwen4Exp's prefix cache (program/prefix/call_plan.h; design §19.3.1,
+// The prefill call planner of Qwen4Exp's prefix cache (program/prefix/call_plan.h; design §15.3,
 // test U2), host only. Checks: the cold grid for F = 0 and the shifted grid after a resume; calls
 // cover [F, n) in order without overlap or gaps and never exceed the chunk; kept exact taps end a
 // call; boundary taps are kept at any cost; an automatic tap is kept when the call it starts is

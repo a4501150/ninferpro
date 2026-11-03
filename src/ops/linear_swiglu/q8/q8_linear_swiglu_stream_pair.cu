@@ -1,5 +1,5 @@
 // Register-streamed Q8 LinearSwiGLU for small T (Qwen3.8-Flash-Next's shared expert, gate/up
-// [1280, 2560] -> [640]; design §19.3.3 Phase 1b). A warp owns output row i: it loads every code and
+// [1280, 2560] -> [640]; design §8.3). A warp owns output row i: it loads every code and
 // scale of gate row i and up row M + i into registers before reading x, then computes both dot
 // products with the K1 lane-chunk order (lane l owns codes k = 8l + 256m, fmaf in k order, a warp
 // butterfly) and writes bf16(SiLU(gate) * up) with gate and up in FP32. A column's result does not

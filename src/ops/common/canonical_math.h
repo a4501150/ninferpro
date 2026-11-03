@@ -1,7 +1,7 @@
 #pragma once
 
 // Canonical routed-expert arithmetic shared by the GPU and CPU routes of offloaded_sparse_moe
-// (design: docs/maintainer/qwen3_8-flash-next-design.md §16.2).
+// (design: docs/maintainer/qwen3_8-flash-next-design.md §17.2).
 //
 // Every function here is part of a bit-exact contract: the CPU and GPU builds of this header must
 // return identical bits for identical inputs. Only IEEE binary32 operations with
@@ -212,7 +212,7 @@ struct A4Block {
     std::int32_t c2_sum;
 };
 
-// ModelOpt's NVFP4 activation rule in exact IEEE binary32 (design §16.2):
+// ModelOpt's NVFP4 activation rule in exact IEEE binary32 (design §17.2):
 //   s = e4m3_rn_satfinite(amax / fl(6 g));  d = fl(e4m3(s) g);  code_j = e2m1_rn_satfinite(v_j / d)
 INFERNIX_CANON_HD A4Block quantize_a4_block(const std::uint16_t* v_bf16, float input_scale) {
     A4Block out{};
@@ -327,7 +327,7 @@ INFERNIX_CANON_HD A4Codes quantize_a4_codes(const std::uint16_t* v_bf16, float i
 
 // ---------------------------------------------------------------------------- A16 (W4A16)
 
-// The W4A16 arithmetic of experts stored without activation scales (design §16.2.1). A BF16 column
+// The W4A16 arithmetic of experts stored without activation scales (design §17.3). A BF16 column
 // v of K elements is encoded once as integers aligned to its largest exponent:
 //   M_j = 128 | mantissa (normal) or mantissa (subnormal),  e_j = max(E_j, 1)
 //   emax = max e_j over the column,  X_j = sign_j * rne(M_j * 2^13 / 2^(emax - e_j))

@@ -1,7 +1,7 @@
 #pragma once
 
 // Streams the Vision tower's weights from their pinned host block through device staging
-// (docs/maintainer/qwen3_8-flash-next-design.md §19.3.2): a prelude region (patch and position
+// (docs/maintainer/qwen3_8-flash-next-design.md §16.5): a prelude region (patch and position
 // embedding), two layer slots refilled one layer ahead of compute, and a merger region. All
 // synchronization is device-side (events); the host never blocks between layers. Shared by
 // Qwen3.5's overlay window and Qwen4Exp's encode window; Program-free.

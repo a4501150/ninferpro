@@ -1,4 +1,4 @@
-// Explicit expert placement (design §19.3.7; --vram-experts / --ram-experts / --expert-placement):
+// Explicit expert placement (design §9.6; --experts / --expert-placement):
 // the placement file's parse and errors, the counts ranking, the export round trip, and the LFRU
 // pinning that keeps a placed set resident (a pinned key is never a victim; admissions stop while
 // only they remain; a shrink they block is refused).
@@ -184,7 +184,7 @@ void test_placement_fits_shape() {
 }
 
 
-// The resident warm fill's window walk (program_impl.h warm_frames; design §19.3.7): the tier's
+// The resident warm fill's window walk (program_impl.h warm_frames; design §9.6): the tier's
 // slots hold a window of the fill order, the frames seed it, the shadows free, and the next
 // window reads the following keys from the artifact. The cursor rule is the regression: it
 // starts past prefill_tier's fill and advances by what each prefill really landed. A fixed span
@@ -287,7 +287,7 @@ void test_refill_batch() {
 
 void expect_spec_error(const std::string& text, const char* why) {
     try {
-        parse_experts_spec(text);
+        static_cast<void>(parse_experts_spec(text));
     } catch (const std::invalid_argument&) { return; }
     require(false, ("the spec should have been rejected: " + std::string(why) + " (" + text + ")").c_str());
 }
@@ -322,7 +322,7 @@ void test_experts_spec() {
     require(experts_spec_counts(parse_experts_spec("vram=100,ram=50"), 1000) == std::pair{std::uint64_t{100}, std::uint64_t{50}},
             "counts pass through");
     try {
-        experts_spec_counts(parse_experts_spec("vram=600,ram=500"), 1000);
+        static_cast<void>(experts_spec_counts(parse_experts_spec("vram=600,ram=500"), 1000));
         require(false, "counts beyond the total are rejected");
     } catch (const std::invalid_argument&) {}
 

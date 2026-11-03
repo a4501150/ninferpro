@@ -1,4 +1,4 @@
-"""Compare the VT6c multimodal wiring dump with the FP64 reference (design §19.3.2).
+"""Compare the VT6c multimodal wiring dump with the FP64 reference (design §16.8).
 
     .venv-convert/bin/python tools/flash_next/vision_oracle.py --model SNAPSHOT --dump OUT_DIR
 

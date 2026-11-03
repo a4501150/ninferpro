@@ -278,7 +278,7 @@ def qwen3_8_27b_nvfp4_orcarouter(model, recipe, sources):
 
 def _flash_next_drafter(model, recipe, experts=Q4):
     """The MTP drafter of both Qwen3.8-Flash-Next recipes. It only proposes tokens that the main
-    model verifies, so its precision changes acceptance, never output (design §11.2). Its
+    model verifies, so its precision changes acceptance, never output (design §11). Its
     projections are ``q8_g32_fp16`` except the router and shared-expert gate (BF16, as NVIDIA stores
     them), and its 512 routed experts, block-FP8 in NVIDIA's checkpoint, ``q4_g64_fp16`` with
     MSE-chosen group scales (1.34 GB, all VRAM-resident; Strata keeps them at 2.25 bits), or
@@ -295,7 +295,7 @@ def _flash_next_drafter(model, recipe, experts=Q4):
 
 
 def qwen3_8_flash_next_nvfp4(model, recipe, sources):
-    """Recipe A of Qwen3.8-Flash-Next (design §6.1): the main model and the vision tower bit-exact to
+    """Recipe A of Qwen3.8-Flash-Next (design §6.2): the main model and the vision tower bit-exact to
     NVIDIA's checkpoint. Every NVIDIA-quantized tensor keeps its codes and scales (the routed
     experts become exact ``nvfp4_mul`` banks in ``nvfp4_expert_rg16_v1`` with each matrix's own
     ModelOpt input scale; the FP8 n-gram table is written to its own volume) and every BF16 or FP32
@@ -322,7 +322,7 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
 
 
 def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
-    """Recipe B of Qwen3.8-Flash-Next (design §6.1): recipe A, plus the dense projection classes
+    """Recipe B of Qwen3.8-Flash-Next (design §6.2): recipe A, plus the dense projection classes
     that dominate per-token weight reads in ``q8_g32_fp16`` (W8A16): the GDN q/k/v/z and output
     projections, the QSA output projection, the shared experts, the hyper-connection mixers, the
     PLE projections and ``lm_head``. ``q8_g32_fp16`` is used for every class rather than FP8 rows: a
@@ -353,7 +353,7 @@ def _flash_next_dense8(model, recipe):
 
 
 def qwen3_8_flash_next_fp8(model, recipe, sources):
-    """Qwen3.8-Flash-Next's official FP8 checkpoint (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25): Qwen's official
+    """Qwen3.8-Flash-Next's official FP8 checkpoint (docs/maintainer/qwen3_8-flash-next-design.md §6.2): Qwen's official
     FP8 checkpoint bit-exact. The routed experts keep their E4M3FN codes and BF16 128 x 128 tile scales
     (``fp8_e4m3fn_b128`` in ``fp8_expert_b128_v1``, run W8A16 with exact arithmetic); every BF16 or
     FP32 tensor keeps its dtype; the n-gram table is the FP8 volume recipes A-C write. Only the MTP
@@ -375,11 +375,11 @@ def qwen3_8_flash_next_fp8(model, recipe, sources):
 
 
 def qwen3_8_flash_next_nvfp4_orcarouter(model, recipe, sources):
-    """Recipe C of Qwen3.8-Flash-Next (design §6.1): orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4,
+    """Recipe C of Qwen3.8-Flash-Next (design §6.2): orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4,
     a weight-only compressed-tensors export of the abliterated model, served with BF16 activations.
 
     Bit-exact where the checkpoint is quantized: the routed experts' NVFP4 codes and block scales (a
-    W4A16 bank, design §16.2.1: the global scale stored as its FP32 reciprocal, no activation scales)
+    W4A16 bank, design §17.3: the global scale stored as its FP32 reciprocal, no activation scales)
     and the row-scaled FP8 GDN, QSA and shared-expert projections (W8A16). Its BF16 classes follow
     recipe B: the hyper-connection mixers, the PLE projections and ``lm_head`` in ``q8_g32_fp16``;
     the router, shared-expert gate, GDN a/b, QSA indexer, embedding and vision tower stay BF16. The
@@ -441,7 +441,7 @@ def qwen3_8_flash_next_nvfp4_orcarouter(model, recipe, sources):
 
 def qwen3_8_flash_next_gsq_rco_iq3s(model, recipe, sources):
     """ISTA-DASLab's GSQ-RCO IQ3_S GGUF of Qwen3.8-Flash-Next, bit-exact
-    (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25). Every GGUF block format is stored verbatim:
+    (docs/maintainer/qwen3_8-flash-next-design.md §6.2). Every GGUF block format is stored verbatim:
     dense matrices of the tiled formats (Q4_K, Q5_K, Q6_K, IQ4_XS) in ``ggml_tiles16_v1`` (the same
     blocks in 16-row tiles, so a tile's block is one contiguous run for the narrow kernels), the
     others and the token embedding (a row gather) in ``ggml_rows_v1``, each in its own per-tensor

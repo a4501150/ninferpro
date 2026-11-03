@@ -1,6 +1,6 @@
 #pragma once
 
-// The host side of CPU-served misses (docs/maintainer/qwen3_8-flash-next-design.md §10.3): a
+// The host side of CPU-served misses (docs/maintainer/moe-offload-design.md §5.4): a
 // service thread watches the mapped request that moe_experts publishes for a layer call, computes
 // the requested experts with the worker team (the service thread is worker 0) from the pinned
 // expert banks, writes the BF16 outputs to mapped memory and answers with the request's sequence.
@@ -44,7 +44,7 @@ public:
         std::vector<int> cpus;   // optional CPU of worker i (worker 0 is the service thread)
         // The arithmetic of every layer's experts; it must equal the calls' MoeExpertSource::activation.
         ExpertActivation activation = ExpertActivation::kA4;
-        // Tiered requests (design §19.3.7): a job without a record pointer is read through `records`
+        // Tiered requests (moe-offload-design.md §4.7): a job without a record pointer is read through `records`
         // (demanded before the other jobs run, computed after them); without a provider, or when a
         // read fails, the request is answered with an errno in the status word. The service keeps its
         // heartbeat word changing while it waits for a record and as its team completes work items,

@@ -1,6 +1,6 @@
 #pragma once
 
-// The ggml-bf16-prefill tiles (docs/maintainer/qwen3_8-flash-next-design.md §19.3.29): BF16 tensor-core
+// The ggml-bf16-prefill tiles (docs/maintainer/qwen3_8-flash-next-design.md §13.5): BF16 tensor-core
 // tiles over decoded GGUF planes (ggml_tile.cuh's CodeStage images, the ones the exact route's tiles
 // read). ops::ggml_linear runs them for wide dense projections (LinearRoutes::GgmlBf16Wide) and the
 // GGUF expert banks for wide jobs (offloaded_moe::WideA16::kGgmlBf16, ggml_expert.cuh).
