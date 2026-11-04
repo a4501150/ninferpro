@@ -1282,9 +1282,9 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
 - A readout of a prompt the prefix cache resumes reads exactly what the same prompt's cold run
   reads on the exact route (`--disable-fast-paths`). On the default fast route a resumed readout
   drifts a little: the resume reuses KV blocks the earlier run computed at another prefill call
-  width, and the fast route's width-keyed arithmetic differs there (up to about 0.5 nats measured;
-  the top token agrees). Read probabilities that must compare across runs with
-  `--disable-fast-paths`.
+  width, and the fast route's width-keyed kernels differ there (up to about 0.6 nats measured) --
+  enough to reorder near-tied candidates, so the top token itself can flip between runs. Read
+  probabilities that must compare across runs with `--disable-fast-paths`.
 
 ## Authentication and CORS
 

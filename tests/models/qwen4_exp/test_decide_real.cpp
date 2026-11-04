@@ -5,7 +5,8 @@
 //   readout      A prompt's readout names its greedy first token and 15 others: the top token is the
 //                one generated, no named token outscores it, and a resumed prompt reads what its cold
 //                run reads -- bit for bit on the exact route (its own engine below), within the fast
-//                route's documented drift (a deep resume reuses KV computed at another call width).
+//                route's documented drift (a deep resume reuses KV computed at another call width,
+//                which can reorder near-tied top candidates).
 //                With INFERNIX_DECIDE_DUMP=DIR the prompt ids and readout are written there for the
 //                FP64 oracle of the gate, which log-softmaxes the forward test's FP32 logits of the
 //                same prompt rounded to BF16.
@@ -108,8 +109,11 @@ infernix::GenerationResult run(infernix::Engine& engine, const std::vector<infer
 // The warm/cold readout comparison over a resumed prefix. On the exact route the resumed prompt
 // must read exactly what its cold run reads (the construction-exact resume keeps every position's
 // bits). On the fast route a deep resume reuses KV that the publishing run computed at another
-// call width, and the width-keyed prefill arithmetic leaves a bounded drift (0.34 nats measured at
-// the 700-token resume of this 512-chunk scenario; /v1/decide documents it).
+// call width, and the width-keyed kernels leave a bounded drift (0.34 nats measured at the
+// 700-token resume of this 512-chunk scenario, 0.53 since the expert route became column-count
+// dependent; /v1/decide documents it). The drift spans this prompt's top candidates (its readout
+// sits about 5.6 nats deep, the cold top two 0.2 nats apart), so the fast route checks the named
+// tokens' and the top's log-probabilities, not the same top token.
 int readout(infernix::Engine& engine, bool dump, double tolerance, const std::string& label) {
     int failures = 0;
     const std::vector<infernix::TokenId> prompt = synthetic_tokens(700, 11);
@@ -158,11 +162,23 @@ int readout(infernix::Engine& engine, bool dump, double tolerance, const std::st
             worst = std::max(worst, std::fabs(static_cast<double>(a.readout->logprobs[i] - b.readout->logprobs[i])));
         }
     }
-    const bool equal = a.readout && b.readout && a.readout->top_token == b.readout->top_token &&
-                       (tolerance > 0.0 ? worst <= tolerance : worst == 0.0);
+    const double top_gap = a.readout && b.readout
+                               ? std::fabs(static_cast<double>(a.readout->top_logprob) -
+                                           static_cast<double>(b.readout->top_logprob))
+                               : 0.0;
+    // Fast route: the drift may reorder near-tied candidates, so the top token itself can flip;
+    // the named tokens' log-probabilities and the two top log-probabilities must stay within the
+    // tolerance. Exact route: bit for bit, the same top token included.
+    const bool equal = a.readout && b.readout &&
+                       (tolerance > 0.0 ? worst <= tolerance && top_gap <= tolerance
+                                        : a.readout->top_token == b.readout->top_token && worst == 0.0);
+    const std::string tops = a.readout && b.readout
+                                 ? ", tops " + std::to_string(a.readout->top_token) + "/" +
+                                       std::to_string(b.readout->top_token)
+                                 : "";
     failures += check(equal, label + (tolerance > 0.0
                                           ? ": resumed equals cold within " + std::to_string(tolerance) +
-                                                " nats (worst " + std::to_string(worst) + ")"
+                                                " nats (worst " + std::to_string(worst) + tops + ")"
                                           : ": resumed equals cold bit for bit (worst " + std::to_string(worst) + ")"));
     return failures;
 }
