@@ -164,6 +164,21 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     const std::uint32_t tree[2] = {
         tokens[0] < live ? causal_tree_mask<Tree>(tree_masks, batch, width, tokens[0]) : ~0u,
         tokens[1] < live ? causal_tree_mask<Tree>(tree_masks, batch, width, tokens[1]) : ~0u};
+    // The K and V fragments' shared addresses. causal_swizzle XORs a row's 16-byte chunk with row & 7, which in every
+    // fragment this lane loads is lane & 7: an address is a per-lane register (the XOR's result for the chunk's low
+    // three bits) plus a compile-time offset (the row block and chunk >> 3). No fragment load computes its address, and
+    // few registers stay live across the tile (the computed form kept dozens, and spilled them: up to 30 stores and
+    // loads a tile). Instances that never spilled and measured slower in this form (their fragment loads sat right
+    // before their MMAs, where the address arithmetic had hidden the shared-memory latency): on two-KV-head
+    // geometries the fused append when masked (verification) or 32 rows wide. They keep the computed addresses and
+    // one K fragment a load. Upstream keeps the lane-address form for the 32-row multibatch append there; this
+    // build's sm_120a SASS spills 8-24 bytes in exactly those instances (their timings are level with it: the
+    // multibatch sweep shows no gain), so they keep the computed addresses too.
+    constexpr bool LaneAddresses =
+        !(G::KVHeads == 2 && Input::writes_cache && (M == 32 || (!MultiBatch && Masked)));
+    const unsigned swizzle = lane & 7, upper = (lane >> 3) & 1;
+    const unsigned k_lane  = (warp_kv * NK + (lane >> 4) * 8 + swizzle) * (2 * D);
+    const unsigned v_lane  = (warp_kv * NK + upper * 8 + swizzle) * (2 * D);
     int page_window = -Storage::kPageWindow;
     for (int k0 = start; k0 < end; k0 += N) {
         const int logical_page = k0 >> kPagedKVPageShift;
@@ -182,18 +197,42 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         cp_wait<0>();
         __syncthreads();
         float score[QKNt][4] = {};
-        // Q and O already occupy 192 registers per lane at D=256. Keep one
-        // K fragment live at a time; double buffering all N fragments spills.
+        // One ldmatrix x4 a k step and pair of key blocks: K rows warp_kv * NK + p * 16 + (lane >> 4) * 8 + lane & 7,
+        // chunk 2 k + upper, at kq[k & 3] + p * 16 rows + 128 * (k >> 2) bytes; its registers 0-1 are block 2 p's
+        // fragment, 2-3 block 2 p + 1's. Each score block still sums its k steps in order (the bits are unchanged).
+        const unsigned k_tile = smem_addr(k_s) + k_lane;
+        unsigned kq[4];
 #pragma unroll
-        for (int n = 0; n < QKNt; ++n) {
+        for (int q = 0; q < 4; ++q) kq[q] = k_tile + 16 * ((2 * q + upper) ^ swizzle);
+        // Q and O already occupy 192 registers per lane at D=256. Keep one
+        // K fragment (pair) live at a time; double buffering all N fragments spills.
+        if constexpr (LaneAddresses) {
 #pragma unroll
             for (int k = 0; k < QKKs; ++k) {
-                unsigned bf[2];
-                const int row = warp_kv * NK + n * 8 + (lane & 7);
-                const int d   = k * 16 + ((lane >> 3) & 1) * 8;
-                ldmatrix_x2(bf[0], bf[1], smem_addr(k_s + row * D + causal_swizzle(row, d)));
-                mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], q_frag[k][0],
-                         q_frag[k][1], q_frag[k][2], q_frag[k][3], bf[0], bf[1]);
+#pragma unroll
+                for (int p = 0; p < QKNt / 2; ++p) {
+                    unsigned bf[4];
+                    ldmatrix_x4(bf[0], bf[1], bf[2], bf[3],
+                                kq[k & 3] + p * (16 * 2 * D) + 128 * (k >> 2));
+                    mma_bf16(score[2 * p][0], score[2 * p][1], score[2 * p][2], score[2 * p][3],
+                             q_frag[k][0], q_frag[k][1], q_frag[k][2], q_frag[k][3], bf[0], bf[1]);
+                    mma_bf16(score[2 * p + 1][0], score[2 * p + 1][1], score[2 * p + 1][2],
+                             score[2 * p + 1][3], q_frag[k][0], q_frag[k][1], q_frag[k][2],
+                             q_frag[k][3], bf[2], bf[3]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int n = 0; n < QKNt; ++n) {
+#pragma unroll
+                for (int k = 0; k < QKKs; ++k) {
+                    unsigned bf[2];
+                    const int row = warp_kv * NK + n * 8 + (lane & 7);
+                    const int d   = k * 16 + ((lane >> 3) & 1) * 8;
+                    ldmatrix_x2(bf[0], bf[1], smem_addr(k_s + row * D + causal_swizzle(row, d)));
+                    mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], q_frag[k][0],
+                             q_frag[k][1], q_frag[k][2], q_frag[k][3], bf[0], bf[1]);
+                }
             }
         }
         float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};
@@ -235,13 +274,17 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         // Batched and read-only wide tiles benefit from paired V loads. Single-row
         // fused append uses scalar fragments to leave room for its input state.
         if constexpr (S::kWarpsQ >= 4 && (MultiBatch || !Input::writes_cache)) {
+            // V rows warp_kv * NK + k * 16 + upper * 8 + lane & 7, chunk n + (lane >> 4) (n even):
+            // vp[(n & 7) >> 1] + k * 16 rows + 128 * (n >> 3) bytes.
+            const unsigned v_tile = smem_addr(v_s) + v_lane, pair = lane >> 4;
+            unsigned vp[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) vp[q] = v_tile + 16 * ((2 * q + pair) ^ swizzle);
             unsigned vf[2][4];
             const auto load_v = [&](int i, int slot) {
                 const int k = i / (PVNt / 2), n = i % (PVNt / 2) * 2;
-                const int row = warp_kv * NK + k * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-                const int d   = n * 8 + (lane >> 4) * 8;
                 ldmatrix_x4_t(vf[slot][0], vf[slot][1], vf[slot][2], vf[slot][3],
-                              smem_addr(v_s + row * D + causal_swizzle(row, d)));
+                              vp[(n & 7) >> 1] + k * (16 * 2 * D) + 128 * (n >> 3));
             };
             load_v(0, 0);
 #pragma unroll
@@ -254,15 +297,24 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                         pf[k][1], pf[k][2], pf[k][3], vf[slot][2], vf[slot][3]);
             }
         } else {
-            // Limit live V fragments too; the grouped path is bandwidth-bound.
+            // Limit live V fragments too; the grouped path is bandwidth-bound. V rows as above, chunk n:
+            // vq[n & 7] + k * 16 rows + 128 * (n >> 3) bytes.
+            const unsigned v_tile = smem_addr(v_s) + v_lane;
+            unsigned vq[8];
+#pragma unroll
+            for (int q = 0; q < 8; ++q) vq[q] = v_tile + 16 * (q ^ swizzle);
 #pragma unroll
             for (int n = 0; n < PVNt; ++n) {
 #pragma unroll
                 for (int k = 0; k < PVKs; ++k) {
                     unsigned vf[2];
-                    const int row = warp_kv * NK + k * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-                    const int d   = n * 8;
-                    ldmatrix_x2_t(vf[0], vf[1], smem_addr(v_s + row * D + causal_swizzle(row, d)));
+                    if constexpr (LaneAddresses) {
+                        ldmatrix_x2_t(vf[0], vf[1], vq[n & 7] + k * (16 * 2 * D) + 128 * (n >> 3));
+                    } else {
+                        const int row = warp_kv * NK + k * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+                        ldmatrix_x2_t(vf[0], vf[1],
+                                      smem_addr(v_s + row * D + causal_swizzle(row, n * 8)));
+                    }
                     mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[k][0], pf[k][1],
                             pf[k][2], pf[k][3], vf[0], vf[1]);
                 }
