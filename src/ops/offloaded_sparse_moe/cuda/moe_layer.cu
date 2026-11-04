@@ -1014,9 +1014,11 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
 // Experts stored without activation scales: x and h are encoded per column (canon::a16_value) and
 // every product is three dp4a (signed codes times the unsigned lo and mid bytes and the signed hi
 // bytes of X), so P_b and the int64 row sums are the CPU engine's bit for bit. Gate/up CTAs write
-// h in BF16 to the entry's row of the workspace's h rows (wide_expert.h); down CTAs encode it under
-// its own column exponent. A call of at most kA16RowsMaxColumns columns runs these kernels; a wider
-// call's narrow jobs run the tensor-core kernels of narrow_a16_mma.cuh (included below).
+// h in BF16 to the entry's row of the workspace's h rows (wide_expert.h) and count themselves
+// into their job's gate/up CTA count; each down CTA encodes the column under its own exponent
+// once that count is complete (wait_job_h), not after the whole gate/up grid. A call of at most
+// kA16RowsMaxColumns columns runs these kernels; a wider call's narrow jobs run the tensor-core
+// kernels of narrow_a16_mma.cuh (included below).
 
 // An encoded A16 block in the layout the dp4a loop reads: four elements' bytes per word.
 struct A16Act {
@@ -1071,9 +1073,14 @@ __device__ __forceinline__ A16Act a16_encode_block(const unsigned (&words)[8], i
 }
 
 __global__ void __launch_bounds__(kEncodeActsThreads)
-    encode_x_acts_kernel(const bf16* __restrict__ x, A16Act* __restrict__ acts, std::int32_t* __restrict__ emax) {
+    encode_x_acts_kernel(const bf16* __restrict__ x, int columns, A16Act* __restrict__ acts,
+                          std::int32_t* __restrict__ emax, std::uint32_t* __restrict__ job_ctas, int max_jobs) {
     __shared__ unsigned keys[kEncodeActsThreads / 32];
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
+    if (t == columns) { // the rows route's per-job gate/up CTA counts, cleared once per call
+        for (int j = b; j < max_jobs; j += kEncodeActsThreads) { job_ctas[j] = 0U; }
+        return;
+    }
     const auto* src = reinterpret_cast<const uint4*>(reinterpret_cast<const std::uint16_t*>(x) +
                                                      static_cast<std::size_t>(t) * moe::kHidden + 16 * b);
     const uint4 v0 = src[0], v1 = src[1];
@@ -1089,9 +1096,11 @@ __global__ void __launch_bounds__(kEncodeActsThreads)
     if (b == 0) { emax[t] = e; }
 }
 
-void launch_encode_x_acts(const Tensor& x, const moe::wide::ExpertsWorkspace& layout, cudaStream_t stream) {
-    encode_x_acts_kernel<<<static_cast<unsigned>(x.ne[1]), kEncodeActsThreads, 0, stream>>>(
-        static_cast<const bf16*>(x.data), reinterpret_cast<A16Act*>(layout.x_acts), layout.x_acts_emax);
+void launch_encode_x_acts(const Tensor& x, std::int32_t max_jobs, const moe::wide::ExpertsWorkspace& layout,
+                          cudaStream_t stream) {
+    encode_x_acts_kernel<<<static_cast<unsigned>(x.ne[1]) + 1, kEncodeActsThreads, 0, stream>>>(
+        static_cast<const bf16*>(x.data), static_cast<int>(x.ne[1]), reinterpret_cast<A16Act*>(layout.x_acts),
+        layout.x_acts_emax, layout.job_ctas, static_cast<int>(max_jobs));
     check_launch("A16 encode x");
 }
 
@@ -1188,10 +1197,12 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
                             const std::uint8_t* const* __restrict__ job_records,
                             const std::int32_t* __restrict__ cpu_flags, int job_base,
                             const A16Act* __restrict__ x_acts, const std::int32_t* __restrict__ x_emax,
-                            std::uint16_t* __restrict__ h_plane, PassPhase phase) {
+                            std::uint16_t* __restrict__ h_plane, std::uint32_t* __restrict__ job_ctas,
+                            bool count_elements, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm = *reinterpret_cast<GateUpRowShared16*>(smem_raw);
-    // The down pass (a programmatic dependent in captured graphs) reads only h_plane after its wait.
+    // The down pass (a programmatic dependent in captured graphs) may launch and load its weights
+    // now: it reads h only after its job's count below is complete.
     pdl::trigger_dependents();
     const int job = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
@@ -1232,8 +1243,30 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
             const int k = threadIdx.x;
             h_plane[static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements + 8 * g + k] =
                 canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
+            if (count_elements) {
+                // Count the element for the job's down CTAs (wait_job_h): fire-and-forget, so no
+                // CTA waits on the count, and the release orders this thread's h store before it.
+                // Eight per column and row group, one per h element, so every store is covered
+                // without a barrier.
+                asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(job_ctas + job) : "memory");
+            }
         }
     }
+}
+
+// A down CTA's per-job wait. The gate/up pass's CTAs count every h element they store with a
+// fire-and-forget release (gate_up_rows_kernel_a16), so polling the job's count with acquire
+// loads until all `target` elements have been counted synchronizes with all their h stores. It
+// replaces the grid-wide PDL wait: a job's down CTAs proceed as soon as that job's h is complete,
+// while other jobs' gate/up CTAs still run, and this grid's completion still implies the gate/up
+// pass's writes — every job a down CTA served was fully counted before it proceeded.
+__device__ __forceinline__ void wait_job_h(const std::uint32_t* count, unsigned target) {
+    unsigned v;
+    do {
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(count) : "memory");
+        if (v >= target) { break; }
+        __nanosleep(64);
+    } while (true);
 }
 
 // The down pass's column encode: encode_a16_columns' exponent and blocks for one h row of
@@ -1296,12 +1329,17 @@ struct DownRowShared16 {
 };
 
 // One CTA per (4 down row groups, job): warps 2r and 2r + 1 take row group 4 * tile + r, blocks
-// 0..19 and 20..39. A programmatic dependent of the gate/up pass under down_kernel's contract: the
-// weights are read before the wait, h_plane only after it, and every CTA waits.
+// 0..19 and 20..39. A programmatic dependent of the gate/up pass: the dispatch, the job records,
+// the frames and the weights are read before the wait, h_plane only after it. In a call of at
+// most kA16PerJobWaitColumns columns the wait is the job's own element count (wait_job_h), not
+// the grid-wide PDL wait — a job's down CTAs proceed as soon as that job's h is complete, while
+// the other jobs' gate/up CTAs still run — because there the earlier start measured faster; in a
+// wider call both passes contend for the same DRAM and the whole-grid wait measured faster.
 __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
     down_rows_kernel_a16(MoeDispatch dispatch, MoeExpertSource source, int hidden,
                          const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
-                         int job_base, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs,
+                         int job_base, const std::uint16_t* __restrict__ h_plane,
+                         const std::uint32_t* __restrict__ job_ctas, bool per_job_wait, bf16* __restrict__ outputs,
                          PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm       = *reinterpret_cast<DownRowShared16*>(smem_raw);
@@ -1327,8 +1365,16 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
         load_warp_units(record + moe::kGateUpBytes + static_cast<std::size_t>(group) * moe::kDownBlocks * moe::kUnitBytes,
                         base, 1, w);
     }
-    pdl::wait_for_dependencies();
-    if (record == nullptr) { return; }
+    if (per_job_wait) {
+        if (record == nullptr) { return; }
+        if (threadIdx.x == 0) {
+            wait_job_h(job_ctas + job, 8U * moe::kGateUpRowGroups * static_cast<unsigned>(count));
+        }
+        __syncthreads();
+    } else {
+        pdl::wait_for_dependencies();
+        if (record == nullptr) { return; }
+    }
     for (int c = 0; c < count; ++c) {
         __syncthreads();
         encode_a16_h(h_plane + static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements, sm.acts, sm.emax,
@@ -1352,16 +1398,17 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
 
 void launch_expert_pass_a16_rows(const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
-                                 const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream,
-                                 PassPhase phase) {
+                                 const moe::wide::ExpertsWorkspace& layout, bool per_job_wait, bf16* outputs,
+                                 cudaStream_t stream, PassPhase phase) {
     auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.h_rows);
     gate_up_rows_kernel_a16<<<dim3(moe::kGateUpRowGroups, jobs), kThreads, sizeof(GateUpRowShared16), stream>>>(
         dispatch, source, top_k, job_records, flags, base, reinterpret_cast<const A16Act*>(layout.x_acts),
-        layout.x_acts_emax, h_plane, phase);
+        layout.x_acts_emax, h_plane, layout.job_ctas, per_job_wait, phase);
     check_launch("A16 gate/up rows");
     CUDA_CHECK(pdl::launch_consumer({dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownRowShared16), stream},
                                     down_rows_kernel_a16, dispatch, source, static_cast<int>(moe::kHidden), job_records,
-                                    flags, base, static_cast<const std::uint16_t*>(h_plane), outputs, phase));
+                                    flags, base, static_cast<const std::uint16_t*>(h_plane),
+                                    static_cast<const std::uint32_t*>(layout.job_ctas), per_job_wait, outputs, phase));
 }
 
 // The dp4a rows kernels' call width. Calls of at most this many columns stay on them: the
@@ -1374,6 +1421,13 @@ void launch_expert_pass_a16_rows(const MoeDispatch& dispatch, const MoeExpertSou
 // run, so the boundary sits below the first width where the tensor-core kernels win outside
 // that wobble). The boundary table is in the commit message.
 constexpr int kA16RowsMaxColumns = 128;
+
+// Calls of at most this many columns release the down pass per job (wait_job_h, the gate/up
+// pass's per-element counts) instead of by the grid-wide PDL wait. Through this width the earlier
+// per-job start measured faster (T1, RTX PRO 6000, 2026-11-04: 1x1 -0.7 %, 1x4 -1.7 %, 6x1
+// -1.0 %, 1x8 -1.0 %); at 12 columns the two measured level, and at 18 the grid-wide wait won by
+// 0.8 % — the down pass's earlier compute contends with the still-running gate/up CTAs for DRAM.
+constexpr int kA16PerJobWaitColumns = 8;
 static_assert(kA16RowsMaxColumns >= kRouteDispatchColumns,
               "the in-place route plan's fused kernel encodes the dp4a x at its whole width");
 
@@ -1404,8 +1458,8 @@ void launch_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSour
     }
     if (source.activation == moe::ExpertActivation::kA16) {
         if (columns <= kA16RowsMaxColumns) {
-            launch_expert_pass_a16_rows(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,
-                                        stream, phase);
+            launch_expert_pass_a16_rows(dispatch, source, top_k, job_records, flags, base, jobs, layout,
+                                        columns <= kA16PerJobWaitColumns, outputs, stream, phase);
         } else {
             launch_expert_pass_a16_nmma(columns, dispatch, source, top_k, job_records, flags, base, jobs, layout,
                                         outputs, stream, phase);
@@ -1702,7 +1756,8 @@ __global__ void __launch_bounds__(kDispatchThreads)
                                   float* __restrict__ shared_gate, MoeDispatch dispatch,
                                   std::int32_t* __restrict__ route_log, MoeExpertSource source,
                                   const bf16* __restrict__ x, int max_jobs, const std::uint8_t** __restrict__ job_records,
-                                  A16Act* __restrict__ acts, std::int32_t* __restrict__ emax) {
+                                  A16Act* __restrict__ acts, std::int32_t* __restrict__ emax,
+                                  std::uint32_t* __restrict__ job_ctas) {
     __shared__ std::int32_t count[kDispatchThreads];
     __shared__ std::int32_t cursor[kDispatchThreads];
     __shared__ std::int32_t routed[kDispatchThreads];
@@ -1729,6 +1784,8 @@ __global__ void __launch_bounds__(kDispatchThreads)
         return;
     }
     count[i] = 0;
+    // The dp4a pass's per-job gate/up CTA counts, cleared once per call (CTA 0, before the pass).
+    for (int j = i; j < max_jobs; j += kDispatchThreads) { job_ctas[j] = 0U; }
     // Thread e reads expert e's frame and slot while the warps route.
     const int frame = i < experts ? source.frames[i] : -1;
     const int slot  = i < experts && source.prefetched != nullptr ? source.prefetched[i] : -1;
@@ -2110,7 +2167,7 @@ void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_
     if (ggml_bank(source)) {
         launch_encode_x_ggml(x, layout, stream);
     } else if (x.ne[1] <= static_cast<std::int64_t>(kA16RowsMaxColumns)) {
-        launch_encode_x_acts(x, layout, stream);
+        launch_encode_x_acts(x, max_jobs, layout, stream);
     } else {
         launch_prepare_a16_nmma(x, static_cast<int>(max_jobs), layout, stream);
     }
@@ -2169,7 +2226,7 @@ MoeRoutePlan moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, M
                                         static_cast<float*>(routing.shared_gate.data), dispatch, route_log, source,
                                         static_cast<const bf16*>(x.data), static_cast<int>(max_jobs),
                                         layout.job_records, reinterpret_cast<A16Act*>(layout.x_acts),
-                                        layout.x_acts_emax));
+                                        layout.x_acts_emax, layout.job_ctas));
         return MoeRoutePlan::InPlace;
     }
     if (!cpu_served(x, source) || !small) {
