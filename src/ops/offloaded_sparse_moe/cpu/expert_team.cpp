@@ -77,6 +77,8 @@ CpuExpertTeam::CpuExpertTeam(Options options)
         x_up_.resize(xs_index(max_jobs_, 0));
         h_.resize(h_index(max_jobs_, 0));
     }
+    round_columns_.reserve(static_cast<std::size_t>(max_jobs_) * kMaxColumns);
+    a4_x_columns_.reserve(static_cast<std::size_t>(max_jobs_) * kMaxColumns * 2);
     threads_.reserve(static_cast<std::size_t>(workers_ - 1));
     for (int w = 1; w < workers_; ++w) {
         const int cpu = w < static_cast<int>(options.cpus.size()) ? options.cpus[static_cast<std::size_t>(w)] : -1;
@@ -116,12 +118,12 @@ void CpuExpertTeam::work_a16(int w) {
     // Phase 0: x encoded in slices of a column's blocks. Every slice derives the column exponent
     // itself (a 2,560-element scan), so no slice waits for another; slice 0 stores it.
     constexpr int kSlices = 8, kSliceBlocks = kGateUpBlocks / kSlices;
-    const int encode_items = n_jobs * kMaxColumns * kSlices;
+    const int encode_items = static_cast<int>(round_columns_.size()) * kSlices;
     for (int i = next_quantize_.fetch_add(1, std::memory_order_relaxed); i < encode_items;
          i = next_quantize_.fetch_add(1, std::memory_order_relaxed)) {
-        const int slice = i % kSlices, j = i / (kSlices * kMaxColumns), c = (i / kSlices) % kMaxColumns;
+        const int slice = i % kSlices, packed = round_columns_[static_cast<std::size_t>(i / kSlices)];
+        const int j = packed / kMaxColumns, c = packed % kMaxColumns;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
-        if (c >= job.ncols) { continue; }
         const int emax = canon::a16_column_exponent(job.x[c], kHidden);
         if (slice == 0) { x_exp_[column(j, c)] = emax; }
         encode_a16_blocks(job.x[c], emax, slice * kSliceBlocks, (slice + 1) * kSliceBlocks, &x16_[xs_index(j, c)]);
@@ -146,11 +148,11 @@ void CpuExpertTeam::work_a16(int w) {
     }
     barrier();
     // Phase A': each column's h encoded under its exponent.
-    const int h_items = n_jobs * kMaxColumns;
+    const int h_items = static_cast<int>(round_columns_.size());
     for (int i = next_encode_h_.fetch_add(1, std::memory_order_relaxed); i < h_items;
          i = next_encode_h_.fetch_add(1, std::memory_order_relaxed)) {
-        const int j = i / kMaxColumns, c = i % kMaxColumns;
-        if (c >= jobs_[static_cast<std::size_t>(j)].ncols) { continue; }
+        const int packed = round_columns_[static_cast<std::size_t>(i)];
+        const int j = packed / kMaxColumns, c = packed % kMaxColumns;
         h_exp_[column(j, c)] = encode_a16(&hv_[column(j, c) * kIntermediate], kIntermediate, &h16_[h_index(j, c)]);
         beat(w);
     }
@@ -240,13 +242,12 @@ void CpuExpertTeam::work(int w) {
     // other workers wait at the barrier. Blocks quantize independently, so slicing changes no bit.
     constexpr int kSlices = 8, kSliceBlocks = kGateUpBlocks / kSlices;
     static_assert(kGateUpBlocks % kSlices == 0);
-    const int quantize_items = n_jobs * kMaxColumns * 2 * kSlices;
+    const int quantize_items = static_cast<int>(a4_x_columns_.size()) * kSlices;
     for (int i = next_quantize_.fetch_add(1, std::memory_order_relaxed); i < quantize_items;
          i = next_quantize_.fetch_add(1, std::memory_order_relaxed)) {
-        const int slice = i % kSlices, column_item = i / kSlices;
+        const int slice = i % kSlices, column_item = a4_x_columns_[static_cast<std::size_t>(i / kSlices)];
         const int j = column_item / (kMaxColumns * 2), c = (column_item / 2) % kMaxColumns, up = column_item % 2;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
-        if (c >= job.ncols || (up && job.scales.input_gate == job.scales.input_up)) { continue; }
         const std::uint16_t* x = job.x[c] + static_cast<std::size_t>(slice) * kSliceBlocks * 16;
         const std::size_t first = xs_index(j, c) + static_cast<std::size_t>(slice) * kSliceBlocks;
         if (up) {
@@ -322,6 +323,20 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat h
     }
     jobs_      = jobs;
     heartbeat_ = heartbeat;
+    if (!ggml) { // the NVFP4 rounds' real columns, published by the epoch below (capacity reserved: no
+                 // allocation here); the GGUF rounds' per-column phases walk every job's slots
+        round_columns_.clear();
+        a4_x_columns_.clear();
+        for (std::size_t j = 0; j < jobs.size(); ++j) {
+            const bool up = jobs[j].scales.input_up != jobs[j].scales.input_gate;
+            for (int c = 0; c < jobs[j].ncols; ++c) {
+                const auto packed = static_cast<std::int32_t>(j * kMaxColumns + static_cast<std::size_t>(c));
+                round_columns_.push_back(packed);
+                a4_x_columns_.push_back(2 * packed);
+                if (up) { a4_x_columns_.push_back(2 * packed + 1); }
+            }
+        }
+    }
     finished_.store(0, std::memory_order_relaxed);
     next_quantize_.store(0, std::memory_order_relaxed);
     next_unit_.store(0, std::memory_order_relaxed);

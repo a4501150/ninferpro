@@ -225,6 +225,81 @@ INFERNIX_AVX2_ROW_SUMS(row_sums_avxvnni, dot4_avxvnni)
 
 #undef INFERNIX_AVX2_ROW_SUMS
 
+// --------------------------------------------------------------- AVX2 canonical functions
+// canonical_math.h's exp_c, silu_c and f32_to_bf16_rn on eight lanes: the same IEEE operations in
+// the same order (vdivps, vaddps and vmulps round like the scalar operations, and vfmadd once like
+// std::fmaf), so every lane equals the scalar function bit for bit, NaN lanes included. Every
+// vector ISA here has AVX2 with FMA (detect_features).
+
+INFERNIX_TARGET("avx2")
+inline __m256 bf16x8_to_f32(const std::uint16_t* p) {
+    const __m256i w = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    return _mm256_castsi256_ps(_mm256_slli_epi32(w, 16));
+}
+
+INFERNIX_TARGET("avx2")
+inline __m256 canonical_nan8() { return _mm256_castsi256_ps(_mm256_set1_epi32(static_cast<int>(canon::kCanonicalNan))); }
+
+INFERNIX_TARGET("avx2,fma")
+inline __m256 exp_c_avx2(__m256 x) {
+    const __m256 magic = _mm256_set1_ps(12582912.0F);
+    const __m256 n  = _mm256_sub_ps(_mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269502162933349609375F)), magic), magic);
+    const __m256 r0 = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693145751953125F), x); // fma(-n, c, x)
+    const __m256 r  = _mm256_fnmadd_ps(n, _mm256_set1_ps(1.428606765330187045e-06F), r0);
+    __m256 p = _mm256_set1_ps(1.0F / 5040.0F);
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F / 720.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F / 120.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F / 24.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F / 6.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F));
+    // 2^n in two exact steps; k / 2 truncates toward zero like the scalar division. Lanes outside the
+    // range below hold garbage here and take their special value at the end.
+    const __m256i k  = _mm256_cvttps_epi32(n);
+    const __m256i k1 = _mm256_srai_epi32(_mm256_add_epi32(k, _mm256_srli_epi32(k, 31)), 1);
+    const __m256i k2 = _mm256_sub_epi32(k, k1);
+    const __m256i bias = _mm256_set1_epi32(127);
+    const __m256 s1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(k1, bias), 23));
+    const __m256 s2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(k2, bias), 23));
+    __m256 y = _mm256_mul_ps(_mm256_mul_ps(p, s1), s2);
+    y = _mm256_blendv_ps(y, _mm256_castsi256_ps(_mm256_set1_epi32(0x7F800000)),
+                         _mm256_cmp_ps(x, _mm256_set1_ps(88.72283935546875F), _CMP_GT_OQ));
+    y = _mm256_blendv_ps(y, _mm256_setzero_ps(), _mm256_cmp_ps(x, _mm256_set1_ps(-103.97208404541015625F), _CMP_LT_OQ));
+    return _mm256_blendv_ps(y, canonical_nan8(), _mm256_cmp_ps(x, x, _CMP_UNORD_Q));
+}
+
+// silu_c: g >= 0 takes g / (1 + exp_c(-g)), else (g e) / (1 + e) with e = exp_c(g).
+INFERNIX_TARGET("avx2,fma")
+inline __m256 silu_c_avx2(__m256 g) {
+    const __m256 nonneg = _mm256_cmp_ps(g, _mm256_setzero_ps(), _CMP_GE_OQ);
+    const __m256 e      = exp_c_avx2(_mm256_blendv_ps(g, _mm256_xor_ps(g, _mm256_set1_ps(-0.0F)), nonneg));
+    const __m256 num    = _mm256_blendv_ps(_mm256_mul_ps(g, e), g, nonneg);
+    const __m256 r      = _mm256_div_ps(num, _mm256_add_ps(_mm256_set1_ps(1.0F), e));
+    return _mm256_blendv_ps(r, canonical_nan8(), _mm256_cmp_ps(r, r, _CMP_UNORD_Q));
+}
+
+// f32_to_bf16_rn, the BF16 word in each 32-bit lane.
+INFERNIX_TARGET("avx2")
+inline __m256i f32_to_bf16_rn_avx2(__m256 x) {
+    const __m256i u   = _mm256_castps_si256(x);
+    const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(u, 16), _mm256_set1_epi32(1));
+    const __m256i r   = _mm256_srli_epi32(_mm256_add_epi32(_mm256_add_epi32(u, _mm256_set1_epi32(0x7FFF)), lsb), 16);
+    return _mm256_blendv_epi8(r, _mm256_set1_epi32(0x7FC0), _mm256_castps_si256(_mm256_cmp_ps(x, x, _CMP_UNORD_Q)));
+}
+
+INFERNIX_TARGET("avx2,fma")
+int swiglu_avx2(const std::uint16_t* g, const std::uint16_t* u, int n, std::uint16_t* h) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256i w = f32_to_bf16_rn_avx2(_mm256_mul_ps(silu_c_avx2(bf16x8_to_f32(g + i)), bf16x8_to_f32(u + i)));
+        // Words 0..3 and 4..7 sit in quads 0 and 2 after the in-lane pack.
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(h + i),
+                         _mm256_castsi256_si128(_mm256_permute4x64_epi64(_mm256_packus_epi32(w, w), 0x08)));
+    }
+    return i;
+}
+
 #define INFERNIX_MOE_DISPATCH(CALL)                                                                   \
     switch (ncols) {                                                                                \
     case 1: CALL(1); break;                                                                         \
@@ -354,6 +429,18 @@ void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_be
 
 void quantize_a4(const std::uint16_t* v, int n, float input_scale, canon::A4Block* out) {
     for (int b = 0; b < n / 16; ++b) { out[b] = canon::quantize_a4_block(v + 16 * b, input_scale); }
+}
+
+// SwiGLU over n elements (a unit's gate and up columns): the AVX2 canonical functions on every
+// vector ISA, canon::swiglu_bf16 element for element on the scalar ISA and the tail.
+void swiglu_bf16_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, int n, std::uint16_t* h) {
+    int i = 0;
+#if defined(INFERNIX_MOE_X86)
+    if (isa != CpuIsa::kScalar) { i = swiglu_avx2(g, u, n, h); }
+#else
+    (void)isa;
+#endif
+    for (; i < n; ++i) { h[i] = canon::swiglu_bf16(g[i], u[i]); }
 }
 
 void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,

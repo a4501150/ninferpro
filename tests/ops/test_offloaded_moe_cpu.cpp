@@ -223,6 +223,34 @@ void test_quantizer() {
     check(s.scale_word == 0x7E && s.c2[0] == -12 && s.c2[1] == 12, "saturating block");
 }
 
+// The vector form of SwiGLU against the scalar canonical function, bit for bit: exhaustive over
+// BF16 gates for a set of up values (zeros, infinities, NaN, subnormals, ±1, random), over a
+// length that leaves a scalar tail.
+void test_vector_canon() {
+    const moe::CpuIsa isa = moe::best_cpu_isa();
+    if (isa == moe::CpuIsa::kScalar) {
+        std::printf("vector canonical functions: no vector ISA on this host (skipped)\n");
+        return;
+    }
+    std::mt19937 rng(11);
+    std::vector<std::uint16_t> g(65536), u(65536), h(65536);
+    for (std::uint32_t i = 0; i < 65536; ++i) { g[i] = static_cast<std::uint16_t>(i); }
+    std::vector<std::uint16_t> ups = {0x0000, 0x8000, 0x3F80, 0xBF80, 0x7F80, 0xFF80, 0x7FC0, 0xFFC1, 0x0001, 0x8001, 0x7F7F};
+    while (ups.size() < 64) { ups.push_back(static_cast<std::uint16_t>(rng())); }
+    long bad = 0;
+    for (const std::uint16_t up : ups) {
+        std::fill(u.begin(), u.end(), up);
+        moe::swiglu_bf16_n(isa, g.data(), u.data(), 65536, h.data());
+        for (std::uint32_t i = 0; i < 65536; ++i) { bad += h[i] != canon::swiglu_bf16(g[i], up); }
+    }
+    for (int it = 0; it < 16; ++it) {
+        for (std::uint32_t i = 0; i < 65536; ++i) { u[i] = static_cast<std::uint16_t>(rng()); }
+        moe::swiglu_bf16_n(isa, g.data(), u.data(), 65531, h.data()); // a scalar tail of 3
+        for (std::uint32_t i = 0; i < 65531; ++i) { bad += h[i] != canon::swiglu_bf16(g[i], u[i]); }
+    }
+    check(bad == 0, "vector SwiGLU equals canon::swiglu_bf16");
+}
+
 // ---------------------------------------------------------------------------- experts
 
 std::vector<std::uint16_t> run(moe::CpuIsa isa, const Expert& e, const std::vector<std::uint16_t>& x, int ncols) {
@@ -406,6 +434,7 @@ int main() {
     test_bf16_round();
     test_exp_silu();
     test_quantizer();
+    test_vector_canon();
     test_isa_equality();
     test_split_invariance();
     test_fp64_oracle();

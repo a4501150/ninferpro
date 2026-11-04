@@ -100,6 +100,12 @@ private:
     bool ggml_ = false;
     std::span<const CpuExpertJob> jobs_;
     CpuExpertHeartbeat heartbeat_;
+    // NVFP4 rounds' per-column phases hand out only the round's real columns (set by run()): every
+    // column as job * kMaxColumns + col, and the A4 round's x encodes as
+    // (job * kMaxColumns + col) * 2 + up (up only for an expert whose up input scale differs from
+    // its gate's). Walking every job's kMaxColumns slots instead took a contended counter increment
+    // per empty slot (a one-column job used 8 of the A4 round's 128).
+    std::vector<std::int32_t> round_columns_, a4_x_columns_;
 
     alignas(64) std::atomic<std::uint64_t> epoch_{0};
     alignas(64) std::atomic<int> sleepers_{0};

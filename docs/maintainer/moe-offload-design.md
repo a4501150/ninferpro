@@ -470,6 +470,12 @@ Work is handed out by atomic counters, not static ownership: x quantization (8 b
 per column; gate and up scales separately when distinct), a barrier, the gate/up
 intermediate units with SwiGLU and the activation quantization of h, a barrier, then the down
 row groups. A16 rounds add an h-encoding phase; ggml rounds run four phases of their own.
+The per-column phases hand out only the round's real columns, published with the epoch (a
+one-column job no longer walks its eight slots a phase; a contended counter increment each).
+SwiGLU runs as AVX2 canonical vector code on every vector ISA (`swiglu_bf16_n`): exp_c, silu_c
+and the BF16 rounding on eight lanes, the scalar functions' IEEE operations in the same
+order, so every element equals `canon::swiglu_bf16` bit for bit (the test checks it
+exhaustively over BF16 gates; 640 elements 5.5 → 1.0 µs on this host, scalar → vector).
 Faster cores take more items. Sums are exact, so the item split changes no bit: the team test
 checks 1-40 workers against the single-threaded reference.
 
