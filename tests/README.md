@@ -248,13 +248,19 @@ which replays the same prompt through the independent FP64 reference; run it aft
 (the reference needs the host RAM the engine held):
 
 ```bash
-INFERNIX_QWEN4_ARTIFACT=$HOME/models/infernix/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix \
+INFERNIX_QWEN4_ARTIFACT=$HOME/models/infernix/Qwen3.8-Flash-Next-ModelOpt-NVFP4-Infernix.infernix \
 INFERNIX_QWEN4_NGRAM=$HOME/models/infernix/Qwen3.8-Flash-Next-BF16.ngram \
   ctest --test-dir build -R infernix_qwen4_exp_vision_oracle_real_test --output-on-failure
-.venv-convert/bin/python tools/flash_next/vision_oracle.py \
-  --model ~/.cache/huggingface/hub/models--jpezzulli--OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4/snapshots/f24d2b68ff2814f24455ae86717be276619b5664 \
+.venv-convert/bin/python -m tools.flash_next.vision_oracle \
+  --model ~/models/Qwen3.8-Flash-Next-ModelOpt-NVFP4-bf16PLE \
   --dump build/tests/vision_oracle_dump
 ```
+
+The reference reads the checkpoint the artifact was converted from: the ModelOpt artifact's mixed
+source directory (the ModelOpt experts with the BF16 PLE; the raw ModelOpt snapshot lacks its PLE
+shards). The orcarouter export's packed expert layout is one the FP64 reference cannot read, so
+the production artifact has no FP64 vision comparison of its own; both artifacts run the same
+vision kernels.
 
 Without their artifact variable, CTest marks these real Engine tests as skipped. Real-artifact targets
 carry the `real` label and `RUN_SERIAL` so CTest runs them alone. Run directly invoked GPU
