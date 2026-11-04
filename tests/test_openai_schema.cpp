@@ -1216,6 +1216,14 @@ int test_common_objects() {
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",
                       "OpenAI common error shape remains stable");
+    // A message quoting a URL id that is not UTF-8 (GET /v1/models/%ff) still renders (candidates QA-13).
+    std::string unrendered;
+    try {
+        unrendered = make_error_body(
+            ApiError{.status = 404, .message = "model '\xff' not found", .code = "model_not_found"});
+    } catch (const std::exception&) {}
+    failures += check(!unrendered.empty() && Json::parse(unrendered)["error"]["code"] == "model_not_found",
+                      "an error message holding non-UTF-8 bytes could not be rendered");
     return failures;
 }
 

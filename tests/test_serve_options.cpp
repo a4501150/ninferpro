@@ -94,6 +94,18 @@ int main() {
                       "a missing --log-file value must be refused");
     failures += check(serve_usage_text("infernix-serve").find("--log-file") != std::string::npos,
                       "serving help must list --log-file");
+    // Integer options past int's range are refused, not saturated (Windows' long is int's size), and the pending
+    // queue (one HTTP worker each) is bounded (candidates QA-13).
+    for (const auto* option : {"--max-http-clients", "--pending-timeout-ms", "--max-pending-requests"}) {
+        failures += check(!parse_error({"infernix-serve", "model.ninfer", option, "99999999999"}).empty(),
+                          "an integer option past int's range was accepted");
+    }
+    failures += check(
+        parse({"infernix-serve", "model.ninfer", "--max-pending-requests", "1024"}).max_pending_requests ==
+            1024,
+        "--max-pending-requests 1024 refused");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--max-pending-requests", "1025"}).empty(),
+                      "--max-pending-requests past 1024 accepted");
     const auto archive = parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});
