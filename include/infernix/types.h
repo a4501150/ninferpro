@@ -1069,6 +1069,10 @@ struct PromptOptions {
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    // Declarations the prompt does not list (deferred tools). Tool-call parsing, selection and
+    // constraints cover them after tool_jsons, in this order, while the template's tool section
+    // omits them; a message that loads one carries its definition in its own content.
+    std::vector<std::string> deferred_tool_jsons;
 };
 
 enum class PromptCacheMarkerKind : std::uint8_t {

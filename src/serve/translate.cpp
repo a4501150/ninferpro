@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -99,7 +100,36 @@ std::string render_tool_definition(const ToolDefinition& tool) {
     return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
 }
 
+bool has_rendered_content(const infernix::ChatMessage& message) {
+    return std::any_of(message.parts.begin(), message.parts.end(), [](const auto& part) {
+        return part.kind != infernix::MessagePartKind::Text || !part.text.empty();
+    });
+}
+
 } // namespace
+
+std::string render_loaded_tools(std::span<const ToolDefinition> tools) {
+    // The Qwen tool section's own wording and framing, so a loaded definition reads like a listed
+    // one; the definitions use the same function form the listed tools are rendered from.
+    std::string text = "You now also have access to the following functions:\n\n<tools>";
+    for (const ToolDefinition& tool : tools) {
+        text += '\n';
+        text += render_tool_definition(tool);
+    }
+    text += "\n</tools>";
+    return text;
+}
+
+std::vector<std::string> tool_declaration_params(const GenerationRequest& request) {
+    std::vector<std::string> params;
+    params.reserve(request.tools.size());
+    for (const bool deferred : {false, true}) {
+        for (const ToolDefinition& tool : request.tools) {
+            if (tool.deferred == deferred) { params.push_back(tool.schema_param); }
+        }
+    }
+    return params;
+}
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server) {
@@ -265,6 +295,13 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
             }
         }
         input.messages.push_back(std::move(message));
+        if (!turn.loaded_tools.empty()) {
+            infernix::ChatMessage& loaded_target = input.messages.back();
+            infernix::MessagePart loaded;
+            loaded.text = (has_rendered_content(loaded_target) ? "\n\n" : "") +
+                          render_loaded_tools(turn.loaded_tools);
+            loaded_target.parts.push_back(std::move(loaded));
+        }
         if (turn.cache_boundary_after) {
             if (input.messages.size() > std::numeric_limits<std::uint32_t>::max()) {
                 throw std::overflow_error("conversation cache boundary exceeds uint32");
@@ -284,16 +321,22 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking         = semantics.preserve_thinking;
     input.options.chat_template_kwargs_json = semantics.chat_template_kwargs_json;
     input.options.add_vision_id             = false;
-    const auto& tools                       = request.tools;
+    // Listed tools render in the prompt's tool section in request order; deferred ones only join
+    // the output contract, so declaring one never changes the prompt.
+    const auto& tools = request.tools;
     input.options.tool_jsons.reserve(tools.size());
-    for (std::size_t index = 0; index < tools.size(); ++index) {
-        input.options.tool_jsons.push_back(render_tool_definition(tools[index]));
-        if (tools[index].cache_boundary_after) {
+    for (const ToolDefinition& tool : tools) {
+        if (tool.deferred) {
+            input.options.deferred_tool_jsons.push_back(render_tool_definition(tool));
+            continue;
+        }
+        input.options.tool_jsons.push_back(render_tool_definition(tool));
+        if (tool.cache_boundary_after) {
             input.context_cache.markers.push_back(infernix::PromptCacheMarker{
-                .kind             = tools[index].cache_boundary_after->kind,
-                .evidence         = tools[index].cache_boundary_after->evidence,
+                .kind             = tool.cache_boundary_after->kind,
+                .evidence         = tool.cache_boundary_after->evidence,
                 .location         = infernix::PromptCacheMarkerLocation::ToolBoundary,
-                .after_tool_count = static_cast<std::uint32_t>(index + 1U),
+                .after_tool_count = static_cast<std::uint32_t>(input.options.tool_jsons.size()),
             });
         }
     }

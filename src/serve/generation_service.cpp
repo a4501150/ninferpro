@@ -369,18 +369,21 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
 }
 
 std::shared_ptr<RequestLifetime>
-GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) const {
-    return acquire_lifetime(request_capacity_, deadline_policy, "inference request queue is full");
+GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy, bool admitted) const {
+    return acquire_lifetime(request_capacity_, deadline_policy, admitted,
+                            "inference request queue is full");
 }
 
 std::shared_ptr<RequestLifetime>
 GenerationService::acquire_lifetime(const std::shared_ptr<RequestCapacity>& capacity,
-                                    DeadlinePolicy deadline_policy,
+                                    DeadlinePolicy deadline_policy, bool admitted,
                                     const char* full_message) const {
     const auto started = Clock::now();
     {
         std::lock_guard lock(capacity->mutex);
-        if (capacity->active >= capacity->maximum) {
+        // A continuation of an admitted request (a server-side tool round) still holds the HTTP
+        // request's ingress slot, so the queue bound does not refuse it.
+        if (!admitted && capacity->active >= capacity->maximum) {
             throw_request_error(infernix::RequestError(RequestErrorKind::Overloaded, full_message));
         }
         ++capacity->active;
@@ -408,15 +411,26 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                         DeadlinePolicy::ClientPendingTimeout);
 }
 
+PreparedRequest GenerationService::prepare_continuation(
+    const GenerationRequest& request, GenerationConsumerMode consumer_mode,
+    infernix::GenerationObservationOptions observation,
+    std::function<bool()> is_cancelled) const {
+    return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
+                        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
+                                                    : CacheParticipation::Disabled,
+                        DeadlinePolicy::ClientPendingTimeout, /*admitted=*/true);
+}
+
 PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
                                                 GenerationConsumerMode consumer_mode,
                                                 infernix::GenerationObservationOptions observation,
                                                 std::function<bool()> is_cancelled,
                                                 CacheParticipation cache_participation,
-                                                DeadlinePolicy deadline_policy) const {
+                                                DeadlinePolicy deadline_policy,
+                                                bool admitted) const {
     PreparedRequest prepared;
     prepared.constraint_param               = request.constraint_param;
-    for (const auto& tool : request.tools) prepared.tool_schema_params.push_back(tool.schema_param);
+    prepared.tool_schema_params             = tool_declaration_params(request);
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     infernix::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
@@ -429,7 +443,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    prepared.lifetime = acquire_request_lifetime(deadline_policy);
+    prepared.lifetime = acquire_request_lifetime(deadline_policy, admitted);
 
     try {
         const auto acquisition_started = Clock::now();
@@ -490,7 +504,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         throw_invalid_input(error, "vision_disabled");
     }
     const std::shared_ptr<RequestLifetime> lifetime = acquire_lifetime(
-        count_capacity_, DeadlinePolicy::ClientPendingTimeout, "token count queue is full");
+        count_capacity_, DeadlinePolicy::ClientPendingTimeout, false, "token count queue is full");
     const Clock::time_point deadline        = lifetime->deadline;
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     try {

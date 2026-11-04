@@ -7,6 +7,9 @@
 #include "serve/serve_options.h"
 
 #include <functional>
+#include <span>
+#include <string>
+#include <vector>
 
 namespace infernix::serve {
 
@@ -28,6 +31,15 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
 infernix::PromptInput to_prompt_input(const GenerationRequest& req,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media);
+
+// The text a turn that loads tools ends with: the definitions in the function form of the listed
+// tools, framed like the prompt's tool section. It depends on the definitions alone, so a history
+// replayed by a later request renders the same tokens.
+std::string render_loaded_tools(std::span<const ToolDefinition> tools);
+
+// Each declaration's protocol schema path in Engine declaration order (listed tools, then deferred
+// ones), for mapping an Engine tool-schema error back to the request.
+std::vector<std::string> tool_declaration_params(const GenerationRequest& req);
 
 // Build public request options (output budget, thinking, stop policy, sampler). The
 // sampler is resolved from the request's SamplingParams over the server defaults;

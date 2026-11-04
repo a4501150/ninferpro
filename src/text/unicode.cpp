@@ -80,6 +80,13 @@ std::string codepoint_to_utf8(std::int32_t codepoint) {
     return {reinterpret_cast<const char*>(buffer), static_cast<std::size_t>(length)};
 }
 
+std::int32_t simple_uppercase(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
+        return codepoint >= 'a' && codepoint <= 'z' ? codepoint - 'a' + 'A' : codepoint;
+    }
+    return utf8proc_toupper(codepoint);
+}
+
 std::int32_t simple_lowercase(std::int32_t codepoint) noexcept {
     if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
         return codepoint >= 'A' && codepoint <= 'Z' ? codepoint - 'A' + 'a' : codepoint;
@@ -127,6 +134,13 @@ bool is_number(std::int32_t codepoint) noexcept {
     default:
         return false;
     }
+}
+
+bool is_decimal_digit(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
+        return codepoint >= '0' && codepoint <= '9';
+    }
+    return utf8proc_category(codepoint) == UTF8PROC_CATEGORY_ND;
 }
 
 bool is_whitespace(std::int32_t codepoint) noexcept {

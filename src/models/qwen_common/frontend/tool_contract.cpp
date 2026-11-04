@@ -289,13 +289,18 @@ void prepare_strict_parameters(Contract::Tool& tool) {
 } // namespace
 
 std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons) {
-    if (tool_jsons.empty()) return {};
+build_tool_call_output_contract(std::span<const std::string> tool_jsons,
+                                std::span<const std::string> deferred_tool_jsons) {
+    const std::size_t count = tool_jsons.size() + deferred_tool_jsons.size();
+    if (count == 0) return {};
     auto result = std::make_shared<Contract>();
     std::set<std::string> names;
-    for (std::size_t i = 0; i < tool_jsons.size(); ++i) {
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::string& source = i < tool_jsons.size()
+                                        ? tool_jsons[i]
+                                        : deferred_tool_jsons[i - tool_jsons.size()];
         try {
-            const auto parsed       = text::parse_json_numbers(tool_jsons[i]);
+            const auto parsed       = text::parse_json_numbers(source);
             const auto& declaration = parsed.value;
             const auto& function    = declaration.at("function");
             Contract::Tool tool;

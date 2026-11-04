@@ -190,6 +190,13 @@ public:
                                           GenerationConsumerMode consumer_mode,
                                           infernix::GenerationObservationOptions observation = {},
                                           std::function<bool()> is_cancelled = {}) const;
+    // The next generation of an admitted request that executed a server-side tool (tool search):
+    // the HTTP request still holds its ingress slot, so the continuation takes another without
+    // the queue bound refusing it.
+    [[nodiscard]] PreparedRequest
+    prepare_continuation(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+                         infernix::GenerationObservationOptions observation = {},
+                         std::function<bool()> is_cancelled = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
@@ -217,12 +224,13 @@ private:
     prepare_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
                  infernix::GenerationObservationOptions observation,
                  std::function<bool()> is_cancelled, CacheParticipation cache_participation,
-                 DeadlinePolicy deadline_policy) const;
+                 DeadlinePolicy deadline_policy, bool admitted = false) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
-    acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
+    acquire_request_lifetime(DeadlinePolicy deadline_policy, bool admitted = false) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_lifetime(const std::shared_ptr<RequestCapacity>& capacity,
-                     DeadlinePolicy deadline_policy, const char* full_message) const;
+                     DeadlinePolicy deadline_policy, bool admitted,
+                     const char* full_message) const;
 
     ServeOptions options_;
     std::unique_ptr<infernix::Engine> engine_;

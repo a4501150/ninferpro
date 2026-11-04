@@ -55,8 +55,11 @@ struct ToolCallOutputContract {
     bool parallel    = true;
 };
 
+// Listed declarations come first, then deferred ones (declared but absent from the prompt's tool
+// section); declaration_index counts across both.
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons);
+build_tool_call_output_contract(std::span<const std::string> tool_jsons,
+                                std::span<const std::string> deferred_tool_jsons = {});
 
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,
