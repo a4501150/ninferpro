@@ -1086,6 +1086,18 @@ int test_stream_response() {
 
 int test_stream_observations() {
     int failures = 0;
+    // The HTTP stream opens with its first event, after the Engine's generation start (SY-07): the
+    // generation start may arrive before the role chunk, and until then the transport's heartbeat
+    // is its SSE comment.
+    OpenAIChatStream late(identity(), false);
+    late.note_start(
+        infernix::GenerationStart{.prompt = {.prompt_tokens = 8}, .reused_prompt_tokens = 0});
+    const Json late_role = parse_sse(late.start());
+    failures += check(late_role["choices"][0]["delta"]["role"] == "assistant" &&
+                          parse_sse(late.content_delta("x"))["choices"][0]["delta"]["content"] ==
+                              "x",
+                      "a role chunk after the generation start lost its shape");
+
     OpenAIChatStream stream(identity(), true, true, true);
     const Json role = parse_sse(stream.start());
     failures += check(!role.contains("timings") && !role.contains("prompt_progress"),

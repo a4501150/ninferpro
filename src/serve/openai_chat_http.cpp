@@ -144,26 +144,22 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         return false;
                     }
                 };
-                try {
+                // The assistant-role chunk opens the stream with its first event (prompt progress,
+                // the first output delta or the finish), not at admission, so a client's time to
+                // its first chunk is the prefill's (as OpenAI's). Until then a heartbeat is the
+                // transport's SSE comment.
+                bool opened     = false;
+                const auto open = [&] {
+                    if (opened) { return; }
+                    opened = true;
                     render_and_write(transport, [&] { return encoder->start(); });
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
-                }
+                };
 
                 GenerationOutcome outcome;
                 try {
                     StreamSink output;
                     output.on_start = [&](const infernix::GenerationStart& start) {
+                        if (return_progress) { open(); }
                         encoder->note_start(start);
                         if (return_progress) {
                             render_and_write(transport,
@@ -172,6 +168,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     };
                     if (return_progress) {
                         output.on_progress = [&](const infernix::PromptProgress& progress) {
+                            open();
                             render_and_write(transport,
                                              [&] { return encoder->prompt_progress(progress); });
                         };
@@ -182,9 +179,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         };
                     }
                     output.on_content = [&](const std::string& text) {
+                        open();
                         render_and_write(transport, [&] { return encoder->content_delta(text); });
                     };
                     output.on_reasoning = [&](const std::string& text) {
+                        open();
                         render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
                     };
                     output.is_cancelled = [&] { return transport.poll(); };
@@ -224,7 +223,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 }
                 std::vector<std::string> terminal;
                 try {
+                    // An answer with no streamed delta (an empty one) opens here.
+                    std::string opening;
+                    if (!opened) {
+                        opened  = true;
+                        opening = encoder->start();
+                    }
                     terminal = encoder->finish(outcome);
+                    if (!opening.empty()) { terminal.insert(terminal.begin(), std::move(opening)); }
                     if (auto comment = ngram_generation_comment(outcome.metrics.ngram_archive);
                         !comment.empty()) {
                         terminal.insert(terminal.begin(), std::move(comment));

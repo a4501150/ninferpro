@@ -52,6 +52,8 @@ public:
                      bool timings_per_token = false, bool return_progress = false,
                      bool usage_chunk_choice = false);
 
+    // The assistant-role chunk; the HTTP stream sends it with its first event (prompt progress, an
+    // output delta or the finish), so it may follow note_start.
     std::string start();
     void note_start(const infernix::GenerationStart& start);
     std::string initial_prompt_progress();
