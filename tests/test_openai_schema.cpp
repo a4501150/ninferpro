@@ -961,6 +961,7 @@ int test_aggregate_response() {
     Json response             = Json::parse(make_chat_completion_response(identity(), outcome));
     failures += check(response["choices"][0]["message"]["content"] == "answer" &&
                           response["choices"][0]["message"]["reasoning_content"] == "thought" &&
+                          response["choices"][0]["message"]["reasoning"] == "thought" &&
                           response["choices"][0]["message"]["refusal"].is_null(),
                       "aggregate response separates reasoning and content");
     failures += check(response["choices"][0]["logprobs"].is_null(),
@@ -1014,6 +1015,8 @@ int test_stream_response() {
     Json reasoning = parse_sse(stream.reasoning_delta("thought"));
     Json content   = parse_sse(stream.content_delta("ans"));
     failures += check(reasoning["choices"][0]["delta"]["reasoning_content"] == "thought" &&
+                          reasoning["choices"][0]["delta"]["reasoning"] == "thought" &&
+                          !content["choices"][0]["delta"].contains("reasoning") &&
                           content["choices"][0]["delta"]["content"] == "ans",
                       "stream separates reasoning and content deltas");
 

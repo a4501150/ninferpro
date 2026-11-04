@@ -332,7 +332,9 @@ relabeled as client input errors.
 The request `model` must equal the public model ID — the artifact `metadata.name` by default
 (falling back to its architecture name when absent), or the explicit `--model-id` override — or
 one of the `--served-model-name` aliases.
-Reasoning is returned separately as `reasoning_content`; answer text remains in `content`.
+Reasoning is returned separately, under both `reasoning_content` (SGLang and earlier vLLM) and
+`reasoning` (current vLLM) with the same text, in messages and stream deltas alike; answer text
+remains in `content`.
 
 For non-strict tools, a direct top-level tool-parameter
 `type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, guides conversion of
