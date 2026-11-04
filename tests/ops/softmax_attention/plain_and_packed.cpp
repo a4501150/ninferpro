@@ -43,7 +43,7 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
 
 void packed_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
                              const std::vector<float>& v, const std::vector<int>& cu_seqlens,
-                             std::vector<double>& out) {
+                             std::vector<double>& out, int workers = 1) {
     const double scale = 1.0 / std::sqrt(72.0);
     out.assign(q.size(), 0.0);
 
@@ -64,7 +64,7 @@ void packed_attention_oracle(const std::vector<float>& q, const std::vector<floa
             [](int, int) { return true; },
             [&](int d, int head, int token, double value) {
                 out[index_of(begin + token, head, d)] = value;
-            });
+            }, workers);
     }
 }
 
@@ -82,6 +82,7 @@ enum class PublicEntry {
 enum class InputProfile {
     Random,
     SegmentIsolation,
+    FlatScores,
 };
 
 const char* storage_name(StorageProfile profile) {
@@ -100,8 +101,18 @@ const char* entry_name(PublicEntry entry) {
     return "unknown";
 }
 
+// Flat-score amplitude: Q and every key hold it, so every key scores 72 * amplitude^2 = 839,808 exactly (a
+// BF16-exact value whose partial sums stay exact in FP32) and the row maximum holds from the first key tile
+// on. The scaled maximum 839,808 * ScaleLog2E rounds with residual e = -3.99e-3, so the old history factor
+// exp2(fma(previous, scale, -rn(maximum * scale))) sat 2^e off 1 at each of the segment's 64 key tiles and
+// tilted the first/last tile weights 2^(63*|e|) = 19% apart. V halves 2.0 / 1.0 at the segment midpoint
+// (both BF16-exact) turn that tilt into an output deviation far past the criterion, while the fixed factor
+// (the difference of the two rounded scaled maxima) is exactly 1 and the exact weights stay uniform.
+constexpr float kFlatScoreAmplitude = 108.0f;
+
 int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProfile storage_profile,
-             PublicEntry entry, InputProfile input_profile = InputProfile::Random) {
+             PublicEntry entry, InputProfile input_profile = InputProfile::Random,
+             int oracle_workers = 1) {
     const int tokens              = cu_seqlens.back();
     const std::size_t token_plane = static_cast<std::size_t>(kHeads) * kDim;
     const std::size_t value_count = static_cast<std::size_t>(tokens) * token_plane;
@@ -122,12 +133,21 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
             }
         }
     }
+    if (input_profile == InputProfile::FlatScores) {
+        std::fill(q.begin(), q.end(), kFlatScoreAmplitude);
+        std::fill(k.begin(), k.end(), kFlatScoreAmplitude);
+        for (int token = 0; token < tokens; ++token) {
+            const float value = token < tokens / 2 ? 2.0f : 1.0f;
+            std::fill_n(v.data() + static_cast<std::size_t>(token) * token_plane, token_plane,
+                        value);
+        }
+    }
     round_to_bf16(q);
     round_to_bf16(k);
     round_to_bf16(v);
 
     std::vector<double> reference;
-    packed_attention_oracle(q, k, v, cu_seqlens, reference);
+    packed_attention_oracle(q, k, v, cu_seqlens, reference, oracle_workers);
 
     const auto q_expected = bf16_bits(q);
     const auto k_expected = bf16_bits(k);
@@ -208,7 +228,9 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                               " S=" + std::to_string(cu_seqlens.size() - 1) + " " +
                               storage_name(storage_profile) + " " + entry_name(entry);
     const std::string qualified_label =
-        input_profile == InputProfile::SegmentIsolation ? label + " segment-isolation" : label;
+        input_profile == InputProfile::SegmentIsolation
+            ? label + " segment-isolation"
+            : (input_profile == InputProfile::FlatScores ? label + " flat-scores" : label);
     int failures =
         verify_reduction(qualified_label.c_str(), from_device_bf16(d_out.data(), value_count),
                          reference, kPackedAttentionBf16Criterion);
@@ -268,6 +290,12 @@ int run_softmax_attention_plain_and_packed_tests() {
         run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
     failures +=
         run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+    // The vision tower's call form (interleaved QKV, uniform segments) with every key scoring
+    // equally over 4,096 tokens: holds the packed kernel's history rescale to exactly 1 (run_case
+    // fills Q, K and the V halves). With the old FMA factor restored this case fails the
+    // BF16 criterion by an order of magnitude.
+    failures += run_case({0, 4096}, 2027u, StorageProfile::InterleavedQkv,
+                         PublicEntry::UniformSegments, InputProfile::FlatScores, 16);
 
     if (failures != 0) {
         std::cerr << "packed_softmax_attention failures=" << failures << '\n';
