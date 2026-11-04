@@ -909,11 +909,10 @@ int test_stops_and_ranges() {
     Json body                               = base_request();
     body["stop"]                            = Json::array({"A", "B"});
     const infernix::RequestOptions translated = options(parse(body).generation);
-    failures += check(translated.stop.strings.size() == 4,
-                      "each stop string applies to Content and Reasoning");
-    failures += check(translated.stop.strings[0].channel == infernix::OutputChannel::Content &&
-                          translated.stop.strings[1].channel == infernix::OutputChannel::Reasoning,
-                      "stop channel ordering is explicit");
+    failures += check(translated.stop.strings.size() == 2 &&
+                          translated.stop.strings[0].channel == infernix::OutputChannel::Content &&
+                          translated.stop.strings[1].channel == infernix::OutputChannel::Content,
+                      "each stop string applies to the answer only");
 
     body["stop"] = Json::array({"1", "2", "3", "4", "5"});
     failures += check(api_error([&] { (void)parse(body); }).param == "stop",

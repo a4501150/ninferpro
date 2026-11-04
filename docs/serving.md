@@ -210,7 +210,10 @@ The endpoint supports:
   processing without generation;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
-- up to four non-empty stop strings, applied to both reasoning and answer output;
+- up to four non-empty stop strings, applied to the answer only: not to reasoning, and not inside a
+  tool call the model opened (between its `<tool_call>` and `</tool_call>` markers, outside
+  Markdown code, where the same spelling is a quoted example), whose arguments are the tool's
+  data (as on the Responses and Messages endpoints);
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`, optionally shaped by `--usage-chunk-choice` for strict client

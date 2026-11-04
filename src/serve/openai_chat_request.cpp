@@ -814,9 +814,8 @@ void parse_parallel_tool_calls(const Json& body, GenerationRequest& output) {
 void parse_stop(const Json& body, GenerationRequest& output) {
     output.ignore_eos = get_bool(body, "ignore_eos", false);
     if (!body.contains("stop") || body.at("stop").is_null()) { return; }
-    output.stop_strings_apply_to_reasoning = true;
-    const Json& stop                       = body.at("stop");
-    auto append                            = [&](const Json& value) {
+    const Json& stop = body.at("stop");
+    auto append      = [&](const Json& value) {
         if (!value.is_string()) { bad_request("stop entries must be strings", "stop"); }
         std::string text = value.get<std::string>();
         if (text.empty()) { bad_request("stop strings must not be empty", "stop"); }

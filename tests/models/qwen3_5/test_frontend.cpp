@@ -7,6 +7,7 @@
 #include "models/qwen_common/frontend/processor.h"
 #include "models/qwen_common/frontend/test_access.h"
 #include "models/qwen_common/frontend/tokenizer.h"
+#include "models/qwen_common/frontend/tool_call_parser.h"
 #include "runtime/contract/execution.h"
 #include "runtime/prefix_cache/block_hash.h"
 #include "text/json_input.h"
@@ -2523,6 +2524,110 @@ int test_tool_marker_after_quoted_marker() {
     return failures;
 }
 
+// A client stop string ends the answer, never a tool call: the call's arguments are the tool's
+// data (vLLM #64088). The same text in the answer, after the call's close, or in a Markdown code
+// example still stops it, at every round width (a constrained tool route refuses custom stops, so
+// these are free tool calls).
+int test_stop_strings_skip_tool_calls() {
+    const Frontend frontend = make_frontend(resources());
+    infernix::PromptInput input;
+    input.messages.push_back({.role  = infernix::ChatRole::User,
+                              .parts = {{.kind = infernix::MessagePartKind::Text, .text = "x"}}});
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    const auto prompt = frontend.prepare(std::move(input));
+    const infernix::TokenId eos = frontend.default_stop_policy().token_ids.front();
+    infernix::StopPolicy stop;
+    stop.strings.push_back(infernix::StopString{.text = "STOP"});
+    infernix::ToolChoice choice;
+    choice.constraints      = infernix::ToolConstraintMode::Automatic;
+    const auto make_session = [&] {
+        return frontend.make_output_session(prompt, stop,
+                                            infernix::OutputOptions{.tool_name_max_length = 64}, {},
+                                            {}, choice);
+    };
+    const std::string call = std::string(fi::kToolOpen) +
+                             "\n<function=bash>\n<parameter=command>\necho STOP\n</parameter>\n</function>\n" +
+                             std::string(fi::kToolClose);
+
+    struct RoundResult {
+        std::string content;
+        std::vector<infernix::GeneratedToolCall> calls;
+        infernix::FinishReason reason = infernix::FinishReason::None;
+        std::optional<std::string> matched;
+    };
+    const auto publish_rounds = [&](const std::vector<infernix::TokenId>& tokens, std::size_t width) {
+        auto session = make_session();
+        RoundResult result;
+        for (std::size_t at = 0; at < tokens.size();) {
+            const std::size_t count = width == 0 ? tokens.size() - at
+                                                 : std::min(width, tokens.size() - at);
+            const auto decision = session.preview_model(
+                std::span<const infernix::TokenId>(tokens.data() + at, count),
+                static_cast<std::uint32_t>(tokens.size() - at), infernix::FinishReason::OutputLimit);
+            const auto output = session.commit_preview();
+            for (const auto& delta : output) {
+                if (delta.channel == infernix::OutputChannel::Content) {
+                    result.content += delta.text;
+                }
+            }
+            at += decision.accepted_tokens;
+            result.reason = decision.finish_reason;
+            if (decision.finished()) { break; }
+        }
+        result.calls   = session.take_tool_calls();
+        result.matched = session.matched_stop_string();
+        return result;
+    };
+
+    int failures = 0;
+    std::vector<infernix::TokenId> inside = fixture_tokens("Running it.");
+    {
+        const auto call_tokens = fixture_tokenizer().encode(call);
+        inside.insert(inside.end(), call_tokens.begin(), call_tokens.end());
+        inside.push_back(eos);
+    }
+    std::vector<infernix::TokenId> after = inside;
+    after.pop_back();
+    {
+        const auto tail = fixture_tokens(" Then STOP here.");
+        after.insert(after.end(), tail.begin(), tail.end());
+        after.push_back(eos);
+    }
+    const std::vector<infernix::TokenId> answer  = fixture_tokens("Say STOP now.");
+    const std::vector<infernix::TokenId> quoted  = fixture_tokenizer().encode(
+        "See:\n```\n" + std::string(fi::kToolOpen) + "\nusage STOP now\n```\ntail.");
+    const auto argument_survived = [](const RoundResult& run) {
+        return run.content.find("echo STOP") != std::string::npos ||
+               (run.calls.size() == 1 && run.calls.front().arguments_json.find("echo STOP") !=
+                                            std::string::npos);
+    };
+    for (const std::size_t width : {0U, 1U, 3U}) {
+        const std::string span = " (round width " + std::to_string(width) + ")";
+        const RoundResult whole = publish_rounds(inside, width);
+        failures += check(whole.reason == infernix::FinishReason::StopToken && argument_survived(whole),
+                          ("a stop string cut a tool call's arguments" + span).c_str());
+        const RoundResult later = publish_rounds(after, width);
+        failures += check(later.reason == infernix::FinishReason::StopString &&
+                              later.matched == std::optional<std::string>("STOP") &&
+                              argument_survived(later) &&
+                              later.content.ends_with(" Then "),
+                          ("a stop string after the call's close did not stop the answer" + span)
+                              .c_str());
+        const RoundResult plain = publish_rounds(answer, width);
+        failures += check(plain.reason == infernix::FinishReason::StopString &&
+                              plain.content == "Say " && plain.matched == std::optional<std::string>("STOP"),
+                          ("a stop string in the answer did not stop it" + span).c_str());
+        const RoundResult fenced = publish_rounds(quoted, width);
+        failures += check(fenced.reason == infernix::FinishReason::StopString &&
+                              fenced.content.ends_with("usage "),
+                          ("a stop string inside a Markdown code example was suppressed" + span)
+                              .c_str());
+    }
+    return failures;
+}
+
 // The reasoning-loop guard through a real output session: thinking that keeps rewriting one
 // verification pass fires the guard at a check boundary (Stop ends the request; Conclude requests
 // the thinking-close control, after which the model answers in content); varied thinking and Off
@@ -3381,6 +3486,7 @@ int main() {
     failures += test_tools_and_json_output();
     failures += test_tool_arguments_nesting_bound();
     failures += test_tool_marker_after_quoted_marker();
+    failures += test_stop_strings_skip_tool_calls();
     failures += test_open_reasoning_tool_recovery();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);

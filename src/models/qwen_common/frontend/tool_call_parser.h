@@ -12,6 +12,11 @@
 
 namespace infernix::models::qwen_common::frontend {
 
+// The framing markers of Qwen's XML-like tool-call format: the answer holds a call
+// between the open marker and the close that follows it.
+inline constexpr std::string_view kToolOpen  = "<tool_call>";
+inline constexpr std::string_view kToolClose = "</tool_call>";
+
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;
     std::string content;

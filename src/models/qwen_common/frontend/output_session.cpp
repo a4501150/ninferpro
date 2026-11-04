@@ -196,6 +196,16 @@ struct DecoderState {
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
     std::optional<std::uint32_t> matched_stop_order;
+    // Between the tool-call open marker in the answer and the close marker that follows it,
+    // stop strings do not match: a call's arguments are the tool's data, not the answer (vLLM
+    // #64088). `tool_call_tail` keeps the call's last bytes, enough to see a close marker split
+    // across feeds; `content_tail` keeps the answer's last bytes, enough to see an open marker
+    // split the same way, and holds them back of `content_code`, whose code state decides whether
+    // a marker is the model's call or a quoted example inside Markdown code.
+    bool in_tool_call             = false;
+    std::string tool_call_tail;
+    std::string content_tail;
+    frontend::MarkdownCodeTracker content_code;
 };
 
 struct SemanticThinkingState {
@@ -313,8 +323,84 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
         text.erase(0, begin);
         if (!text.empty()) { state.strip_content_leading = false; }
     }
-    feed_channel(state, OutputChannel::Content, text, policy, emitted, committed_tokens,
-                 best_match);
+    // A stop string ends the answer, never a tool call: from an open marker the Markdown code
+    // state leaves (inside code the same spelling is a quoted example, exactly as the tool-call
+    // output decoder reads it) to the close marker that follows it, the content channel
+    // publishes without holding or matching. The answer before a call and the text after its
+    // close keep the policy's matching, and a stop string whose match would end inside a call is
+    // not a match: the bytes the answer held before the call publish with it, unmatched. The
+    // decoder's wrapper rule (a bare marker right after a quoted open spelling) is not applied:
+    // it disambiguates content recovery, and suppressing matching over one more span changes no
+    // published byte.
+    static const StopPolicy kNoStops{};
+    const std::string_view channel = text;
+    std::size_t pos                = 0;
+    while (pos < channel.size()) {
+        if (state.in_tool_call) {
+            // Inside a call nothing is held or matched; its bytes publish as they come, up to and
+            // including the close, after which matching resumes.
+            const std::string_view call = channel.substr(pos);
+            std::string seen            = state.tool_call_tail;
+            seen.append(call);
+            const std::size_t close = seen.find(frontend::kToolClose);
+            std::size_t inside     = call.size();
+            if (close != std::string::npos) {
+                inside              = close + frontend::kToolClose.size() - state.tool_call_tail.size();
+                state.in_tool_call  = false;
+                state.tool_call_tail.clear();
+            } else {
+                const std::size_t keep = std::min(seen.size(), frontend::kToolClose.size() - 1U);
+                state.tool_call_tail   = seen.substr(seen.size() - keep);
+            }
+            feed_channel(state, OutputChannel::Content, call.substr(0, inside), kNoStops,
+                         emitted, committed_tokens, nullptr);
+            pos += inside;
+            continue;
+        }
+
+        // The answer, up to the call whose open marker is next: a marker split across feeds is
+        // found through the tail of the previous one, and a marker inside Markdown code is
+        // skipped as ordinary text.
+        const std::string_view rest = channel.substr(pos);
+        std::string combined        = state.content_tail;
+        combined.append(rest);
+        std::size_t fed  = 0; // combined bytes the code tracker has consumed
+        std::size_t open = std::string::npos;
+        for (std::size_t found = combined.find(frontend::kToolOpen); found != std::string::npos;
+             found            = combined.find(frontend::kToolOpen, found + 1)) {
+            state.content_code.feed(
+                std::string_view(combined).substr(fed, found - fed));
+            fed = found;
+            if (!state.content_code.in_code()) {
+                open = found;
+                break;
+            }
+        }
+        if (open == std::string::npos) {
+            const std::size_t held = std::min(combined.size(), frontend::kToolOpen.size() - 1U);
+            const std::size_t end  = combined.size() - held;
+            if (end > fed) {
+                state.content_code.feed(std::string_view(combined).substr(fed, end - fed));
+            }
+            state.content_tail = combined.substr(combined.size() - held);
+            feed_channel(state, OutputChannel::Content, rest, policy, emitted, committed_tokens,
+                         best_match);
+            return;
+        }
+        // The open marker starts a call at `open` of the tail-joined text: when it lies inside
+        // the held tail, its earlier bytes already published as answer, and the whole rest is
+        // the call's.
+        const std::size_t pre =
+            open > state.content_tail.size() ? open - state.content_tail.size() : 0;
+        if (pre > 0) {
+            feed_channel(state, OutputChannel::Content, rest.substr(0, pre), policy, emitted,
+                         committed_tokens, best_match);
+        }
+        state.in_tool_call = true;
+        state.tool_call_tail.clear();
+        state.content_tail.clear();
+        pos += pre;
+    }
 }
 
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
