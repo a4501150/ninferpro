@@ -1131,9 +1131,9 @@ public:
         // After the tier (whose pinned slots are the probe's source when the banks stay in the
         // artifact), before the CPU service and the split take the measured rate.
         measure_link();
-        expert_error_ = PinnedHostBuffer(64);
-        std::memset(expert_error_.data(), 0, 64);
-        experts.error = static_cast<std::uint32_t*>(expert_error_.data());
+        device_error_ = PinnedHostBuffer(64);
+        std::memset(device_error_.data(), 0, 64);
+        experts.error = static_cast<std::uint32_t*>(device_error_.data());
         // The prefill stream copies records into ring slots of the frame pitch; a GGUF import's
         // banks keep their own (smaller) strides.
         if (options_.prefill_stream && options_.expert_cache) {
@@ -2001,7 +2001,7 @@ public:
                 const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
                 device_.synchronize();
             }
-            check_expert_error();
+            check_device_error();
             const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                     static_cast<std::uint64_t>(width));
             trace_round(offload::RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
@@ -2091,7 +2091,7 @@ public:
             ~Close() { m.active = false; }
         } close{mixed_};
         PendingBatch pending = decode(sequences, budgets, masks); // synchronized: its acceptance or draw
-        check_expert_error();
+        check_device_error();
         lane.state_tokens += static_cast<std::uint32_t>(width);
         if (dflash2_) { lane.dflash_frontier = lane.state_tokens; }
         prefix_after_prefill_call(lane, index, false);
@@ -2580,7 +2580,7 @@ public:
             const auto chunk = stage_mtp_chunk(lane, index, begin, static_cast<std::int32_t>(stride));
             run(1, static_cast<std::int32_t>(stride), 1, chunk ? &*chunk : nullptr);
             device_.synchronize();
-            check_expert_error();
+            check_device_error();
             trace_round(offload::RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride,
                         kDecodePromotionsPerLayer, static_cast<std::uint32_t>(begin));
             residency_->after_round(device_.stream, static_cast<std::int32_t>(stride), kDecodePromotionsPerLayer);
@@ -3224,12 +3224,13 @@ private:
     }
 
 public:
-    // After every synchronization of a round with MoE layers: a call that could not serve an expert
-    // (design §9.3: an unreadable record, a host service that stopped answering) left undefined
-    // outputs, so the round's requests fail and the engine keeps serving. Prefix-cache entries the
-    // round may have published are dropped when the lanes are released.
-    void check_expert_error() {
-        auto* word           = static_cast<volatile std::uint32_t*>(expert_error_.data());
+    // After every synchronization of a round: a call that could not serve an expert (design §9.3:
+    // an unreadable record, a host service that stopped answering), an n-gram gate whose rows were
+    // never published or a token id outside the vocabulary left undefined outputs, so the round's
+    // requests fail and the engine keeps serving (no device trap: the context survives). Prefix-cache
+    // entries the round may have published are dropped when the lanes are released.
+    void check_device_error() {
+        auto* word           = static_cast<volatile std::uint32_t*>(device_error_.data());
         std::uint32_t value  = *word;
         if (value == 0 && testing::take_expert_fault()) { value = EIO; } // layer 0
         if (value == 0) { return; }
@@ -3247,6 +3248,15 @@ public:
             }
         }
         const std::uint32_t code = value & 0xFFFFU;
+        if (code == execution::kErrorTokenId) {
+            throw runtime::RecoverableExecutionError("Qwen3.8-Flash-Next: a token id outside the vocabulary reached the "
+                                                     "token embedding");
+        }
+        if (code == execution::kErrorRowGateTimeout) {
+            throw runtime::RecoverableExecutionError(
+                "Qwen3.8-Flash-Next layer " + std::to_string(value >> 16U) + ": the n-gram rows were not published within " +
+                std::to_string(kPinnedGateTimeoutNs / 1000000000ULL) + " s (the host thread reading them stalled)");
+        }
         std::string what         = code == ops::offloaded_moe::kErrorUnservedRecord ? "an SSD-only expert had no path to it"
                                    : code == ops::offloaded_moe::kErrorHostSilent   ? "the CPU expert service stopped answering"
                                    : code == ops::offloaded_moe::kErrorFetchSilent  ? "the SSD expert tier's read agent stopped answering"
@@ -5312,7 +5322,7 @@ private:
             release_gate.owner = nullptr;
         }
         device_.synchronize();
-        check_expert_error();
+        check_device_error();
 
         const std::int32_t* licensed_host = spec_host(spec_layout_.licensed);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -6074,7 +6084,7 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_.data(), sampled_.p, 4ULL * batch, cudaMemcpyDeviceToHost, s));
         if (before_wait) { before_wait(); }
         device_.synchronize();
-        check_expert_error();
+        check_device_error();
         const auto* tokens = static_cast<const std::int32_t*>(host_sampled_.data());
         for (std::int32_t b = 0; b < batch; ++b) { pending_tokens_[b] = tokens[b]; }
         if (constrained) {
@@ -6561,7 +6571,7 @@ private:
     std::optional<offload::ExpertStore> striped_store_;
     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
     std::unique_ptr<offload::HostExpertTier> tier_;
-    PinnedHostBuffer expert_error_{1}; // mapped u32: ops::MoeExpertSource::error of every call
+    PinnedHostBuffer device_error_{1}; // mapped u32: every call's MoE error word and Forward's faults (check_device_error)
     bool clear_prefix_on_release_ = false;
     std::unique_ptr<offload::ExpertResidency> residency_;
     std::unique_ptr<execution::ExpertStream> expert_stream_;

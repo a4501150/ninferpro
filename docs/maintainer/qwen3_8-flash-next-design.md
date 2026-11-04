@@ -735,10 +735,10 @@ outputs, tier slots) is read with `.cv` loads (`__ldcv`) so a stale L2 line is n
 | Channel | Direction | Content |
 |---|---|---|
 | Round io | host → device | ids, positions, RoPE positions, block starts, slots, rows. One `upload_pinned` copy, read by the SMs through the mapping: small per-round inputs never queue behind bulk copy-engine transfers of other streams (§13's promotions share that engine in FIFO order). |
-| N-gram row gate | host → device | `upload_pinned_when`: the copy waits in stream order until the pinned ready word equals the device word; the host publishes the rows, then `publish_pinned_word`. A wait longer than 120 s traps (§12). |
+| N-gram row gate | host → device | `upload_pinned_when`: the copy waits in stream order until the pinned ready word equals the device word; the host publishes the rows, then `publish_pinned_word`. A wait longer than 120 s stores its fault in the device error word and skips the copy (§12). |
 | CPU miss channel | device → host → device | `MoeCpuChannel`: `MissRequest` (jobs, experts, record pointers, per-job columns), the compacted x columns, mapped y outputs, `done` (the answered sequence), `status`, `heartbeat`, and a device sequence counter. Owned by the miss service (§10). |
 | Fetch channel | device → host → device | `MoeFetchChannel`: `FetchRequest`/`FetchResponse`/`consumed` plus heartbeat; serves SSD-only experts (§9). |
-| Error word | device → host | Mapped u32, `layer << 16 \| code`. A call that cannot serve an expert writes it; the Program checks it after every synchronization and fails the round. |
+| Error word | device → host | Mapped u32, `layer << 16 \| code`. A call that cannot serve an expert writes it, and so do the Forward's own kernels' faults — the token embedding's id outside the vocabulary (`kErrorTokenId`) and the n-gram gate past its bound (`kErrorRowGateTimeout`); the Program checks it after every synchronization and fails the round. |
 | Route log | device → host | The round's routed ids, downloaded after the round for the cache policy (§9). |
 | Landing tables | host → device, device | I32 [layers][16], uploaded by `before_round`; the stage kernels write each landed expert (§9). |
 
@@ -746,7 +746,9 @@ Polling discipline: one thread per CTA polls a host word, with `__nanosleep(200)
 fetch channel elects one poller CTA per call (`atomicCAS` token) that mirrors the host's answer into
 device memory; the CPU wait runs `min(8, jobs)` waiting CTAs. Every wait is bounded: a heartbeat that
 stands still for 10 s (`kHeartbeatTimeoutNs`) fails the call through the error word; a channel
-without a heartbeat is bounded at 2 s; a channel with neither error word nor heartbeat traps.
+without a heartbeat is bounded at 2 s. No wait traps (port of upstream 3b34b6e7): a trap loses the
+CUDA context and every lane with it, and on sm_120 one has hung the driver until a power cycle; a
+channel without an error word goes unreported instead.
 
 ### 8.3 Per-layer kernel sequence
 
@@ -1586,7 +1588,11 @@ rows inside the graph, before `ple_embed`, once the pinned ready word equals the
 word; `publish_pinned_word` (sfence, then store) releases it. At most 16 CTAs of 256 threads copy
 32 KiB each; each CTA's thread 0 polls with `__nanosleep(200)`, then `__threadfence_system` and
 `__ldcv` loads, so no CTA depends on another and no stale cache line of an earlier round is read. A
-gate traps after 120 s (`kPinnedGateTimeoutNs`): that bounds a producer bug, not a slow read. Round
+gate that waits past 120 s (`kPinnedGateTimeoutNs`) stores `layer << 16 | kErrorRowGateTimeout` in
+the Program's device error word and skips its copy instead of trapping (a trap until this change;
+on sm_120 a deliberate trap hung the driver until a power cycle, and a trap names no site): the
+round drains and fails its requests while the context, the other lanes and the Engine survive.
+Round
 words are strictly increasing and skip zero, so a stale word never matches; the io layout places the
 gate word before the rows, so a round uploads it with the io prefix.
 
