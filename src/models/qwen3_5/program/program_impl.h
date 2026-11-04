@@ -488,6 +488,12 @@ public:
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
     Tensor token_counts;
+    // Per lane: the sampler's non-finite flag (ops::SamplingConfig::nonfinite), written by the
+    // round's kernels through the host mapping.
+    PinnedHostBuffer nonfinite_flags{sizeof(std::int32_t) * kMaximumConcurrency};
+    [[nodiscard]] std::int32_t* nonfinite_flag(std::uint32_t lane) const noexcept {
+        return static_cast<std::int32_t*>(nonfinite_flags.data()) + lane;
+    }
 
     VisionHandoffState vision_handoff;
     std::array<SequenceState, kMaximumConcurrency> sequences;

@@ -58,6 +58,7 @@ void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const st
         dflash_host(dflash_io_.slots)[b]     = static_cast<std::int32_t>(lanes[b]);
         configs[b]                           = lane.sampling;
         configs[b].mask                      = {};
+        configs[b].nonfinite                 = nullptr; // a draft's selection never fails the request
     }
     upload_pinned(dflash_device_.p, dflash_host_.data(), 4ULL * dflash_io_.ids, s);
     upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);

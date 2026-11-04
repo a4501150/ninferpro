@@ -300,6 +300,18 @@ __device__ inline void sampling_sort_tile_desc(float* vals, int* idxs) {
     }
 }
 
+// A logit as FP32 (exact for both storage types; FP32 logits are the lossless route's).
+__device__ __forceinline__ float sampling_logit(__nv_bfloat16 value) { return __bfloat162float(value); }
+__device__ __forceinline__ float sampling_logit(float value) { return value; }
+
+// A row without a finite selection (sampling.h): the model's execution failed (the caller provides
+// nonempty masks). It is reported through cfg.nonfinite for the caller to fail the request, and
+// token 0, an id every consumer of the round can index, takes the selection's place.
+__device__ __forceinline__ int sampling_report_nonfinite(const SamplingConfig& cfg) {
+    if (cfg.nonfinite != nullptr) { *cfg.nonfinite = 1; }
+    return 0;
+}
+
 __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, float* cand_val,
                                                   int* cand_idx, float* prob, int* n_support,
                                                   int n) {
@@ -307,9 +319,10 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
     if (tid == 0) {
         while (n > 0 && !isfinite(cand_val[n - 1])) { --n; }
         if (n == 0 || !isfinite(cand_val[0])) {
-            // The caller provides nonempty masks. Missing finite support is a model execution
-            // failure, not a distribution from which a placeholder token can be published.
-            asm volatile("trap;");
+            // No finite support: a one-token support at token 0 keeps every pick in range.
+            cand_idx[0] = sampling_report_nonfinite(cfg);
+            prob[0]     = 1.0f;
+            *n_support  = 1;
         } else {
             const float inv_temp = 1.0f / cfg.temperature;
             const float m        = cand_val[0] * inv_temp;

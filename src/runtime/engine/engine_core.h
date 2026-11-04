@@ -1148,6 +1148,7 @@ private:
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
         std::array<bool, kMaximumConcurrency> failed{};
+        std::array<PendingRowFailure, kMaximumConcurrency> failures{};
         // A row whose output refused its tokens: released like a cancelled row, failed alone.
         std::array<std::exception_ptr, kMaximumConcurrency> refused{};
         bool generated_staged = false;
@@ -1176,7 +1177,8 @@ private:
                 }
                 if (decode_round) { ++request->host_timing.decode_rounds; }
                 cancelled[row] = cancelled_at_unit_start[lane];
-                failed[row]    = !cancelled[row] && pending.constraint_failed(row);
+                failures[row] = cancelled[row] ? PendingRowFailure::None : pending.row_failure(row);
+                failed[row]    = failures[row] != PendingRowFailure::None;
                 const std::int32_t raw_count =
                     pending.row_counts().empty() ? 1 : pending.row_counts()[row];
                 if (raw_count <= 0 || raw_count > static_cast<std::int32_t>(pending.row_stride())) {
@@ -1324,10 +1326,21 @@ private:
                 const std::uint32_t lane     = lane_indices[row];
                 const auto& request          = slots_[lane];
                 const std::uint32_t accepted = decisions[row].accepted_tokens;
-                if (failed[row]) {
+                if (failures[row] == PendingRowFailure::ConstraintDeadEnd) {
                     complete_error(request, std::make_exception_ptr(
                                                 RequestError(RequestErrorKind::ConstraintDeadEnd,
                                                              "grammar has no valid next token")));
+                    remove_completed_slot(lane);
+                    continue;
+                }
+                if (failures[row] == PendingRowFailure::NonFiniteLogits) {
+                    // A numerical failure of this request's execution, not of its input.
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "the model produced non-finite logits: failed 1 request; "
+                                       "the Engine keeps serving");
+                    complete_error(request, std::make_exception_ptr(std::runtime_error(
+                                                "the model produced non-finite logits (NaN or "
+                                                "infinity); the request was not completed")));
                     remove_completed_slot(lane);
                     continue;
                 }

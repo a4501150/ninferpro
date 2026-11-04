@@ -95,6 +95,8 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
     request.sampling_host     = config;
+    *nonfinite_flag(sequence.lane) = 0; // the lane's earlier rounds have completed
+    request.sampling_host.nonfinite = nonfinite_flag(sequence.lane);
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,

@@ -101,8 +101,9 @@ struct ExecutionSchedule {
 
 namespace infernix::models::qwen3_5::detail {
 struct ContractAccess {
-    static void constraint_failed(PendingBatch& pending, std::size_t row, bool failed) {
-        pending.constraint_failed_.at(row) = failed;
+    static void row_failure(PendingBatch& pending, std::size_t row,
+                            runtime::PendingRowFailure failure) {
+        pending.row_failures_.at(row) = failure;
     }
 
     static SequenceHandle make_sequence(const void* owner, runtime::LaneId lane,

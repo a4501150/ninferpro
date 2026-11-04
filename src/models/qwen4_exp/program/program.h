@@ -199,7 +199,7 @@ public:
           rows_(other.rows_), row_count_(std::exchange(other.row_count_, 0)),
           tokens_(std::exchange(other.tokens_, {})), row_counts_(std::exchange(other.row_counts_, {})),
           row_stride_(std::exchange(other.row_stride_, 0)),
-          timing_(std::exchange(other.timing_, {})), constraint_failed_(other.constraint_failed_) {}
+          timing_(std::exchange(other.timing_, {})), row_failures_(other.row_failures_) {}
     PendingBatch& operator=(PendingBatch&&)      = delete;
     PendingBatch(const PendingBatch&)            = delete;
     PendingBatch& operator=(const PendingBatch&) = delete;
@@ -210,8 +210,10 @@ public:
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return row_counts_; }
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
-    // The row's emitted tokens reach a position where its grammar admits no token.
-    [[nodiscard]] bool constraint_failed(std::size_t row) const { return constraint_failed_.at(row); }
+    // Why the row cannot commit (None: it can).
+    [[nodiscard]] runtime::PendingRowFailure row_failure(std::size_t row) const {
+        return row_failures_.at(row);
+    }
 
 private:
     const void* owner_         = nullptr;
@@ -222,7 +224,7 @@ private:
     std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
-    std::array<bool, kMaximumConcurrency> constraint_failed_{};
+    std::array<runtime::PendingRowFailure, kMaximumConcurrency> row_failures_{};
 
     friend struct detail::ContractAccess;
 };

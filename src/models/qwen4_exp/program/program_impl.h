@@ -217,8 +217,9 @@ struct ContractAccess {
         out.timing_     = timing;
         return out;
     }
-    static void set_constraint_failed(PendingBatch& p, std::size_t row, bool failed) noexcept {
-        p.constraint_failed_[row] = failed;
+    static void set_row_failure(PendingBatch& p, std::size_t row,
+                                 runtime::PendingRowFailure failure) noexcept {
+        p.row_failures_[row] = failure;
     }
     static const void* owner(const PendingBatch& p) noexcept { return p.owner_; }
     static std::uint64_t transaction(const PendingBatch& p) noexcept { return p.transaction_; }
@@ -1532,6 +1533,8 @@ public:
         lane.constraint_trace.clear();
         lane.sampling.token_counts =
             static_cast<std::int32_t*>(token_counts_.p) + static_cast<std::size_t>(index) * token_domain_;
+        *nonfinite_flag(index)  = 0; // the lane's earlier rounds have completed
+        lane.sampling.nonfinite = nonfinite_flag(index);
         lane.epoch           = ++next_epoch_;
         lane.phase           = Phase::Prefill;
         lane.prefill_ns      = 0;
@@ -1704,6 +1707,8 @@ public:
         lane.sampling = b.sampling;
         lane.sampling.token_counts =
             static_cast<std::int32_t*>(token_counts_.p) + static_cast<std::size_t>(index) * token_domain_;
+        *nonfinite_flag(index)  = 0;
+        lane.sampling.nonfinite = nonfinite_flag(index);
         rebuild_token_counts(lane);
         lane.readout.clear(); // the prompt's readout was delivered before the pause
         lane.prompt     = b.prompt;
@@ -2262,7 +2267,7 @@ public:
         lane.prefill_ns += out.timing.submit_host_ns;
         out.pending.emplace(ContractAccess::make_pending(this, ++next_transaction_, handles,
                                                          {pending_tokens_.data(), 1}, out.timing));
-        mark_grammar_failures(*out.pending, {});
+        mark_row_failures(*out.pending, {});
         plain_round_ = false;
         pending_transaction_ = next_transaction_;
         return out;
@@ -2315,7 +2320,7 @@ public:
             lane.prefill_ns += out.timing.submit_host_ns;
             out.pending.emplace(ContractAccess::make_pending(this, ++next_transaction_, rows,
                                                              {pending_tokens_.data(), 1}, out.timing));
-            mark_grammar_failures(*out.pending, {});
+            mark_row_failures(*out.pending, {});
             plain_round_ = false;
             pending_transaction_ = next_transaction_;
         } else {
@@ -2554,7 +2559,7 @@ public:
         pending_transaction_  = ++next_transaction_;
         auto pending = ContractAccess::make_pending(this, pending_transaction_, sequences,
                                                     {pending_tokens_.data(), static_cast<std::size_t>(batch)}, timing);
-        mark_grammar_failures(pending, {});
+        mark_row_failures(pending, {});
         return pending;
     }
 
@@ -2614,6 +2619,15 @@ public:
         }
         const auto rows = ContractAccess::rows(pending);
         if (decisions.size() != rows.size()) { throw std::logic_error("Qwen4Exp: commit decisions are not row aligned"); }
+        // A failed row (its PendingRowFailure) commits nothing and is released like a cancelled one.
+        for (std::size_t row = 0; row < rows.size(); ++row) {
+            const auto& d = decisions[row];
+            if ((d.cancelled && d.failed) ||
+                (!d.cancelled && d.failed != (pending.row_failure(row) != runtime::PendingRowFailure::None)) ||
+                (d.failed && (d.accepted_tokens != 0 || !d.terminal))) {
+                throw std::logic_error("Qwen4Exp: a commit decision is invalid");
+            }
+        }
         if (round_width_ > 1) { return commit_verified(std::move(pending), decisions); }
         CommitResult out;
         out.row_count = rows.size();
@@ -2628,7 +2642,7 @@ public:
             const auto& d    = decisions[row];
             if (commit != nullptr) { commit[row] = 0; }
             out.rows[row].speculative_counters = speculative_counters(lane.speculative);
-            if (d.cancelled) {
+            if (d.cancelled || d.failed) {
                 if (catch_up && lane.mtp_live) {
                     // MR2: decode() advanced the state past the round's position at submission and
                     // a cancelled row skips the catch-up, so that position's cell becomes the
@@ -2641,7 +2655,8 @@ public:
                 lane.constraint_round.clear();
                 out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
-                out.rows[row].disposition = runtime::CommitDisposition::CancelledReleased;
+                out.rows[row].disposition = d.failed ? runtime::CommitDisposition::FailedReleased
+                                                     : runtime::CommitDisposition::CancelledReleased;
                 continue;
             }
             if (d.accepted_tokens != 1) { throw std::logic_error("Qwen4Exp: a row commits exactly one token"); }
@@ -2670,14 +2685,14 @@ public:
         }
         for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
         for (std::size_t row = 0; row < rows.size(); ++row) {
-            if (!decisions[row].cancelled) {
+            if (!decisions[row].cancelled && !decisions[row].failed) {
                 Lane& lane = lanes_[ContractAccess::lane(rows[row])];
                 prefix_publish(lane, prefix_frontier(lane, false));
             }
         }
         settle_round();
         for (std::size_t row = 0; row < rows.size(); ++row) {
-            if (decisions[row].cancelled) { release(ContractAccess::lane(rows[row])); }
+            if (decisions[row].cancelled || decisions[row].failed) { release(ContractAccess::lane(rows[row])); }
         }
         plain_round_ = false;
         ContractAccess::consume(pending);
@@ -5410,7 +5425,7 @@ private:
                                                     {pending_tokens_.data(), static_cast<std::size_t>(batch * W)},
                                                     timing, {pending_counts_.data(), static_cast<std::size_t>(batch)},
                                                     static_cast<std::uint32_t>(W));
-        mark_grammar_failures(pending, {pending_counts_.data(), static_cast<std::size_t>(batch)});
+        mark_row_failures(pending, {pending_counts_.data(), static_cast<std::size_t>(batch)});
         return pending;
     }
 
@@ -5433,11 +5448,12 @@ private:
             fold_rows[row]   = {static_cast<std::int32_t>(index), static_cast<std::int32_t>(index), 0};
             commit[row]      = 0;
             out.rows[row].speculative_counters = speculative_counters(lane.speculative);
-            if (d.cancelled) {
+            if (d.cancelled || d.failed) {
                 lane.constraint_round.clear();
                 out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
-                out.rows[row].disposition = runtime::CommitDisposition::CancelledReleased;
+                out.rows[row].disposition = d.failed ? runtime::CommitDisposition::FailedReleased
+                                                     : runtime::CommitDisposition::CancelledReleased;
                 continue;
             }
             const auto k = static_cast<std::int32_t>(d.accepted_tokens);
@@ -5475,14 +5491,16 @@ private:
         if (dflash2_) { dflash2_catch_up(rows, W, commit); }
         for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
         for (std::int32_t row = 0; row < batch; ++row) {
-            if (!decisions[static_cast<std::size_t>(row)].cancelled) {
+            const auto& d = decisions[static_cast<std::size_t>(row)];
+            if (!d.cancelled && !d.failed) {
                 Lane& lane = lanes_[ContractAccess::lane(rows[row])];
                 prefix_publish(lane, prefix_frontier(lane, false));
             }
         }
         settle_round();
         for (std::int32_t row = 0; row < batch; ++row) {
-            if (decisions[static_cast<std::size_t>(row)].cancelled) { release(ContractAccess::lane(rows[row])); }
+            const auto& d = decisions[static_cast<std::size_t>(row)];
+            if (d.cancelled || d.failed) { release(ContractAccess::lane(rows[row])); }
         }
         ContractAccess::consume(pending);
         pending_transaction_ = 0;
@@ -5924,6 +5942,7 @@ private:
             for (std::int32_t b = 0; b < batch; ++b) {
                 configs[b]      = lanes_[lanes[b]].sampling;
                 configs[b].mask = {};
+                configs[b].nonfinite = nullptr; // a draft's selection never fails the request
             }
             upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         }
@@ -6540,13 +6559,28 @@ private:
         grammar_->uploaded(row, host.size_bytes());
         return {device_words, static_cast<std::int32_t>(words)};
     }
-    // A row fails when the tokens it emits reach a dead-end position (one mask position per token).
-    void mark_grammar_failures(PendingBatch& pending, std::span<const std::int32_t> counts) const noexcept {
-        for (std::size_t row = 0; row < pending.row_count(); ++row) {
+    // After the round's synchronize. A row fails when its sampler found no finite logit (the lane's
+    // flag, cleared here for its next round; its tokens are placeholders), or when the tokens it
+    // emits reach a dead-end position (one mask position per token).
+    void mark_row_failures(PendingBatch& pending, std::span<const std::int32_t> counts) noexcept {
+        const auto rows = ContractAccess::rows(pending);
+        for (std::size_t row = 0; row < rows.size(); ++row) {
             const auto count = counts.empty() ? 1 : counts[row];
             const std::uint64_t reached = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1U;
-            ContractAccess::set_constraint_failed(pending, row, (grammar_dead_[row] & reached) != 0);
+            std::int32_t* const nonfinite = nonfinite_flag(ContractAccess::lane(rows[row]));
+            ContractAccess::set_row_failure(pending, row,
+                                            std::exchange(*nonfinite, 0) != 0
+                                                ? runtime::PendingRowFailure::NonFiniteLogits
+                                                : (grammar_dead_[row] & reached) != 0
+                                                      ? runtime::PendingRowFailure::ConstraintDeadEnd
+                                                      : runtime::PendingRowFailure::None);
         }
+    }
+    // Per lane: the sampler's non-finite flag (ops::SamplingConfig::nonfinite), written by the
+    // round's kernels through the host mapping.
+    PinnedHostBuffer nonfinite_flags_{sizeof(std::int32_t) * kMaximumConcurrency};
+    [[nodiscard]] std::int32_t* nonfinite_flag(std::uint32_t lane) const noexcept {
+        return static_cast<std::int32_t*>(nonfinite_flags_.data()) + lane;
     }
     // Set for the duration of one decode or prefill call.
     struct GrammarScope {

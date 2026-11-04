@@ -119,7 +119,8 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
-        configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes));
+        configs, static_cast<const __nv_bfloat16*>(logits.data), token_domain, physical_rows, cols,
+        partial_blocks, groups, scratch, layout.bytes));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -134,10 +135,12 @@ void speculative_accept_sparse_drafts_launch(
     const std::int32_t cols  = k + 1;
     if (raw_greedy) {
         speculative_accept_sparse_warp_greedy_kernel<<<1, 32 * batch, 0, stream>>>(
-            static_cast<const int*>(target_tokens.data), static_cast<const int*>(drafts.data),
+            static_cast<const int*>(target_tokens.data),
+            static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int*>(drafts.data),
             static_cast<const int*>(current_extents.data), static_cast<int*>(round_lengths.data),
             static_cast<int*>(round_anchors.data), static_cast<int*>(licensed_tokens.data),
-            static_cast<int*>(licensed_counts.data), static_cast<int*>(accepted_drafts.data), k);
+            static_cast<int*>(licensed_counts.data), static_cast<int*>(accepted_drafts.data),
+            configs, static_cast<int>(logits.ne[0]), k);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -172,8 +175,9 @@ void speculative_accept_sparse_drafts_launch(
                                     static_cast<std::int32_t*>(licensed_tokens.data),
                                     static_cast<std::int32_t*>(licensed_counts.data),
                                     static_cast<std::int32_t*>(accepted_drafts.data), configs,
-                                    token_domain, cols, partial_blocks, groups, scratch,
-                                    layout.bytes));
+                                    static_cast<const __nv_bfloat16*>(logits.data), token_domain,
+                                    static_cast<std::int32_t>(logits.ne[0]), cols, partial_blocks,
+                                    groups, scratch, layout.bytes));
 
     CUDA_CHECK(cudaGetLastError());
 }
@@ -208,12 +212,13 @@ void speculative_accept_sparse_tree_launch(
     const auto* trees        = static_cast<const SpeculativeTreeRow*>(tree_rows.data);
     if (raw_greedy) {
         speculative_accept_tree_warp_greedy_kernel<<<1, 32 * batch, 0, stream>>>(
-            static_cast<const int*>(target_tokens.data), static_cast<const int*>(drafts.data),
+            static_cast<const int*>(target_tokens.data),
+            static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int*>(drafts.data),
             static_cast<const int*>(current_extents.data), static_cast<int*>(round_lengths.data),
             static_cast<int*>(round_anchors.data), static_cast<int*>(licensed_tokens.data),
             static_cast<int*>(licensed_counts.data), static_cast<int*>(accepted_drafts.data),
-            static_cast<int*>(accepted_path.data), static_cast<int*>(accepted_branch.data), trees,
-            cols);
+            static_cast<int*>(accepted_path.data), static_cast<int*>(accepted_branch.data), configs,
+            static_cast<int>(logits.ne[0]), trees, cols);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -239,6 +244,7 @@ void speculative_accept_sparse_tree_launch(
     CUDA_CHECK(pdl::launch_consumer({dim3(group_grid), dim3(kSamplerGroupBlock), 0, stream},
                                     speculative_tree_sampling_group_finalize_kernel,
                                     static_cast<const std::int32_t*>(target_tokens.data),
+                                    static_cast<const __nv_bfloat16*>(logits.data),
                                     static_cast<const std::int32_t*>(drafts.data),
                                     static_cast<const std::int32_t*>(candidate_ids.data),
                                     static_cast<const float*>(proposal_q.data),
@@ -250,7 +256,8 @@ void speculative_accept_sparse_tree_launch(
                                     static_cast<std::int32_t*>(accepted_drafts.data),
                                     static_cast<std::int32_t*>(accepted_path.data),
                                     static_cast<std::int32_t*>(accepted_branch.data), configs,
-                                    token_domain, partial_blocks, groups, scratch, layout.bytes,
+                                    token_domain, static_cast<std::int32_t>(logits.ne[0]),
+                                    partial_blocks, groups, scratch, layout.bytes,
                                     trees, static_cast<int>(cols)));
     CUDA_CHECK(cudaGetLastError());
 }

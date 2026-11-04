@@ -40,6 +40,9 @@ struct SamplingConfig {
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
     SamplingMask mask;
+    // Optional device-addressable I32 (pinned host memory serves under UVA), or null: the Op sets
+    // it to 1 when the row's selection has no finite value, and never clears it. See sample().
+    std::int32_t* nonfinite = nullptr;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -79,10 +82,18 @@ struct SamplingConfig {
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the
  * compact row index. In every mode the selected token atomically increments
- * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
+ * configs[b].token_counts when it is non-null.
+ *
+ * A row has no finite selection when its greedy winner's adjusted value, or its best
+ * positive-temperature candidate, is NaN or infinite, or when no finite candidate remains (model
+ * execution failed; a nonempty mask is the caller's contract). Such a row writes 1 to
+ * *configs[b].nonfinite when it is non-null and publishes token 0 (counted as above), an id every
+ * consumer of the round can index; the caller fails the row's request instead of committing it.
+ * Rows with a finite selection are unaffected. Non-null token-count arrays belonging to distinct
  * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
  * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
- * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
+ * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect than the
+ * counts and the non-finite flags.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,

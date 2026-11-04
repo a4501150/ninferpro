@@ -1868,6 +1868,152 @@ int sample_sparse_drafts_case() {
 
 } // namespace
 
+// A verification column without a finite logit (every value NaN) sets the row's
+// SamplingConfig::nonfinite flag and selects token 0 in its place, on the single-block (64) and
+// multi-block (257) routes; the finite column before it is still verified and accepted.
+int nonfinite_column_case(int token_domain) {
+    constexpr int k = 2;
+    const std::vector<std::int32_t> drafts{1, 1};
+    const std::vector<std::int32_t> raw_targets{1, 1, 1};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0F);
+    logits[1] = 5.0F;
+    for (int token = 0; token < token_domain; ++token) {
+        logits[static_cast<std::size_t>(token_domain + token)] =
+            std::numeric_limits<float>::quiet_NaN();
+    }
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t index = 0; index < logits.size(); ++index) {
+        bits[index] = f32_to_bf16(logits[index]);
+    }
+
+    GuardedDeviceBuffer flag(sizeof(std::int32_t));
+    initialize(flag, std::vector<std::int32_t>{0});
+    ops::SamplingConfig config{};
+    config.temperature      = 0.0F;
+    config.presence_penalty = 1.0F; // the general route, which selects from the logits
+    config.nonfinite        = static_cast<std::int32_t*>(flag.data());
+    const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    const auto expected     = accept_state_oracle(drafts, 1, 0, 100);
+    const std::string label = "speculative non-finite column token-domain=" + std::to_string(token_domain);
+    int failures = execute_accept_case(label, raw_targets, bits, token_domain, drafts, 100,
+                                       token_domain, config, counts, expected);
+    failures += verify_exact((label + " flag").c_str(), read<std::int32_t>(flag, 1), {1});
+    failures += flag.verify_guards((label + " flag guards").c_str());
+    return failures;
+}
+
+// The single-block route picks each column's target in sequence and stops at the first rejection:
+// a NaN column an earlier finite rejection leaves unreached is never picked, so the row's flag
+// stays clear and the finite correction is licensed. (The multi-block finalize computes every
+// column's pick whatever the acceptance reaches, so an unreached NaN column flags there.)
+int nonfinite_unreached_column_case() {
+    constexpr int token_domain = 64;
+    constexpr int k            = 2;
+    const std::vector<std::int32_t> drafts{2, 1}; // rejects at column 0 against argmax 1
+    const std::vector<std::int32_t> raw_targets{1, 1, 1};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0F);
+    logits[1] = 5.0F;
+    for (int token = 0; token < token_domain; ++token) {
+        logits[static_cast<std::size_t>(token_domain + token)] =
+            std::numeric_limits<float>::quiet_NaN();
+    }
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t index = 0; index < logits.size(); ++index) {
+        bits[index] = f32_to_bf16(logits[index]);
+    }
+
+    GuardedDeviceBuffer flag(sizeof(std::int32_t));
+    initialize(flag, std::vector<std::int32_t>{0});
+    ops::SamplingConfig config{};
+    config.temperature      = 0.0F;
+    config.presence_penalty = 1.0F;
+    config.nonfinite        = static_cast<std::int32_t*>(flag.data());
+    const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    const auto expected     = accept_state_oracle(drafts, 0, 1, 100);
+    const std::string label = "speculative unreached non-finite column";
+    int failures = execute_accept_case(label, raw_targets, bits, token_domain, drafts, 100,
+                                       token_domain, config, counts, expected);
+    failures += verify_exact((label + " flag").c_str(), read<std::int32_t>(flag, 1), {0});
+    failures += flag.verify_guards((label + " flag guards").c_str());
+    return failures;
+}
+
+// The sparse Op's workspace route (production's envelope) at its registered profile: row 0's
+// column 1 is all NaN (its pick reports the row's flag and takes token 0's place, so the draft
+// there is rejected and token 0 corrects), row 1 is finite and rejects at column 0. The greedy
+// finalize computes every live column's pick, so a NaN column flags whether or not the
+// acceptance reaches it.
+int sparse_nonfinite_column_case() {
+    constexpr int k = 2, columns = k + 1, batch = 2;
+    const std::vector<std::int32_t> drafts{11, 12, 11, 12};      // [K,B]
+    const std::vector<std::int32_t> targets{11, 0, 7, 13, 0, 7}; // [K+1,B]
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) * columns * batch,
+                                      f32_to_bf16(-20.0F));
+    const auto at = [&](int row, int column, int token) {
+        return (static_cast<std::size_t>(row) * columns + column) * kSparsePhysicalRows + token;
+    };
+    for (int row = 0; row < batch; ++row) {
+        for (int column = 0; column < columns; ++column) {
+            logits[at(row, column, targets[static_cast<std::size_t>(row * columns + column)])] =
+                f32_to_bf16(9.0F);
+        }
+    }
+    for (int token = 0; token < kSparsePhysicalRows; ++token) {
+        logits[at(0, 1, token)] = f32_to_bf16(std::numeric_limits<float>::quiet_NaN()); // row 0's column 1
+    }
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(kSparseCandidates) * k * batch);
+    for (std::size_t i = 0; i < ids.size(); ++i) { ids[i] = static_cast<std::int32_t>(1000 + i); }
+    std::vector<float> q(ids.size(), 0.0F);
+    for (std::size_t i = 0; i < q.size(); i += kSparseCandidates) { q[i] = 1.0F; }
+
+    GuardedDeviceBuffer flags(batch * sizeof(std::int32_t));
+    initialize(flags, std::vector<std::int32_t>{0, 0});
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int row = 0; row < batch; ++row) {
+        configs[static_cast<std::size_t>(row)].nonfinite =
+            static_cast<std::int32_t*>(flags.data()) + row;
+    }
+    DeviceBuffer d_targets = to_device(targets), d_logits = to_device(logits), d_drafts = to_device(drafts);
+    DeviceBuffer d_ids = to_device(ids), d_q = to_device(q), d_configs = to_device(configs);
+    DeviceBuffer d_extents = to_device(std::vector<std::int32_t>{k, k});
+    GuardedDeviceBuffer d_lengths(batch * sizeof(std::int32_t)), d_anchors(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_licensed(columns * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_counts(batch * sizeof(std::int32_t)), d_accepted(batch * sizeof(std::int32_t));
+    initialize(d_lengths, std::vector<std::int32_t>{50, 60});
+    initialize(d_anchors, std::vector<std::int32_t>{-1, -1});
+
+    Tensor target_tensor(d_targets.p, DType::I32, {columns, batch});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {kSparsePhysicalRows, columns, batch});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+    Tensor id_tensor(d_ids.p, DType::I32, {kSparseCandidates, k, batch});
+    Tensor q_tensor(d_q.p, DType::FP32, {kSparseCandidates, k, batch});
+    Tensor extent_tensor(d_extents.p, DType::I32, {batch});
+    Tensor lengths(d_lengths.data(), DType::I32, {batch});
+    Tensor anchors(d_anchors.data(), DType::I32, {batch});
+    Tensor licensed(d_licensed.data(), DType::I32, {columns, batch});
+    Tensor counts(d_counts.data(), DType::I32, {batch});
+    Tensor accepted(d_accepted.data(), DType::I32, {batch});
+    const ops::SpeculativeAcceptExecutionEnvelope envelope{}; // the workspace route
+    WorkspaceArena workspace(std::max<std::size_t>(
+        256, ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(kSparseTokenDomain,
+                                                                             envelope, k, k, batch,
+                                                                             batch)));
+    ops::speculative_accept_sparse_drafts(target_tensor, logits_tensor, draft_tensor, id_tensor,
+                                          q_tensor, extent_tensor, lengths, anchors, licensed,
+                                          counts, accepted, kSparseTokenDomain,
+                                          static_cast<const ops::SamplingConfig*>(d_configs.p),
+                                          envelope, workspace, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact("sparse non-finite licensed tokens", read<std::int32_t>(d_licensed, 6),
+                                {11, 0, 0, 13, 0, 0});
+    failures += verify_exact("sparse non-finite accepted", read<std::int32_t>(d_accepted, 2), {1, 0});
+    failures += verify_exact("sparse non-finite flags", read<std::int32_t>(flags, 2), {1, 0});
+    failures += flags.verify_guards("sparse non-finite flag guards");
+    failures += d_licensed.verify_guards("sparse non-finite licensed guards");
+    return failures;
+}
+
 int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "speculative_round: SKIP (CUDA unavailable)\n";
@@ -2073,6 +2219,10 @@ int main(int argc, char** argv) {
         failures += SparseAcceptSuite(k, 1).repeated_history_case(false);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(true);
     }
+    failures += nonfinite_column_case(64);
+    failures += nonfinite_column_case(257);
+    failures += nonfinite_unreached_column_case();
+    failures += sparse_nonfinite_column_case();
 
     if (failures != 0) {
         std::cerr << "speculative_round failures=" << failures << '\n';

@@ -59,6 +59,8 @@ void ProgramImpl::install_resume_sampling(SequenceState& sequence, RequestContro
     // The configuration and occurrence storage are lane bindings. Timings and speculative
     // statistics belong to the original request and must survive every rebinding.
     request.sampling_host = request.base->sampling;
+    *nonfinite_flag(sequence.lane)  = 0;
+    request.sampling_host.nonfinite = nonfinite_flag(sequence.lane);
     const bool penalties  = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
     Tensor counts =

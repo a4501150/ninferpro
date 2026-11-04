@@ -140,11 +140,57 @@ __device__ __forceinline__ void speculative_sparse_warp_store(const int* drafts,
     }
 }
 
+// The raw greedy route takes its targets from ops::argmax, which publishes an in-range row even
+// for a column with no finite value. A column the verification reached whose target's logit is
+// not finite (sampling.h's rule) sets the row's SamplingConfig::nonfinite. `row_logits` is the
+// row's column 0 (columns physical_rows apart; FP32 or BF16); a null pointer or flag skips the
+// check.
+template <class Logit = __nv_bfloat16>
+__device__ __forceinline__ bool speculative_target_finite(const Logit* row_logits, int physical_rows,
+                                                          int column, int target) {
+    return isfinite(
+        sampling_logit(row_logits[static_cast<std::int64_t>(column) * physical_rows + target]));
+}
+
+// thread-local form: the reached columns are 0..a.
+template <class Logit = __nv_bfloat16>
+__device__ __forceinline__ void speculative_check_targets(const std::int32_t* row_targets,
+                                                          const Logit* row_logits, int physical_rows,
+                                                          int a, std::int32_t* nonfinite) {
+    if (row_logits == nullptr || nonfinite == nullptr) { return; }
+    bool finite = true;
+    for (int column = 0; column <= a; ++column) {
+        finite = finite &&
+                 speculative_target_finite(row_logits, physical_rows, column, row_targets[column]);
+    }
+    if (!finite) { *nonfinite = 1; }
+}
+
+// warp-wide form of speculative_check_targets (every lane of the warp calls).
+template <class Logit = __nv_bfloat16>
+__device__ __forceinline__ void speculative_check_targets_warp(const std::int32_t* row_targets,
+                                                               const Logit* row_logits,
+                                                               int physical_rows, int a,
+                                                               std::int32_t* nonfinite) {
+    if (row_logits == nullptr || nonfinite == nullptr) { return; } // uniform across the warp
+    const int lane = threadIdx.x & 31;
+    bool finite    = true;
+    for (int column = lane; column <= a; column += 32) {
+        finite = finite &&
+                 speculative_target_finite(row_logits, physical_rows, column, row_targets[column]);
+    }
+    if (__ballot_sync(0xffffffffU, !finite) != 0U && lane == 0) { *nonfinite = 1; }
+}
+
+template <class Logit = __nv_bfloat16>
 __device__ __forceinline__ void speculative_sparse_warp_greedy(const int* target_tokens,
                                                                const int* drafts, int* lengths,
                                                                int* anchors, int* licensed_tokens,
                                                                int* licensed_counts, int* accepted,
-                                                               int row, int extent, int k) {
+                                                               int row, int extent, int k,
+                                                               const Logit* row_logits = nullptr,
+                                                               int physical_rows       = 0,
+                                                               std::int32_t* nonfinite = nullptr) {
     const int lane = threadIdx.x & 31;
     int a          = extent;
     for (int base = 0; base < k; base += 32) {
@@ -157,15 +203,21 @@ __device__ __forceinline__ void speculative_sparse_warp_greedy(const int* target
     const int terminal = target_tokens[row * (k + 1) + a];
     speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
                                   licensed_counts, accepted);
+    speculative_check_targets_warp(target_tokens + row * (k + 1), row_logits, physical_rows, a,
+                                  nonfinite);
 }
 
 __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_kernel(
-    const int* target_tokens, const int* drafts, const int* current_extents, int* lengths,
-    int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted, int k) {
+    const int* target_tokens, const __nv_bfloat16* logits, const int* drafts,
+    const int* current_extents, int* lengths, int* anchors, int* licensed_tokens,
+    int* licensed_counts, int* accepted, const SamplingConfig* configs, int physical_rows,
+    int k) {
     const int row    = threadIdx.x / 32;
     const int extent = min(k, max(0, current_extents[row]));
-    speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors, licensed_tokens,
-                                   licensed_counts, accepted, row, extent, k);
+    speculative_sparse_warp_greedy(
+        target_tokens, drafts, lengths, anchors, licensed_tokens, licensed_counts, accepted, row,
+        extent, k, logits + static_cast<std::int64_t>(row) * (k + 1) * physical_rows, physical_rows,
+        configs[row].nonfinite);
 }
 
 __device__ __forceinline__ void speculative_sparse_warp_accept(
@@ -285,6 +337,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             const int t_star = row_targets[a];
             speculative_store_accept_result<true>(row_drafts, k, row, a, t_star, lengths, anchors,
                                                   row_tokens, licensed_counts, accepted, &cfg);
+            speculative_check_targets(row_targets, row_logits, physical_rows, a, cfg.nonfinite);
         }
         return;
     }
@@ -343,9 +396,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 __syncthreads();
             }
             if (tid == 0) {
-                if (cfg.mask.words && !isfinite(red_val[0])) { asm volatile("trap;"); }
-                const int selected = red_idx[0];
-                if (i < extent && selected == row_drafts[i]) {
+                const bool finite  = isfinite(red_val[0]);
+                const int selected = finite ? red_idx[0] : sampling_report_nonfinite(cfg);
+                if (finite && i < extent && selected == row_drafts[i]) {
                     a_sh = i + 1;
                 } else {
                     tstar_sh = selected;
@@ -503,7 +556,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const std::int32_t* candidate_ids, const float* proposal_q, const std::int32_t* current_extents,
     std::int32_t* lengths, std::int32_t* anchors, std::int32_t* licensed_tokens,
     std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
-    std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
+    const __nv_bfloat16* logits, std::int32_t token_domain, std::int32_t physical_rows,
+    std::int32_t cols, std::int32_t partial_blocks,
     std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride) {
     pdl::enter();
     const int row   = static_cast<int>(blockIdx.z);
@@ -518,6 +572,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
+    const __nv_bfloat16* row_logits =
+        logits + static_cast<std::int64_t>(row) * cols * physical_rows;
     if (token_domain <= kSamplerTileItems) { return; }
     const bool greedy    = !(cfg.temperature > 0.0f);
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
@@ -527,7 +583,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             if (tid < 32 && col == 0 && group == 0)
                 speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors,
                                                licensed_tokens, licensed_counts, accepted, row,
-                                               extent, k);
+                                               extent, k, row_logits, physical_rows,
+                                               cfg.nonfinite);
         } else {
 
             if (tid == 0 && col == 0 && group == 0) {
@@ -537,6 +594,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 speculative_store_accept_result<!SparseProposal>(row_drafts, k, row, a, t_star,
                                                                  lengths, anchors, row_tokens,
                                                                  licensed_counts, accepted, &cfg);
+                speculative_check_targets(row_targets, row_logits, physical_rows, a, cfg.nonfinite);
             }
         }
         return;
@@ -609,7 +667,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     }
     __syncthreads();
 
-    if (tid == 0 && greedy && cfg.mask.words && !isfinite(cand_val[0])) { asm volatile("trap;"); }
+    if (tid == 0 && greedy && !isfinite(cand_val[0])) { cand_idx[0] = sampling_report_nonfinite(cfg); }
 
     if constexpr (SparseProposal) {
         __shared__ int last_column;
@@ -947,9 +1005,11 @@ __device__ __forceinline__ void speculative_tree_chain_path(int row, int columns
 }
 
 __global__ __launch_bounds__(256) void speculative_accept_tree_warp_greedy_kernel(
-    const int* target_tokens, const int* drafts, const int* current_extents, int* lengths,
-    int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted, int* accepted_path,
-    int* accepted_branch, const SpeculativeTreeRow* trees, int columns) {
+    const int* target_tokens, const __nv_bfloat16* logits, const int* drafts,
+    const int* current_extents, int* lengths, int* anchors, int* licensed_tokens,
+    int* licensed_counts, int* accepted, int* accepted_path, int* accepted_branch,
+    const SamplingConfig* configs, int physical_rows, const SpeculativeTreeRow* trees,
+    int columns) {
     const int row                  = threadIdx.x / 32;
     const SpeculativeTreeRow& tree = trees[row];
     if (tree.tree != 0) {
@@ -960,8 +1020,10 @@ __global__ __launch_bounds__(256) void speculative_accept_tree_warp_greedy_kerne
         return;
     }
     const int chain = min(columns - 1, max(0, current_extents[row]));
-    speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors, licensed_tokens,
-                                   licensed_counts, accepted, row, chain, columns - 1);
+    speculative_sparse_warp_greedy(
+        target_tokens, drafts, lengths, anchors, licensed_tokens, licensed_counts, accepted, row,
+        chain, columns - 1, logits + static_cast<std::int64_t>(row) * columns * physical_rows,
+        physical_rows, configs[row].nonfinite);
     speculative_tree_chain_path(row, columns, accepted, accepted_path, accepted_branch);
 }
 
@@ -1042,13 +1104,13 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
 
 __launch_bounds__(kSamplerGroupBlock) __global__
     void speculative_tree_sampling_group_finalize_kernel(
-        const std::int32_t* target_tokens, const std::int32_t* drafts,
+        const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
         const std::int32_t* candidate_ids, const float* proposal_q,
         const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
         std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
         std::int32_t* accepted_path, std::int32_t* accepted_branch, const SamplingConfig* configs,
-        std::int32_t token_domain, std::int32_t partial_blocks, std::int32_t group_count,
-        SamplingWorkspace workspace, std::size_t workspace_row_stride,
+        std::int32_t token_domain, std::int32_t physical_rows, std::int32_t partial_blocks,
+        std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride,
         const SpeculativeTreeRow* trees, int cols) {
     pdl::enter();
     const int row                  = static_cast<int>(blockIdx.z);
@@ -1075,9 +1137,11 @@ __launch_bounds__(kSamplerGroupBlock) __global__
                     row, cols, lengths, anchors, licensed_tokens, licensed_counts, accepted,
                     accepted_path, accepted_branch);
             } else {
-                speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors,
-                                               licensed_tokens, licensed_counts, accepted, row,
-                                               chain, k);
+                speculative_sparse_warp_greedy(
+                    target_tokens, drafts, lengths, anchors, licensed_tokens, licensed_counts,
+                    accepted, row, chain, k,
+                    logits + static_cast<std::int64_t>(row) * cols * physical_rows, physical_rows,
+                    cfg.nonfinite);
                 speculative_tree_chain_path(row, cols, accepted, accepted_path, accepted_branch);
             }
         }
@@ -1150,7 +1214,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__
     __syncthreads();
 
     if (greedy) {
-        if (tid == 0) workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
+        if (tid == 0) {
+            workspace.dist_idx[sampling_dist_offset(col, 0)] =
+                isfinite(cand_val[0]) ? cand_idx[0] : sampling_report_nonfinite(cfg);
+        }
     } else {
         sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
         if (tid == 0) {
