@@ -352,8 +352,11 @@ tool-call region ordinary content. Later content is still examined:
 the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
 quoted markup before it stays ordinary content. A marker inside a Markdown code fence (```` ``` ```` or
 `~~~`) or inline code of the answer is a quoted example and stays content even when it is a complete
-call; only the text before the marker decides, so streamed and complete responses agree. A marker
-after a closed fence, or after a sentence on the same line, still opens a call. Generated reasoning closes only at a `</think>`
+call; only the text before the marker decides, so streamed and complete responses agree. A marker at
+the start of a line (after its leading whitespace) is never inside inline code an earlier line
+opened: a streamed response cannot know that such a backtick run is never closed (CommonMark then
+makes it text), and a stray backtick in a sentence before the call must not turn the call into
+text. A marker after a closed fence, or after a sentence on the same line, still opens a call. Generated reasoning closes only at a `</think>`
 followed by a line break or the end of the turn, so a marker the model quotes while reasoning (followed
 by a space, punctuation or an escaped `
 `) stays in the reasoning channel.

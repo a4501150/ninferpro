@@ -252,6 +252,21 @@ void quoted_openers(infernix::text::GrammarCompiler& compiled) {
     const auto result    = decoder.finish();
     require(result.tool_calls.empty() && published + result.content == prose,
             "quoted markup became a call");
+    // A stray backtick in an earlier line's sentence does not reach a call at the next line's
+    // start (Strata #4923): the grammar opens the call there, and so does the decoder's tracker.
+    {
+        const std::string whole   = call("v");
+        const std::string through = whole.substr(0, whole.find("<parameter="));
+        const auto at = feed(compiled, *basic, {}, "Let me use `run_commands to check.\n" + through);
+        require(at.admitted && !at.other, "a call at a line's start stayed quoted text");
+        frontend::ToolCallOutputDecoder stray_decoder(basic, 64);
+        const std::string stray = "Let me use `run_commands to check.\n" + whole;
+        std::string stray_published;
+        for (char c : stray) stray_published += stray_decoder.feed(std::string_view(&c, 1));
+        const auto stray_result = stray_decoder.finish();
+        require(stray_result.tool_calls.size() == 1, "the decoder quoted a call at a line's start");
+    }
+
     require(!feed(compiled, *basic, {}, "Calling it: <tool_call>").other,
             "an unquoted opener no longer starts a call");
 }

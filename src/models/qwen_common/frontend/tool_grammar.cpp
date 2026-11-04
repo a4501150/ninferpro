@@ -45,10 +45,16 @@ struct TextState {
     std::uint8_t rest = 0;  // the current run of run_char after an opener's first three
     std::uint8_t matched = 0; // bytes of kCallOpen matched outside code
     std::uint8_t closed   = 0; // bytes of the reasoning close matched (reasoning section)
+    std::uint8_t indent   = 0; // columns of leading whitespace consumed in Lead
 
-    [[nodiscard]] bool in_code() const noexcept { return fence != '\0' || paragraph != line; }
+    // A marker at a line's start (phase Lead: only leading whitespace before it on the line) is
+    // never inside a code span an earlier line opened: a streamed reader cannot know that such a
+    // backtick run is never closed (Strata #4923).
+    [[nodiscard]] bool in_code() const noexcept {
+        return fence != '\0' || (phase != Lead && paragraph != line);
+    }
     auto key() const noexcept {
-        return std::tuple(fence, paragraph, line, phase, run_char, rest, matched, closed);
+        return std::tuple(fence, paragraph, line, phase, run_char, rest, matched, closed, indent);
     }
     bool operator<(const TextState& other) const noexcept { return key() < other.key(); }
 
@@ -62,7 +68,11 @@ struct TextState {
         opened         = false;
         exited         = false;
         refused        = false;
-        const bool outside = !in_code();
+        // A marker's code decision is made at its first byte, as the tracker does: a partial
+        // opener's continuation holds it (its bytes leave the line's start, where an earlier
+        // line's span must not decide, Strata #4923), while a fresh candidate start samples the
+        // current state.
+        const bool continues = matched != 0 && byte == static_cast<unsigned char>(kCallOpen[matched]);
         if (byte == '\n') {
             if (fence != '\0') {
                 if (phase == Closer) next.fence = '\0';
@@ -77,6 +87,7 @@ struct TextState {
             next.phase    = Lead;
             next.run_char = '\0';
             next.rest     = 0;
+            next.indent   = 0;
         } else {
             if (fence == '\0' && byte == '`') next.line = !line;
             const bool blank = byte == ' ' || byte == '\t' || byte == '\r' || byte == '\f' ||
@@ -84,7 +95,10 @@ struct TextState {
             const char fence_char = fence != '\0' ? fence : static_cast<char>(byte);
             switch (phase) {
             case Lead:
-                if (blank) break;
+                if (blank) {
+                    next.indent = indent < 255 ? static_cast<std::uint8_t>(indent + 1) : indent;
+                    break;
+                }
                 if ((byte == '`' || byte == '~') && fence_char == static_cast<char>(byte)) {
                     next.phase    = Run1;
                     next.run_char = static_cast<char>(byte);
@@ -119,8 +133,8 @@ struct TextState {
         // The opener holds no backtick, tilde or line break, so the code state at its first byte
         // holds through its last.
         next.matched = 0;
-        if (outside) {
-            if (byte == static_cast<unsigned char>(kCallOpen[matched])) {
+        if (!in_code() || continues) {
+            if (continues) {
                 next.matched = static_cast<std::uint8_t>(matched + 1);
             } else if (byte == static_cast<unsigned char>(kCallOpen[0])) {
                 next.matched = 1;

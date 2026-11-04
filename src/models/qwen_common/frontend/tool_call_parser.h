@@ -21,7 +21,9 @@ struct ParsedToolCallOutput {
 
 // The Markdown code state of answer text read so far: an open ``` or ~~~ fence, and the
 // backticks of the current paragraph. A tool-call marker inside a fence or inline code is a quoted
-// example and stays text, on the constrained route too (its grammar applies the same rule). Only
+// example and stays text, on the constrained route too (its grammar applies the same rule); a
+// marker at a line's start (after its leading whitespace) is outside any code span an earlier line
+// opened, whose run may never close. Only
 // the text before a marker decides, so streamed and whole outputs agree.
 class MarkdownCodeTracker {
 public:
@@ -78,6 +80,8 @@ private:
     std::string trailing_whitespace_;
     std::string tool_region_;
     std::string pending_tag_;
+    // The last published bytes, enough to see a quoted opener spelling followed by its markup.
+    std::string published_tail_;
     // The code state of the text fed before the next byte, and of the text before the tool
     // region (the state its parse starts from).
     MarkdownCodeTracker code_;

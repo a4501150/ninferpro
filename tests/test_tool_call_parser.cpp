@@ -1354,11 +1354,16 @@ int test_tolerant_undeclared_and_value_cut() {
 int test_markdown_quoted_calls() {
     const std::vector<std::string> definitions = {
         tool_definition("write", Json{{"path", Json{{"type", "string"}}}})};
-    const auto contract = contract_from_definitions(definitions);
+    const auto free_contract = contract_from_definitions(definitions);
+    const auto constrained   = fi::select_tool_call_contract(free_contract, infernix::ToolChoice{});
+    using Contract           = std::shared_ptr<const fi::ToolCallOutputContract>;
+    const std::vector<std::pair<Contract, bool>> routes{
+        {free_contract, false}, {free_contract, true}, {constrained, false}};
     const auto call     = tool_call("write", {{"path", "/tmp/a.txt"}});
     // (calls, content) of one output.
     using Outcome  = std::pair<std::size_t, std::string>;
-    const auto run = [&](const std::string& text, bool tolerant, std::size_t width) {
+    const auto run = [&](const std::string& text, const Contract& contract, bool tolerant,
+                         std::size_t width) {
         fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
         std::string content;
         for (std::size_t at = 0; at < text.size(); at += width) {
@@ -1369,27 +1374,43 @@ int test_markdown_quoted_calls() {
     };
     int failures       = 0;
     const auto outcome = [&](const std::string& text, bool tolerant) {
-        const auto whole = fi::parse_qwen_tool_call_output(text, 64, *contract, tolerant);
+        const auto whole = fi::parse_qwen_tool_call_output(text, 64, *free_contract, tolerant);
         Outcome reference(whole.tool_calls.size(), whole.content);
         const std::vector<std::size_t> widths{1, 2, 3, 5, 7, 64, text.size()};
-        for (const std::size_t width : widths) {
-            if (run(text, tolerant, width) != reference) {
-                failures += fail("a streamed chunking of width " + std::to_string(width) +
-                                 " disagrees with the whole output: " + text.substr(0, 40));
+        for (const auto& [contract, route_tolerant] : routes) {
+            if (route_tolerant != tolerant) { continue; }
+            const auto route_whole =
+                fi::parse_qwen_tool_call_output(text, 64, *contract, route_tolerant);
+            Outcome route_reference(route_whole.tool_calls.size(), route_whole.content);
+            if (route_reference != reference) {
+                failures += fail("a route's whole parse disagrees with the free route: " +
+                                 text.substr(0, 40));
+            }
+            for (const std::size_t width : widths) {
+                if (run(text, contract, route_tolerant, width) != route_reference) {
+                    failures += fail("a streamed chunking of width " + std::to_string(width) +
+                                     " disagrees with the whole output: " + text.substr(0, 40));
+                }
             }
         }
         return reference;
     };
     const std::vector<std::string> quoted{
         "Format:\n```xml\n" + call + "\n```\nDone.", "Format:\n~~~\n" + call + "\n~~~\nDone.",
-        "Use `" + call + "` like this.", "Use `x`, then `\n" + call + "`", "```\n" + call,
+        "Use `" + call + "` like this.", "```\n" + call,
+        // A stray backtick on the call's own line still opens a span there.
+        "Let me use `run_commands " + call,
         "Text\n\n```python\nx = 1\n```\n```\n" + call};
     const std::vector<std::string> real{call,
                                         "Let me do it.\n\n" + call,
                                         "Let me do it. " + call,
                                         "```\ncode\n```\n" + call,
                                         "`a` and `b` " + call,
-                                        "~~~\nx\n~~~\n\n" + call};
+                                        "~~~\nx\n~~~\n\n" + call,
+                                        // A span left open on an earlier line of the paragraph does not
+                                        // reach a call at a line's start (Strata #4923).
+                                        "Let me use `run_commands to check.\n" + call,
+                                        "Use `x`, then `\n   " + call};
     for (const bool tolerant : {false, true}) {
         for (const std::string& body : quoted) {
             const Outcome got = outcome(body, tolerant);

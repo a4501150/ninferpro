@@ -1046,8 +1046,17 @@ void MarkdownCodeTracker::end_line() {
 }
 
 bool MarkdownCodeTracker::in_code() const noexcept {
-    return fence_ != '\0' ||
-           (ticks_ + static_cast<std::uint32_t>(std::count(line_.begin(), line_.end(), '`'))) % 2 == 1;
+    if (fence_ != '\0') { return true; }
+    // A marker at a line's start (only leading whitespace before it on the line) is never inside
+    // a code span an earlier line opened: a streamed reader cannot know that such a backtick run
+    // is never closed (CommonMark then makes it text), and a stray backtick in a sentence before
+    // the call must not turn the call into text (Strata #4923).
+    if (line_.find('`') == std::string::npos &&
+        line_.find_first_not_of(" \t\r\f\v") == std::string::npos) {
+        return false;
+    }
+    return (ticks_ + static_cast<std::uint32_t>(std::count(line_.begin(), line_.end(), '`'))) % 2 ==
+           1;
 }
 
 bool contains_unquoted_tool_marker(std::string_view text) {
@@ -1085,8 +1094,21 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         const std::size_t found = find_first_tool_marker(source.substr(from));
         return found == std::string_view::npos ? std::string::npos : from + found;
     };
+    // A bare marker right after a quoted opener spelling belongs to that wrapper, which is text:
+    // its own markup must not open a region.
+    std::size_t quoted_opener = std::string::npos;
+    const auto skipped = [&](std::size_t at) {
+        if (quoted(at)) {
+            if (source.substr(at, kToolOpen.size()) == kToolOpen) { quoted_opener = at; }
+            return true;
+        }
+        if (quoted_opener == std::string::npos) { return false; }
+        const std::size_t between = at - quoted_opener - kToolOpen.size();
+        return source.substr(quoted_opener + kToolOpen.size(), between)
+                   .find_first_not_of(" \t\r\n\f\v") == std::string_view::npos;
+    };
     std::size_t candidate = find_first_tool_marker(source);
-    while (candidate != std::string::npos && quoted(candidate)) { candidate = next_marker(candidate + 1); }
+    while (candidate != std::string::npos && skipped(candidate)) { candidate = next_marker(candidate + 1); }
     if (candidate == std::string::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
@@ -1167,6 +1189,10 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
     const auto publish = [&](std::string_view bytes) {
         visible.append(bytes);
         code_.feed(bytes);
+        published_tail_.append(bytes);
+        if (published_tail_.size() > kToolOpen.size()) {
+            published_tail_.erase(0, published_tail_.size() - kToolOpen.size());
+        }
     };
     for (std::size_t index = 0; index < text.size(); ++index) {
         const char byte = text[index];
@@ -1175,7 +1201,9 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
             if (matches_any_marker(pending_tag_, tool_call_only)) {
                 MarkdownCodeTracker before_marker = code_;
                 before_marker.feed(trailing_whitespace_);
-                if (before_marker.in_code()) {
+                // A bare marker right after a quoted opener spelling belongs to that wrapper,
+                // which is text: its own markup must not open a region.
+                if (before_marker.in_code() || published_tail_ == kToolOpen) {
                     // A quoted example inside Markdown code: the marker is text.
                     publish(trailing_whitespace_);
                     trailing_whitespace_.clear();
