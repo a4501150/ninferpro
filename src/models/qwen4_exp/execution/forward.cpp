@@ -99,10 +99,11 @@ void project_group(const Tensor& x, const LinearParameters& first, std::span<Ten
 // Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly (an id outside the vocabulary
 // writes kErrorTokenId to `error`).
 void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s, std::uint32_t* error) {
+    const DeviceFault fault{.word = error, .value = kErrorTokenId};
     if (table.layout == QuantLayout::GgmlRows) {
-        ops::ggml_embedding(ids, table, out, s, DeviceFault{.word = error, .value = kErrorTokenId});
+        ops::ggml_embedding(ids, table, out, s, fault);
     } else {
-        ops::embedding(ids, table, out, s);
+        ops::embedding(ids, table, out, s, fault);
     }
 }
 
