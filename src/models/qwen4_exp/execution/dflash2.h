@@ -11,6 +11,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "infernix/ops/linear.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/types.h"
 #include "models/qwen4_exp/config.h"
@@ -54,9 +55,12 @@ public:
     // `ring` holds one layer view per drafter layer (capacity = the window). `head` selects the
     // proposal head (--lm-head-draft) or the text head; max_context bounds every frontier. An anchor
     // outside the vocabulary writes kErrorTokenId to the Program's `error` word (ForwardExperts::error).
+    // `routes` carries the Program's dense-projection fast-route flags (ForwardFastPaths::dense_routes);
+    // a flag reaches only the drafter's projections that register one (today the feature projection's
+    // q8-sliced-k table).
     DFlash2(const Parameters& parameters, const DFlash2Config& config, ProposalHead head, DeviceContext& device,
             WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context,
-            std::uint32_t* error);
+            std::uint32_t* error, ops::LinearRoutes routes = ops::LinearRoutes::Exact);
 
     void materialize(const DFlash2ContextCall& call);
     void propose(const DFlash2ProposalCall& call);
@@ -88,6 +92,7 @@ private:
     std::vector<CyclicKVCacheLayerView> ring_;
     std::uint32_t max_context_ = 0;
     std::uint32_t* error_      = nullptr;
+    ops::LinearRoutes routes_ = ops::LinearRoutes::Exact;
 };
 
 } // namespace infernix::models::qwen4_exp::execution

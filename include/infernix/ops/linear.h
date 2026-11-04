@@ -50,7 +50,8 @@ enum class LinearPolicy : std::uint8_t {
  */
 enum class LinearRoutes : std::uint8_t {
     Exact     = 0,
-    Q8SlicedK = 1, ///< q8-sliced-k: NInfer's Q8 GEMV/sliced-K routes (Flash-Next [16384,2560], [2560,6144]).
+    Q8SlicedK = 1, ///< q8-sliced-k: NInfer's Q8 GEMV/sliced-K routes (Flash-Next [16384,2560],
+                   ///< [2560,6144]) and the DFlash2 feature projection's sliced-K tiles [2560,12800].
     Fp8A8Pair = 2, ///< fp8-a8-pair: FP8 weights with the activation as two E4M3 terms.
     Q4W4A8    = 4, ///< q4-w4a8: groupwise Q4 weights with int8 activations.
     /// batched-decode: NVFP4 linear_add [5120,17408] A16 tiles of 8 K-warps at 5-16 columns (the

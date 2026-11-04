@@ -20,6 +20,9 @@ const Q8ShapeEntry qwen4_exp_q8_shapes[] = {
      select_q8_n320_k10240_fast},
     {10240, 320, select_q8_n10240_k320, nullptr, select_q8_n10240_k320_invariant},
     {2560, 640, select_q8_n2560_k640, nullptr, select_q8_n2560_k640_invariant},
+    // The DFlash2 drafter's feature projection: the exact selector keeps the runtime-shape
+    // routes; the fast one carries the q8-sliced-k flag's tuned sliced-K tiles.
+    {2560, 12800, select_q8_n2560_k12800, select_q8_n2560_k12800_fast},
     // NInfer's tunings for its own 2560-wide groupings.
     {6144, 2560, select_q8_n6144_k2560},
     {10240, 2560, select_q8_n10240_k2560},

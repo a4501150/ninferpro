@@ -36,9 +36,9 @@ void ProgramImpl::create_dflash2_drafter() {
     for (std::uint32_t l = 0; l < dflash_ring_->layer_count(); ++l) { ring.push_back(dflash_ring_->layer_view(l)); }
     // --lm-head-draft binds the proposal head; the drafts then read it instead of the text head.
     const ProposalHead head = parameters_.draft_head.rows ? ProposalHead::Optimized : ProposalHead::Full;
-    drafter_ = std::make_unique<execution::DFlash2>(parameters_, *parameters_.model.config().dflash2, head, device_,
-                                                    *work_, std::move(ring), options_.max_context,
-                                                    static_cast<std::uint32_t*>(device_error_.data()));
+    drafter_ = std::make_unique<execution::DFlash2>(
+        parameters_, *parameters_.model.config().dflash2, head, device_, *work_, std::move(ring),
+        options_.max_context, static_cast<std::uint32_t*>(device_error_.data()), options_.fast_paths.dense_routes);
 }
 
 void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const std::function<void()>& while_drafting) {

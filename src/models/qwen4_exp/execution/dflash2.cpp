@@ -35,8 +35,9 @@ std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
 // The drafter's top-16 candidates per position (the selector's lattice).
 constexpr std::int32_t kCandidates = 16;
 
-void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
-    ops::linear(x, p.weight, out, p.policy, work, s);
+void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s,
+             ops::LinearRoutes routes) {
+    ops::linear(x, p.weight, out, p.policy, work, s, routes);
 }
 
 // Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly (as Forward embeds them).
@@ -61,9 +62,10 @@ void require_q8(const Weight& weight, const char* name) {
 
 DFlash2::DFlash2(const Parameters& parameters, const DFlash2Config& config, ProposalHead head, DeviceContext& device,
                  WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context,
-                 std::uint32_t* error)
+                 std::uint32_t* error, ops::LinearRoutes routes)
     : parameters_(parameters), p_(parameters.dflash2.value()), config_(config), text_(parameters.model.config().text),
-      head_(head), device_(device), work_(work), ring_(std::move(ring)), max_context_(max_context), error_(error) {
+      head_(head), device_(device), work_(work), ring_(std::move(ring)), max_context_(max_context), error_(error),
+      routes_(routes) {
     if (ring_.size() != config_.layers || p_.layers.size() != config_.layers) {
         throw std::invalid_argument("Qwen4Exp DFlash2: one context ring layer per drafter layer");
     }
@@ -108,7 +110,7 @@ void DFlash2::materialize(const DFlash2ContextCall& call) {
     const nvtx::ScopedRange range(nvtx::Name::DFlashContextAppend, nvtx::Category::DFlash, static_cast<std::uint64_t>(W * B));
     work_.reset();
     Tensor projected = work_.alloc(DType::BF16, {H, W * B});
-    project(call.features.view({call.features.ne[0], W * B}), p_.feature_projection, projected, work_, s);
+    project(call.features.view({call.features.ne[0], W * B}), p_.feature_projection, projected, work_, s, routes_);
     Tensor context = work_.alloc(DType::BF16, {H, W, B});
     Tensor flat    = context.view({H, W * B});
     ops::rmsnorm(projected, p_.context_norm, config_.rms_norm_eps, false, flat, s);
@@ -244,7 +246,7 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
     Tensor scores     = work_.alloc(DType::FP32, {kCandidates, K * B});
     head_candidates(hidden, ids_flat, scores);
     Tensor projected = work_.alloc(DType::BF16, {dim(config_.selector_rank), K * B});
-    project(hidden, p_.selector_hidden, projected, work_, s);
+    project(hidden, p_.selector_hidden, projected, work_, s, routes_);
     Tensor drafts     = call.drafts;
     Tensor q          = call.proposal_q;
     Tensor confidence = call.confidence;

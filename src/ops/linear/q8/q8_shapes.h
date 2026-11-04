@@ -12,6 +12,7 @@ using Q8N2048K4096   = Q8LinearGeometry<2048, 4096>;
 using Q8N2048K4608   = Q8LinearGeometry<2048, 4608>;
 using Q8N2048K16384  = Q8LinearGeometry<2048, 16384>;
 using Q8N2560K6144   = Q8LinearGeometry<2560, 6144>;
+using Q8N2560K12800  = Q8LinearGeometry<2560, 12800>;
 using Q8N4608K4608   = Q8LinearGeometry<4608, 4608>;
 using Q8N5120K4608   = Q8LinearGeometry<5120, 4608>;
 using Q8N5120K6144   = Q8LinearGeometry<5120, 6144>;
@@ -74,11 +75,16 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n1280_k2560(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k6144(std::int32_t tokens);
 // The q8-sliced-k fast path (LinearRoutes::Q8SlicedK): NInfer's GEMV, sliced-K and grouped sliced-K
-// routes for the same two problems, whose accumulation order differs from the exact routes'.
+// routes for the same two problems, whose accumulation order differs from the exact routes', and
+// the DFlash2 feature projection's sliced-K routes (RTX PRO 6000 tuning, same flag).
 [[nodiscard]] Q8Launch select_q8_n16384_k2560_fast(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k6144_fast(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n324_k10240_fast(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n320_k10240_fast(std::int32_t tokens);
+// The feature projection of Qwen3.8-Flash-Next's DFlash2 drafter (five target taps of 2560): the
+// exact selector keeps the runtime-shape routes, the fast one the tuned sliced-K tiles.
+[[nodiscard]] Q8Launch select_q8_n2560_k12800(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k12800_fast(std::int32_t tokens);
 // The [16384,2560] GDN projection on the same routes, rows [0,10240) written to qkv [10240,T] and
 // rows [10240,16384) to z [6144,T] (gdn_input_proj).
 void launch_q8_n16384_k2560_split(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,

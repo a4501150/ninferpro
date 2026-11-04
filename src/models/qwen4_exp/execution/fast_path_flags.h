@@ -9,8 +9,9 @@ namespace infernix::models::qwen4_exp::execution {
 // FastPathSelection::forward). The default value is the width-routed exact route; a construction-exact
 // configuration's exact route also sets gdn_arithmetic and column_invariant.
 struct ForwardFastPaths {
-    // The dense projections' fast-route flags: q8-sliced-k (GDN q/k/v/z, GDN and QSA output) and
-    // fp8-a8-pair (recipe C's FP8 rows). Each flag reaches only the problems that register it.
+    // The dense projections' fast-route flags: q8-sliced-k (GDN q/k/v/z, GDN and QSA output, and
+    // the DFlash2 drafter's feature projection) and fp8-a8-pair (recipe C's FP8 rows). Each flag
+    // reaches only the problems that register it.
     ops::LinearRoutes dense_routes = ops::LinearRoutes::Exact;
     // gdn-conv-fused: the GDN projection and its causal convolution in one kernel (FP32 current token).
     bool gdn_conv_fused = false;

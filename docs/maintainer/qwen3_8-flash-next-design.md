@@ -1371,6 +1371,18 @@ kernel and no atomics, and the workspace carries only the producer keys and the 
 Keys are unique (distinct ids), so the selected keys and their order are those of a full sort: the
 selection is bit-equal to a full stable sort whatever the merge tree, ties included.
 
+The drafter's context feature projection, Q8 [2560, 12800] (five target taps of 2560), has a tuned
+fast route under the `q8-sliced-k` flag: sliced-K MMA tiles (double-buffered weight stages, 8 K warps
+to 32 columns and 4 beyond, one stage past 64 where the kernel loops token blocks) through 128
+columns and the r32/r64 MMA tiles beyond — on the RTX PRO 6000, cold-op minima against the
+runtime-shape routes the problem ran before: 24.3 against 38.7 µs at one column, 26.4 against 127 at
+16, 48.9 against 129 at 48, 63.5 against 124.9 at 64, 110.4 against 132.9 at 128, and 569.3 against
+720.9 at 2,048. The exact route keeps the runtime-shape routes bit for bit (the table's exact
+selector replicates them); the fast selector is width-keyed like the flag's other problems, its
+FP64-oracle conformance at every seam is in `test_q8_a16`, and the flag reaches the projection only
+where it is selected (Dense8 today; recipe C selects no `q8-sliced-k`, so production's recipe C
+artifact keeps the exact routes until a qualified row adds it).
+
 ### 11.4 Draft-length policy
 
 `--draft-tokens auto` chooses per round. K = 0 (a plain round) is always a candidate, so the
