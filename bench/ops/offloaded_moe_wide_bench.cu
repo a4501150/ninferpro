@@ -225,6 +225,9 @@ struct Fixture {
         }
         scales = DeviceBuffer(sizeof(moe::ExpertScales) * kExperts);
         CUDA_CHECK(cudaMemcpy(scales.p, s.data(), scales.bytes, cudaMemcpyHostToDevice));
+        // The bank's pageable copies may still be in flight when cudaMemcpy returns; the expert
+        // kernels read them from the non-blocking compute stream, so settle the device here.
+        CUDA_CHECK(cudaDeviceSynchronize());
         staging = DeviceBuffer(static_cast<std::size_t>(kStagingSlots) * moe::kRecordBytes);
         CUDA_CHECK(cudaStreamCreateWithFlags(&overlap, cudaStreamNonBlocking));
         for (auto& event : events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
@@ -265,7 +268,10 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
     const int entries = kTopK * tokens;
     const auto logits = routing_logits(rng, tokens, options.columns_per_expert);
     DeviceBuffer d_logits(logits.size() * sizeof(float));
-    CUDA_CHECK(cudaMemcpy(d_logits.p, logits.data(), d_logits.bytes, cudaMemcpyHostToDevice));
+    // Stream-ordered: a synchronous pageable cudaMemcpy may return before the device transfer
+    // completes, and the compute stream is non-blocking, so moe_route could otherwise read
+    // logits that are still in flight (varying routing between invocations).
+    CUDA_CHECK(cudaMemcpyAsync(d_logits.p, logits.data(), d_logits.bytes, cudaMemcpyHostToDevice, stream));
     DeviceBuffer ids(sizeof(std::int32_t) * entries), weights(sizeof(float) * entries), gate(sizeof(float) * tokens);
     ops::MoeRouting routing{Tensor(ids.p, DType::I32, {kTopK, tokens}), Tensor(weights.p, DType::FP32, {kTopK, tokens}),
                             Tensor(gate.p, DType::FP32, {tokens})};

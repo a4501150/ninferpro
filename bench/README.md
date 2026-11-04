@@ -35,6 +35,18 @@ workload. These changes establish a new input/timing baseline: older constant or
 fixtures and repeated in-place chains are not directly comparable. Compare implementations using
 the same fixture, seed, cache policy, and timing mode.
 
+Inputs a bench feeds an Op on a non-blocking stream (the `DeviceContext` compute stream) must be
+copied on that stream (`cudaMemcpyAsync(..., stream)`) or followed by an explicit settle
+(`cudaStreamSynchronize(nullptr)` / `cudaDeviceSynchronize()`), never by a bare synchronous
+`cudaMemcpy` whose consumer launches immediately: a pageable host-to-device `cudaMemcpy` may
+return before the device transfer completes, so the first kernel can read operand bytes that are
+still in flight and the run's hashes then vary between invocations of the same binary. The
+wide-bench's router logits hit exactly this (varying routing and output hashes at multi-point
+runs; fixed 2026-11-03 by copying the logits on the measured stream). Core's
+`DeviceBuffer::copy_from_host` already settles for the same reason; raw `cudaMemcpy` calls in
+benches bypass that guard. A device synchronize that happens to follow the copy (as
+`make_bf16`'s) also settles it, but only an explicit ordering keeps the hash meaningful.
+
 ## Build
 
 `CMakeLists.txt` includes explicit registrations from `ops/`, `inference/`, `decode_quality/`,
