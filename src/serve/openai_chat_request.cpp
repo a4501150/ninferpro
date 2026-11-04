@@ -8,7 +8,9 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace infernix::serve {
 namespace {
@@ -551,6 +553,45 @@ ChatTurn parse_message(const Json& item, std::size_t index) {
     return parse_regular_message(item, index, role);
 }
 
+// The tool results that answer one assistant turn's calls follow the calls' order, as on the
+// Responses and Messages endpoints: the template renders results without their ids, so results a
+// client returns as they finish (parallel tool runners) would otherwise read as answers to the wrong
+// calls. Only a run whose ids are unique and name exactly the turn's calls is reordered; any other
+// run keeps the order received (Chat Completions has no call-graph contract to refuse it under).
+void order_tool_results(std::vector<ChatTurn>& messages) {
+    for (std::size_t index = 0; index < messages.size(); ++index) {
+        const std::vector<ToolCall>& calls = messages[index].tool_calls;
+        if (messages[index].role != ChatRole::Assistant || calls.size() < 2) { continue; }
+        const std::size_t first = index + 1;
+        std::size_t end         = first;
+        while (end < messages.size() && messages[end].role == ChatRole::Tool) { ++end; }
+        if (end - first != calls.size()) { continue; }
+        std::unordered_map<std::string_view, std::size_t> position;
+        position.reserve(calls.size());
+        bool ordered = true, unique = true;
+        for (std::size_t call = 0; call < calls.size() && unique; ++call) {
+            unique = !calls[call].id.empty() && position.emplace(calls[call].id, call).second;
+        }
+        std::vector<std::size_t> slot(calls.size());
+        std::vector<bool> taken(calls.size(), false);
+        for (std::size_t result = first; result < end && unique; ++result) {
+            const auto found = position.find(messages[result].tool_call_id);
+            unique           = found != position.end() && !taken[found->second];
+            if (!unique) { break; }
+            taken[found->second]       = true;
+            slot[result - first] = found->second;
+            ordered              = ordered && found->second == result - first;
+        }
+        if (!unique || ordered) { continue; }
+        std::vector<ChatTurn> results(calls.size());
+        for (std::size_t result = first; result < end; ++result) {
+            results[slot[result - first]] = std::move(messages[result]);
+        }
+        std::move(results.begin(), results.end(), messages.begin() + static_cast<std::ptrdiff_t>(first));
+        index = end - 1;
+    }
+}
+
 void parse_messages(const Json& body, GenerationRequest& output) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
@@ -561,6 +602,7 @@ void parse_messages(const Json& body, GenerationRequest& output) {
     for (std::size_t index = 0; index < messages.size(); ++index) {
         output.messages.push_back(parse_message(messages.at(index), index));
     }
+    order_tool_results(output.messages);
     // A trailing assistant message is an assistant prefill, matching the Anthropic endpoint: the
     // client sends back a partial assistant turn and the Engine continues it in place.
     if (!output.messages.empty() && output.messages.back().role == ChatRole::Assistant) {

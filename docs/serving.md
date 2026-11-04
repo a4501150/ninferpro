@@ -222,7 +222,9 @@ The endpoint supports:
   callers that dispatch by name keep working;
 - `tool_choice` `auto`/`none`/`required`, named function or `custom` selection, `allowed_tools`, and
   `parallel_tool_calls`; assistant tool-call history, tool-result messages, and legacy
-  function-call history;
+  function-call history (a run of tool results whose `tool_call_id`s name exactly the preceding
+  assistant turn's calls is rendered in call order, as on the Responses and Messages endpoints; any
+  other run keeps the order received);
 - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
   server-configured level;
 - `enable_thinking` and `preserve_thinking`, either at top level or in

@@ -586,6 +586,38 @@ int test_tools() {
     failures += check(parse(history).generation.has_tool_history(),
                       "tool-call history follows wire types without inventing JSON validation");
 
+    // Results returned out of call order (as parallel runners finish) are put back in call order
+    // when their ids name exactly the turn's calls; any other run keeps the order received.
+    const auto call = [](const char* id, const char* name) {
+        return Json{{"id", id}, {"type", "function"}, {"function", Json{{"name", name}, {"arguments", "{}"}}}};
+    };
+    const auto result = [](const char* id, const char* text) {
+        return Json{{"role", "tool"}, {"tool_call_id", id}, {"content", text}};
+    };
+    const auto results_order = [&](Json results) {
+        Json body        = base_request();
+        body["messages"] = Json::array({Json{{"role", "user"}, {"content", "go"}},
+                                        Json{{"role", "assistant"},
+                                             {"content", nullptr},
+                                             {"tool_calls", Json::array({call("c1", "a"), call("c2", "b"),
+                                                                         call("c3", "c")})}}});
+        for (Json& item : results) { body["messages"].push_back(std::move(item)); }
+        std::vector<std::string> ids;
+        for (const auto& turn : parse(body).generation.messages) {
+            if (turn.role == infernix::ChatRole::Tool) { ids.push_back(turn.tool_call_id); }
+        }
+        return ids;
+    };
+    using Ids = std::vector<std::string>;
+    failures += check(results_order(Json::array({result("c3", "z"), result("c1", "x"), result("c2", "y")})) ==
+                          Ids{"c1", "c2", "c3"},
+                      "out-of-order tool results follow the call order");
+    failures += check(results_order(Json::array({result("c2", "y"), result("c1", "x")})) == Ids{"c2", "c1"},
+                      "a partial run keeps the order received");
+    failures += check(results_order(Json::array({result("c2", "y"), result("c2", "x"), result("c1", "z")})) ==
+                          Ids{"c2", "c2", "c1"},
+                      "a run with a repeated id keeps the order received");
+
     Json mixed_assistant        = base_request();
     mixed_assistant["messages"] = Json::array(
         {Json{{"role", "user"}, {"content", "inspect"}},
