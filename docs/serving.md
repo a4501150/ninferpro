@@ -120,6 +120,12 @@ How failures end:
   in-process: the server prints `CUDA_CHECK(...) failed` with the error and exits, without final
   request-log records for the requests in flight.
 
+The listener's port is its own: on Linux a second server cannot bind it beside a running one (the
+listener sets `SO_REUSEADDR`, which binds over an earlier server's TIME_WAIT remnants, but not
+`SO_REUSEPORT`; the Windows half of that exclusivity is not taken). A restart binds at once after a
+stop. A port in use stops the start before the model loads, with `cannot bind HOST:PORT: the port
+is in use ...`, and status 1.
+
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
 
