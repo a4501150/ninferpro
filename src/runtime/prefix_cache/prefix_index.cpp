@@ -613,12 +613,13 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
         // A fill in flight reads the record the page would displace: no attach then, and the
         // page stays private.
         const bool filling = node.host == CopyState::Filling;
+        const bool unpinned = node.pins == 0;
         if (attach && node.device == CopyState::Absent && !filling) {
             // A host-only block recomputed by this sequence regains its Device copy.
             node.device_id = device_id;
             set_device(node, CopyState::Resident);
             result.device_attached = true;
-        } else if (attach && node.device == CopyState::Resident && node.pins == 0 && !filling) {
+        } else if (attach && node.device == CopyState::Resident && unpinned && !filling) {
             // A block recomputed by this sequence whose Device copy nobody maps: the sequence's page
             // replaces it, so the two never hold two pages for one block (the sequence pins its
             // own, and an evictable copy would otherwise become pinned beside it).
@@ -631,8 +632,10 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
         // the block: it would serve a later Host restore, and a snapshot over the path, bits the
         // recomputing sequence's own state contradicts. The record is dropped and the sequence's
         // release writes the page back through. No fill is in flight once the page attached, so
-        // the record is only ever resident or absent here.
-        if (result.device_attached && node.host == CopyState::Resident) {
+        // the record is only ever resident or absent here. A pinned node's record stays: a
+        // restore copy may still be reading its slab (it serves the bits the snapshot it was
+        // pinned for recorded), and the slab is not the sequence's to free.
+        if (result.device_attached && unpinned && node.host == CopyState::Resident) {
             drop_node_host_copy(existing->index);
         }
         ++node.pins;

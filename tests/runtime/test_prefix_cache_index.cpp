@@ -453,25 +453,30 @@ void test_host_only_reattach() {
         require(index.node(node).device == CopyState::Absent, "block must be host-only");
     }
     const std::size_t live_before = backend.live.size();
+    const std::array<NodeRef, 1> reader{path[0]};
+    index.acquire_path(reader); // another sequence restores block 0 from its Host slab
 
-    // A sequence recomputing the same blocks re-establishes their Device copies; the records no
-    // longer describe the pages (a resume inside a block recomputes on another call grid), so
-    // they are dropped until the sequence's release writes the pages through.
+    // A sequence recomputing the same blocks re-establishes their Device copies. A recomputation
+    // need not repeat the earlier bits, so an unpinned block's earlier Host record goes (the
+    // write-through backs the new page); a pinned block's slab may be under a restore copy, and
+    // stays.
     const auto again = insert_sequence(index, backend, tokens);
     require(again == path, "recomputed blocks must resolve to the existing nodes");
     require(backend.live.size() == live_before + 3, "the index must keep the recomputed pages");
-    for (const NodeRef node : path) {
-        const NodeView view = index.node(node);
-        require(view.device == CopyState::Resident && view.host == CopyState::Absent,
-                "a reattached block drops its stale Host record");
+    for (std::size_t b = 0; b < path.size(); ++b) {
+        const NodeView view = index.node(path[b]);
+        require(view.device == CopyState::Resident, "a reattached block has its Device copy");
+        require(view.host == (b == 0 ? CopyState::Resident : CopyState::Absent),
+                "a reattached block keeps its earlier Host copy only while another sequence pins it");
     }
     // Duplicates of Device copies another sequence pins stay private to the inserting sequence.
     const auto twice = insert_sequence(index, backend, tokens);
     require(backend.live.size() == live_before + 3, "a pinned resident duplicate must not be retained");
     index.release_path(twice);
     index.release_path(again);
-    for (const NodeRef node : path) { backup_node(index, node); } // the release's write-through
+    index.release_path(reader);
     index.check_invariants();
+    for (std::size_t b = 1; b < path.size(); ++b) { backup_node(index, path[b]); } // the write-through
     require(index.evict_device_blocks(3) == 3, "reattached backed blocks are evictable again");
     index.check_invariants();
 }

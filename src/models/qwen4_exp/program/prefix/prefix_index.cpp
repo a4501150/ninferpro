@@ -715,12 +715,13 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
         // A fill in flight reads a record the page would displace (a Disk write the Host record, a
         // fetch the Disk record into the Host): no attach then, and the page stays private.
         const bool filling = node.host == CopyState::Filling || node.disk == CopyState::Filling;
+        const bool unpinned = node.pins == 0;
         if (attach && node.device == CopyState::Absent && !filling) {
             // A host-only block recomputed by this sequence regains its Device copy.
             node.device_id = device_id;
             set_device(node, CopyState::Resident);
             result.device_attached = true;
-        } else if (attach && node.device == CopyState::Resident && node.pins == 0 && !filling) {
+        } else if (attach && node.device == CopyState::Resident && unpinned && !filling) {
             // A block recomputed by this sequence whose Device copy nobody maps: the sequence's page
             // replaces it, so the two never hold two pages for one block (the sequence pins its
             // own, and an evictable copy would otherwise become pinned beside it).
@@ -733,11 +734,15 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
         // the block: it would serve a later Host restore, and a snapshot over the path, bits the
         // recomputing sequence's own state contradicts. The record is dropped and the sequence's
         // release writes the page back through. No fill is in flight once the page attached, so
-        // both records are only ever resident or absent here.
-        if (result.device_attached && node.host == CopyState::Resident) {
+        // both records are only ever resident or absent here. A pinned node's records stay: a
+        // restore copy may still be reading the Host slab (it serves the bits the snapshot it was
+        // pinned for recorded, and a Disk write may be reading it into its slot), and neither is
+        // the sequence's to free. The Disk record goes with the Host one, so the two never
+        // disagree about which computation they hold.
+        if (result.device_attached && unpinned && node.host == CopyState::Resident) {
             drop_node_host_copy(existing->index);
         }
-        if (result.device_attached && node.disk == CopyState::Resident) {
+        if (result.device_attached && unpinned && node.disk == CopyState::Resident) {
             drop_node_disk_copy(existing->index);
             backend_->disk_record_replaced(*existing);
         }
