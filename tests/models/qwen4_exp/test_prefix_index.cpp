@@ -374,6 +374,31 @@ void test_device_lru_order() {
     index.check_invariants();
 }
 
+// A snapshot whose Host write is in flight outlives its released path: the unbacked eviction that
+// would remove its anchor's subtree (the snapshot with it) waits until the write lands.
+void test_pinned_snapshot_keeps_anchor() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64), backend);
+    const auto tokens          = make_tokens(64 * 4, 70);
+    const auto path            = insert_sequence(index, backend, tokens);
+    const SnapshotRef endpoint = publish_tap(index, path[3]);
+    index.pin_snapshot(endpoint);
+    require(index.begin_snapshot_host_fill(endpoint), "no slabs for the snapshot's Host write");
+    index.release_path(path);
+    index.check_invariants();
+    require(index.device_evictable_blocks() == 0,
+            "a pinned snapshot's anchor path must not be evictable");
+    require(index.evict_device_blocks(4) == 0 && index.valid(endpoint),
+            "an unbacked eviction must not remove a pinned snapshot");
+    index.complete_snapshot_host_fill(endpoint);
+    index.unpin_snapshot(endpoint);
+    index.check_invariants();
+    require(index.device_evictable_blocks() == 4, "the path is evictable once the write lands");
+    require(index.evict_device_blocks(4) == 4 && backend.live.empty(),
+            "every page must be released after the write");
+    index.check_invariants();
+}
+
 void test_backed_before_unbacked() {
     RecordingBackend backend;
     PrefixCacheIndex index(small_config(64), backend);
@@ -1999,6 +2024,7 @@ int main() {
         test_prompt_end_head_residual();
         test_collisions_and_tails();
         test_device_lru_order();
+        test_pinned_snapshot_keeps_anchor();
         test_backed_before_unbacked();
         test_host_dead_and_gdsf();
         test_device_slots();

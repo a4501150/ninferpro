@@ -52,9 +52,12 @@ std::uint64_t all_vision_key(std::span<const qwen_common::detail::VisionTokenRan
     return cumulative;
 }
 
+// A frontier inside an item's exclusion (pc::media_exclusion): inside its tokens, or past its start
+// in the block it begins in, where no key would cover it.
 bool inside_vision(std::uint32_t frontier, std::span<const qwen_common::detail::VisionTokenRange> ranges) noexcept {
     return std::any_of(ranges.begin(), ranges.end(), [&](const qwen_common::detail::VisionTokenRange& range) {
-        return range.begin < frontier && frontier < range.end;
+        const pc::TapExclusion span = pc::media_exclusion(range.begin, range.end);
+        return span.begin < frontier && frontier < span.end;
     });
 }
 
@@ -957,7 +960,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     std::vector<pc::TapExclusion> exclusions;
     exclusions.reserve(ranges.size());
     for (const qwen_common::detail::VisionTokenRange& range : ranges) {
-        exclusions.push_back(pc::TapExclusion{range.begin, range.end});
+        exclusions.push_back(pc::media_exclusion(range.begin, range.end));
     }
     std::vector<pc::PlannedTap> taps;
     if (publish && !tx.resume) {

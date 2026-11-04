@@ -486,8 +486,12 @@ Gated DeltaNet recurrent state is 144 of an image's 186.8 MiB (§3.2). `--cache-
    list) whose tail tokens equal `prompt[64·(anchor.depth+1) .. F)`, with **`F ≤ n − 1`**. At
    least one prompt token is always prefilled, so logits, continuation hidden and MTP/DFlash
    bridges come from the normal path. No full-hit path exists.
-3. Frontiers inside a Vision token span are not valid resume points. Tap placement never creates
-   them, and match rejects them defensively.
+3. Frontiers inside a Vision token span are not valid resume points, and neither are frontiers
+   past an item's start in the 64-token block it begins in: a snapshot's key is its anchor path
+   (each full block carries the media key of the items beginning before its end) plus its tail
+   tokens, so an item lying wholly in the tail block is in no key, and two prompts differing only
+   by it would share the snapshot (`media_exclusion`). Tap placement never creates them, and match
+   rejects them (both models).
 
 Complexity is O(k + snapshots on path). A 240 k prompt is 3,750 hash probes and exact 256 B
 compares: tens of microseconds.
@@ -935,7 +939,9 @@ policy lives:
 ### 9.1 Device KV (LRU, tail-first)
 
 - One intrusive list of `Cached` device pages whose owner has no refs and no pins: nodes with
-  `active_refs == 0 && restore_pins == 0`, and snapshot tails with `restore_pins == 0`.
+  `active_refs == 0 && restore_pins == 0`, and snapshot tails with `restore_pins == 0`. A pinned
+  snapshot (an image or tail transfer in flight, or a quote being bound) pins its anchor path, so
+  an unbacked eviction (§9.4) never removes a subtree that holds it.
 - On a hit, touched nodes move to the MRU end.
 - On release, nodes are appended in reverse block order.
 - Allocation pops from the LRU head:
@@ -1687,7 +1693,7 @@ rules, measurements and the build record are in the
 | Taps | `plan_taps` with Vision exclusions, then the call planner (`prefix/call_plan.h`); the rules are the prose below the table |
 | Supersession | Unlike §9.3, a request's captures never supersede its own earlier ones: its first capture (tap or endpoint) supersedes the snapshot it resumed from and the endpoints it went past; its ladder taps, system-block boundary and the prompt's last tap stay retained and GDSF values them. The prompt-end capture is a Boundary like them, and it never raises the capturing lane's `deepest`: the finish endpoint still publishes over the turn's generated tokens. In agentic replays the edits and loop-detection side calls diverge at exactly those taps: superseded first, a full Host tier evicted them before they were reused |
 | Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate |
-| Vision | A resume frontier strictly inside an item is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
+| Vision | A resume frontier strictly inside an item, or past its start in the block it begins in (rule 3 of §6.1), is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
 | Statistics | `RuntimeStats::hybrid_*` and the request log's `cached_prefix_tokens` / `restored_host_bytes` as in Qwen3.5, plus `hybrid_prompt_end_captures`, `hybrid_prompt_end_gated` (skipped by design) and `hybrid_prompt_end_failed` (refused for capacity) and the Disk tier's `hybrid_disk_*` (capacity, use, image and block writes, fetches, read bytes, failures, capture and spill skips, evictions); a request resumed from a fetched source reports `prefix_from_disk` (`, from disk` on its `req#N done` line) |
 | Persistence | The Disk tier (above): its journal records each block's `mtp_next` and each snapshot's meta (`StateImageHeader`), and its manifest the slot geometry and the state-image layout fingerprint. The whole-file save (`--prefix-cache-file`) is Qwen3.5's only |
 | Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §15.7); the snapshot is held, written to the Disk first, and fetched before the resume (§17.1 rule 7), which binds from it without replay |
