@@ -406,9 +406,17 @@ int main() {
         client_rejection.severity == OperationalSeverity::Info &&
             client_rejection.message.find("req#8 rejected during prepare") != std::string::npos &&
             client_rejection.message.find("context length exceeded") != std::string::npos &&
-            client_rejection.message.find("sentinel-client-value") == std::string::npos &&
+            client_rejection.message.find("sentinel-client-value second-record") != std::string::npos &&
             client_rejection.message.find('\n') == std::string::npos,
-        "operational rejection severity or client-data policy mismatch");
+        "operational rejection severity, reason or single-line policy mismatch");
+    // The reason clause is bounded: a pathological error message cannot dominate the log line.
+    RequestRejectionLogContext unbounded_reason        = rejected_context;
+    unbounded_reason.error.message                     = std::string(600, 'x') + "\ntail";
+    const std::string unbounded_line = render_request_rejected(unbounded_reason).message;
+    failures += check(unbounded_line.find(std::string(240, 'x') + "...") != std::string::npos &&
+                          unbounded_line.find(std::string(241, 'x')) == std::string::npos &&
+                          unbounded_line.find('\n') == std::string::npos,
+                      "operational rejection reason is not bounded to one line");
     RequestRejectionLogContext overload_context = rejected_context;
     overload_context.error.status               = 429;
     overload_context.error.code                 = "server_overloaded";

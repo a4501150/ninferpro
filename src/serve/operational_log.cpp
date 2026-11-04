@@ -182,6 +182,19 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
     }
 }
 
+// The clause an operator reads to tell why a request was refused: the client-facing error message,
+// bounded and with control characters folded to spaces so one rejection stays one log line. The
+// refusing layer's message may quote client input (a role name, a template parameter), so the
+// bound keeps a pathological payload from dominating the record.
+std::string sanitize_log_reason(const std::string& message, std::size_t limit) {
+    std::string reason = message.substr(0, limit);
+    if (message.size() > limit) { reason += "..."; }
+    for (char& byte : reason) {
+        if (static_cast<unsigned char>(byte) < 0x20 || byte == 0x7F) { byte = ' '; }
+    }
+    return reason;
+}
+
 } // namespace
 
 void set_operational_log_colours(bool enabled) { colours_enabled().store(enabled); }
@@ -230,6 +243,10 @@ OperationalRecord render_request_rejected(const RequestRejectionLogContext& cont
     out << "req#" << context.id << ' ' << status << " during prepare | "
         << protocol_name(context.protocol) << ' ' << (context.stream ? "stream" : "non-stream");
     append_failure_fields(out, failure);
+    // The reason the request was refused, so "invalid prompt" alone does not leave an operator
+    // guessing (the JSONL record carries the same message unsanitized).
+    const std::string reason = sanitize_log_reason(context.error.message, 240);
+    if (!reason.empty()) { append_clause(out, reason); }
     append_counted_clause(out, "messages", context.message_count);
     if (context.media_item_count != 0) {
         append_counted_clause(out, "media", context.media_item_count);
