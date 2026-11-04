@@ -422,6 +422,9 @@ effective_GB/s DRAM_% READ_%
 useful_TFLOP/s tensor_profile tensor_peak_pct memory_floor_pct t1_linear_extrapolation
 ```
 
+Every row also prints `hash`, the FNV-1a of the last timed launch's output bytes for that point, so
+two runs of the bench can be compared for bit-exactness (the CSV carries it as `output_hash`).
+
 A sweep additionally outputs the `delta_%` between adjacent T values. The CSV can add the weight/x/out
 byte breakdown, warmup, repeat and environment versions, but does not restore the following fields:
 

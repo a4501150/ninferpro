@@ -152,6 +152,7 @@ struct Result {
     std::size_t graph_nodes = 0;
     int graph_calls         = 1;
     std::string labels;
+    std::uint64_t output_hash = 0;
     const char* qtype_name         = "";
     const char* policy_name        = "";
     std::int32_t n                 = 0;
@@ -207,6 +208,18 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     if (alignment == 0) { throw std::invalid_argument("alignment must be positive"); }
     return checked_mul((checked_add(value, alignment - 1, "aligned size") / alignment), alignment,
                        "aligned size");
+}
+
+// FNV-1a over the measured output bytes, so a bit-exactness claim can compare two runs of the
+// bench without carrying the outputs around.
+std::uint64_t fnv1a(const void* data, std::size_t bytes) {
+    const auto* stream = static_cast<const unsigned char*>(data);
+    std::uint64_t hash  = 14695981039346656037ULL;
+    for (std::size_t index = 0; index < bytes; ++index) {
+        hash ^= stream[index];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
 }
 
 std::string lower(std::string_view text) {
@@ -739,6 +752,14 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt,
             result.delta_pct = (result.median_us / previous_median - 1.0) * 100.0;
         }
         if (point.sweep_point) { previous_median = result.median_us; }
+        // The last timed launch's output is still in the buffer; hash it for bit-exactness checks.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const std::uint64_t point_out_bytes = checked_mul(
+            checked_mul(static_cast<std::uint64_t>(point.n), point.t, "hash elements"), 2,
+            "hash bytes");
+        std::vector<unsigned char> host_out(point_out_bytes);
+        CUDA_CHECK(cudaMemcpy(host_out.data(), out.p, point_out_bytes, cudaMemcpyDeviceToHost));
+        result.output_hash = fnv1a(host_out.data(), host_out.size());
         results.push_back(std::move(result));
     }
     return results;
@@ -821,10 +842,10 @@ void print_header(const Options& opt) {
 
 void print_results(const std::vector<Result>& results) {
     std::printf("%-44s %5s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %11s %8s "
-                "%9s %9s %8s\n",
+                "%9s %9s %8s %16s\n",
                 "label", "qt", "pol", "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s",
                 "DRAM_%", "READ_%", "TFLOP/s", "TC_profile", "TC_%", "mem_%", "T1_lin_x",
-                "delta_%");
+                "delta_%", "hash");
     for (const Result& result : results) {
         const bool have_delta = std::isfinite(result.delta_pct);
         char delta[32];
@@ -846,13 +867,14 @@ void print_results(const std::vector<Result>& results) {
             std::snprintf(tensor_peak, sizeof(tensor_peak), "-");
         }
         std::printf("%-44s %5s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
-                    "%7.2f %10.2f %11s %8s %9.2f %9s %8s\n",
+                    "%7.2f %10.2f %11s %8s %9.2f %9s %8s %016llx\n",
                     result.labels.c_str(), result.qtype_name, result.policy_name, result.n,
                     result.k, result.t, result.median_us, result.min_us, result.p95_us,
                     result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
                     result.useful_tflops,
                     result.tensor_profile[0] == '\0' ? "-" : result.tensor_profile, tensor_peak,
-                    result.memory_floor_pct, t1_linear, delta);
+                    result.memory_floor_pct, t1_linear, delta,
+                    static_cast<unsigned long long>(result.output_hash));
     }
 }
 
@@ -874,7 +896,7 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
            "useful_flops,median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,"
            "sustained_read_gbs,sustained_read_pct,useful_tflops,tensor_profile,"
            "tensor_peak_tflops,tensor_peak_pct,memory_floor_us,memory_floor_pct,"
-           "t1_linear_extrapolation,delta_pct,"
+           "t1_linear_extrapolation,delta_pct,output_hash,"
            "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
@@ -894,7 +916,8 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
         }
         out << ',';
         if (std::isfinite(result.delta_pct)) { out << result.delta_pct; }
-        out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << ','
+        out << ',' << result.output_hash << ',' << result.warmup << ',' << result.repeat << ','
+            << result.flush_bytes << ','
             << result.execution << ',';
         if (result.graph_nodes) out << result.graph_nodes;
         out << ',' << result.graph_calls << '\n';
