@@ -150,6 +150,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         return t;
     };
     if (cpu_service_) { cpu_service_->wake(); }
+    settle_round(); // a deferred update precedes the next forward
     residency_->before_round(s, /*landing=*/false, /*walking=*/false, kStreamReadSlots);
     expert_stream_->begin(ring_span(), residency_->host_table(), s, /*gated=*/false, /*ssd=*/true);
     for (std::size_t c = 0; c < n; ++c) {

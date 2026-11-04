@@ -397,6 +397,7 @@ embed (host row) ─ per layer: HC mixers ─ GDN or QSA ─ out_proj + inject �
 head (projection_fp32) ─ sample ─ DFlash2 proposal ─ verify (CUDA graph per B, W)
 commit: GDN replay fold, ple_conv_commit, qsa_commit_tails, drafter catch-up
 after_round (deferred): route log, LFRU accounting, promotions, tier boundaries
+  (a DFlash2 round's update waits for the next proposal, which settles it while drafting)
 ```
 
 Four ideas carry the design as built:
@@ -931,7 +932,15 @@ read after the launch, behind the gate before `ple_embed` (§12). The graph ends
 engine thread synchronizes, reads the sampled tokens, and checks the error word.
 
 `commit()` runs the drafter catch-up, then `settle_round()`: the round's route log feeds `after_round`
-— the cache accounting, promotions and landing adoption of §9. Host time between rounds was
+— the cache accounting, promotions and landing adoption of §9. A DFlash2 verification round (MTP
+off) instead leaves the update pending (`DeferredRound::to_proposal`), and the next round's proposal
+settles it in its `while_drafting` window, after the proposal is enqueued; the update keeps the
+round's width and lanes, so nothing it reads is rewritten before it runs, and expert placement is
+bitwise invariant. Every other path settles it first: each forward's launch before `before_round`,
+the registration of the next round's update, a commit that releases a row, and the Program's other
+entry points (maintain, binding, context, reclaim and prefetch, pause, replay, prefill, mixed,
+forced tokens, prefix-cache attach, scoring); `finish`, `abort` and shutdown drop an update that
+throws. Host time between rounds was
 re-measured without a profiler at 82-89 µs (settle 42-49, the decode prologue 26.6, the engine ~13),
 about 1.1 % of a plain round at 132 tok/s (RTX 5090, 2026-10-10). An earlier 0.45 ms (~4 %,
 2026-10-05) predates the LFRU victim-search fix (a budgeted step at 9,000 residents went from 22.8

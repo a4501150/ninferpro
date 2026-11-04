@@ -37,7 +37,11 @@ bool Program::background_pending() const noexcept { return impl_->prefix_backgro
 
 void Program::background_poll() { impl_->prefix_background_poll(); }
 
+// A verification round's expert-cache update may wait for the next round's proposal (ProgramImpl::DeferredRound):
+// the entry points that can touch the expert cache, launch a forward or report on it settle it first; decode settles
+// it while its proposal drafts, commit defers it, and planning and accessors leave it.
 void Program::maintain() {
+    impl_->settle_deferred();
     impl_->apply_vram_target(true);
     impl_->maintain_expert_state();
 }
@@ -73,6 +77,7 @@ std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base
 BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                           const SourceCandidate& source, ResumeState* resume,
                                           ExecutionUnitKind, std::uint32_t) {
+    impl_->settle_deferred();
     const runtime::ResourceReservation reserved = impl_->start_binding(base, lane, source, resume);
     BindingReservation out;
     out.reserved = static_cast<bool>(reserved);
@@ -81,6 +86,7 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
 }
 
 ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation) {
+    impl_->settle_deferred();
     return impl_->poll_context(cancellation);
 }
 
@@ -88,8 +94,14 @@ bool Program::has_context_transaction() const noexcept { return impl_->in_transa
 
 bool Program::context_blocks(SequenceHandle sequence) const noexcept { return impl_->context_blocks(sequence); }
 
-bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) { return impl_->hybrid_reclaim(shortage); }
-std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) { return impl_->hybrid_prefetch(base); }
+bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
+    impl_->settle_deferred();
+    return impl_->hybrid_reclaim(shortage);
+}
+std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) {
+    impl_->settle_deferred();
+    return impl_->hybrid_prefetch(base);
+}
 std::uint32_t Program::hybrid_prefetch_room() const noexcept { return impl_->hybrid_prefetch_room(); }
 void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) { impl_->hybrid_hold_queue(queue); }
 std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
@@ -99,15 +111,18 @@ runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUni
 }
 
 bool Program::start_pause(SequenceHandle sequence, runtime::ExecutionTiming*) {
+    impl_->settle_deferred();
     return impl_->start_pause(sequence);
 }
 
 ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::ExecutionTiming*) {
+    impl_->settle_deferred();
     return impl_->advance_replay(sequence);
 }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*,
                                          runtime::TokenMaskProvider* masks) {
+    impl_->settle_deferred();
     return impl_->advance_prefill(sequence, masks);
 }
 
@@ -128,6 +143,7 @@ runtime::ExecutionTiming Program::append_forced_tokens(std::span<const SequenceH
                                                        std::uint32_t row_stride,
                                                        std::span<const std::optional<std::uint32_t>>,
                                                        runtime::ExecutionTiming*) {
+    impl_->settle_deferred();
     return impl_->append_forced(sequences, row_major_tokens, row_stride);
 }
 
@@ -138,15 +154,22 @@ CommitResult Program::commit(PendingBatch&& pending, std::span<const runtime::Co
 
 DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept { return impl_->discard(std::move(pending)); }
 
-FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->finish(sequence); }
+FinishResult Program::finish(SequenceHandle sequence) noexcept {
+    impl_->settle_deferred_or_drop();
+    return impl_->finish(sequence);
+}
 
-AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
+AbortResult Program::abort(SequenceHandle sequence) noexcept {
+    impl_->settle_deferred_or_drop();
+    return impl_->abort(sequence);
+}
 
 void Program::fail_all_cleanup() noexcept { impl_->release_all(); }
 
 bool Program::recover_after_failure() noexcept { return impl_->recover_after_failure(); }
 
 void Program::shutdown_cleanup() noexcept {
+    impl_->settle_deferred_or_drop();
     impl_->report_cache_layers();
     impl_->release_all();
     impl_->save_expert_state();
@@ -155,12 +178,14 @@ void Program::shutdown_cleanup() noexcept {
 
 PrefixCacheDiskOpen Program::attach_prefix_cache_disk(const std::filesystem::path& directory,
                                                       std::string_view fingerprint) {
+    impl_->settle_deferred();
     return impl_->attach_prefix_cache_disk(directory, fingerprint);
 }
 
 std::optional<PrefixCacheDiskSpill> Program::prefix_shutdown_spill() const { return impl_->prefix_shutdown_spill(); }
 
 ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target, const ScoreOptions& options) {
+    impl_->settle_deferred();
     return impl_->causal_score(std::move(prompt), first_target, options);
 }
 

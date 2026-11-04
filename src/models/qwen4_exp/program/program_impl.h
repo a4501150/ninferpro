@@ -1831,6 +1831,7 @@ public:
             const std::uint32_t have   = lane.prefix.page_base + static_cast<std::uint32_t>(lane.pages.size());
             if (needed <= have) { continue; }
             const std::uint32_t missing = needed - have;
+            settle_round(); // growing the KV pool may take expert frames: a deferred cache update lands first
             kv_busy();
             if (prefix_) { pc_make_room(missing); }
             if (pool_->available_pages() < missing) { (void)grow_kv(missing); }
@@ -2510,13 +2511,17 @@ public:
             // row copies an n-gram), while the host stages the verification's n-gram rows.
             bool neural = false;
             for (std::int32_t b = 0; b < batch; ++b) { neural = neural || (!from_ngram_[b] && extents[b] > 0); }
+            // While the proposal drafts, the host settles the previous round's cache update (DeferredRound), then stages
+            // the verification's n-gram rows.
             const auto stage_rows = [&] {
+                settle_round();
                 for (std::int32_t b = 0; b < batch; ++b) {
                     staged[b] = from_ngram_[b] ? width : 1;
                     queue_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
                 }
                 read_queued_ngram();
             };
+            if (!neural) { settle_round(); }
             if (neural) {
                 dflash2_propose(std::span<const std::uint32_t>(lanes.data(), batch), stage_rows);
                 for (std::int32_t b = 0; b < batch; ++b) {
@@ -2568,6 +2573,7 @@ public:
             }
             upload_pinned(io_device_.p, io_host_.data(), io_prefix(batch + mixed_.width), device_.stream);
             if (cpu_service_) { cpu_service_->wake(); }
+            settle_round(); // a deferred update precedes the next forward
             residency_->before_round(device_.stream, /*landing=*/true, /*walking=*/false);
             run_mixed(batch, 1, nullptr);
         } else {
@@ -2582,7 +2588,7 @@ public:
         }
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(round_lanes, round_positions);
-        deferred_ = {.columns = batch, .tokens = 1, .live = false, .pending = true};
+        defer_round(batch, 1, false, 1, round_lanes);
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -2839,6 +2845,7 @@ public:
         transaction_lane_.reset();
         pending_transaction_ = 0;
         round_width_         = 1; // an abandoned verification round leaves no width behind
+        deferred_.pending    = false; // after a failure the last round's cache update is dropped (shutdown settles it first)
         try { device_.synchronize(); } catch (...) {}
         if (clear_prefix_on_release_) { // a failed round may have published state it never computed
             if (prefix_) { prefix_->clear(); }
@@ -2927,15 +2934,43 @@ private:
 
     // A decode or verification round's cache update (routes, LFRU, promotions) runs on the host
     // after its commit has enqueued its GPU work (the GDN fold, tail commits, the drafter's
-    // catch-up), so the policy overlaps that work instead of idling the GPU after the round.
+    // catch-up), so the policy overlaps that work instead of idling the GPU after the round. A
+    // DFlash2 verification's update waits longer: the next round's proposal settles it while it
+    // drafts (dflash2_propose's while_drafting), the proposal being the next GPU work. Every other
+    // path settles it first: each round's launch before its residency's before_round, the
+    // assignment of the next round's update, and the Program's other entry points (program.cpp).
+    // The update reads the round's routes, which no proposal or commit overwrites, its live
+    // columns (live_, rewritten only by the next verification's acceptance) and the width and
+    // lanes it was submitted with. Outputs never depend on it: expert placement is bitwise
+    // invariant.
     struct DeferredRound {
         std::int32_t columns  = 0;
         std::uint32_t tokens  = 0;
         bool live             = false; // only the verification's accepted columns count
         bool pending          = false;
         std::int32_t prefill_columns = 0; // a mixed round's prompt call, after the rows' columns
+        std::int32_t width    = 1;     // the round's columns per row
+        std::array<std::int32_t, kMaximumConcurrency> lanes{}; // its rows' lanes
+        // A DFlash2 proposal drafted the round (MTP off): its commit leaves the update to the next proposal.
+        bool to_proposal      = false;
     };
     DeferredRound deferred_;
+
+    // The round's update, registered after any earlier one has settled. The mixed round's prompt
+    // columns are added to it afterward (mixed's prefill_columns).
+    void defer_round(std::int32_t columns, std::uint32_t tokens, bool live, std::int32_t width,
+                     std::span<const std::uint32_t> lanes, bool to_proposal = false) {
+        settle_round();
+        deferred_ = {.columns     = columns,
+                     .tokens      = tokens,
+                     .live        = live,
+                     .pending     = true,
+                     .width       = width,
+                     .to_proposal = to_proposal};
+        for (std::size_t b = 0; b < lanes.size() && b < deferred_.lanes.size(); ++b) {
+            deferred_.lanes[b] = static_cast<std::int32_t>(lanes[b]);
+        }
+    }
     // The mixed round in flight (mixed): its prompt call's lane and columns.
     struct MixedPrefill {
         bool active        = false;
@@ -2951,12 +2986,14 @@ private:
         deferred_.pending = false;
         const std::size_t budget = decode_budget(deferred_.tokens);
         if (trace_) {
-            const std::int32_t width = deferred_.live ? round_width_ : 1;
+            const std::int32_t width = deferred_.live ? deferred_.width : 1;
             trace_round(deferred_.live ? offload::RouteTraceKind::Verify : offload::RouteTraceKind::Decode, deferred_.columns / width,
                         width, deferred_.tokens, budget, offload::RouteTrace::kUnknownPosition,
                         deferred_.live ? std::span<const std::uint8_t>(live_.data(),
                                                                        static_cast<std::size_t>(deferred_.columns))
-                                       : std::span<const std::uint8_t>{});
+                                       : std::span<const std::uint8_t>{},
+                        std::span<const std::int32_t>(deferred_.lanes.data(),
+                                                      static_cast<std::size_t>(deferred_.columns / width)));
         }
         // A mixed round's prompt call counts with its rows (every one of its columns live).
         const auto columns = static_cast<std::size_t>(deferred_.columns + deferred_.prefill_columns);
@@ -2970,6 +3007,20 @@ private:
         apply_vram_target(false);
     }
 
+public:
+    // The Program's entry points that can touch the expert cache, launch a forward or report on it settle a deferred
+    // update first (program.cpp; DeferredRound). Planning and accessors do not.
+    void settle_deferred() { settle_round(); }
+    // The same for an entry point that may not throw: an update that fails is dropped, as a failed round's is.
+    void settle_deferred_or_drop() noexcept {
+        try {
+            settle_round();
+        } catch (...) {
+            deferred_.pending = false;
+        }
+    }
+
+private:
     // ---------------------------------------------------------------- VRAM monitor (design §9.7)
     void start_vram_monitor(const VramDemand& demand) {
         if (!options_.vram_monitor || options_.expert_frame_ceiling != 0) { return; }
@@ -4110,9 +4161,10 @@ private:
     static constexpr std::int32_t kStaticWorkColumns = 512;
 
     // Appends the round whose routes after_round is about to apply to the internal route trace
-    // (ProgramOptions::route_trace); rows' lanes are host_lanes_ as staged for the round.
+    // (ProgramOptions::route_trace); rows' lanes are `lanes`, else host_lanes_ as staged for the round.
     void trace_round(offload::RouteTraceKind kind, std::int32_t rows, std::int32_t width, std::uint32_t tokens,
-                     std::size_t budget, std::uint32_t position, std::span<const std::uint8_t> live = {}) {
+                     std::size_t budget, std::uint32_t position, std::span<const std::uint8_t> live = {},
+                     std::span<const std::int32_t> lanes = {}) {
         if (!trace_) { return; }
         trace_->append({.kind     = kind,
                         .rows     = static_cast<std::uint32_t>(rows),
@@ -4121,8 +4173,9 @@ private:
                         .budget   = static_cast<std::uint32_t>(std::min<std::size_t>(budget, 0xFFFFFFFFU)),
                         .position = position,
                         .frames   = residency_->frames()},
-                       std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(rows)), live,
-                       residency_->route_host(), residency_->route_stride());
+                       lanes.empty() ? std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(rows))
+                                    : lanes,
+                       live, residency_->route_host(), residency_->route_stride());
     }
 
     // Reports the expert cache over the finished request (and since start) as an Engine diagnostic,
@@ -4708,6 +4761,7 @@ private:
             CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
         }
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this call
+        settle_round(); // a deferred update precedes the next forward
         residency_->before_round(s);
         // The ring's copies queue on the copy engine behind the io upload above. A call the CPU can
         // share (design §10.6) gates the stream on each layer's routing.
@@ -5028,6 +5082,7 @@ private:
         if (one_column_divisor() != 0) { *reinterpret_cast<std::int32_t*>(host_io() + io_layout_.divisor) = plain_divisor(position); }
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
+        settle_round(); // a deferred update precedes the next forward
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
         replay(graphs_[static_cast<std::size_t>(batch - 1)],
@@ -5335,6 +5390,7 @@ private:
         upload_pinned(io_device_.p, io_host_.data(), mixed_.active ? io_prefix(batch * W + mixed_.width) : io_layout_.ngram, s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
+        settle_round(); // a deferred update precedes the next forward
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         if (mixed_.active) {
             const execution::ForwardVerify view = verify_view(batch, W);
@@ -5378,6 +5434,7 @@ private:
         // by sparse rejection sampling with them (greedy rows' laws are one-hot, n-gram rows' copies
         // one-hot too). A round of greedy rows drafted deterministically and takes the greedy Op.
         bool dflash_sampled = false;
+        const bool drafted  = dflash_round_; // the round's commit may leave its cache update to the next proposal
         if (std::exchange(dflash_round_, false)) {
             for (std::int32_t b = 0; b < batch; ++b) {
                 dflash_sampled = dflash_sampled || lanes_[lanes[b]].sampling.temperature > 0.0F;
@@ -5506,7 +5563,7 @@ private:
         for (std::int32_t b = 0; b < batch; ++b) {
             advanced = std::max<std::uint32_t>(advanced, static_cast<std::uint32_t>(pending_counts_[b]));
         }
-        deferred_ = {.columns = batch * W, .tokens = advanced, .live = true, .pending = true};
+        defer_round(batch * W, advanced, true, W, lanes, drafted && !mtp_);
         round_width_ = W;
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
@@ -5591,7 +5648,14 @@ private:
                 prefix_publish(lane, prefix_frontier(lane, false));
             }
         }
-        settle_round();
+        // A drafted DFlash2 round's next is most likely one too, whose proposal settles this round's cache update
+        // while it drafts (DeferredRound); a cancelled or failed row's release settles it first.
+        bool releases = false;
+        for (std::int32_t row = 0; row < batch; ++row) {
+            const auto& d = decisions[static_cast<std::size_t>(row)];
+            releases      = releases || d.cancelled || d.failed;
+        }
+        if (!deferred_.to_proposal || releases) { settle_round(); }
         for (std::int32_t row = 0; row < batch; ++row) {
             const auto& d = decisions[static_cast<std::size_t>(row)];
             if (d.cancelled || d.failed) { release(ContractAccess::lane(rows[row])); }
