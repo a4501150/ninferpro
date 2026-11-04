@@ -4,8 +4,8 @@ Copyright 2026 a4501150
 This product is derived from Infernix (https://github.com/Wallawalla47/Infernix),
 itself a fork of NInfer by Neroued (https://github.com/Neroued/ninfer), both
 licensed under the Apache License, Version 2.0. The starting point is Infernix
-commit 7dbe99a ("feat(qwen4_exp): DFlash2 drafter for Qwen3.8-Flash-Next
-(--draft-model)").
+commit accbd1e3 ("feat(qwen4_exp): DFlash2 drafter for Qwen3.8-Flash-Next
+(--draft-model)"; 7dbe99a before Infernix rewrote its history on 2026-11-02).
 
 Modifications made in this product (summary; see README.md for details):
 - Exclusive three-tier expert placement for Qwen3.8-Flash-Next (VRAM, RAM and

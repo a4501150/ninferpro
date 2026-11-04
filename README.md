@@ -153,7 +153,7 @@ people and agents are in [AGENTS.md](AGENTS.md).
 
 ## Credits
 
-ninferpro starts from Infernix commit `7dbe99a` by [Wallawalla47](https://github.com/Wallawalla47),
+ninferpro starts from Infernix commit `accbd1e3` (formerly `7dbe99a`) by [Wallawalla47](https://github.com/Wallawalla47),
 which grew out of [NInfer](https://github.com/Neroued/ninfer) by
 [Neroued](https://github.com/Neroued). The engine, its kernels, its artifact format and most of its
 documentation are their work; [NOTICE](NOTICE) lists what changed here. Infernix in turn credits

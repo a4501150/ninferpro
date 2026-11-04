@@ -5,7 +5,8 @@ These rules apply to the whole repository. `CLAUDE.md` imports this file; keep t
 ## This repository
 
 ninferpro is the local inference engine for one machine and one owner. It starts as a single
-commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.com/Wallawalla47/Infernix));
+commit from Infernix commit `accbd1e3` ([Wallawalla47/Infernix](https://github.com/Wallawalla47/Infernix);
+`7dbe99a` before upstream rewrote its hashes on 2026-11-02, same tree);
 `NOTICE` records the origin and the changes made here. Keep `LICENSE` and `NOTICE`, and update
 `NOTICE` when a change is large enough to list.
 
@@ -16,9 +17,9 @@ commit from Infernix commit `7dbe99a` ([Wallawalla47/Infernix](https://github.co
   then lands on `main` by fast-forward and is pushed to `origin`. A small self-contained change
   may be committed on `main` directly. Never rewrite `main` once pushed; a commit hash a doc or
   comment cites must stay reachable.
-- There is no shared history with Infernix. To take an upstream change, diff it against `7dbe99a`
+- There is no shared history with Infernix. To take an upstream change, diff it against `accbd1e3`
   (or the upstream commit last ported, recorded in the commit message) and port it as its own
-  commit. Drop a local change when upstream ships an equivalent.
+  commit. A port recorded before 2026-11-02 cites a pre-rewrite hash; find its commit by subject. Drop a local change when upstream ships an equivalent.
 - What this repository adds to Infernix:
   - three-tier expert placement for Qwen3.8-Flash-Next: every routed expert lives in exactly one of
     VRAM, RAM or SSD (`--experts vram=N%,ram=M%[,ssd=K%]` or counts; `--expert-placement FILE`),
