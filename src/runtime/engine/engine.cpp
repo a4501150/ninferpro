@@ -111,6 +111,8 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
                 throw std::invalid_argument("constraint observed tokens must be distinct");
             }
         }
+        // A token constraint chooses every output step itself, the end of the turn included.
+        options.execution.thinking.end_turn_in_thinking = true;
     }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =

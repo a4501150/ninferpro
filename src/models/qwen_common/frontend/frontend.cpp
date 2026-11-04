@@ -514,6 +514,25 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
     return out;
 }
 
+// The reasoning-end exclusion's tokens (OutputSession::reasoning_ban): the close marker as one
+// token, and the model's default end-of-turn tokens (generation_config.json's first two), which
+// take no probability while a reply's thinking is open.
+fi::OutputMarkerTokens output_marker_tokens(const fi::Tokenizer& tokenizer,
+                                            const std::vector<TokenId>& default_stops) {
+    const std::vector<int> close = tokenizer.encode(kThinkClose);
+    if (close.size() != 1) {
+        throw std::invalid_argument(
+            "Qwen tokenizer must encode the reasoning close marker as one token");
+    }
+    fi::OutputMarkerTokens markers;
+    markers.reasoning_close = close.front();
+    for (std::size_t index = 0; index < markers.turn_ends.size() && index < default_stops.size();
+         ++index) {
+        markers.turn_ends[index] = default_stops[index];
+    }
+    return markers;
+}
+
 } // namespace
 
 ModelSamplingDefaults default_sampling(Architecture architecture) {
@@ -590,6 +609,7 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
+        markers = output_marker_tokens(*tokenizer, defaults.token_ids);
         std::string control_suffix(kThinkingControl);
         const char* control_name = "canonical thinking control suffix";
         if (!options.thinking_budget_message.empty()) {
@@ -632,6 +652,7 @@ public:
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
+    fi::OutputMarkerTokens markers; // the reasoning-end exclusion's tokens (reasoning_ban)
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool ngram_sources_enabled = false;
@@ -1107,7 +1128,8 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     return OutputSession(impl_->tokenizer, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
                          impl_->thinking_control_tokens, std::move(tool_contract),
-                         std::move(matcher), prompt.data_->continuation_content, combined);
+                         impl_->markers, std::move(matcher), prompt.data_->continuation_content,
+                         combined);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

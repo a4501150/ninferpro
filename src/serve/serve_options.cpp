@@ -108,6 +108,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--default-thinking-budget"},
     ServeOptionArity{"--thinking-budget-message"},
     ServeOptionArity{"--reasoning-loop"},
+    ServeOptionArity{"--end-in-thinking"},
     ServeOptionArity{"--vision", false},
     ServeOptionArity{"--vision-offload"},
     ServeOptionArity{"--vision-max-merged"},
@@ -349,6 +350,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             repeat 12-word passages seen 3 times; stop ends the\n"
            "                             reply as length, conclude closes the thinking with\n"
            "                             the thinking-budget message and lets the model answer\n"
+           "  --end-in-thinking MODE     refuse (default) or allow: whether a reply may end\n"
+           "                             while its thinking is open (refuse: the end-of-turn\n"
+           "                             tokens get no probability until the thinking closes)\n"
            "  --model-id ID              override the artifact metadata.name reported by\n"
            "                             /v1/models and required in request model fields\n"
            "  --served-model-name NAME   accept NAME beside the public model id in request model\n"
@@ -1075,6 +1079,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.reasoning_loop = infernix::ReasoningLoopAction::Conclude;
             } else {
                 throw std::invalid_argument("--reasoning-loop must be off, stop or conclude");
+            }
+        } else if (arg == "--end-in-thinking") {
+            const std::string_view value = require_value("--end-in-thinking");
+            if (value == "refuse") {
+                options.end_turn_in_thinking = false;
+            } else if (value == "allow") {
+                options.end_turn_in_thinking = true;
+            } else {
+                throw std::invalid_argument("--end-in-thinking must be refuse or allow");
             }
         } else if (arg == "--vision") {
             options.enable_vision = true;

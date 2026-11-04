@@ -327,6 +327,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             ordinary_host_ingress->sampling[row].mask           = fill_grammar_mask(masks, row, {});
+            bind_reasoning_ban(masks, row, ordinary_host_ingress->sampling[row]);
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
 
@@ -630,6 +631,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            bind_reasoning_ban(masks, row, mtp_host_ingress->sampling[row]);
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + mtp_ar_depth));
         }
@@ -950,6 +952,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             dflash_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            bind_reasoning_ban(masks, row, dflash_host_ingress->sampling[row]);
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }

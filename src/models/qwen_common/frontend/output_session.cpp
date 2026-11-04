@@ -511,15 +511,15 @@ public:
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
          std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
-         std::unique_ptr<text::GrammarSession> grammar_, std::string_view continuation,
-         bool combined_)
+         fi::OutputMarkerTokens markers_, std::unique_ptr<text::GrammarSession> grammar_,
+         std::string_view continuation, bool combined_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length, output.tolerant_tool_calls),
-          grammar(std::move(grammar_)), combined(combined_) {
+          markers(markers_), grammar(std::move(grammar_)), combined(combined_) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -528,6 +528,7 @@ public:
         prefix_execution.tracking = starts_in_reasoning;
         semantic.budget           = thinking.budget;
         semantic.loop             = thinking.loop;
+        end_turn_in_thinking      = thinking.end_turn_in_thinking;
         semantic.exact_reasoning_framing = grammar != nullptr;
         // The semantic tracker counts the model's own thinking tokens for every response that starts
         // in thinking: the request log reports that count (model_thinking_tokens), so it must run
@@ -574,8 +575,11 @@ public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
-    bool preserve_special = false;
-    bool split_reasoning  = false;
+    bool preserve_special     = false;
+    bool split_reasoning      = false;
+    bool end_turn_in_thinking = false; // ThinkingControlOptions::end_turn_in_thinking
+    fi::OutputMarkerTokens markers;    // the reasoning-end exclusion's tokens (reasoning_ban)
+
     DecoderState state;
     DecoderState preview_state;
     SemanticThinkingState semantic;
@@ -643,13 +647,23 @@ OutputSession::OutputSession(
     bool starts_in_reasoning, ThinkingControlOptions thinking,
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
-    std::unique_ptr<text::GrammarSession> grammar, std::string_view continuation, bool combined)
+    frontend::OutputMarkerTokens markers, std::unique_ptr<text::GrammarSession> grammar,
+    std::string_view continuation, bool combined)
     : impl_(std::make_unique<Impl>(std::move(tokenizer), std::move(policy), output,
                                    starts_in_reasoning, thinking,
                                    std::move(thinking_control_tokens), std::move(tool_call_output),
-                                   std::move(grammar), continuation, combined)) {}
+                                   markers, std::move(grammar), continuation, combined)) {}
 
 bool OutputSession::constrained() const noexcept { return impl_ && impl_->grammar != nullptr; }
+
+runtime::ReasoningBan OutputSession::reasoning_ban() const noexcept {
+    if (!impl_ || impl_->end_turn_in_thinking || !impl_->semantic.in_reasoning ||
+        impl_->markers.reasoning_close < 0 || impl_->markers.turn_ends[0] < 0) {
+        return {};
+    }
+    return {.close = impl_->markers.reasoning_close,
+            .ends  = {impl_->markers.turn_ends[0], impl_->markers.turn_ends[1]}};
+}
 
 void OutputSession::observe_constraint(bool timings, double prepare_seconds) noexcept {
     if (constrained()) impl_->grammar->observe(timings, prepare_seconds);

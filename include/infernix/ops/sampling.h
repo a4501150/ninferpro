@@ -43,6 +43,13 @@ struct SamplingConfig {
     // Optional device-addressable I32 (pinned host memory serves under UVA), or null: the Op sets
     // it to 1 when the row's selection has no finite value, and never clears it. See sample().
     std::int32_t* nonfinite = nullptr;
+    // A row whose reasoning is open at the call's first position (the frontend's thinking not yet
+    // closed): reasoning_close is the close token and reasoning_ends the end-of-turn tokens (-1:
+    // none), which take no probability at a position before which the row has not written
+    // reasoning_close (sample(): the call's one position; speculative verify column c:
+    // drafts[0..c-1]). reasoning_close -1: no such row.
+    std::int32_t reasoning_close   = -1;
+    std::int32_t reasoning_ends[2] = {-1, -1};
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -60,6 +67,10 @@ struct SamplingConfig {
  * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.
  * A non-null config.mask excludes vocabulary rows before argmax/top-k and normalization. sample()
  * consumes mask position zero; speculative acceptance consumes its corresponding verify position.
+ * A row whose config carries a reasoning close token (reasoning_close >= 0) excludes its
+ * reasoning_ends tokens the same way at every position before the close, in sample() and in
+ * speculative verification alike (the overlay of accepted drafts decides the position there;
+ * sampling_adjusted_logit in the kernels is the single implementation).
  *
  * For row b with configs[b].temperature<=0:
  *

@@ -94,6 +94,19 @@ int main() {
                       "a missing --log-file value must be refused");
     failures += check(serve_usage_text("infernix-serve").find("--log-file") != std::string::npos,
                       "serving help must list --log-file");
+    // --end-in-thinking: a reply may not end while its thinking is open unless allowed.
+    failures += check(!parse({"infernix-serve", "model.ninfer"}).end_turn_in_thinking &&
+                          parse({"infernix-serve", "model.ninfer", "--end-in-thinking", "allow"})
+                              .end_turn_in_thinking &&
+                          !parse({"infernix-serve", "model.ninfer", "--end-in-thinking", "allow",
+                                  "--end-in-thinking", "refuse"})
+                              .end_turn_in_thinking,
+                      "--end-in-thinking must default to refuse and parse allow and refuse");
+    failures += check(
+        !parse_error({"infernix-serve", "model.ninfer", "--end-in-thinking", "off"}).empty(),
+        "--end-in-thinking must reject another value");
+    failures += check(serve_usage_text("infernix-serve").find("--end-in-thinking") != std::string::npos,
+                      "serving help must list --end-in-thinking");
     // Integer options past int's range are refused, not saturated (Windows' long is int's size), and the pending
     // queue (one HTTP worker each) is bounded (candidates QA-13).
     for (const auto* option : {"--max-http-clients", "--pending-timeout-ms", "--max-pending-requests"}) {

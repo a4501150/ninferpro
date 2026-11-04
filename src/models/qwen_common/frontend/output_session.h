@@ -18,6 +18,13 @@ namespace infernix::models::qwen_common {
 namespace frontend {
 class Tokenizer;
 struct ToolCallOutputContract;
+// The model tokens the output session's reasoning-end exclusion names: the close token that ends
+// thinking, and the model's default end-of-turn tokens (generation_config.json's first two), which
+// take no probability while thinking is open (OutputSession::reasoning_ban). -1: none.
+struct OutputMarkerTokens {
+    TokenId reasoning_close = -1;
+    std::array<TokenId, 2> turn_ends{-1, -1};
+};
 } // namespace frontend
 class Frontend;
 
@@ -79,6 +86,10 @@ public:
     [[nodiscard]] PublishedOutput commit_preview();
     void discard_preview();
     [[nodiscard]] bool constrained() const noexcept;
+    // While the committed output's thinking is open (and
+    // ThinkingControlOptions::end_turn_in_thinking is off): the close token and the end-of-turn
+    // tokens the next round may not produce before it (runtime::ReasoningBan).
+    [[nodiscard]] runtime::ReasoningBan reasoning_ban() const noexcept;
     void observe_constraint(bool timings, double prepare_seconds) noexcept;
     void constraint_uploaded(std::size_t bytes) noexcept;
     [[nodiscard]] std::optional<ConstraintObservation> constraint_observation() const;
@@ -97,6 +108,7 @@ private:
                   OutputOptions output, bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
                   std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
+                  frontend::OutputMarkerTokens markers,
                   std::unique_ptr<text::GrammarSession> grammar = {},
                   std::string_view continuation = {}, bool combined = false);
     std::unique_ptr<Impl> impl_;
