@@ -1506,6 +1506,97 @@ int test_tolerant_undeclared_and_value_cut() {
 // A call opener inside a Markdown code fence or inline code of the answer is a quoted example:
 // it stays text, with no byte lost, while calls at the top level still fire. Only the text before
 // an opener decides, so every streamed chunking agrees with the whole output.
+// Tolerant mode reads a parameter opener that lost its keyword, `<=NAME>`, as <parameter=NAME>
+// when the call's tool declares NAME (Strata PR #3960: a drifting quant wrote
+// `loop guard\n</parameter>\n<=output_mode>\ncontent`, and the next parameter ended up inside
+// the previous value). An undeclared NAME, and every damaged opener in strict mode, stay value
+// text.
+int test_damaged_parameter_opener() {
+    const auto contract = output_contract_for(
+        "grep", Json{{"pattern", Json{{"type", "string"}}},
+                     {"output_mode", Json{{"type", "string"}}},
+                     {"path", Json{{"type", "string"}}}});
+    const std::string open  = "<parameter=";
+    const std::string close = "</parameter>";
+    const auto region = [&](const std::string& body) {
+        return "Searching.\n" + std::string(fi::kToolOpen) + "\n<function=grep>\n" + body +
+               "</function>\n" + std::string(fi::kToolClose);
+    };
+    int failures = 0;
+    struct Case {
+        std::string label;
+        std::string body;
+        Json recovered;
+    };
+    const std::vector<Case> cases = {
+        {"after a closer",
+         open + "pattern>\nloop guard\n" + close + "\n<=output_mode>\ncontent\n" + close + "\n",
+         Json{{"pattern", "loop guard"}, {"output_mode", "content"}}},
+        {"first parameter",
+         "<=pattern>\nloop guard\n" + close + "\n" + open + "path>\nsrc\n" + close + "\n",
+         Json{{"pattern", "loop guard"}, {"path", "src"}}},
+        {"two in a row",
+         open + "pattern>\nx\n" + close + "\n<=output_mode>\ncount\n" + close +
+             "\n<=path>\nsrc\n" + close + "\n",
+         Json{{"pattern", "x"}, {"output_mode", "count"}, {"path", "src"}}},
+    };
+    for (const auto& c : cases) {
+        const std::string text = region(c.body);
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *contract, true);
+        failures +=
+            check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                      parsed.content == "Searching." && parsed.diagnostics.tolerant_recovered,
+                  "tolerant mode did not repair the damaged opener (" + c.label + ")");
+        if (parsed.tool_calls.size() == 1) {
+            failures += check(Json::parse(parsed.tool_calls.front().arguments_json) == c.recovered,
+                              "the damaged opener (" + c.label + ") gave other arguments: " +
+                                  parsed.tool_calls.front().arguments_json);
+        }
+        // Strict mode keeps the old reading: the damaged opener's text belongs to a value or ends
+        // the call.
+        const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
+        failures += check(!strict.diagnostics.tolerant_recovered &&
+                              (!strict.is_tool_call_response || strict.tool_calls.size() != 1 ||
+                               Json::parse(strict.tool_calls.front().arguments_json) != c.recovered),
+                          "strict mode repaired the damaged opener (" + c.label + ")");
+    }
+    // The reported string in strict mode: the second parameter stays inside the first value.
+    {
+        const auto strict = fi::parse_qwen_tool_call_output(region(cases.front().body), 64,
+                                                            *contract);
+        failures += check(strict.is_tool_call_response && strict.tool_calls.size() == 1 &&
+                              Json::parse(strict.tool_calls.front().arguments_json) ==
+                                  Json{{"pattern", "loop guard\n" + close + "\n<=output_mode>\ncontent"}},
+                          "strict mode changed its reading of the damaged opener");
+    }
+    // A name the tool does not declare is value text in tolerant mode too.
+    {
+        const std::string body =
+            open + "pattern>\nloop guard\n" + close + "\n<=color>\nred\n" + close + "\n";
+        const auto parsed = fi::parse_qwen_tool_call_output(region(body), 64, *contract, true);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              Json::parse(parsed.tool_calls.front().arguments_json) ==
+                                  Json{{"pattern", "loop guard\n" + close + "\n<=color>\nred"}},
+                          "tolerant mode read an undeclared damaged opener as a parameter");
+    }
+    // The streamed decoder agrees with the whole parse.
+    {
+        const std::string text = region(cases.front().body);
+        fi::ToolCallOutputDecoder decoder(contract, 64, /*tolerant*/ true);
+        std::string visible;
+        for (std::size_t offset = 0; offset < text.size(); offset += 7) {
+            visible += decoder.feed(std::string_view(text).substr(offset, 7));
+        }
+        const auto terminal = decoder.finish();
+        failures += check(visible + terminal.content == "Searching." &&
+                              terminal.tool_calls.size() == 1 &&
+                              Json::parse(terminal.tool_calls.front().arguments_json) ==
+                                  cases.front().recovered,
+                          "the streamed decoder did not repair the damaged opener");
+    }
+    return failures;
+}
+
 int test_markdown_quoted_calls() {
     const std::vector<std::string> definitions = {
         tool_definition("write", Json{{"path", Json{{"type", "string"}}}})};
@@ -1693,6 +1784,7 @@ int main() {
     failures += test_tolerant_truncated_final_call();
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_undeclared_and_value_cut();
+    failures += test_damaged_parameter_opener();
     failures += test_markdown_quoted_calls();
     failures += test_quoted_call_closers();
     if (failures == 0) { std::cout << "ok\n"; }

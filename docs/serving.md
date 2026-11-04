@@ -384,7 +384,11 @@ By default the unconstrained parser keeps that all-or-nothing behaviour. With
 complete call, a second call is malformed, a single final call is cut by the output budget before
 its closing tags, or the closing bracket after the function name is missing: the recovered call is
 reported structurally with a `truncated_tail` diagnostic (logged at Info severity) rather than
-demoted to text, and an undeclared tool name stays structured for the consumer to judge.
+demoted to text, and an undeclared tool name stays structured for the consumer to judge. Inside a
+call, a parameter opener that lost its keyword, `<=NAME>` (where the next `<parameter=NAME>`
+belongs, or first in the call), reads as `<parameter=NAME>` when the call's tool declares `NAME`;
+otherwise it stays text of the value it follows, and the strict parser keeps it as value text
+too.
 
 A call cannot start inside thinking. Under a tool constraint the reasoning section of the
 constraint grammar refuses the call opener outside Markdown code, so the model closes its
