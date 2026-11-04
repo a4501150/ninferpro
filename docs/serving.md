@@ -337,7 +337,9 @@ For non-strict tools, a direct top-level tool-parameter
 Qwen's untyped parameter text. It does not decide whether structurally complete markup is a tool
 call. String-admitting values remain strings, including the empty string. An empty block for a
 declared non-string parameter is omitted. Admitted JSON values retain their JSON type;
-case-insensitive boolean text is normalized to `true` or `false`. A nonempty schema mismatch remains
+case-insensitive boolean text is normalized to `true` or `false`. An array or object whose strings
+hold raw control characters (a real line break or tab inside a multi-line edit, which strict JSON
+refuses) is read with them escaped, so it keeps its JSON type. A nonempty schema mismatch remains
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
 supported explicit type retain untyped inference. The engine does not apply defaults, enforce required
