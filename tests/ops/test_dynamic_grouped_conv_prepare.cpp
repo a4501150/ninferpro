@@ -305,6 +305,79 @@ int run_geometry(std::int32_t hidden) {
             }
         }
     }
+    // The fused fast route (DynamicConvRoutes::FusedPrepare): H 2560 and at most 16 columns run the
+    // one-kernel route against the same oracle; wider calls and H 5120 keep the exact route (the
+    // flag changes no capacity there). The drafter captures its proposal rounds in a graph, so the
+    // route replays from one too.
+    if (g_hidden == 2560) {
+        for (int width = 2; width <= 16; ++width) {
+            set_reference_width(reference, base_host, width);
+            for (int batch = 1; batch * width <= 16; ++batch) {
+                const std::size_t pe = static_cast<std::size_t>(g_hidden) * width * batch;
+                const std::size_t fe = static_cast<std::size_t>(g_groups) * 2 * width * batch;
+                GuardedDeviceBuffer pd(pe * sizeof(std::uint16_t)), fd(fe * sizeof(std::uint16_t));
+                Tensor residual(residual_device.p, DType::BF16, {g_hidden, width, batch});
+                Tensor prepared(pd.data(), DType::BF16, {g_hidden, width, batch});
+                Tensor finish(fd.data(), DType::BF16, {g_groups, kTaps, width, batch});
+                const bool graph_case = (width == 5 && batch == 3) || (width == 16 && batch == 1);
+                for (int replay = 0; replay < (graph_case ? 2 : 1); ++replay) {
+                    pd.fill(0xff);
+                    fd.fill(0xff);
+                    cuda_check(cudaStreamSynchronize(nullptr), "fixture fill synchronize");
+                    workspace.reset_peak();
+                    const auto launch = [&] {
+                        ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, kEps, base, weight,
+                                                                  prepared, finish, workspace, stream,
+                                                                  ops::DynamicConvRoutes::FusedPrepare);
+                    };
+                    if (replay) {
+                        DecodeGraphDefinition definition;
+                        DecodeGraphExecutable executable;
+                        definition.capture(stream, launch);
+                        executable.instantiate(definition);
+                        executable.launch(stream);
+                        executable.launch(stream);
+                        cuda_check(cudaStreamSynchronize(stream), "graph synchronize");
+                    } else
+                        launch();
+                    cuda_synchronize();
+                    const std::string label = "dynamic conv prepare fused H=2560 W=" +
+                                              std::to_string(width) +
+                                              " B=" + std::to_string(batch) +
+                                              " graph=" + std::to_string(replay);
+                    failures += verify_reduction(label + " prepared", from_device_bf16(pd.data(), pe),
+                                                 std::span<const double>(reference.prepared.data(), pe),
+                                                 kPreparedCriterion);
+                    failures +=
+                        verify_reduction(label + " finish", from_device_bf16(fd.data(), fe),
+                                         std::span<const double>(reference.finish_delta.data(), fe),
+                                         kFinishDeltaCriterion);
+                    failures += pd.verify_guards(label);
+                    failures += fd.verify_guards(label);
+                    if (workspace.used() != 0 || workspace.peak_used() != 0) {
+                        std::cerr << label << ": the fused route used workspace\n";
+                        ++failures;
+                    }
+                }
+            }
+        }
+        if (ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                g_hidden, 2, 16, 1, 1, ops::DynamicConvRoutes::FusedPrepare) != 0) {
+            std::cerr << "fused capacity: a B=1 domain lies wholly in the fused route\n";
+            ++failures;
+        }
+    }
+    const auto fused_span =
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+            g_hidden, 2, 16, 1, 8, ops::DynamicConvRoutes::FusedPrepare);
+    const auto exact_span =
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+            g_hidden, 2, 16, 1, 8, ops::DynamicConvRoutes::Exact);
+    if (fused_span == 0 || fused_span != exact_span) {
+        std::cerr << "fused capacity: a domain spanning 17+ columns must keep the split scratch at H "
+                  << g_hidden << '\n';
+        ++failures;
+    }
     cuda_check(cudaStreamDestroy(stream), "destroy stream");
     failures += verify_preserved("residual", residual_device, residual_host);
     failures += verify_preserved("norm", norm_device, norm_host);

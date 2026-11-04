@@ -11,6 +11,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "infernix/ops/dynamic_grouped_conv.h"
 #include "infernix/ops/linear.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/types.h"
@@ -57,10 +58,12 @@ public:
     // outside the vocabulary writes kErrorTokenId to the Program's `error` word (ForwardExperts::error).
     // `routes` carries the Program's dense-projection fast-route flags (ForwardFastPaths::dense_routes);
     // a flag reaches only the drafter's projections that register one (today the feature projection's
-    // q8-sliced-k table).
+    // q8-sliced-k table). `prepare_routes` carries the prepare fast path's flag
+    // (ForwardFastPaths::dflash2_prepare_fused), which the prepare calls that fall in its domain take.
     DFlash2(const Parameters& parameters, const DFlash2Config& config, ProposalHead head, DeviceContext& device,
             WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context,
-            std::uint32_t* error, ops::LinearRoutes routes = ops::LinearRoutes::Exact);
+            std::uint32_t* error, ops::LinearRoutes routes = ops::LinearRoutes::Exact,
+            ops::DynamicConvRoutes prepare_routes = ops::DynamicConvRoutes::Exact);
 
     void materialize(const DFlash2ContextCall& call);
     void propose(const DFlash2ProposalCall& call);
@@ -93,6 +96,7 @@ private:
     std::uint32_t max_context_ = 0;
     std::uint32_t* error_      = nullptr;
     ops::LinearRoutes routes_ = ops::LinearRoutes::Exact;
+    ops::DynamicConvRoutes prepare_routes_ = ops::DynamicConvRoutes::Exact;
 };
 
 } // namespace infernix::models::qwen4_exp::execution

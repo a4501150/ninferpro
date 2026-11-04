@@ -12,14 +12,32 @@
 namespace infernix::ops {
 
 /**
+ * @brief The fast-path routes the prepare may select (a set of flags).
+ *
+ * Exact (no flag) keeps the three-launch route (RMSNorm, split-K coefficient projection,
+ * reduction) and its bits from release to release. FusedPrepare runs the whole prepare in one
+ * kernel where it is registered (H 2560 at most 16 columns, every Qwen3.8-Flash-Next DFlash2
+ * drafter call): the RMS scale factors out of the projection, so the sums of squares, the
+ * coefficient products and the epilogue carry FP32 where the exact route rounds to BF16 between
+ * the launches, and the reduction order differs; the bits differ from the exact route's. A shape
+ * outside the fused route's domain runs the exact route under either flag.
+ */
+enum class DynamicConvRoutes : std::uint8_t {
+    Exact        = 0,
+    FusedPrepare = 1, ///< dflash2-prepare-fused: the norm, projection and writes in one kernel.
+};
+
+/**
  * Returns the transient capacity required by rmsnorm_dynamic_grouped_conv_prepare at hidden width
  * H (5120 or 2560) for every width/batch pair in the inclusive intervals. Width endpoints lie in
  * [2,16], batch endpoints in [1,8]. Capacity covers every shape-selected route in the requested
- * domain.
+ * domain; it is zero where every such route needs none (H 2560 with W x B <= 16 under
+ * FusedPrepare: one kernel).
  */
 [[nodiscard]] std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
     std::int32_t hidden, std::int32_t min_width, std::int32_t max_width,
-    std::int32_t min_batch_size, std::int32_t max_batch_size);
+    std::int32_t min_batch_size, std::int32_t max_batch_size,
+    DynamicConvRoutes routes = DynamicConvRoutes::Exact);
 
 /**
  * Op: rmsnorm_dynamic_grouped_conv_prepare
@@ -60,13 +78,20 @@ namespace infernix::ops {
  *
  * Workspace:
  *   Caller-owned call-scoped storage sized by the capacity query above. The implementation does
- *   not allocate or retain device memory.
+ *   not allocate or retain device memory. A shape whose capacity is zero leaves the workspace
+ *   unused, so it may then hold the call's tensors.
+ *
+ * Routes:
+ *   Under DynamicConvRoutes::FusedPrepare a shape in the fused route's domain (H 2560, at most
+ *   16 columns) runs the one-kernel route, whose bits differ as the enum documents; every other
+ *   shape and the default run the exact route. The two routes meet the same numerical criterion.
  */
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const Tensor& base_kernel,
                                           const Weight& kernel_projection_weight, Tensor& prepared,
                                           Tensor& finish_delta, WorkspaceArena& workspace,
-                                          cudaStream_t stream);
+                                          cudaStream_t stream,
+                                          DynamicConvRoutes routes = DynamicConvRoutes::Exact);
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch

@@ -17,6 +17,12 @@ struct ForwardFastPaths {
     bool gdn_conv_fused = false;
     // qsa-prepare-fused: one QSA prepare kernel (norms, rotations, K/V and index-key appends).
     bool qsa_prepare_fused = false;
+    // dflash2-prepare-fused: the DFlash2 drafter's prepare (H 2560, at most 16 columns) in one
+    // kernel — the RMS scale factors out of the coefficient projection, which stays FP32 through
+    // the sums of squares, products and epilogue — instead of the exact route's RMSNorm, split-K
+    // projection and reduction. The route changes the drafts' bits, not the verified output's
+    // distribution; a column's arithmetic keeps one order at every width and batch.
+    bool dflash2_prepare_fused = false;
     // expert-a4-residual: W4A16 experts' wide calls take the residual A4 route
     // (ops::offloaded_moe::WideA16::kA4Residual, design §13.4); no effect on W4A4 experts.
     bool expert_a4_residual = false;

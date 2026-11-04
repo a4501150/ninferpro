@@ -1502,6 +1502,29 @@ convolution reads scale with the row count and it measured slower from two rows 
 one-row verifications take it; multi-row rounds, mixed calls and wider verifications (n-gram, wide
 trees) keep the composed kernels.
 
+The `dflash2-prepare-fused` fast path runs the DFlash2 drafter's norm and dynamic-conv prepare
+(`rmsnorm_dynamic_grouped_conv_prepare`, ten calls a proposal round) in one kernel where it is
+registered — H 2560 at most 16 columns — instead of the exact route's RMSNorm, split-K projection
+and reduction: the RMS scale factors out of the projection (d = inv · Σ W[row,h] · (r[h] · w[h])), a
+CTA of eight warps projects its four groups' sixteen coefficient rows over all of H by BF16 MMA
+with FP32 accumulation, sums each column's squares in a fixed order whatever the width and batch,
+and writes the finish deltas and prepared channels from an FP32 n; the weights, the norm weight and
+the base kernel stage before the PDL wait, and the route needs no workspace (the capacity query
+returns zero there, so the drafter passes its own arena). Its bits differ from the exact route's
+(FP32 between the steps, a different reduction order), so it changes the drafts a round proposes —
+the verification keeps the output distribution — and it is qualified nowhere yet: it runs only as
+an explicit `--fast-path-candidate dflash2-prepare-fused` until an end-to-end gate here (T2-bench /
+T3: acceptance and tok/s at this engine's round sizes) registers it. Op-level, this GPU (cold L2,
+min/median of 60, production concurrent): W8 B1 8.2/8.2 → 5.9/6.1 µs (−28 %), W16 B1 7.9/10.2 →
+5.8/8.2 (−27 %), W8 B2 14.1/16.2 → 5.9/8.2 (−58 %), W2 B8 14.2/16.4 → 6.1/8.2 (−57 %), W3 B5
+7.9/8.2 → 5.9/8.2; W4 B4 ties at the 8.2 µs quantum (the exact route's 16-column tile is as fast
+there). One row's proposal graph drops from 30 to 10 prepare nodes. Rounds over 16 columns (this
+engine's six-lane W8 rounds are 48) and the H 5120 drafter keep the exact route, their timings
+unchanged; upstream's end-to-end (single-row rounds, RTX 5090) measured the proposal graph 592.6 →
+572.2 µs a round, +0.2-0.5 % tok/s on three arms and one −4.3 % case (greedy conv
+`--a8-activations`, acceptance 2.874 → 2.759) from the changed drafts — the A/B this engine's GPU
+window still owes the path.
+
 Each request reports `SpeculativeStats`: rounds, drafted and accepted tokens, acceptance per
 position, n-gram rounds, fallback steps. The same observations drive the policies: the lane's
 per-position acceptance EWMA, the n-gram bucket EWMA, and DFlash2's decile calibration.

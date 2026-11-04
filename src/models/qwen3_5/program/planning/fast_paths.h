@@ -51,7 +51,8 @@ struct FastPathConfiguration {
     case FastPath::Fp8A8Pair:
     case FastPath::Q4W4A8:
     case FastPath::SampledMtpDrafts:
-    case FastPath::GdnF16Accumulate: return false;
+    case FastPath::GdnF16Accumulate:
+    case FastPath::Dflash2PrepareFused: return false;
     case FastPath::ExpertA4Residual:
     case FastPath::BatchedDecode:
     case FastPath::BatchedA8Decode:

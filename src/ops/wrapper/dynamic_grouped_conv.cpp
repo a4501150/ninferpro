@@ -112,16 +112,16 @@ void require_disjoint(const std::array<Range, N>& ranges, const char* op) {
 
 std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
     std::int32_t hidden, std::int32_t min_width, std::int32_t max_width,
-    std::int32_t min_batch_size, std::int32_t max_batch_size) {
+    std::int32_t min_batch_size, std::int32_t max_batch_size, DynamicConvRoutes routes) {
     return detail::bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-        hidden, min_width, max_width, min_batch_size, max_batch_size);
+        hidden, min_width, max_width, min_batch_size, max_batch_size, routes);
 }
 
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const Tensor& base_kernel,
                                           const Weight& kernel_projection_weight, Tensor& prepared,
                                           Tensor& finish_delta, WorkspaceArena& workspace,
-                                          cudaStream_t stream) {
+                                          cudaStream_t stream, DynamicConvRoutes routes) {
     const std::int32_t hidden     = residual.ne[0];
     const std::int32_t batch_size = residual.ne[2];
     const std::int32_t width      = residual.ne[1];
@@ -147,6 +147,10 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
     require_kernel_projection_weight(kernel_projection_weight, hidden);
     const std::size_t weight_bytes = static_cast<std::size_t>(coefficient_rows(hidden)) *
                                      static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+    // A shape whose route takes no scratch has no live workspace, so the caller's arena may hold
+    // its tensors; only the exact route's split scratch is a real operand.
+    const bool scratch = detail::bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                             hidden, width, width, batch_size, batch_size, routes) != 0;
     require_disjoint(std::array<Range, 7>{{
                          {residual.data, residual.bytes(), "residual"},
                          {norm_weight.data, norm_weight.bytes(), "norm_weight"},
@@ -154,13 +158,13 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
                          {kernel_projection_weight.qdata, weight_bytes, "kernel_projection_weight"},
                          {prepared.data, prepared.bytes(), "prepared"},
                          {finish_delta.data, finish_delta.bytes(), "finish_delta"},
-                         {workspace.base(), workspace.capacity(), "workspace"},
+                         {workspace.base(), scratch ? workspace.capacity() : 0, "workspace"},
                      }},
                      kPrepareOp);
 
     detail::bf16_dynamic_grouped_conv_prepare_dispatch(residual, norm_weight, eps, base_kernel,
                                                        kernel_projection_weight, prepared,
-                                                       finish_delta, workspace, stream);
+                                                       finish_delta, workspace, stream, routes);
 }
 
 std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(

@@ -40,6 +40,23 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
     ops::linear(x, p.weight, out, p.policy, work, s, routes);
 }
 
+// The norm and dynamic-conv prepare in an arena of its own carved from `work`; a call that needs no
+// scratch (the fused route: H 2560, at most 16 columns) runs in `work` itself, as an arena cannot
+// be empty.
+void prepare(const Tensor& residual, const Tensor& norm, float eps, const Tensor& base, const Weight& projection,
+             Tensor& prepared, Tensor& delta, ops::DynamicConvRoutes routes, WorkspaceArena& work, cudaStream_t s) {
+    const std::size_t bytes = ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+        residual.ne[0], residual.ne[1], residual.ne[1], residual.ne[2], residual.ne[2], routes);
+    if (bytes == 0) {
+        ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, eps, base, projection, prepared, delta, work, s,
+                                                  routes);
+        return;
+    }
+    WorkspaceArena scratch(work.alloc_bytes(bytes));
+    ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, eps, base, projection, prepared, delta, scratch, s,
+                                              routes);
+}
+
 // Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly (as Forward embeds them).
 void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s, std::uint32_t* error) {
     const DeviceFault fault{.word = error, .value = kErrorTokenId};
@@ -62,10 +79,10 @@ void require_q8(const Weight& weight, const char* name) {
 
 DFlash2::DFlash2(const Parameters& parameters, const DFlash2Config& config, ProposalHead head, DeviceContext& device,
                  WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context,
-                 std::uint32_t* error, ops::LinearRoutes routes)
+                 std::uint32_t* error, ops::LinearRoutes routes, ops::DynamicConvRoutes prepare_routes)
     : parameters_(parameters), p_(parameters.dflash2.value()), config_(config), text_(parameters.model.config().text),
       head_(head), device_(device), work_(work), ring_(std::move(ring)), max_context_(max_context), error_(error),
-      routes_(routes) {
+      routes_(routes), prepare_routes_(prepare_routes) {
     if (ring_.size() != config_.layers || p_.layers.size() != config_.layers) {
         throw std::invalid_argument("Qwen4Exp DFlash2: one context ring layer per drafter layer");
     }
@@ -193,13 +210,8 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
             auto scope       = work_.scope();
             Tensor prepared  = work_.alloc(DType::BF16, {H, W, B});
             Tensor delta     = work_.alloc(DType::BF16, {G, 2, W, B});
-            {
-                WorkspaceArena scratch(work_.alloc_bytes(
-                    ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(H, W, W, B, B)));
-                ops::rmsnorm_dynamic_grouped_conv_prepare(residual, layer.input_norm, config_.rms_norm_eps,
-                                                          layer.attention_base, layer.attention_projection.weight,
-                                                          prepared, delta, scratch, s);
-            }
+            prepare(residual, layer.input_norm, config_.rms_norm_eps, layer.attention_base,
+                    layer.attention_projection.weight, prepared, delta, prepare_routes_, work_, s);
             Tensor q = work_.alloc(DType::BF16, {D, Hq, W, B});
             Tensor k = work_.alloc(DType::BF16, {D, Hk, W, B});
             Tensor v = work_.alloc(DType::BF16, {D, Hk, W, B});
@@ -221,13 +233,8 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
             auto scope      = work_.scope();
             Tensor prepared = work_.alloc(DType::BF16, {H, W, B});
             Tensor delta    = work_.alloc(DType::BF16, {G, 2, W, B});
-            {
-                WorkspaceArena scratch(work_.alloc_bytes(
-                    ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(H, W, W, B, B)));
-                ops::rmsnorm_dynamic_grouped_conv_prepare(residual, layer.post_attention_norm, config_.rms_norm_eps,
-                                                          layer.mlp_base, layer.mlp_projection.weight, prepared, delta,
-                                                          scratch, s);
-            }
+            prepare(residual, layer.post_attention_norm, config_.rms_norm_eps, layer.mlp_base,
+                    layer.mlp_projection.weight, prepared, delta, prepare_routes_, work_, s);
             Tensor product = work_.alloc(DType::BF16, {I, W, B});
             {
                 Tensor flat = product.view({I, columns});

@@ -189,16 +189,39 @@ int main() {
                           "qsa-prepare-fused is qualified on recipe C with FP8 KV only");
     }
 
+    // dflash2-prepare-fused fuses the DFlash2 drafter's prepare; it applies wherever the DFlash2
+    // backend runs, regardless of the dense format, and is qualified nowhere yet (the Op-level
+    // port is measured; its end-to-end gate has not run here), so no configuration selects it by
+    // default. A column's arithmetic keeps one order at every width and batch, so the path is not
+    // width-keyed.
+    {
+        infernix::EngineOptions dflash2;
+        dflash2.speculative.backend = infernix::SpeculativeBackend::DFlash2;
+        for (const FastPathConfiguration& config :
+             {dense8, FastPathConfiguration{DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}}) {
+            failures += check(q::fast_path_applies(FastPath::Dflash2PrepareFused, config, dflash2) &&
+                                  !q::fast_path_applies(FastPath::Dflash2PrepareFused, config, options),
+                              "dflash2-prepare-fused applies only with the DFlash2 backend");
+            failures += check(!q::fast_path_qualified(FastPath::Dflash2PrepareFused, config),
+                              "dflash2-prepare-fused is qualified nowhere yet");
+            const q::FastPathSelection fused{.configuration = config,
+                                             .paths = {FastPath::Dflash2PrepareFused}};
+            failures += check(fused.forward().dflash2_prepare_fused && !fused.width_keyed() &&
+                                  fused.request_invariant(),
+                              "dflash2-prepare-fused sets its flag without coupling a column to its call's width");
+        }
+    }
+
     q::FastPathSelection selection{.configuration = dense8, .paths = {}};
     const auto exact = selection.forward();
     failures += check(exact.dense_routes == infernix::ops::LinearRoutes::Exact && !exact.gdn_conv_fused &&
-                          !exact.qsa_prepare_fused,
-                      "the exact route without a selected path");
+                           !exact.qsa_prepare_fused && !exact.dflash2_prepare_fused,
+                       "the exact route without a selected path");
     selection.paths = {FastPath::Q8SlicedK, FastPath::GdnConvFused, FastPath::QsaPrepareFused};
     const auto fast = selection.forward();
     failures += check(fast.dense_routes == infernix::ops::LinearRoutes::Q8SlicedK && fast.gdn_conv_fused &&
-                          fast.qsa_prepare_fused,
-                      "each selected path sets its Forward flag");
+                           fast.qsa_prepare_fused && !fast.dflash2_prepare_fused,
+                       "each selected path sets its Forward flag");
     // q8-sliced-k's reduction order depends on the round's width; the fused kernels are per column.
     failures += check(!selection.request_invariant(), "q8-sliced-k couples a request to its round");
     selection.paths = {FastPath::GdnConvFused, FastPath::QsaPrepareFused};

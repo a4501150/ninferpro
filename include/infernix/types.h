@@ -95,6 +95,14 @@ enum class FastPath : std::uint8_t {
     // of k16 products in FP16 before the FP32 carry (ops::GdnChunkArithmetic::Fp16Accumulate).
     // Without it they keep BF16/TF32 operands with FP32 accumulators.
     GdnF16Accumulate,
+    // Qwen3.8-Flash-Next's DFlash2 drafter: a prepare call of H 2560 and at most 16 columns runs
+    // the norm, the coefficient projection and both public writes in one kernel, which factors
+    // the RMS scale out of the projection and keeps FP32 between the steps, instead of the exact
+    // route's three launches (RMSNorm, split-K projection, reduction). A column's bits differ from
+    // the exact route's, in an order that does not depend on the call's width or batch; the
+    // drafts it steers change, the verification's output distribution does not. Without it the
+    // three launches run.
+    Dflash2PrepareFused,
     // The paths below couple a request's arithmetic to the other requests of the Engine. Without
     // them a request's outputs depend only on the request, the artifact, the options and the build
     // (LoadSummary::request_invariant); they apply where the exact route is request-invariant.
@@ -181,12 +189,12 @@ enum class FastPath : std::uint8_t {
     Bf16IndexMma,
 };
 
-inline constexpr std::array<FastPath, 25> kFastPaths{
+inline constexpr std::array<FastPath, 26> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
     FastPath::Q4W4A8,              FastPath::SampledMtpDrafts,
-    FastPath::GdnF16Accumulate,
+    FastPath::GdnF16Accumulate,   FastPath::Dflash2PrepareFused,
     FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
     FastPath::BatchedA4Decode,     FastPath::BatchedA4ResidualDecode,
     FastPath::BatchedA8ResidualDecode, FastPath::ExpertA4Residual,
@@ -219,6 +227,7 @@ inline constexpr std::array<FastPath, 25> kFastPaths{
     case FastPath::Q4W4A8: return "q4-w4a8";
     case FastPath::SampledMtpDrafts: return "sampled-mtp-drafts";
     case FastPath::GdnF16Accumulate: return "gdn-f16-accumulate";
+    case FastPath::Dflash2PrepareFused: return "dflash2-prepare-fused";
     case FastPath::GgmlBf16Prefill: return "ggml-bf16-prefill";
     case FastPath::GdnCompensated: return "gdn-compensated";
     case FastPath::HcSlicedK: return "hc-sliced-k";

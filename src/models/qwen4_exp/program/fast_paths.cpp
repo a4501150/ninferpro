@@ -335,6 +335,9 @@ constexpr std::array kQualified{
     // (bound 1.5e-3), top-1 -3.1e-4 (bound 2.4e-3), p99.9 0.93. Prefill: FP8 KL 5.8e-4 (bound
     // 6.6e-4), top-1 9.8e-4 (bound 1.5e-3), corpus NLL -6.2e-5. Timed: T1 1 x 1 -1.3 %, 6 x 2 -1.0 %.
     Qualification{FastPath::QsaPrepareFused, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    // dflash2-prepare-fused is qualified nowhere yet: the port measured it at the Op level
+    // (design §11.6) and its end-to-end gate (the drafter's acceptance and tok/s, T2-bench/T3) has
+    // not run here. It runs only as an explicit --fast-path-candidate until a row lands.
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -433,6 +436,10 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::SampledMtpDrafts: return options.speculative.backend == SpeculativeBackend::Mtp;
     // The GDN layers normalize Q/K; their chunked calls serve prefill.
     case FastPath::GdnF16Accumulate: return true;
+    // The drafter's fused prepare runs only in the DFlash2 rounds' own geometry (H 2560, at most 16
+    // columns); the dense format never enters it (the drafter's projections are the companion
+    // artifact's Q8).
+    case FastPath::Dflash2PrepareFused: return options.speculative.backend == SpeculativeBackend::DFlash2;
     // Recipe C's row-FP8 dense projections run 16-bit activations (A16Only).
     case FastPath::Fp8A8Pair: return configuration.dense == DenseKernels::Fp8Row;
     case FastPath::Q8SlicedK:
@@ -538,6 +545,7 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     return {.dense_routes       = routes,
             .gdn_conv_fused     = selected(FastPath::GdnConvFused),
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
+            .dflash2_prepare_fused = selected(FastPath::Dflash2PrepareFused),
             .expert_a4_residual = selected(FastPath::ExpertA4Residual),
             .gdn_arithmetic     = gdn,
             .column_invariant   = invariant && !width_keyed() && !width_routed};
