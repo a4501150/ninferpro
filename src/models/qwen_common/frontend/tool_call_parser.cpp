@@ -697,6 +697,43 @@ private:
                starts_with_at(text_, pos, "</function>") || starts_with_at(text_, pos, "</invoke>");
     }
 
+    // Where the call's own closers that follow `pos` (whitespace between) end: the function close,
+    // then any call and wrapper closes; npos when no function close follows.
+    std::size_t after_call_close(std::size_t pos) const {
+        skip_format_whitespace(text_, pos);
+        if (!consume(pos, "</function>") && !consume(pos, "</invoke>")) {
+            return std::string_view::npos;
+        }
+        for (;;) {
+            skip_format_whitespace(text_, pos);
+            if (!consume(pos, kToolClose) && !consume(pos, "</function_calls>")) { return pos; }
+        }
+    }
+
+    // Whether the region ends at `pos`, or another call begins there.
+    bool call_boundary(std::size_t pos) const {
+        skip_format_whitespace(text_, pos);
+        return pos >= text_.size() || starts_with_at(text_, pos, kToolOpen) ||
+               starts_with_at(text_, pos, "<function") || starts_with_at(text_, pos, "<invoke");
+    }
+
+    // A closer at `scan` that the call's own closers follow, and then text that is no other call,
+    // quotes those closing lines (a document showing a call's format) when a later closer, before
+    // the next call opener's spelling, ends the call at a boundary: the value goes on. The
+    // constrained grammar reads them the same way.
+    bool quoted_call_close(std::size_t scan, std::string_view required_close) const {
+        const std::size_t after = after_call_close(scan + required_close.size());
+        if (after == std::string_view::npos || call_boundary(after)) { return false; }
+        const std::size_t next  = text_.find(kToolOpen, after);
+        const std::size_t limit = next == std::string_view::npos ? text_.size() : next;
+        for (std::size_t later = text_.find(required_close, after); later < limit;
+             later = text_.find(required_close, later + 1)) {
+            const std::size_t end = after_call_close(later + required_close.size());
+            if (end != std::string_view::npos && call_boundary(end)) { return true; }
+        }
+        return false;
+    }
+
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
                               std::size_t& close_len, std::string_view required_close) const {
         std::size_t depth = 1;
@@ -704,8 +741,12 @@ private:
         while (scan < text_.size()) {
             if (starts_with_at(text_, scan, required_close)) {
                 // Closers of parameters the value quotes whole always balance their openers; only
-                // the outermost one must be followed by the grammar's next token.
-                if (depth != 1 || closes_parameter(scan + required_close.size())) { --depth; }
+                // the outermost one must be followed by the grammar's next token, and not quote
+                // the call's own closing lines.
+                if (depth != 1 || (closes_parameter(scan + required_close.size()) &&
+                                  !quoted_call_close(scan, required_close))) {
+                    --depth;
+                }
                 if (depth == 0) {
                     value_end = scan;
                     close_len = required_close.size();
@@ -809,7 +850,11 @@ public:
                 if (parameter && parameter->encoding == Contract::Encoding::Json) {
                     if (!json_value()) return status_;
                 } else {
-                    const auto close = input_.find("\n</parameter>", position_);
+                    // A raw value ends at its first `\n</parameter>`, unless the whole call's
+                    // closing lines follow it and value text follows them: those lines are value
+                    // text then (a document quoting the call format), and a later closer ends the
+                    // value at the call's boundary (the grammar's raw string rule).
+                    const auto close = raw_string_close(position_);
                     if (close == std::string_view::npos) return Status::Incomplete;
                     position_ = close;
                 }
@@ -862,6 +907,47 @@ public:
     }
 
 private:
+    // Whether the region ends at `pos`, or the next call's opener begins there. The grammar
+    // admits a second call only where calls are parallel, so a non-parallel region ends only at
+    // its end. The opener may be cut short by the end of the output (a truncation), so a prefix of
+    // its framing ends the call at a boundary too; the model never spells it as value text.
+    bool call_boundary(std::size_t pos) const {
+        if (pos >= input_.size()) { return true; }
+        if (!contract_.parallel || input_[pos] != '\n') { return false; }
+        // The next opener: `\n`, the opener token, then its own framing.
+        const std::string_view after = input_.substr(pos + 1);
+        constexpr std::string_view kFunctionTag = "\n<function=";
+        if (after.size() <= kToolOpen.size()) {
+            return kToolOpen.substr(0, after.size()) == after;
+        }
+        if (after.substr(0, kToolOpen.size()) != kToolOpen) { return false; }
+        const std::string_view framed = after.substr(kToolOpen.size());
+        if (framed.size() >= kFunctionTag.size()) { return framed.starts_with(kFunctionTag); }
+        return kFunctionTag.substr(0, framed.size()) == framed;
+    }
+
+    // The end of the raw value that starts at `from`: its first `\n</parameter>`, unless the
+    // whole call's closing lines follow it and value text follows them: the lines are value text
+    // then (a document quoting the call format) and a later closer ends the value. npos when no
+    // closer does.
+    std::size_t raw_string_close(std::size_t from) const {
+        constexpr std::string_view kValueEnd      = "\n</parameter>";
+        constexpr std::string_view kFunctionClose = "\n</function>\n";
+        for (std::size_t scan = from;;) {
+            const std::size_t candidate = input_.find(kValueEnd, scan);
+            if (candidate == std::string_view::npos) { return std::string_view::npos; }
+            const std::size_t after      = candidate + kValueEnd.size();
+            const std::size_t past_close = after + kFunctionClose.size();
+            if (input_.substr(after).starts_with(kFunctionClose) &&
+                input_.substr(past_close).starts_with(kToolClose) &&
+                !call_boundary(past_close + kToolClose.size())) {
+                scan = past_close + kToolClose.size(); // the closing lines are value text; read on
+                continue;
+            }
+            return candidate;
+        }
+    }
+
     bool take(std::string_view literal) {
         const auto remaining = input_.substr(position_);
         if (remaining.starts_with(literal)) {

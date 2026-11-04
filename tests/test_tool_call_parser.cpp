@@ -248,9 +248,18 @@ int test_parameter_delimiters_in_values() {
     failures += check_rejected(tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}}),
                                contract, Reason::MalformedStructure,
                                "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(tool_call("bash", {{"command", "echo '</parameter></function>'"}}),
-                               contract, Reason::MalformedStructure,
-                               "a closer followed by a function closer was guessed to be text");
+    // A closer followed by the call's own closers and then text is value text when a later closer
+    // ends the call (Strata #4701): only that reading parses the whole output, and the constrained
+    // route reads such a value the same way.
+    {
+        const std::string command = "echo '</parameter></function>'";
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(tool_call("bash", {{"command", command}}), 64, contract);
+        failures += check(parsed.tool_calls.size() == 1 &&
+                              Json::parse(parsed.tool_calls.front().arguments_json).at("command") ==
+                                  command,
+                          "a value quoting the call's closing tags was cut or demoted");
+    }
 
     // Tolerant truncation: a closer at the region end still closes the value, and a quoted closer
     // inside a value the budget cut stays part of the kept partial value.
@@ -1404,6 +1413,70 @@ int test_markdown_quoted_calls() {
     return failures;
 }
 
+// A file whose content documents the call format holds the call's own closing lines and then more
+// text (Strata #4701): those lines are value text, so the file keeps every byte, on the free route
+// (strict and tolerant, whole and at every chunking) and the constrained one. Without a later
+// closer, or with another call after the prose, a call still ends at its first closers, as before.
+int test_quoted_call_closers() {
+    const std::vector<std::string> definitions = {tool_definition(
+        "write_file", Json{{"path", Json{{"type", "string"}}},
+                           {"content", Json{{"type", "string"}}}})};
+    const auto free_contract = contract_from_definitions(definitions);
+    const auto constrained   = fi::select_tool_call_contract(free_contract, infernix::ToolChoice{});
+    using Contract           = std::shared_ptr<const fi::ToolCallOutputContract>;
+    const std::string plain     = tool_call("write_file", {{"path", "/tmp/a"}, {"content", "x"}});
+    const std::string closers   = plain.substr(plain.rfind("\n</parameter>"));
+    const std::string document  = "# Format\nA call ends with:" + closers + "\nThen the reply goes on.";
+    const std::string call      = tool_call("write_file",
+                                           {{"path", "/tmp/format.md"}, {"content", document}});
+    const std::string arguments = Json{{"path", "/tmp/format.md"}, {"content", document}}.dump();
+    int failures                = 0;
+    const std::vector<std::pair<Contract, bool>> routes{
+        {free_contract, false}, {free_contract, true}, {constrained, false}};
+    for (const auto& [contract, tolerant] : routes) {
+        const std::string route =
+            contract->constrained ? " (constrained)" : tolerant ? " (tolerant)" : " (strict)";
+        const std::string text  = "Writing it.\n" + call;
+        for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{7}, text.size()}) {
+            fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
+            std::string visible;
+            for (std::size_t at = 0; at < text.size(); at += width) {
+                visible += decoder.feed(std::string_view(text).substr(at, width));
+            }
+            const auto terminal = decoder.finish(infernix::FinishReason::StopToken);
+            failures += check(terminal.tool_calls.size() == 1 &&
+                                  Json::parse(terminal.tool_calls[0].arguments_json) ==
+                                      Json::parse(arguments) &&
+                                  visible + terminal.content == "Writing it.",
+                              "a file was cut at its quoted closing lines" + route + ", width " +
+                                  std::to_string(width));
+        }
+    }
+    // Prose after a call with no later closer: strict demotes it to text, tolerant keeps it cut there.
+    const std::string trailed = plain + "\nThat wrote the file.";
+    failures += check(
+        fi::parse_qwen_tool_call_output(trailed, 64, *free_contract).tool_calls.empty(),
+        "strict kept a call with trailing prose");
+    const auto kept = fi::parse_qwen_tool_call_output(trailed, 64, *free_contract, true);
+    failures += check(kept.tool_calls.size() == 1 &&
+                          Json::parse(kept.tool_calls[0].arguments_json)["content"] == "x",
+                      "tolerant did not keep a call before trailing prose");
+    // Another call after the prose: the first call's closers stay its closers (no value holds the
+    // next call's opener), as before: strict takes the second call, tolerant the first.
+    const std::string two =
+        plain + "\nNext one.\n" +
+        tool_call("write_file", {{"path", "/tmp/b"}, {"content", "y"}});
+    const auto strict_two = fi::parse_qwen_tool_call_output(two, 64, *free_contract);
+    failures += check(strict_two.tool_calls.size() == 1 &&
+                          Json::parse(strict_two.tool_calls[0].arguments_json)["path"] == "/tmp/b",
+                      "strict read prose between two calls differently");
+    const auto tolerant_two = fi::parse_qwen_tool_call_output(two, 64, *free_contract, true);
+    failures += check(tolerant_two.tool_calls.size() == 1 &&
+                          Json::parse(tolerant_two.tool_calls[0].arguments_json)["content"] == "x",
+                      "tolerant let a value swallow the next call");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_free_tool_continuation();
@@ -1442,6 +1515,7 @@ int main() {
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_undeclared_and_value_cut();
     failures += test_markdown_quoted_calls();
+    failures += test_quoted_call_closers();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

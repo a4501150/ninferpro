@@ -429,7 +429,14 @@ whose branch the model format cannot determine is rejected for strict compositio
 existing "any argument that allows string is read as string" cannot be claimed to enforce the other
 branches.
 
-A raw string argument ends at `\n</parameter>`, which must not occur in the value. Grammar and parser
+A raw string argument ends at `\n</parameter>`, which occurs in the value only inside the whole
+call's closing lines, `\n</parameter>\n</function>\n</tool_call>`, that more value text follows (a
+document quoting them; Strata #4701). The free string rule is a segment without the
+delimiter, then any number of those closing lines and another segment (`xml_string` in the vendored
+converter), so the matcher keeps both readings after the closers until the next bytes decide: the
+end of the output or the next call's opener (only where calls are parallel) closes the call, other
+text continues the value. The region parser reads the completed output by the same rule. Strings
+with a length bound or a pattern keep the plain exclusion. Grammar and parser
 use the same delimiter rule and strict output generates only losslessly representable values; a
 required const/enum value that cannot be represented returns an explicit error instead of being
 changed. A string's pattern/length and the delimiter exclusion hold together. The outer framing has no

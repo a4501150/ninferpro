@@ -256,6 +256,51 @@ void quoted_openers(infernix::text::GrammarCompiler& compiled) {
             "an unquoted opener no longer starts a call");
 }
 
+// A raw value holds the whole call's closing lines when more value text follows (a file that
+// documents the call format, Strata #4701, where the value was cut there): the grammar keeps the
+// value open after them, the call still ends at its own closers before the end or the next call,
+// and the decoder publishes the whole value at every chunking. Text after closers with no later
+// closer cannot end the output, and a bounded string keeps the plain exclusion.
+void quoted_closers(infernix::text::GrammarCompiler& compiled) {
+    const std::string whole    = call("a");
+    const std::string closers  = whole.substr(whole.rfind("\n</parameter>"));
+    const std::string document = "A call ends with:" + closers + "\nThen the reply goes on.";
+    for (const bool strict : {false, true}) {
+        const auto bound = contract(schema({{"type", "string"}}), strict);
+        require(accepts(compiled, *bound, call(document)),
+                "the grammar cut a value at quoted closing lines");
+        require(accepts(compiled, *bound, "Writing.\n" + call(document) + "\n" + call("b")),
+                "a value with quoted closing lines and a following call were refused");
+        require(accepts(compiled, *bound, call("a")), "a plain call no longer ends at its closers");
+        require(!accepts(compiled, *bound, call("a") + "\nThat wrote it."),
+                "a call ended with prose after it");
+        for (const std::size_t width : {std::size_t{1}, std::size_t{5}, std::size_t{4096}}) {
+            const std::string text = "Writing.\n" + call(document);
+            frontend::ToolCallOutputDecoder decoder(bound, 64);
+            std::string published;
+            for (std::size_t at = 0; at < text.size(); at += width) {
+                published += decoder.feed(std::string_view(text).substr(at, width));
+            }
+            const auto terminal = decoder.finish();
+            require(published + terminal.content == "Writing.",
+                    "the answer text before a quoted-closers call changed");
+            require(terminal.tool_calls.size() == 1 &&
+                        Json::parse(terminal.tool_calls[0].arguments_json) == Json{{"x", document}},
+                    "the decoder cut a value at quoted closing lines");
+        }
+        // The matcher keeps both readings after the closers: the completed call may end there, and
+        // the value goes on, its own later closers admitting the end.
+        const auto after_closers = feed(compiled, *bound, {}, call("a"));
+        require(after_closers.admitted && after_closers.eos && after_closers.other,
+                "the matcher dropped a reading at a call's closing lines");
+        require(feed(compiled, *bound, {}, call("a") + "\nb" + closers).eos,
+                "a value's own closers after a quoted one did not admit the end");
+    }
+    const auto bounded = contract(schema({{"type", "string"}, {"maxLength", 100}}), true);
+    require(!accepts(compiled, *bounded, call(document)),
+            "a bounded string held quoted closing lines");
+}
+
 // The reasoning section refuses a call opener outside Markdown code, so a call cannot start
 // inside thinking and the turn cannot end there: the model closes its thinking first (the
 // 2026-10-28 turns could only write more calls).
@@ -319,6 +364,7 @@ void run() {
     basic_contracts(compiled);
     selected_contracts(compiled);
     quoted_openers(compiled);
+    quoted_closers(compiled);
     masked_reasoning(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
