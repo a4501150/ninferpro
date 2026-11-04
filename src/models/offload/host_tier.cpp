@@ -10,31 +10,62 @@ namespace infernix::models::offload::expert_cache {
 
 namespace {
 
-constexpr double kNever = -std::numeric_limits<double>::infinity();
+// Victim heaps: min-heaps on (value, slot), the lowest value first, ties to the lower slot, with
+// each entry's index in pos (per slot).
+template <typename Entry>
+bool heap_before(const Entry& a, const Entry& b) {
+    return a.value < b.value || (a.value == b.value && a.slot < b.slot);
+}
 
-// Min-heap order on (value, slot): the lowest value first, ties to the lower slot.
-bool heap_after(double va, std::uint32_t sa, double vb, std::uint32_t sb) {
-    return va > vb || (va == vb && sa > sb);
+template <typename Entry>
+void sift_up(std::vector<Entry>& heap, std::vector<std::int32_t>& pos, std::size_t i) {
+    const Entry e = heap[i];
+    while (i > 0) {
+        const std::size_t parent = (i - 1) / 2;
+        if (!heap_before(e, heap[parent])) { break; }
+        heap[i]     = heap[parent];
+        pos[heap[i].slot] = static_cast<std::int32_t>(i);
+        i           = parent;
+    }
+    heap[i]   = e;
+    pos[e.slot] = static_cast<std::int32_t>(i);
+}
+
+template <typename Entry>
+void sift_down(std::vector<Entry>& heap, std::vector<std::int32_t>& pos, std::size_t i) {
+    const Entry e       = heap[i];
+    const std::size_t n = heap.size();
+    for (;;) {
+        std::size_t child = 2 * i + 1;
+        if (child >= n) { break; }
+        if (child + 1 < n && heap_before(heap[child + 1], heap[child])) { ++child; }
+        if (!heap_before(heap[child], e)) { break; }
+        heap[i]     = heap[child];
+        pos[heap[i].slot] = static_cast<std::int32_t>(i);
+        i           = child;
+    }
+    heap[i]   = e;
+    pos[e.slot] = static_cast<std::int32_t>(i);
 }
 
 } // namespace
 
 // ---------------------------------------------------------------------------- DecayedLfu
 
-DecayedLfu::DecayedLfu(std::uint32_t num_keys, double half_life) : half_life_(half_life), value_(num_keys, kNever) {
+DecayedLfu::DecayedLfu(std::uint32_t num_keys, double half_life) : half_life_(half_life), value_(num_keys, 0.0) {
     if (!(half_life > 0)) { throw std::invalid_argument("DecayedLfu: the half-life must be positive"); }
 }
 
-void DecayedLfu::use(std::uint32_t key, double weight) {
-    const double t = now_ / half_life_;
-    double& v      = value_[key];
-    // v = log2(2^(v - t/h) + w) + t/h, written to stay exact for the first use.
-    v = v == kNever ? std::log2(weight) + t : std::log2(std::exp2(v - t) + weight) + t;
-}
-
-double DecayedLfu::score(std::uint32_t key) const {
-    const double v = value_[key];
-    return v == kNever ? 0.0 : std::exp2(v - now_ / half_life_);
+int DecayedLfu::advance(double dt) {
+    now_ += dt;
+    int halvings = 0;
+    if (const double span = (now_ - base_) / half_life_; span >= kRebase) {
+        halvings = static_cast<int>(std::floor(span));
+        base_ += static_cast<double>(halvings) * half_life_;
+        for (double& v : value_) { v = std::ldexp(v, -halvings); }
+    }
+    growth_ = std::exp2((now_ - base_) / half_life_);
+    return halvings;
 }
 
 // ---------------------------------------------------------------------------- HostTier
@@ -42,6 +73,7 @@ double DecayedLfu::score(std::uint32_t key) const {
 HostTier::HostTier(const Config& config)
     : config_(config), lfu_(config.num_keys, config.half_life), slots_(config.slots),
       slot_of_(config.num_keys, -1), held_(config.num_keys, 0), dirty_mark_(config.num_keys, 0) {
+    for (auto& pos : heap_pos_) { pos.assign(config.slots, -1); }
     const std::uint64_t lists = static_cast<std::uint64_t>(config.ring) + config.prefetch + config.demotion;
     if (config.num_keys == 0 || config.slots <= lists) {
         throw std::invalid_argument("HostTier: the slots must exceed the ring, prefetch and demotion lists");
@@ -89,34 +121,61 @@ double HostTier::victim_value(std::uint32_t key, Victims kind) const {
 }
 
 void HostTier::push_victim(std::uint32_t slot) {
-    Slot& s = slots_[slot];
-    ++s.stamp;
+    const Slot& s = slots_[slot];
     for (const auto kind : {Victims::kShadow, Victims::kResident}) {
-        if (!eligible(s, kind)) { continue; }
-        auto& heap = heap_[static_cast<int>(kind)];
-        heap.push_back({victim_value(s.key, kind), slot, s.stamp});
-        std::push_heap(heap.begin(), heap.end(), [](const HeapEntry& a, const HeapEntry& b) {
-            return heap_after(a.value, a.slot, b.value, b.slot);
-        });
+        place_victim(kind, slot, eligible(s, kind));
+    }
+}
+
+void HostTier::place_victim(Victims kind, std::uint32_t slot, bool wanted) {
+    const int k                    = static_cast<int>(kind);
+    std::vector<std::int32_t>& pos = heap_pos_[k];
+    if (pos[slot] >= 0 && !wanted) {
+        auto& heap          = heap_[k];
+        const auto at       = static_cast<std::size_t>(pos[slot]);
+        const HeapEntry last = heap.back();
+        heap.pop_back();
+        pos[slot] = -1;
+        if (at < heap.size()) {
+            heap[at]       = last;
+            pos[last.slot] = static_cast<std::int32_t>(at);
+            sift_up(heap, pos, at);
+            sift_down(heap, pos, static_cast<std::size_t>(pos[last.slot]));
+        }
+        return;
+    }
+    if (!wanted) { return; }
+    auto& heap     = heap_[k];
+    const double v = victim_value(slots_[slot].key, kind);
+    if (pos[slot] >= 0) {
+        const auto at = static_cast<std::size_t>(pos[slot]);
+        if (heap[at].value == v) { return; }
+        heap[at].value = v;
+        sift_up(heap, pos, at);
+        sift_down(heap, pos, static_cast<std::size_t>(pos[slot]));
+        return;
+    }
+    heap.push_back({v, slot});
+    sift_up(heap, pos, heap.size() - 1);
+}
+
+void HostTier::rescale_victims(int halvings) {
+    for (int k = 0; k < 2; ++k) {
+        auto& heap = heap_[k];
+        for (HeapEntry& e : heap) { e.value = std::ldexp(e.value, -halvings); }
+        // Values that fell below the subnormals may now tie: restore the (value, slot) order.
+        for (std::size_t i = heap.size() / 2; i-- > 0;) { sift_down(heap, heap_pos_[k], i); }
     }
 }
 
 std::int32_t HostTier::peek_victim(Victims kind) {
-    auto& heap      = heap_[static_cast<int>(kind)];
-    const auto less = [](const HeapEntry& a, const HeapEntry& b) { return heap_after(a.value, a.slot, b.value, b.slot); };
+    auto& heap = heap_[static_cast<int>(kind)];
     while (!heap.empty()) {
-        const HeapEntry top = heap.front();
-        const Slot& s       = slots_[top.slot];
-        if (top.stamp != s.stamp || !eligible(s, kind)) {
-            std::pop_heap(heap.begin(), heap.end(), less);
-            heap.pop_back();
-            continue;
-        }
-        const double v = victim_value(s.key, kind);
-        if (top.value != v) { // used since it was pushed: re-rank
-            std::pop_heap(heap.begin(), heap.end(), less);
-            heap.back().value = v;
-            std::push_heap(heap.begin(), heap.end(), less);
+        const HeapEntry& top = heap.front();
+        const double v       = victim_value(slots_[top.slot].key, kind);
+        if (top.value != v) { // a resident used since it was placed: re-rank
+            heap.front().value = v;
+            sift_down(heap, heap_pos_[static_cast<int>(kind)], 0);
             continue;
         }
         return static_cast<std::int32_t>(top.slot);
@@ -194,10 +253,10 @@ void HostTier::seed_uses(std::span<const std::uint32_t> counts, std::uint32_t ca
 
 void HostTier::rerank_shadow(std::uint32_t key) {
     // A use raises a shadow's rank (shadows leave most-used first), and peek_victim re-ranks lazily only entries that
-    // fell: the shadow's entry is replaced.
+    // fell: the shadow's entry moves now.
     const std::int32_t slot = slot_of_[key];
-    if (slot >= 0 && eligible(slots_[static_cast<std::uint32_t>(slot)], Victims::kShadow)) {
-        push_victim(static_cast<std::uint32_t>(slot));
+    if (slot >= 0 && heap_pos_[static_cast<int>(Victims::kShadow)][static_cast<std::uint32_t>(slot)] >= 0) {
+        place_victim(Victims::kShadow, static_cast<std::uint32_t>(slot), true);
     }
 }
 
@@ -279,7 +338,7 @@ void HostTier::release_stream_pins() {
 }
 
 void HostTier::record_uses(double dt, std::span<const std::uint32_t> keys, double weight) {
-    lfu_.advance(dt);
+    if (const int halvings = lfu_.advance(dt); halvings > 0) { rescale_victims(halvings); }
     for (const auto k : keys) {
         lfu_.use(k, weight);
         rerank_shadow(k);
@@ -488,6 +547,31 @@ void HostTier::check() const {
     for (const Slot& slot : slots_) { stream_pins += (slot.pins & kPinStream) ? 1 : 0; }
     if (stream_pins != streamed_.size()) { fail("stream pins"); }
     if (residents != resident_count_ || shadows != shadow_count_) { fail("counts"); }
+    // The victim heaps: every eligible slot once, in (value, slot) order, a shadow at its current value
+    // and a resident at most at it.
+    std::size_t heaped[2] = {0, 0};
+    for (const auto kind : {Victims::kShadow, Victims::kResident}) {
+        const int k      = static_cast<int>(kind);
+        const auto& heap = heap_[k];
+        std::size_t eligible_slots = 0;
+        for (std::uint32_t s = 0; s < slots_.size(); ++s) { eligible_slots += eligible(slots_[s], kind) ? 1 : 0; }
+        if (heap.size() != eligible_slots) { fail("victim heap size"); }
+        heaped[k] += heap.size();
+        for (std::size_t i = 0; i < heap.size(); ++i) {
+            const HeapEntry& e = heap[i];
+            if (heap_pos_[k][e.slot] != static_cast<std::int32_t>(i) || !eligible(slots_[e.slot], kind)) {
+                fail("victim heap entry");
+            }
+            if (i > 0 && heap_before(e, heap[(i - 1) / 2])) { fail("victim heap order"); }
+            const double v = victim_value(slots_[e.slot].key, kind);
+            if (kind == Victims::kShadow ? e.value != v : e.value > v) { fail("victim heap value"); }
+        }
+    }
+    for (int k = 0; k < 2; ++k) {
+        const auto placed_slots = static_cast<std::size_t>(
+            std::count_if(heap_pos_[k].begin(), heap_pos_[k].end(), [](std::int32_t p) { return p >= 0; }));
+        if (placed_slots != heaped[k]) { fail("victim heap positions"); }
+    }
     std::size_t held_keys = 0;
     for (std::uint32_t k = 0; k < slot_of_.size(); ++k) {
         const std::int32_t s = slot_of_[k];

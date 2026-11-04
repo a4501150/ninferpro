@@ -174,6 +174,15 @@ period is a family-tuned constant. Replay on Qwen3.8-Flash-Next traces (greedy d
 mixed requests, 8,000 frames, 2026-10-10) measured halving 9-12 % better than never halving,
 and never-halved LFRU loses to plain LRU by 4-5 % on a topic-changing trace.
 
+**Victim search.** A budgeted round picks its victims through a low set (`LfruPolicy::build_low`):
+the unpinned residents that can reach the 256th-lowest score or less within 64 ticks answer each
+search exactly (a resident's score only falls until its next use, so one left out stays above the
+bound until then; a use, credit, insert, halving or pin re-tests or empties the set), and a set that
+cannot answer falls back to the full scan. The scan ordered every resident for each of ~75 victims
+a round — upstream measured 992 µs a round on its 9,125-resident Dense8 struct fixture, against
+155 µs with the set (2026-10-29). A step without an admission budget (the swap disabled) skips
+ordering its misses.
+
 **Evidence.** Replay of routing traces (`tools/expert_cache_replay/replay.py`; FreeToken
 community traces of Qwen3.8-Flash-Next, 383 decode tokens each, batch 1, event-atomic — a
 layer's experts must be resident together; recorded 2026-10-03), misses per token:
@@ -267,8 +276,12 @@ host slots, read in place from the artifact. An agent thread owns the unbuffered
 (§4.7) and spins from `begin_round` to `end_round`, so a request waits for no timer.
 
 **Ranking: decayed LFU.** Score `Σ w · 2^−(t − t_use)/h`, kept per key as the time-invariant
-`v = log2 s + t/h`, so a use is O(1) and ranking by `v` equals ranking by the current score;
-victims come from lazy min-heaps. The clock advances by decode tokens, accepted verification
+`v = Σ w · 2^((t_use − base)/h)` — one multiply-add per use by the clock's growth, with a rebase
+dividing every `v` by the same power of two once the clock is 256 half-lives past the base — so
+ranking by `v` equals ranking by the current score; victims come from indexed min-heaps (each
+eligible slot once; a resident's entry re-ranked lazily at the top, a shadow's at each use). The
+log2 form (`v = log2 s + t/h`, two transcendentals a use) and lazy heaps that grew an entry a
+use are gone. The clock advances by decode tokens, accepted verification
 tokens and `min(columns, 16)` per prefill chunk; the half-life is a family constant. A demand
 landing is admitted when it outranks the lowest resident; a prefetch landing at a margin
 above the victim's score; a VRAM victim is demotion-worthy at a margin above the RAM victim.
