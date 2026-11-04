@@ -152,6 +152,104 @@ std::uint8_t domain(const Json& source, const Json& document, std::set<std::stri
     return types;
 }
 
+// A root union's branch as the object schema it names, through local references; nullptr when it
+// cannot be read (not an object, or a remote, missing or cyclic reference).
+const Json* variant_object(const Json& branch, const Json& document) {
+    const Json* node = &branch;
+    std::set<const Json*> seen;
+    while (node->is_object() && node->contains("$ref")) {
+        const Json& ref = (*node)["$ref"];
+        if (!ref.is_string() || !seen.insert(node).second) return nullptr;
+        const auto& pointer = ref.get_ref<const std::string&>();
+        if (pointer != "#" && !pointer.starts_with("#/")) return nullptr;
+        try {
+            node = &document.at(Json::json_pointer(pointer.substr(1)));
+        } catch (const Json::exception&) { return nullptr; }
+    }
+    return node->is_object() ? node : nullptr;
+}
+
+// A non-strict tool's parameters, whose types guide their value text: the root's `properties`, and
+// those of the object variants of a root `anyOf` / `oneOf` (a zod or Pydantic discriminated union,
+// Codex's `automation_update`), each name once. A variant property's types are the union of the
+// types its declaring variants give it, known only when each of them is; a root property of the
+// same name narrows them. A union with a branch that cannot be read declares nothing, so those
+// values keep inference.
+std::vector<Contract::Parameter> non_strict_parameters(const Json& schema) {
+    struct Declared {
+        std::string name;
+        TypeSet types{};
+        bool known = false;
+    };
+    const auto named = [](std::vector<Declared>& list, const std::string& name) {
+        return std::find_if(list.begin(), list.end(),
+                            [&](const Declared& entry) { return entry.name == name; });
+    };
+    // The types a property schema declares, read the same way as the root's own properties.
+    const auto domain_of = [](const Json& property) {
+        Declared entry;
+        entry.known = compile_schema_types(property, entry.types);
+        return entry;
+    };
+    // A declared name narrowed by another declaration of it: the types both admit, and known as
+    // soon as one of them is (an unknown one leaves the other's types standing).
+    const auto narrow = [](Declared& to, const Declared& by) {
+        if (!by.known) return;
+        to.types.bits &= by.types.bits;
+        to.known = true;
+    };
+    std::vector<Declared> declared;
+    if (const auto properties = schema.find("properties");
+        properties != schema.end() && properties->is_object())
+        for (const auto& [name, property] : properties->items()) {
+            Declared entry = domain_of(property);
+            entry.name     = name;
+            declared.push_back(std::move(entry));
+        }
+    for (const char* key : {"anyOf", "oneOf"}) {
+        const auto branches = schema.find(key);
+        if (branches == schema.end() || !branches->is_array()) continue;
+        std::vector<Declared> united;
+        bool readable = true;
+        for (const Json& branch : *branches) {
+            const Json* variant = variant_object(branch, schema);
+            if (variant == nullptr) {
+                readable = false;
+                break;
+            }
+            const auto properties = variant->find("properties");
+            if (properties == variant->end() || !properties->is_object()) continue;
+            for (const auto& [name, property] : properties->items()) {
+                const Declared entry = domain_of(property);
+                if (const auto united_entry = named(united, name); united_entry != united.end()) {
+                    united_entry->types.bits |= entry.types.bits;
+                    united_entry->known = united_entry->known && entry.known;
+                } else {
+                    united.push_back({name, entry.types, entry.known});
+                }
+            }
+        }
+        if (!readable) continue;
+        for (Declared& entry : united) {
+            if (const auto root = named(declared, entry.name); root != declared.end())
+                narrow(*root, entry);
+            else
+                declared.push_back(std::move(entry));
+        }
+    }
+    std::vector<Contract::Parameter> parameters;
+    for (const Declared& entry : declared) {
+        Contract::Parameter parameter;
+        parameter.name = entry.name;
+        if (entry.known) {
+            parameter.policy     = NormalizationPolicy::DeclaredTypes;
+            parameter.types.bits = entry.types.bits;
+        }
+        parameters.push_back(std::move(parameter));
+    }
+    return parameters;
+}
+
 void prepare_strict_parameters(Contract::Tool& tool) {
     const Json document = Json::parse(text::prepare_json_schema(tool.schema_json));
     std::set<std::string> seen;
@@ -220,17 +318,11 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons) {
                 "parameters", Json{{"type", "object"}, {"properties", Json::object()}});
             tool.schema_json       = schema.dump();
             tool.declaration_index = i;
-            // Non-strict output keeps the established best-effort normalization contract.
-            if (schema.is_object() && schema.contains("properties") &&
-                schema["properties"].is_object()) {
-                for (const auto& [name, property] : schema["properties"].items()) {
-                    Contract::Parameter parameter;
-                    parameter.name = name;
-                    if (compile_schema_types(property, parameter.types))
-                        parameter.policy = NormalizationPolicy::DeclaredTypes;
-                    tool.parameters.push_back(std::move(parameter));
-                }
-            }
+            // Non-strict output keeps the established best-effort normalization contract: the
+            // types its schema names, through local references and enum / const values, guide
+            // the value text (a constrained strict tool's are replaced at selection by its
+            // strict list).
+            if (schema.is_object()) tool.parameters = non_strict_parameters(schema);
             result->tools.push_back(std::move(tool));
         } catch (const Json::exception& error) {
             fail(std::string("invalid tool declaration: ") + error.what(), "/" + std::to_string(i));

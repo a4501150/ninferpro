@@ -503,6 +503,64 @@ int test_composed_schema_types() {
     return failures;
 }
 
+int test_root_union_type_hints() {
+    // A non-strict tool whose parameters are a root `oneOf` / `anyOf` of object variants (a zod
+    // or Pydantic discriminated union, Codex's `automation_update`; Basalt #208) declares its
+    // variants' properties: a string-typed one keeps `2026`, `true` and `null` as text. A name
+    // the variants type differently takes the union of their types; a variant that leaves it
+    // untyped, or a branch that cannot be read (a remote reference), leaves the value text to
+    // decide, as for an undeclared name.
+    const Json zod = {
+        {"type", "object"},
+        {"properties", Json::object()},
+        {"$defs",
+         {{"Create", {{"type", "object"},
+                      {"properties", {{"mode", {{"const", "create"}}}, {"name", {{"type", "string"}}},
+                                      {"shared", {{"type", "string"}}}, {"loose", Json::object()}}}}},
+          {"Update", {{"type", "object"},
+                      {"properties", {{"mode", {{"const", "update"}}}, {"paused", {{"type", "boolean"}}},
+                                      {"shared", {{"type", "integer"}}}, {"loose", {{"type", "string"}}}}}}}}},
+        {"oneOf", Json::array({Json{{"$ref", "#/$defs/Create"}}, Json{{"$ref", "#/$defs/Update"}}})}};
+    const Json remote = {
+        {"type", "object"},
+        {"anyOf", Json::array({Json{{"$ref", "https://example.com/schema.json"}},
+                               Json{{"type", "object"}, {"properties", {{"name", {{"type", "string"}}}}}}})}};
+    const auto declarations = contract_from_definitions(
+        {Json{{"type", "function"},
+              {"function", Json{{"name", "automate"}, {"parameters", zod}}}}
+                 .dump(),
+         Json{{"type", "function"},
+              {"function", Json{{"name", "fetch"}, {"parameters", remote}}}}
+                 .dump()});
+    const auto constrained =
+        fi::select_tool_call_contract(declarations, infernix::ToolChoice{});
+    int failures = 0;
+    if (!constrained) { return check(false, "default tool choice did not constrain the calls"); }
+    // Each call's text and the JSON its arguments must decode to.
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {tool_call("automate",
+                   {{"mode", "update"}, {"name", "2026"}, {"paused", "true"}, {"shared", "null"},
+                    {"loose", "7"}}),
+         R"({"mode":"update","name":"2026","paused":true,"shared":"null","loose":7})"},
+        {tool_call("automate", {{"name", "true"}, {"shared", "2026"}}),
+         R"({"name":"true","shared":"2026"})"},
+        {tool_call("fetch", {{"name", "2026"}}), R"({"name":2026})"}};
+    for (const auto& [text, expected] : cases) {
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *declarations);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                             parsed.tool_calls.front().arguments_json == expected,
+                         "a root union's arguments were typed wrongly: " + expected);
+        fi::ToolCallOutputDecoder decoder(constrained, 64);
+        (void)decoder.feed(text);
+        const auto terminal = decoder.finish();
+        failures +=
+            check(terminal.tool_calls.size() == 1 &&
+                      terminal.tool_calls.front().arguments_json == expected,
+                  "the constrained route typed a root union's arguments differently: " + expected);
+    }
+    return failures;
+}
+
 int test_empty_declared_non_string_is_omitted() {
     const Json properties = {
         {"file_path", Json{{"type", "string"}}},
@@ -1562,6 +1620,7 @@ int main() {
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
     failures += test_composed_schema_types();
+    failures += test_root_union_type_hints();
     failures += test_empty_declared_non_string_is_omitted();
     failures += test_schema_mismatches_remain_structured();
     failures += test_unsupported_schema_uses_legacy_policy();

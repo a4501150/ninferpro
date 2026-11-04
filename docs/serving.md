@@ -410,7 +410,11 @@ declared function name.
 
 Non-strict parameter names and order remain open. Their schema supplies the existing value
 normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
-unsupported schema assertions therefore remain usable. Repeated parameter names use the last
+unsupported schema assertions therefore remain usable. A root `oneOf` / `anyOf` of object variants
+(a zod or Pydantic discriminated union) supplies its variants' properties as hints too: a name
+takes the union of the types its variants give it, so a string-typed field keeps `2026` or `true`
+as text; a variant that leaves it untyped, or a branch that cannot be read, leaves the value text
+to decide. Repeated parameter names use the last
 value, retaining the first key position; the published JSON object contains each key once.
 `strict:true` additionally enforces the parameter contract below.
 
