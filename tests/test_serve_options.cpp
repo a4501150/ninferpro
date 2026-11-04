@@ -487,6 +487,10 @@ int main() {
                                            "12",
                                            "--pending-timeout-ms",
                                            "2500",
+                                           "--keep-alive-timeout-sec",
+                                           "90",
+                                           "--max-http-clients",
+                                           "32",
                                            "--max-context",
                                            "4096",
                                            "--kv-capacity",
@@ -525,6 +529,28 @@ int main() {
                       "--max-pending-requests did not reach serving options");
     failures += check(configured.pending_timeout_ms == 2500,
                       "--pending-timeout-ms did not reach serving options");
+    failures += check(configured.keep_alive_timeout_sec == 90,
+                      "--keep-alive-timeout-sec did not reach serving options");
+    failures += check(configured.max_http_clients == 32,
+                      "--max-http-clients did not reach serving options");
+    failures += check(parse_error({"infernix-serve", "model.ninfer"}).empty() &&
+                          parse({"infernix-serve", "model.ninfer"}).keep_alive_timeout_sec == 360,
+                      "--keep-alive-timeout-sec does not outlast a 5-minute client pool by default");
+    failures += check(parse_error({"infernix-serve", "model.ninfer"}).empty() &&
+                          parse({"infernix-serve", "model.ninfer"}).max_http_clients == 64,
+                      "--max-http-clients is not 64 by default");
+    for (const char* bad : {"0", "3601", "-1", "abc"}) {
+        const std::string error =
+            parse_error({"infernix-serve", "model.ninfer", "--keep-alive-timeout-sec", bad});
+        failures += check(error.find("keep-alive-timeout-sec") != std::string::npos,
+                          "--keep-alive-timeout-sec accepted an invalid value");
+    }
+    for (const char* bad : {"0", "-1", "abc"}) {
+        const std::string error =
+            parse_error({"infernix-serve", "model.ninfer", "--max-http-clients", bad});
+        failures += check(error.find("max-http-clients") != std::string::npos,
+                          "--max-http-clients accepted an invalid value");
+    }
     failures += check(configured.log_stats_interval_ms == 0,
                       "--log-stats-interval-ms did not disable periodic reporting");
     failures += check(!configured.log_stats_panel &&

@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <exception>
@@ -199,6 +200,22 @@ std::string_view canonical_api_path(std::string_view path) noexcept {
     return path;
 }
 
+httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options) {
+    const std::size_t queued_requests =
+        static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests;
+    const std::size_t worker_count = queued_requests + 1;
+    // cpp-httplib runs each accepted connection's keep-alive loop as one pool task, so an
+    // open connection — idle or not — occupies its worker for the whole idle window. Stock
+    // sizes the pool max_n == base, capping both workers and, with them, simultaneous
+    // connections; the keep-alive window makes that cap worth stating openly rather than
+    // leaving hardwired: base workers keep request admission permanently reachable, and
+    // connections up to --max-http-clients hold a worker each, with the rest queueing
+    // (max_pending_requests deep) before the accept loop starts refusing them.
+    const std::size_t worker_ceiling =
+        std::max(worker_count, static_cast<std::size_t>(options.max_http_clients));
+    return new httplib::ThreadPool(worker_count, worker_ceiling, queued_requests);
+}
+
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
                        std::shared_ptr<product::TerminalPanel> panel)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
@@ -209,12 +226,7 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
         console_stats_ = std::make_unique<ConsoleStatsPanel>(
             std::move(panel), options_.speculative.ngram_draft_tokens != 0);
     }
-    const std::size_t queued_requests =
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
-    server_.new_task_queue         = [queued_requests, worker_count] {
-        return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
-    };
+    server_.new_task_queue = [this] { return new_http_worker_pool(options_); };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
@@ -372,6 +384,19 @@ void HttpServer::stop_stats_reporter() {
 }
 
 void HttpServer::register_routes() {
+    // HTTP keep-alive window after a response finishes (cpp-httplib defaults to 5 s, which
+    // closes pooled connections between agent turns; clients then pay a reconnect — or race
+    // the close if their pool outlives it). The library's timeout close is already graceful
+    // (drain_and_close_socket: a half-close, then a bounded drain), and a live request re-arms
+    // the window on both sides, so no per-response retirement is needed. A client that probes a
+    // pooled socket before reuse still loses a request written between its probe and a close in
+    // flight (a POST is not retried), so the server must not close first: clients that read the
+    // Keep-Alive header retire at the advertised timeout, which the close follows by
+    // kKeepAliveBufferSec; clients that do not (Bun's fetch: 4-5 minutes) are outlasted by the
+    // default window. Idle connections hold a worker each — bounded by the pool ceiling
+    // (--max-http-clients), not by the window.
+    server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
+    server_.set_keep_alive_timeout_buffer(kKeepAliveBufferSec);
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
     });

@@ -45,6 +45,10 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 [[nodiscard]] std::string api_route_pattern(std::string_view endpoint);
 [[nodiscard]] std::string_view canonical_api_path(std::string_view path) noexcept;
 
+// The HTTP server's worker pool (its new_task_queue, owned by the server): a worker for every
+// admitted or waiting request and one more, growing to --max-http-clients open connections.
+[[nodiscard]] httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options);
+
 class HttpServer {
 public:
     // `panel` is the console panel for the session statistics; it is drawn only when enabled by
