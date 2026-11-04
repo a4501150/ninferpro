@@ -561,6 +561,54 @@ int test_root_union_type_hints() {
     return failures;
 }
 
+// A generated value nested deeper than 256 arrays or objects stays text (a JSON string, counted
+// as a schema mismatch), typed or not, so no call reaches a client as a tree too deep to
+// serialize; 256 levels stay JSON (LE-14). A strict value streams as the model writes it, so the
+// constrained decoder ends the request at the 257th level instead.
+int test_argument_nesting_bound() {
+    const auto nested = [](int levels) { return std::string(levels, '[') + std::string(levels, ']'); };
+    const auto contract = contract_from_definitions(
+        {tool_definition("store", Json{{"data", Json::object()}, {"list", Json{{"type", "array"}}}})});
+    int failures = 0;
+    for (const char* name : {"data", "list"}) {
+        for (const int levels : {256, 257, 4000}) {
+            const std::string value = nested(levels);
+            const std::string text  = tool_call("store", {{name, value}});
+            const auto parsed       = fi::parse_qwen_tool_call_output(text, 64, *contract);
+            const Json expected{{name, levels <= 256 ? Json::parse(value) : Json(value)}};
+            failures +=
+                check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          Json::parse(parsed.tool_calls.front().arguments_json) == expected &&
+                          (levels <= 256) == (parsed.diagnostics.schema_mismatch_arguments == 0),
+                      "a value " + std::to_string(levels) + " levels deep in '" + name +
+                          "' was not kept as JSON up to 256 levels and as text beyond");
+        }
+    }
+    const auto strict = fi::select_tool_call_contract(
+        contract_from_definitions({Json{{"type", "function"},
+                                        {"function", {{"name", "store"},
+                                                      {"strict", true},
+                                                      {"parameters", {{"type", "object"},
+                                                                      {"properties", {{"list", {{"type", "array"}}}}},
+                                                                      {"required", Json::array({"list"})},
+                                                                      {"additionalProperties", false}}}}}}
+                                       .dump()}),
+        infernix::ToolChoice{});
+    for (const int levels : {256, 257}) {
+        fi::ToolCallOutputDecoder decoder(strict, 64);
+        const std::string text = tool_call("store", {{"list", nested(levels)}});
+        bool refused           = false;
+        try {
+            (void)decoder.feed(text);
+            (void)decoder.finish();
+        } catch (const std::length_error&) { refused = true; }
+        failures += check(refused == (levels > 256),
+                          "the constrained decoder did not stop a strict value at 257 levels, or "
+                          "stopped one at 256");
+    }
+    return failures;
+}
+
 int test_empty_declared_non_string_is_omitted() {
     const Json properties = {
         {"file_path", Json{{"type", "string"}}},
@@ -1621,6 +1669,7 @@ int main() {
     failures += test_exact_integer_boundary();
     failures += test_composed_schema_types();
     failures += test_root_union_type_hints();
+    failures += test_argument_nesting_bound();
     failures += test_empty_declared_non_string_is_omitted();
     failures += test_schema_mismatches_remain_structured();
     failures += test_unsupported_schema_uses_legacy_policy();

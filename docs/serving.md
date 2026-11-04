@@ -87,6 +87,7 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 | `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, `meta` and `chat_template_caps` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
+| `GET /v1/responses` | a WebSocket upgrade (OpenAI's Responses WebSocket mode, not served) answers `426` with `code: "websocket_not_supported"`, so Codex's built-in provider switches to HTTP at once; any other GET answers `404` |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
 | `GET /v1/responses/{id}` | retrieve a locally stored terminal Response |
 | `DELETE /v1/responses/{id}` | delete a locally stored Response |
@@ -133,9 +134,13 @@ is in use ...`, and status 1.
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
 
-All three generation SSE endpoints emit the standard `: keep-alive` comment after five seconds
-without a protocol event. The comment is transport-only: SSE clients ignore it, and it does not
-change generated text, event ordering, usage, stored Responses, or request logs. Accepted
+All three generation SSE endpoints emit a heartbeat after five seconds without a protocol event:
+Chat Completions a chunk whose `delta` is empty, Responses `response.in_progress` again (the same
+response, the next `sequence_number`), and Anthropic Messages its `ping` event (before
+`message_start`, the standard `: keep-alive` comment). A client whose idle timer counts events,
+not bytes, keeps the stream through a long prefill (Codex restarts its timer only on an event, and
+an SSE comment is none). The heartbeat changes no generated text, usage, stored Responses or
+request logs. Accepted
 connections also use TCP keepalive and a 15-second retransmission limit (`TCP_USER_TIMEOUT` on
 Linux, `TCP_MAXRTMS` on Windows); together with the heartbeat,
 a dead or unacknowledging peer is normally cancelled within about 20 seconds, including while the
@@ -411,10 +416,13 @@ declared function name.
 Non-strict parameter names and order remain open. Their schema supplies the existing value
 normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
 unsupported schema assertions therefore remain usable. A root `oneOf` / `anyOf` of object variants
-(a zod or Pydantic discriminated union) supplies its variants' properties as hints too: a name
+ (a zod or Pydantic discriminated union) supplies its variants' properties as hints too: a name
 takes the union of the types its variants give it, so a string-typed field keeps `2026` or `true`
 as text; a variant that leaves it untyped, or a branch that cannot be read, leaves the value text
-to decide. Repeated parameter names use the last
+to decide. A generated value nested deeper than 256 arrays or objects is kept as text (a JSON
+string, counted as a schema mismatch), so no call reaches a client as a tree too deep to
+serialize; a `strict:true` value streams as the model writes it, so there the request ends with an
+error at the 257th level. Repeated parameter names use the last
 value, retaining the first key position; the published JSON object contains each key once.
 `strict:true` additionally enforces the parameter contract below.
 

@@ -61,6 +61,10 @@ public:
     void note_timing(const infernix::GenerationTimingObservation& timing);
     std::string reasoning_delta(const std::string& text);
     std::string content_delta(const std::string& text);
+    // A quiet stream's heartbeat (SseTransport::set_heartbeat): a chunk with an empty delta,
+    // which a client whose idle timer counts events takes as one; empty before start (the
+    // transport then writes an SSE comment) and after finish.
+    [[nodiscard]] std::string keep_alive() const;
     std::vector<std::string> finish(const GenerationOutcome& outcome);
 
 private:

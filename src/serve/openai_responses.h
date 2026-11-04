@@ -116,6 +116,10 @@ public:
     OpenAIResponsesEventStream& operator=(const OpenAIResponsesEventStream&) = delete;
 
     std::vector<std::string> start();
+    // A quiet stream's heartbeat (SseTransport::set_heartbeat): `response.in_progress` again,
+    // with the next sequence number, which a client whose idle timer counts events (Codex) takes
+    // as one; empty before start and after the finish.
+    [[nodiscard]] std::string keep_alive();
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     OpenAIResponsesStreamFinish finish(const GenerationOutcome& outcome);

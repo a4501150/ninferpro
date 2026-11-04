@@ -287,6 +287,11 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
 }
 
+std::string OpenAIChatStream::keep_alive() const {
+    if (!started_ || finished_) { return {}; }
+    return chunk(identity_, Json::object(), nullptr, include_usage_);
+}
+
 std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outcome) {
     if (!started_ || finished_) {
         throw std::logic_error("invalid OpenAI Chat stream finish state");

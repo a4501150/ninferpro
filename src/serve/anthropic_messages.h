@@ -80,6 +80,11 @@ public:
 
     [[nodiscard]] bool started() const noexcept { return started_; }
 
+    // A quiet stream's heartbeat (SseTransport::set_heartbeat): the protocol's `ping` event,
+    // which a client whose idle timer counts events takes as one; empty before message_start
+    // and after the stop.
+    [[nodiscard]] std::string ping() const;
+
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     std::vector<std::string> finish(const GenerationOutcome& outcome);
