@@ -2035,6 +2035,67 @@ int test_cross_round_stop(const Frontend& frontend) {
     return failures;
 }
 
+// A long client stop string holds back exactly its ambiguous suffix (candidates QA-14): the
+// bytes that could still grow into the stop stay unpublished across rounds — no more than the
+// stop's own length, down to the longest prefix the text ends with — and the completed stop ends
+// the answer wherever it appears.
+int test_long_stop_string_hold_back(const Frontend& frontend) {
+    auto prompt = frontend.prepare_tokens({0});
+    infernix::StopPolicy stop;
+    const std::string long_stop = std::string(64, 'S') + "TOP";
+    stop.strings.push_back(infernix::StopString{.text = long_stop});
+    auto session = frontend.make_output_session(prompt, stop);
+
+    const std::string held = long_stop.substr(0, long_stop.size() - 4);
+    const auto first_tokens = fixture_tokens("answer" + held);
+    const auto first_decision =
+        session.preview_model(first_tokens, static_cast<std::uint32_t>(first_tokens.size() + 1U),
+                              infernix::FinishReason::OutputLimit);
+    int failures = check(first_decision.accepted_tokens == first_tokens.size() &&
+                             !first_decision.finished(),
+                         "a long stop string ended the answer before it was complete");
+    const auto first = session.commit_preview();
+    failures += check(channel_text(first, infernix::OutputChannel::Content) == "answer",
+                      "a long stop string did not hold back its ambiguous suffix across the round");
+
+    const auto rest_tokens = fixture_tokens(long_stop.substr(held.size()));
+    const auto second_decision = session.preview_model(
+        rest_tokens, static_cast<std::uint32_t>(rest_tokens.size() + 1U),
+        infernix::FinishReason::OutputLimit);
+    failures += check(second_decision.finish_reason == infernix::FinishReason::StopString,
+                      "the completed long stop string did not end the answer");
+    const auto second = session.commit_preview();
+    failures += check(channel_text(second, infernix::OutputChannel::Content).empty(),
+                      "the held suffix of a long stop string leaked into the answer");
+    failures += check(session.matched_stop_string() == std::optional<std::string>(long_stop),
+                      "the terminal output session lost the long stop declaration");
+
+    // A text that already ends with the complete stop ends at the match; the hold-back never
+    // reaches past it, and a self-overlapping partial prefix holds exactly its own length.
+    auto whole = frontend.make_output_session(prompt, stop);
+    const auto whole_tokens = fixture_tokens("zz" + long_stop);
+    const auto whole_decision =
+        whole.preview_model(whole_tokens, static_cast<std::uint32_t>(whole_tokens.size() + 1U),
+                            infernix::FinishReason::OutputLimit);
+    failures += check(whole_decision.finish_reason == infernix::FinishReason::StopString &&
+                          channel_text(whole.commit_preview(),
+                                       infernix::OutputChannel::Content) == "zz",
+                      "a complete long stop string did not end the answer at the match");
+
+    infernix::StopPolicy overlap;
+    overlap.strings.push_back(infernix::StopString{.text = "ABABAB"});
+    auto partial = frontend.make_output_session(prompt, overlap);
+    const auto partial_tokens = fixture_tokens("xxABAB");
+    const auto partial_decision =
+        partial.preview_model(partial_tokens, static_cast<std::uint32_t>(partial_tokens.size() + 1U),
+                              infernix::FinishReason::OutputLimit);
+    failures += check(!partial_decision.finished() &&
+                          channel_text(partial.commit_preview(),
+                                       infernix::OutputChannel::Content) == "xx",
+                      "a self-overlapping partial stop prefix was not held back exactly");
+    return failures;
+}
+
 int test_same_token_stop_priority(const Frontend& frontend) {
     auto prompt = frontend.prepare_tokens({0});
     infernix::StopPolicy stop;
@@ -3481,6 +3542,7 @@ int main() {
     failures += test_prefix_block_keys(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);
+    failures += test_long_stop_string_hold_back(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_tools_and_json_output();

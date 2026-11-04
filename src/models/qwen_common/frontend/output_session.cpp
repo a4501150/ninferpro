@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace infernix::models::qwen_common {
 namespace {
@@ -94,14 +95,31 @@ std::string consume_generated_utf8(std::string& pending) {
     return decoded;
 }
 
+// The longest prefix of `marker` that `text` ends with, in O(n) for n = min(|text|, |marker|):
+// Knuth-Morris-Pratt over text's last n bytes. The complete marker counts only when the caller
+// holds a full match pending (`allow_complete`); otherwise the longest proper prefix stands in.
+// (Comparing every size from the largest down was quadratic once a long held prefix broke, and a
+// stop string's length is the client's; QA-14.)
 std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker,
                                   bool allow_complete = false) {
-    const std::size_t maximum = std::min(text.size(), marker.size());
-    for (std::size_t size = maximum; size != 0; --size) {
-        if (!allow_complete && size == marker.size()) { continue; }
-        if (text.substr(text.size() - size) == marker.substr(0, size)) { return size; }
+    const std::size_t n = std::min(text.size(), marker.size());
+    if (n == 0) { return 0; }
+    thread_local std::vector<std::size_t> border;
+    border.assign(n, 0);
+    for (std::size_t i = 1, k = 0; i < n; ++i) {
+        while (k != 0 && marker[i] != marker[k]) { k = border[k - 1]; }
+        if (marker[i] == marker[k]) { ++k; }
+        border[i] = k;
     }
-    return 0;
+    std::size_t state = 0;
+    for (const char c : text.substr(text.size() - n)) {
+        while (state != 0 && (state == marker.size() || c != marker[state])) {
+            state = border[state - 1];
+        }
+        if (c == marker[state]) { ++state; }
+    }
+    if (state == marker.size()) { return allow_complete ? marker.size() : border[state - 1]; }
+    return state;
 }
 
 // The model serializes its reasoning close as "\n</think>\n\n", so only a line break confirms a
