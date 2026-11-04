@@ -627,6 +627,9 @@ private:
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) {
         std::size_t header_begin = 0;
         std::string_view fn_close = "</function>";
+        // Whether this call's opener was recovered rather than well formed: a drifted opener is
+        // a call only for a name the request declares.
+        bool drifted_opener = false;
         if (starts_with_at(text_, pos, "<function")) {
             header_begin = pos + 9;
             fn_close = "</function>";
@@ -653,6 +656,7 @@ private:
             header_begin  = scan;
             fn_close      = kw_len == 8 ? "</function>" : "</invoke>";
             call.repaired = true;
+            drifted_opener = true;
         } else {
             return FallbackReason::MalformedStructure;
         }
@@ -691,13 +695,18 @@ private:
         if (!valid_function_name(call.name, max_name_length_)) {
             return FallbackReason::InvalidToolName;
         }
-        // Strict mode rejects a name outside the declared tool set. Tolerant mode keeps an
-        // otherwise well-formed call structured and leaves the identity judgment to the consumer:
-        // leaking the raw region to content would turn a valid call into prose.
+        // Strict mode rejects a name outside the declared tool set, unless the client keeps tool
+        // definitions out of the request (Contract::open_names). Tolerant mode keeps an otherwise
+        // well-formed call structured and leaves the identity judgment to the consumer: leaking the
+        // raw region to content would turn a valid call into prose. A drifted opener without its
+        // keyword is too weak a signal for that: it is a call only for a declared name.
         current_tool_ = find_tool_contract(contract_, call.name);
         if (current_tool_ == nullptr) {
-            if (!tolerant_) { return FallbackReason::UndeclaredTool; }
-            call.repaired = true;
+            if (!tolerant_ && !contract_.open_names) { return FallbackReason::UndeclaredTool; }
+            if (contract_.open_names && drifted_opener) {
+                return FallbackReason::MalformedStructure;
+            }
+            if (!contract_.open_names) { call.repaired = true; }
         }
         pos = ws_boundary ? tag_end : tag_end + 1;
 

@@ -1123,11 +1123,13 @@ history. `output_config.effort` passes its protocol-validated value to the
 selected template, substituting the nearest value the template accepts as described above.
 `output_config.format` accepts JSON Schema output as described above.
 
-User-defined tools support `name`, `description`, object `input_schema`, `input_examples`, and
-`strict`. `tool_choice` accepts `auto`, `none`, `any`, or named `tool`; `disable_parallel_tool_use`
-enforces a single-call limit. See the common tool contract above for schema and framing details.
-Deferred tools, tools that exclude direct model calls, Anthropic-provided/server tools, toolsets,
-MCP, and containers remain unsupported. `tool_result` preserves text/image order and marks
+User-defined tools support `name`, `description`, object `input_schema`, `input_examples`,
+`strict`, and `defer_loading`. `tool_choice` accepts `auto`, `none`, `any`, or named `tool`;
+`disable_parallel_tool_use` enforces a single-call limit. See the common tool contract above for
+schema and framing details, and [Deferred tools and tool search](#deferred-tools-and-tool-search)
+for deferral and the server tool search tools. Tools that exclude direct model calls,
+Anthropic-provided/server tools other than the tool search tools, toolsets, MCP, and containers
+remain unsupported. `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated
@@ -1177,6 +1179,113 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## Deferred tools and tool search
+
+Agent clients with large tool catalogs (many MCP servers) can mark tools `defer_loading:true` on
+Anthropic Messages. The client still sends every definition on every request, but the prompt's
+tool list leaves deferred tools out: the model finds them with a tool search, and a found tool's
+definition appears in the conversation at the search's result. Everything before that result
+(System prompt, listed tools, earlier turns) keeps its tokens as tools load, so the prefix cache
+keeps serving the conversation, and the first prompt carries none of the deferred schemas.
+
+- **Rendering.** Listed tools render in the template's tool section exactly as before; a request
+  that defers nothing renders token-identically to one without these features. A result that loads
+  tools ends with `You now also have access to the following functions:`, a blank line, and the
+  definitions inside `<tools>`...`</tools>`, one JSON function definition per line in the form the
+  listed tools use (with `input_examples` when declared). The text depends only on the loaded
+  definitions, so a continuation Infernix runs and a later request that replays the same history
+  render the same tokens. Each tool loads once per result.
+- **Calls.** Every declared tool, deferred or not, belongs to the tool-call contract, which the
+  Engine builds from the listed tools followed by the deferred ones
+  (`PromptOptions::deferred_tool_jsons`). A call to a deferred tool parses, and is constrained
+  under basic constraints or `strict:true`, like a call to a listed one, whether or not it has been
+  loaded; the contract does not change as tools load. A named `tool_choice` may select a deferred
+  tool.
+- **Searching.** Infernix searches the deferred tools' names, descriptions, and their input
+  schema's top-level property names and property descriptions. The regex search follows Python
+  `re.search` with `IGNORECASE`, field by field (a field is one string, so `^` and `$` anchor to a
+  name or a description), in linear time: patterns that need backtracking (backreferences,
+  lookaround, possessive quantifiers, atomic and conditional groups) are refused as invalid input,
+  as is a pattern over 200 characters or one that expands past 10,000 automaton states. Name
+  matches come first, then other matches, each in declaration order. The BM25 search (k1 1.2,
+  b 0.75) ranks tools by word tokens split at non-alphanumerics and lower-to-upper case changes,
+  lowercased, with a final plural `s` removed from words over three characters; name words count
+  twice; queries are at most 500 characters. Results are capped by `limit` (1 to 10,000, default
+  5).
+- **Server-side searches continue the response.** When the model calls a search tool Infernix
+  executes (Anthropic's search tools), the response does not end: Infernix appends the call and
+  its result to the conversation and runs another generation, as a client tool loop would. A
+  generation that also calls a client tool, or that the output limit cut, ends the response after
+  its searches run. One response runs at most 10 generations; the output budget (`max_tokens`)
+  covers all of them; a continuation keeps the request's ingress reservation. Usage sums the
+  generations' input, cached and output tokens; `timings` sum them too, except that time to first
+  token is the first generation's. A tool choice that forced a call was satisfied by the search:
+  continuations use `auto`, and a selection that named only the search tool is lifted.
+
+### Anthropic Messages
+
+Declare a search tool beside the tools:
+
+```json
+{"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}
+{"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"}
+```
+
+The `name` may be omitted but no other name is accepted. The model sees an ordinary function with
+`pattern` (regex) or `query` (BM25) and an optional integer `limit`. Requests follow Anthropic's
+rules: at least one tool stays listed (`all_tools_deferred`), a search tool is never deferred
+(`invalid_deferred_tool`), a deferred tool carries no `cache_control` (`invalid_cache_control`),
+and at most 10,000 tools are deferred (`too_many_deferred_tools`).
+
+A search appears in the response as Anthropic returns it: the generation's calls in call order
+(`server_tool_use` with a `srvtoolu_` id for a search, `tool_use` for a client tool), then each
+search's result, then the next generation's blocks:
+
+```json
+{"type": "server_tool_use", "id": "srvtoolu_…", "name": "tool_search_tool_regex",
+ "input": {"pattern": "weather"}}
+{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_…",
+ "content": {"type": "tool_search_tool_search_result",
+             "tool_references": [{"type": "tool_reference", "tool_name": "get_weather"}]}}
+```
+
+A failed search returns `content: {"type": "tool_search_tool_result_error", "error_code":
+"invalid_tool_input" | "execution_time_exceeded", "error_message": "…"}` with HTTP 200, and the
+model reads `Tool search failed (code): message` as an error result; a search that matches nothing
+returns an empty `tool_references` array, which the model reads as `No deferred tools matched the
+search.` Streaming emits a search call as a `server_tool_use` block and its result as one
+`tool_search_tool_result` block carried whole by its `content_block_start`. A response that
+reaches the generation limit ends with `stop_reason:"pause_turn"`; one whose budget or context
+runs out after a search ends with `max_tokens` or `model_context_window_exceeded`.
+
+The client sends the assistant content back unchanged. Request lowering splits it at search
+results: the blocks after a result belong to the generation the server ran after it, so the
+history renders as the continuation did. Results follow call order even when a generation mixed a
+search with a client call. A `tool_result` for a `srvtoolu_` id, a `server_tool_use` without its
+result, a result before its call, a client `tool_use` answered nowhere before the next
+generation, and a search history for a search tool the request does not declare are rejected; a
+`tool_reference` to an undeclared tool fails with `tool_reference_not_found`. An Assistant message
+that ends with a search result (a paused response) resumes with a new assistant turn.
+
+A client that runs its own search (Claude Code's tool search, for example) returns
+`tool_reference` blocks inside an ordinary `tool_result`:
+
+```json
+{"type": "tool_result", "tool_use_id": "toolu_…",
+ "content": [{"type": "tool_reference", "tool_name": "get_weather"}]}
+```
+
+The referenced definitions load after the result's text and images. A `tool_reference` outside a
+`tool_result` is rejected. Count Tokens lowers the same history.
+
+Such a client may know tools it does not declare at all: Claude Code declares one deferred
+`DeferredToolPlaceholder` and lists its MCP tools by name in a system reminder until its search
+loads them. A request with a deferred tool and no tool search tool therefore takes a model's
+direct call to an undeclared name as a `tool_use` for the client to judge (Claude Code runs a
+deferred MCP tool called this way) instead of turning it into text; with a tool search tool every
+deferred tool is declared, and a call outside the declared names stays text under the default
+parser.
 
 ## Decisions
 
