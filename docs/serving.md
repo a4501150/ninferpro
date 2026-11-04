@@ -847,8 +847,11 @@ model's text exactly; streaming emits `response.output_item.added`, then
 `response.custom_tool_call_input.delta` and `.done`, then `response.output_item.done`. The client
 sends its result back as a `custom_tool_call_output` Item.
 
-Hosted tools, remote MCP tools, deferred loading, output schemas, and caller restrictions that
-exclude direct invocation remain unsupported.
+A hosted `web_search` declaration (`{"type":"web_search", ...}`, which Codex sends on every turn
+unless its configuration sets `web_search = "disabled"`) is accepted and echoed in the response's
+`tools`, but the model is not offered it, since Infernix runs no search; a `tool_choice` naming it is
+a 400. Other hosted tools, remote MCP tools, deferred loading, output schemas, and caller
+restrictions that exclude direct invocation remain unsupported.
 
 ### Response object and usage
 

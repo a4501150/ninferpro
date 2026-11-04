@@ -1007,6 +1007,37 @@ int test_custom_tools() {
     return failures;
 }
 
+// Codex declares the hosted web search tool on every turn by default (cached and live forms).
+int test_hosted_web_search_declaration() {
+    int failures = 0;
+    for (const bool live : {false, true}) {
+        const Json web_search = {{"type", "web_search"}, {"external_web_access", live}};
+        const Json body       = {{"model", "m"},
+                                 {"input", "fix the bug"},
+                                 {"tools", Json::array({Json{{"type", "function"}, {"name", "shell"}}, web_search,
+                                                        Json{{"type", "custom"}, {"name", "apply_patch"}}})}};
+        const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(body, limits());
+        const auto& tools                          = request.prompt.generation.tools;
+        failures += check(tools.size() == 2 && tools[0].name == "shell" && tools[1].name == "apply_patch" &&
+                              request.tools.size() == 3 && request.tools[1] == web_search,
+                          std::string("a declared web_search tool (") + (live ? "live" : "cached") +
+                              ") is accepted and echoed, and not offered to the model");
+        const OpenAIResponsesRuntimeValues runtime;
+        const BuiltOpenAIResponse built =
+            make_openai_response_object("resp_web", 1, request, runtime, GenerationOutcome{});
+        failures += check(built.body.at("tools").at(1) == web_search,
+                          "the response echoes the web_search declaration");
+    }
+    Json forced = {{"model", "m"},
+                   {"input", "search"},
+                   {"tools", Json::array({Json{{"type", "web_search"}}})},
+                   {"tool_choice", Json{{"type", "web_search"}}}};
+    failures += check(api_error([&] { (void)parse_openai_responses_create_request(forced, limits()); }).param ==
+                          "tool_choice",
+                      "a tool_choice naming the hosted web search is refused");
+    return failures;
+}
+
 int test_explicit_rejections() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
@@ -1499,6 +1530,7 @@ int main() {
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
     failures += test_custom_tools();
+    failures += test_hosted_web_search_declaration();
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();
     failures += test_response_object();
