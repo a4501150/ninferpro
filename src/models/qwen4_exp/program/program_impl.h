@@ -6493,15 +6493,19 @@ private:
     // that the one-column rate the rules take hides, so wide verification rounds give the CPU more.
     // Fixed family constants, not measured rates — a MEASURED fractional share flipped calls' splits
     // at floor(M * share) between startups (3 workers: 100.8 against 107.5 tok/s, 2026-10-09), which
-    // is why the divisor rule above steps at a measured boundary instead. The constants are
-    // upstream's, derived on its host (i9-13900K, RTX 5090 over Gen5 x8, NVFP4 records, DFlash2
-    // auto, three interleaved pairs each): 67/256 in place of the divisor rule's 1/3 decoded its
-    // FP4-Local W4A16 struct fixture +6.3 % and short context +5.4 % (2026-10-30); 51/256 from
-    // eight columns added struct +2.5 %, conv +0.7 % on W4A16 and +4.3 %, after 16K +1.7 % against
-    // the divisor rule on W4A4 (2026-11-02). NOT re-derived on this machine's CPU (9950X3D2, Gen5
-    // x16): both need re-deriving at T3 in a RAM/SSD placement; they sit here as named constants
-    // for that. A positive cpu_pcie_divisor leaves every width on the divisor rule; banks other
-    // than NVFP4 keep the rule everywhere.
+    // is why the divisor rule above steps at a measured boundary instead. The decode share is set
+    // for this machine (2026-11-04, 9950X3D2, RTX PRO 6000 over Gen5 x16, recipe C NVFP4 W4A16
+    // records, DFlash2 auto, vram=50%,ram=50%) on weak evidence: a sweep of two rotated boots per
+    // value decoded a 30k-context prompt at 196 (51/256), 217 (67/256, upstream's) and 231 tok/s
+    // (85/256), one request per boot, with six lanes and short prompts flat; the divisor rule
+    // derives d = 2 (128/256) here, against 1/3 on upstream's x8 link. The final T3 (two boots per
+    // build, full KV) did not confirm it: 85 gave 230/210 against 67's 215/248, inside that cell's
+    // boot-to-boot spread, and no row regressed beyond it. Re-derive it with a lower-noise measure
+    // before relying on the value. The wide share is still upstream's (i9-13900K, RTX 5090 over
+    // Gen5 x8): 51/256 from eight columns added struct +2.5 %, conv +0.7 % on W4A16 and +4.3 %,
+    // after 16K +1.7 % against the divisor rule on W4A4 (2026-11-02); not re-derived on this
+    // machine. A positive cpu_pcie_divisor leaves every width on the divisor rule; banks other than
+    // NVFP4 keep the rule everywhere.
     [[nodiscard]] int pcie_share() const noexcept {
         if (options_.cpu_pcie_divisor > 0) { return 0; }
         const auto& bank = *parameters_.layers.front().moe.bank;
@@ -6522,7 +6526,7 @@ private:
         }
         return {kWideLinkShare256, ops::offloaded_moe::kMaxColumns};
     }
-    static constexpr std::int32_t kDecodeLinkShare256 = 67; // upstream's FP4-Local NVFP4 W4A16 banks
+    static constexpr std::int32_t kDecodeLinkShare256 = 85; // this machine's x16 link, NVFP4 W4A16 banks (see above)
     static constexpr std::int32_t kWideLinkShare256  = 51;  // upstream's, every NVFP4 bank
 
     // Without speculation, a GGUF import's one-column calls (plain decode) take the round's divisor
