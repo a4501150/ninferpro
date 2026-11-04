@@ -239,6 +239,23 @@ INFERNIX_QWEN4_NGRAM=G:/out/qwen3_8_flash_next.ninfer.ngram \
 They cover the forward pass against the FP64 reference, the SSD tier's records, the route trace, VRAM
 pressure, the prefix cache, preemption, `/v1/decide` and recovery from a failed expert read.
 
+The multimodal wiring oracle (`infernix_qwen4_exp_vision_oracle_real_test`) runs in two steps. The
+CTest entry dumps the prepared media prompt's token ids, M-RoPE positions, Vision patches and patch
+grid, plus the exact route's first greedy tokens, into
+`build/tests/vision_oracle_dump` (which it creates), checking only its own
+invariants. The FP64 comparison itself is a separate step, `tools/flash_next/vision_oracle.py`,
+which replays the same prompt through the independent FP64 reference; run it after the test exits
+(the reference needs the host RAM the engine held):
+
+```bash
+INFERNIX_QWEN4_ARTIFACT=$HOME/models/infernix/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix \
+INFERNIX_QWEN4_NGRAM=$HOME/models/infernix/Qwen3.8-Flash-Next-BF16.ngram \
+  ctest --test-dir build -R infernix_qwen4_exp_vision_oracle_real_test --output-on-failure
+.venv-convert/bin/python tools/flash_next/vision_oracle.py \
+  --model ~/.cache/huggingface/hub/models--jpezzulli--OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4/snapshots/f24d2b68ff2814f24455ae86717be276619b5664 \
+  --dump build/tests/vision_oracle_dump
+```
+
 Without their artifact variable, CTest marks these real Engine tests as skipped. Real-artifact targets
 carry the `real` label and `RUN_SERIAL` so CTest runs them alone. Run directly invoked GPU
 integration tests serially. `INFERNIX_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as

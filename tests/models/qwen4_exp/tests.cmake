@@ -159,9 +159,11 @@ infernix_add_test(infernix_qwen4_exp_fast_paths_test
 # VT6c (design §16.8): the >2,051-token multimodal wiring oracle. Dumps the prepared prompt's
 # ids, positions and Vision patches for the FP64 reference and runs the same prompt's first greedy
 # tokens through the public Engine's exact route; tools/flash_next/vision_oracle.py compares.
+# The dump directory is under the build tree; the test creates it before writing.
 infernix_add_test(infernix_qwen4_exp_vision_oracle_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_oracle_real.cpp"
-  LIBRARIES infernix_engine infernix_model_runtime)
+  LIBRARIES infernix_engine infernix_model_runtime
+  ARGS "${CMAKE_CURRENT_BINARY_DIR}/vision_oracle_dump")
 set_tests_properties(infernix_qwen4_exp_vision_oracle_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
 
 # The T2 start-up and correctness smoke test (AGENTS.md "Iteration tiers"): the Engine with

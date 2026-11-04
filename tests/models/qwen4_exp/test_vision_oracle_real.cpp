@@ -11,7 +11,9 @@
 //
 //   infernix_qwen4_exp_vision_oracle_real_test OUT_DIR
 //
-// OUT_DIR receives ids.txt (whitespace-separated), positions.txt ("delta D", then one "a0 a1 a2"
+// CTest runs it with the build-tree directory vision_oracle_dump (created by the test); a direct
+// invocation passes its own. OUT_DIR receives ids.txt (whitespace-separated), positions.txt
+// ("delta D", then one "a0 a1 a2"
 // line per token), patches.bin (raw little-endian BF16 bits, P x 1536), grid.txt (t h w and the
 // merged token count) and greedy.txt (the Engine's first greedy token ids). Compare with the FP64
 // reference (positions exact, greedy token 1 exact) through tools/flash_next/vision_oracle.py:
@@ -34,6 +36,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
@@ -187,6 +190,8 @@ int main(int argc, char** argv) {
     }
     try {
         const std::string out_dir = argv[1];
+        // CTest's registration names a build-tree directory that no build step creates.
+        std::filesystem::create_directories(out_dir);
         const infernix::EngineOptions options = oracle_options(artifact, std::getenv("INFERNIX_QWEN4_NGRAM"));
         int failures = 0;
 
