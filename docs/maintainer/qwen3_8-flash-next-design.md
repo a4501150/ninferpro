@@ -1599,7 +1599,13 @@ gate word before the rows, so a round uploads it with the io prefix.
 - **Verification rounds.** `decode()` fixes each row's draft source and width before drafting. While
   the drafter runs (after a `device_.flush()`), the engine queues and reads the anchor column (the
   committed tokens) and every column of an n-gram copy row; after the launch, while the GPU embeds
-  and runs layer 0, it reads the remaining columns and publishes. All rows queued for a round are
+  and runs layer 0, it reads the remaining columns and publishes. The worker reads and releases
+  them before it queues anything else (route copies, sampler, acceptance): until the word is
+  published the GPU waits on that thread, and a call that waits for the device deadlocks the round.
+  A kernel's first launch is one, as the driver loads its code then and, with the process past its
+  OS budget, waits for the device to do so (port of upstream c2afefb2; queued ahead of the release
+  there, a first sampler or acceptance launch stalled the round until the gate trapped after
+  `kPinnedGateTimeoutNs`, 120 s, in 5 of 7 such starts). All rows queued for a round are
   read in one volume call (`read_queued_ngram`): read lane by lane, six lanes' misses summed to a
   median 489 µs of GPU wait per round, and one call brought that to 11 µs (2026-10-22, RTX PRO 6000);
   six in-process requests of 256 tokens went from 464.1 to 493.1 tok/s.
