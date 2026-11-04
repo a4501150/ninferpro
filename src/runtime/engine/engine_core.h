@@ -1797,8 +1797,6 @@ private:
                 }
                 if (restoring) {
                     std::erase(paused_, request);
-                    observe_scheduling(request, GenerationSchedulingTransition::RestoreStarted,
-                                       binding_started);
                 } else {
                     std::lock_guard lock(queue_mutex_);
                     scheduler_.admitted(pending_, *request, max_concurrency_);
@@ -1806,6 +1804,11 @@ private:
                 }
                 request->model_state = EngineRequestState::Materializing;
                 materializing_.emplace(MaterializingRequest{request, LaneId{*lane}, begin, restoring});
+                // Observed once materializing_ owns the request: an observation that throws then fails it
+                // with the others instead of leaving it in no list, unanswered.
+                if (restoring) {
+                    observe_scheduling(request, GenerationSchedulingTransition::RestoreStarted, binding_started);
+                }
                 admission_decision_.reset();
                 request->traced_deferral = 0;
                 publish_trace(diagnostics_, DebugCategory::Scheduler,

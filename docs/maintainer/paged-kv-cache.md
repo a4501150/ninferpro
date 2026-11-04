@@ -759,7 +759,8 @@ a replay is in flight.
 17. A block-table publication's H2D reads the execution row's pinned shadow only when the stream reaches
     it. A later publication of the same row (including the next owner's publication after release) waits
     for that copy to complete before rewriting shadow entries that overlap a copy still in the queue;
-    non-overlapping entries do not wait.
+    non-overlapping entries do not wait. A publication issued during a stream capture can neither query
+    nor wait for that copy, and is refused instead of published past its fence.
 
 ---
 
