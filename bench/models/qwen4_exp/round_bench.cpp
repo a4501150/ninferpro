@@ -527,7 +527,7 @@ struct Harness {
     std::vector<KVExecutionRowLease> row_leases;
     cudaStream_t overlap_stream = nullptr, shared_stream = nullptr;
     std::array<cudaEvent_t, 5> overlap_events{};
-    std::array<cudaEvent_t, 2> shared_events{};
+    std::array<cudaEvent_t, 4> shared_events{};
     std::unique_ptr<WorkspaceArena> work;
     std::unique_ptr<q4::execution::Forward> forward;
 

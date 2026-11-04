@@ -94,9 +94,10 @@ struct ForwardExperts {
     cudaStream_t overlap_stream = nullptr;
     std::array<cudaEvent_t, 5> overlap_events{};
     // Decode and verification calls run the shared expert on this stream (forked at the layer's
-    // input, joined before the combine) while the routed experts compute. Null: in order.
+    // input, joined before the combine) while the routed experts compute, and the routed experts'
+    // activation encoding before it (events 2 and 3, joined before the experts). Null: in order.
     cudaStream_t shared_stream = nullptr;
-    std::array<cudaEvent_t, 2> shared_events{};
+    std::array<cudaEvent_t, 4> shared_events{};
     // Landing frames of decode and verification calls (design §9.3; see
     // ops::MoeExpertSource::landing): layer l uses landing + l * landing_slots and landed + l *
     // landing_slots. Null disables.

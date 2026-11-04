@@ -993,20 +993,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     Tensor product = work_.alloc(DType::BF16, {I, T});
     Tensor shared  = work_.alloc(DType::BF16, {H, T});
     // The shared expert reads only x. In decode and verification calls it runs on its own stream from
-    // here, beside the router, the route and the routed experts; every buffer the routed experts use
-    // is allocated above, so its scoped workspace lies past them, and this stream allocates nothing
-    // more until the join. Otherwise (prefill chunks) it runs after the routed experts are enqueued,
-    // while the host computes the CPU-served misses.
+    // here (forked below, after the routed experts' activation encoding), beside the router, the
+    // route and the routed experts; every buffer the routed experts use is allocated above, so its
+    // scoped workspace lies past them, and this stream allocates nothing more until the join.
+    // Otherwise (prefill chunks) it runs after the routed experts are enqueued, while the host
+    // computes the CPU-served misses.
     const bool side = !eager_chunk_ && experts_.shared_stream != nullptr;
-    if (side) {
-        CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
-        CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
-        shared_swiglu(x, p.shared_gate_up, product, work_, experts_.shared_stream, dense_routes(), fast_.column_invariant);
-        project(product, p.shared_down, shared, work_, experts_.shared_stream, dense_routes(), fast_.column_invariant);
-        CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], experts_.shared_stream));
-    }
-    const Tensor* rows[] = {&p.router, &p.shared_score};
-    ops::projection_fp32(x, rows, logits, s);
     // The route log holds the call's last `logged` columns: all of them (written by the dispatch), or
     // the trailing ones (a layer walk's grouped call logs its last chunk), copied from the routing.
     const std::int32_t logged = route_columns < 0 ? T : std::min(route_columns, T);
@@ -1028,12 +1020,6 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const bool streamed_chunk = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
                                 experts_.stream->active();
     const bool route_plans = route_tap == nullptr && !streamed_chunk;
-    if (!route_plans) { ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s); }
-    if (route_tap != nullptr &&
-        cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
-            cudaSuccess) {
-        throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
-    }
     ops::MoeExpertSource source{.frame_base   = experts_.frame_bases.empty() ? nullptr : experts_.frame_bases.at(layer),
                                 .frames       = experts_.frames.at(layer),
                                 .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.device_records),
@@ -1140,6 +1126,52 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             ++i;
         }
     }
+    // The layer's frame pool: its pitch is the layer's own record stride.
+    const std::uint64_t pitch = experts_.frame_pitches.empty() ? 0 : experts_.frame_pitches.at(layer);
+    const auto& planes = p.bank->planes;
+    if (planes.gate_up_format != QType::NVFP4_MUL) {
+        // A GGUF import's or block-FP8 bank: its own record size in frames of its pool's pitch, the
+        // exact A16 kernels on every column count, and CPU-served misses through the exact CPU
+        // route; the SSD tier's fetch channel hands over its records like any other. Stages copy the
+        // record rounded up to 16 bytes (the stride's zero padding).
+        source.ggml = ops::MoeGgmlBank{.gate_up_format = planes.gate_up_format,
+                                       .down_format    = planes.down_format,
+                                       .gate_row_bytes = static_cast<std::uint32_t>(planes.gate_row_bytes),
+                                       .down_row_bytes = static_cast<std::uint32_t>(planes.down_row_bytes),
+                                       .record_bytes   = (planes.record_bytes + 15) / 16 * 16};
+    }
+    source.frame_stride = pitch;
+    if (pitch != 0 && pitch != source.record_stride) {
+        throw std::invalid_argument("Qwen4Exp MoE: the layer's frame pitch differs from its bank's record stride");
+    }
+    source.wide_a16 = wide_a16;
+    // The routed experts' activation encoding needs x alone, so a side-stream call runs it beside
+    // the router and the route (it followed the route on the call's critical path, ~3 us a layer;
+    // upstream 2026-10-29: IQ3_S 16K decode 265.5 -> 267.7 tok/s, Dense8 flat). A call without one
+    // (W4A4, or one the in-place plan's fused kernel encodes) forks nothing: the fork and join
+    // alone cost Dense8 MTP decode 1.4 %.
+    const bool early = side && ops::moe_experts_prepares(x, source, K, max_jobs, expert_ws.data, outputs);
+    if (early) {
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[2], s));
+        CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[2], 0));
+        ops::moe_experts_prepare(x, source, K, max_jobs, expert_ws.data, outputs, experts_.shared_stream);
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[3], experts_.shared_stream));
+    }
+    if (side) {
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
+        CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
+        shared_swiglu(x, p.shared_gate_up, product, work_, experts_.shared_stream, dense_routes(), fast_.column_invariant);
+        project(product, p.shared_down, shared, work_, experts_.shared_stream, dense_routes(), fast_.column_invariant);
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], experts_.shared_stream));
+    }
+    const Tensor* rows[] = {&p.router, &p.shared_score};
+    ops::projection_fp32(x, rows, logits, s);
+    if (!route_plans) { ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s); }
+    if (route_tap != nullptr &&
+        cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
+            cudaSuccess) {
+        throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
+    }
     // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
     ExpertStream* const streaming = streamed_chunk ? experts_.stream : nullptr;
     if (streaming != nullptr && streaming->gated()) {
@@ -1183,25 +1215,6 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             source.overlap_stream = nullptr;
         }
     }
-    // The layer's frame pool: its pitch is the layer's own record stride.
-    const std::uint64_t pitch = experts_.frame_pitches.empty() ? 0 : experts_.frame_pitches.at(layer);
-    const auto& planes = p.bank->planes;
-    if (planes.gate_up_format != QType::NVFP4_MUL) {
-        // A GGUF import's or block-FP8 bank: its own record size in frames of its pool's pitch, the
-        // exact A16 kernels on every column count, and CPU-served misses through the exact CPU
-        // route; the SSD tier's fetch channel hands over its records like any other. Stages copy the
-        // record rounded up to 16 bytes (the stride's zero padding).
-        source.ggml = ops::MoeGgmlBank{.gate_up_format = planes.gate_up_format,
-                                       .down_format    = planes.down_format,
-                                       .gate_row_bytes = static_cast<std::uint32_t>(planes.gate_row_bytes),
-                                       .down_row_bytes = static_cast<std::uint32_t>(planes.down_row_bytes),
-                                       .record_bytes   = (planes.record_bytes + 15) / 16 * 16};
-    }
-    source.frame_stride = pitch;
-    if (pitch != 0 && pitch != source.record_stride) {
-        throw std::invalid_argument("Qwen4Exp MoE: the layer's frame pitch differs from its bank's record stride");
-    }
-    source.wide_a16 = wide_a16;
     const ops::MoeRoutePlan planned =
         route_plans ? ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source, max_jobs,
                                                    expert_ws.data, outputs, s)
@@ -1210,7 +1223,9 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         CUDA_CHECK(cudaMemcpyAsync(log_tail, static_cast<const std::int32_t*>(routing.ids.data) + static_cast<std::size_t>(K) * (T - logged),
                                    static_cast<std::size_t>(K) * logged * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
     }
-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned);
+    if (early) { CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[3], 0)); }
+    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned,
+                     /*x_prepared=*/early);
     if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
     if (!side) {
         shared_swiglu(x, p.shared_gate_up, product, work_, s, dense_routes(), fast_.column_invariant);

@@ -484,19 +484,32 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
     unsigned key[kPerLane]; // 0 past the experts: below every key, never selected
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) { key[i] = lane + 32 * i < experts ? route_key(raw[i]) : 0U; }
-    // The lane's earliest choice: the largest key, the lowest index among equal ones.
+    // The lane's earliest choice: the largest key, the lowest index among equal ones. A depth-4
+    // tree over the 16 candidates (the 16-step compare chain it replaced took most of the fused
+    // route kernel's cycles at decode widths; upstream 2026-10-29: the selections 7,400 -> 3,500
+    // cycles of that kernel).
     unsigned best_key = 0;
     int best_i        = 0;
     const auto lane_best = [&] {
-        best_key = key[0];
-        best_i   = 0;
+        unsigned bk[kPerLane / 2];
+        int bi[kPerLane / 2];
 #pragma unroll
-        for (int i = 1; i < kPerLane; ++i) {
-            if (key[i] > best_key) {
-                best_key = key[i];
-                best_i   = i;
+        for (int p = 0; p < kPerLane / 2; ++p) {
+            const bool upper = key[2 * p + 1] > key[2 * p];
+            bk[p]            = upper ? key[2 * p + 1] : key[2 * p];
+            bi[p]            = upper ? 2 * p + 1 : 2 * p;
+        }
+#pragma unroll
+        for (int width = kPerLane / 4; width >= 1; width /= 2) {
+#pragma unroll
+            for (int p = 0; p < width; ++p) {
+                const bool upper = bk[2 * p + 1] > bk[2 * p];
+                bk[p]            = upper ? bk[2 * p + 1] : bk[2 * p];
+                bi[p]            = upper ? bi[2 * p + 1] : bi[2 * p];
             }
         }
+        best_key = bk[0];
+        best_i   = bi[0];
     };
     lane_best();
     // Lane k keeps the k-th selection. A selected expert stays a candidate at -inf, as it was.
@@ -521,15 +534,11 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
         }
     }
     // softmax over all experts then renormalized over the selected ones equals the softmax of the
-    // selected logits. Every lane sums them in selection order.
+    // selected logits. Every lane computes its own term once; the sum adds them in selection order.
     const float top  = __shfl_sync(0xFFFFFFFFU, selected, 0);
     const float mine = expf(selected - top);
     float sum        = 0.0F;
-#pragma unroll
-    for (int k = 0; k < 16; ++k) {
-        const float term = __shfl_sync(0xFFFFFFFFU, mine, k);
-        if (k < top_k) { sum += term; }
-    }
+    for (int k = 0; k < top_k; ++k) { sum += __shfl_sync(0xFFFFFFFFU, mine, k); }
     if (lane < top_k) {
         ids[static_cast<std::size_t>(t) * top_k + lane]     = chosen;
         weights[static_cast<std::size_t>(t) * top_k + lane] = mine / sum;
@@ -1422,7 +1431,9 @@ constexpr int kWaitCtas = offloaded_moe::kMaxCpuJobs < 8 ? offloaded_moe::kMaxCp
 // Each thread ranks its jobs among their width with warp ballots, so no thread walks the
 // job list. The chosen jobs are marked in cpu_flags and listed in that order in call->job and the
 // request. The x columns they read are published compacted, in column order (the request names
-// them by compact index), then the request's sequence after a system-scope fence.
+// them by compact index), or, by the fused route (Named), every column at its own index by the
+// warps that route no column while the others route, then the request's sequence after a
+// system-scope fence.
 // The CPU plan of one call by the threads [0, kThreads) of a CTA: the plan kernel's whole CTA, or
 // (Named) the first kThreads threads of the fused route kernel, which synchronize on a named barrier.
 template <bool Named>
@@ -1564,7 +1575,12 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
                 slot_first[slot]              = first;
                 for (int c = 0; c < width; ++c) {
                     const int column = dispatch.entries[first + c] / top_k;
-                    atomicOr(&used[column / 32], 1U << (column % 32));
+                    if constexpr (Named) {
+                        // The fused route published every column at its own index before the routing.
+                        channel.request->column[slot][c] = column;
+                    } else {
+                        atomicOr(&used[column / 32], 1U << (column % 32));
+                    }
                 }
             }
         }
@@ -1575,33 +1591,37 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         plan_barrier<Named>();
     }
     if (threadIdx.x == 0) {
-        int k = 0;
-        for (int t = 0; t < columns; ++t) {
-            if ((used[t / 32] >> (t % 32)) & 1U) {
-                compact[t]     = static_cast<short>(k);
-                published[k++] = static_cast<short>(t);
+        if constexpr (!Named) {
+            int k = 0;
+            for (int t = 0; t < columns; ++t) {
+                if ((used[t / 32] >> (t % 32)) & 1U) {
+                    compact[t]     = static_cast<short>(k);
+                    published[k++] = static_cast<short>(t);
+                }
             }
+            publish_count = k;
         }
-        publish_count          = k;
         channel.request->layer  = channel.layer;
         channel.request->jobs   = chosen;
         channel.request->tiered = source.host_table != nullptr ? 1 : 0;
     }
     plan_barrier<Named>();
-    // Each chosen job's columns by compact index.
-    for (int i = threadIdx.x; i < chosen * offloaded_moe::kMaxCpuColumns; i += kThreads) {
-        const int slot = i / offloaded_moe::kMaxCpuColumns, c = i % offloaded_moe::kMaxCpuColumns;
-        if (c < channel.request->ncols[slot]) {
-            channel.request->column[slot][c] = compact[dispatch.entries[slot_first[slot] + c] / top_k];
+    if constexpr (!Named) {
+        // Each chosen job's columns by compact index.
+        for (int i = threadIdx.x; i < chosen * offloaded_moe::kMaxCpuColumns; i += kThreads) {
+            const int slot = i / offloaded_moe::kMaxCpuColumns, c = i % offloaded_moe::kMaxCpuColumns;
+            if (c < channel.request->ncols[slot]) {
+                channel.request->column[slot][c] = compact[dispatch.entries[slot_first[slot] + c] / top_k];
+            }
         }
-    }
-    // The chosen jobs' columns, compacted, 16 bytes per store.
-    constexpr int kVectors = moe::kHidden * 2 / 16;
-    const auto* src        = reinterpret_cast<const int4*>(x);
-    auto* dst              = reinterpret_cast<int4*>(channel.x);
-    for (int i = threadIdx.x; i < publish_count * kVectors; i += kThreads) {
-        const int k = i / kVectors, v = i % kVectors;
-        dst[static_cast<std::size_t>(k) * kVectors + v] = src[static_cast<std::size_t>(published[k]) * kVectors + v];
+        // The chosen jobs' columns, compacted, 16 bytes per store.
+        constexpr int kVectors = moe::kHidden * 2 / 16;
+        const auto* src        = reinterpret_cast<const int4*>(x);
+        auto* dst              = reinterpret_cast<int4*>(channel.x);
+        for (int i = threadIdx.x; i < publish_count * kVectors; i += kThreads) {
+            const int k = i / kVectors, v = i % kVectors;
+            dst[static_cast<std::size_t>(k) * kVectors + v] = src[static_cast<std::size_t>(published[k]) * kVectors + v];
+        }
     }
     __threadfence_system();
     plan_barrier<Named>();
@@ -1622,10 +1642,24 @@ __global__ void __launch_bounds__(kThreads)
     cpu_plan_body<false>(dispatch, source, x, columns, top_k, max_jobs, cpu_flags, call);
 }
 
+// The fused route's x for the CPU channel: every column at its own index (the request names columns
+// by their index), by threads [first, first + count) of the CTA.
+__device__ __forceinline__ void publish_x_columns(const MoeCpuChannel& channel, const bf16* __restrict__ x,
+                                                  int hidden, int columns, int first, int count) {
+    const int vectors = hidden * 2 / 16;
+    const auto* src   = reinterpret_cast<const int4*>(x);
+    auto* dst         = reinterpret_cast<int4*>(channel.x);
+    for (int i = static_cast<int>(threadIdx.x) - first; i < columns * vectors; i += count) { dst[i] = src[i]; }
+}
+
 // route_dispatch_kernel followed by the CPU plan in the same CTA: after a barrier of the whole CTA
 // makes the dispatch visible, its first kThreads threads plan as cpu_plan_kernel does (the same
 // results) and the rest exit, so the plan, and the host's start, follow the dispatch with no kernel
-// boundary.
+// boundary. The warps that route no column publish x for the CPU while the others route (a call of
+// 32 columns: every thread, after the routing), so the copy, ~4,300 cycles after the plan's
+// decision before, overlaps the routing and the request goes out that much sooner (upstream
+// 2026-10-29); the plan's system fence orders these stores too (every thread passed the barriers
+// before it).
 __global__ void __launch_bounds__(kDispatchThreads)
     route_dispatch_plan_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
                                std::int32_t* __restrict__ ids, float* __restrict__ weights,
@@ -1643,8 +1677,13 @@ __global__ void __launch_bounds__(kDispatchThreads)
     if (warp < columns) {
         const int id = route_column(logits, experts, top_k, warp, ids, weights, shared_gate);
         if (lane < top_k) { routed[warp * top_k + lane] = id; }
+    } else {
+        publish_x_columns(source.cpu, x, moe::kHidden, columns, 32 * columns, kDispatchThreads - 32 * columns);
     }
     __syncthreads();
+    if (32 * columns == kDispatchThreads) {
+        publish_x_columns(source.cpu, x, moe::kHidden, columns, 0, kDispatchThreads);
+    }
     const int entries = columns * top_k;
     dispatch_small(i < entries ? routed[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
     __syncthreads();
@@ -2052,6 +2091,31 @@ bool in_place_call(const Tensor& x, const MoeExpertSource& source) {
            source.activation == moe::ExpertActivation::kA16;
 }
 
+// The call's routing-independent preparation (its activation encoding), which needs neither the
+// dispatch nor the CPU plan: every token's x encoded once per call - an NVFP4 A16 call of at most
+// kA16RowsMaxColumns columns as the dp4a rows kernels' A16Act rows, a wider one as the wide route's
+// limb rows with the jobs' gate/up CTA counts (the tensor-core narrow kernels), a ggml bank's call
+// in its limb layout. Every A16 call needs one except the in-place route plan's (a call of the
+// fused route's width whose source stages nothing and serves no miss: its fused kernel is the
+// encoding).
+bool needs_prepare(const Tensor& x, const MoeExpertSource& source, std::int32_t top_k) {
+    if (source.activation != moe::ExpertActivation::kA16) { return false; }
+    const std::int64_t columns = x.ne[1];
+    const bool fused = columns <= kRouteDispatchColumns && columns * top_k <= kDispatchThreads;
+    return !fused || !in_place_call(x, source);
+}
+
+void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
+               const moe::wide::ExpertsWorkspace& layout, cudaStream_t stream) {
+    if (ggml_bank(source)) {
+        launch_encode_x_ggml(x, layout, stream);
+    } else if (x.ne[1] <= static_cast<std::int64_t>(kA16RowsMaxColumns)) {
+        launch_encode_x_acts(x, layout, stream);
+    } else {
+        launch_prepare_a16_nmma(x, static_cast<int>(max_jobs), layout, stream);
+    }
+}
+
 void require_route_outputs(const Tensor& logits, std::int32_t top_k, const MoeRouting& routing, int experts,
                            int columns) {
     require(contiguous(logits, DType::FP32) && contiguous(routing.ids, DType::I32) &&
@@ -2065,6 +2129,24 @@ void require_route_outputs(const Tensor& logits, std::int32_t top_k, const MoeRo
 }
 
 } // namespace
+
+bool moe_experts_prepares(const Tensor& x, const MoeExpertSource& source, std::int32_t top_k,
+                          std::int32_t max_jobs, void* workspace, const Tensor& outputs) {
+    (void)max_jobs;
+    (void)workspace;
+    (void)outputs;
+    return needs_prepare(x, source, top_k);
+}
+
+void moe_experts_prepare(const Tensor& x, const MoeExpertSource& source, std::int32_t top_k, std::int32_t max_jobs,
+                         void* workspace, const Tensor& outputs, cudaStream_t stream) {
+    require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16) && max_jobs > 0,
+            "experts prepare needs BF16 x and outputs and jobs");
+    if (!needs_prepare(x, source, top_k)) { return; }
+    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1], x.ne[1],
+                                                          source.activation, source.wide_a16);
+    prepare_x(x, source, max_jobs, layout, stream);
+}
 
 MoeRoutePlan moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRouting& routing,
                                      MoeDispatch& dispatch, std::int32_t* route_log, const Tensor& x,
@@ -2135,7 +2217,7 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
 
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu, MoeRoutePlan plan) {
+                 cudaStream_t stream, bool wait_for_cpu, MoeRoutePlan plan, bool x_prepared) {
     require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16), "experts need BF16 x and outputs");
     require(x.ne[0] == moe::kHidden && outputs.ne[0] == moe::kHidden && outputs.ne[1] == x.ne[1] * top_k,
             "experts geometry differs from the nvfp4_expert_rg16_v1 record");
@@ -2182,22 +2264,16 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("fetch plan");
     }
     const std::int32_t* flags = cpu ? cpu_flags : nullptr;
-    // The A16 narrow route reads every token's encoded x, encoded once here (or by the in-place
-    // route plan), before any fork: the dp4a rows kernels' acts in calls of at most
-    // kA16RowsMaxColumns columns, the tensor-core kernels' limbs with the jobs' gate/up CTA counts
-    // in wider ones.
-    if (!ggml && source.activation == moe::ExpertActivation::kA16 && !in_place) {
-        if (x.ne[1] <= static_cast<std::int64_t>(kA16RowsMaxColumns)) {
-            launch_encode_x_acts(x, layout, stream);
-        } else {
-            launch_prepare_a16_nmma(x, static_cast<int>(max_jobs), layout, stream);
-        }
+    // The call's activation encoding, once per call before any fork: here, serialized after the
+    // route, or earlier beside the router on another stream (moe_experts_prepare, x_prepared), or
+    // by the in-place route plan's fused kernel (in_place). Any A16 call the plan did not encode
+    // itself encodes here, whatever its source: a call that stages nothing and serves no miss at
+    // more than the fused route's width takes no plan and is one of these.
+    if (!x_prepared && !in_place && source.activation == moe::ExpertActivation::kA16) {
+        prepare_x(x, source, max_jobs, layout, stream);
     }
-    // A ggml bank's gate/up kernels read every token's x limbs, encoded once here, before any fork.
-    if (ggml) {
-        launch_encode_x_ggml(x, layout, stream);
-        if (x.ne[1] > moe::kMaxColumns) { launch_plan_ggml(dispatch, max_jobs, layout, stream); }
-    }
+    // A ggml bank's wide jobs' work tiles, planned once the dispatch is known.
+    if (ggml && x.ne[1] > moe::kMaxColumns) { launch_plan_ggml(dispatch, max_jobs, layout, stream); }
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     const int half      = source.staging_slots / 2;

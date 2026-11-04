@@ -265,14 +265,27 @@ struct MoeExpertSource {
 /// With wait_for_cpu == false the call returns before placing CPU-served outputs; the caller may
 /// enqueue unrelated work (the shared expert) and must call moe_experts_cpu_wait with the same
 /// arguments before reading `outputs`. The workspace stays reserved until then.
-/// What moe_route_dispatch_plan did for the moe_experts call it was given: nothing beyond the route
-/// (None), its CPU plan (Cpu), or, for a call that stages nothing, its records and encoded x
-/// (InPlace). That moe_experts call passes the same value.
+/// With x_prepared the caller ran moe_experts_prepare for this call, on a stream ordered before this
+/// one; the call skips its own activation encoding.
 enum class MoeRoutePlan : std::uint8_t { None, Cpu, InPlace };
 
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu = true, MoeRoutePlan plan = MoeRoutePlan::None);
+                 cudaStream_t stream, bool wait_for_cpu = true, MoeRoutePlan plan = MoeRoutePlan::None,
+                 bool x_prepared = false);
+
+/// The routing-independent preparation of the moe_experts call with these x, source, top_k, max_jobs,
+/// workspace and outputs (its activation encoding: every token's x limbs), which needs neither the
+/// dispatch nor the CPU plan: run on any stream after x's producer, so it overlaps the router and
+/// the route, and ordered before that call, which passes x_prepared. Whether it launches anything
+/// for the call - false for W4A4 experts and for a call the in-place route plan takes (that plan's
+/// fused kernel is the encoding; a fork that moves no work only adds dependencies).
+[[nodiscard]] bool moe_experts_prepares(const Tensor& x, const MoeExpertSource& source, std::int32_t top_k,
+                                       std::int32_t max_jobs, void* workspace, const Tensor& outputs);
+
+/// Runs that preparation. A no-op for a call moe_experts_prepares refuses.
+void moe_experts_prepare(const Tensor& x, const MoeExpertSource& source, std::int32_t top_k,
+                         std::int32_t max_jobs, void* workspace, const Tensor& outputs, cudaStream_t stream);
 
 /// moe_route_dispatch and, at decode or verification width, the plan of the moe_experts call with
 /// these x, source, max_jobs, workspace and outputs, in one kernel: the CPU plan of a CPU-served
