@@ -4,6 +4,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/openai_responses.h"
+#include "serve/server_tools.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1094,6 +1096,305 @@ int test_explicit_rejections() {
     return failures;
 }
 
+// Deferred tools and tool search.
+
+Json deferred_function(std::string name, std::string description) {
+    return Json{{"type", "function"},
+                {"name", std::move(name)},
+                {"description", std::move(description)},
+                {"parameters", Json{{"type", "object"},
+                                    {"properties", Json{{"order_id", Json{{"type", "string"}}}}},
+                                    {"required", Json::array({"order_id"})}}},
+                {"defer_loading", true}};
+}
+
+Json hosted_search_body() {
+    const Json crm = {
+        {"type", "namespace"},
+        {"name", "crm"},
+        {"description", "CRM tools for customer lookup."},
+        {"tools", Json::array({Json{{"type", "function"},
+                                    {"name", "get_customer"},
+                                    {"parameters", Json{{"type", "object"}}}},
+                               deferred_function("list_open_orders",
+                                                 "List open orders for a customer.")})}};
+    return Json{{"model", "m"},
+                {"input", "Which orders are open?"},
+                {"tools", Json::array({Json{{"type", "tool_search"}}, crm,
+                                       deferred_function("get_shipping_eta",
+                                                         "Shipping ETA for an order.")})}};
+}
+
+int test_deferred_tools_and_hosted_search() {
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(hosted_search_body(), limits());
+    const std::vector<ToolDefinition>& tools = request.prompt.generation.tools;
+    int failures = check(tools.size() == 4 && tools[0].name == "tool_search" && !tools[0].deferred &&
+                             tools[1].name == "crm__get_customer" && !tools[1].deferred &&
+                             tools[2].name == "crm__list_open_orders" && tools[2].deferred &&
+                             tools[3].name == "get_shipping_eta" && tools[3].deferred &&
+                             request.tool_identities.at("tool_search").tool_search &&
+                             request.tools[2].at("defer_loading") == true,
+                         "deferred functions and the tool_search tool were not declared");
+    const OpenAIResponsesToolSearch& search = *request.prompt.tool_search;
+    failures += check(search.server && search.paths.size() == 2 && search.paths[0].path == "crm" &&
+                          search.paths[0].wire.at("tools").size() == 1 &&
+                          search.paths[0].wire.at("tools")[0].at("name") == "list_open_orders" &&
+                          search.paths[1].path == "get_shipping_eta",
+                      "the hosted search catalog does not hold the deferred members");
+    failures += check(
+        tools[0].description.find("- crm (namespace): CRM tools for customer lookup.") !=
+                std::string::npos &&
+            tools[0].description.find("- get_shipping_eta: Shipping ETA for an order.") !=
+                std::string::npos &&
+            tools[0].description.find("get_customer") == std::string::npos,
+        "the hosted search tool does not list the loadable catalog");
+    const infernix::PromptInput prompt =
+        to_prompt_input(request.prompt.generation, ResolvedPromptSemantics{}, {});
+    failures += check(prompt.options.tool_jsons.size() == 2 &&
+                          prompt.options.deferred_tool_jsons.size() == 2,
+                      "deferred functions reached the prompt's tool list");
+
+    Json unsearchable     = hosted_search_body();
+    unsearchable["tools"].erase(0);
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(unsearchable, limits());
+                      }) == "tool_search_required",
+                      "deferred functions without a tool_search tool were accepted");
+    Json twice = hosted_search_body();
+    twice["tools"].push_back(Json{{"type", "tool_search"}});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(twice, limits());
+                      }) == "duplicate_tool_name",
+                      "two tool_search tools were accepted");
+
+    const OpenAIToolSearchExecution loaded = execute_openai_tool_search(
+        request, ToolCall{.id = "tsc_1", .name = "tool_search",
+                          .arguments_json = R"({"paths":["crm","unknown","crm"]})"});
+    failures += check(loaded.tools.size() == 1 && loaded.tools[0].at("type") == "namespace" &&
+                          loaded.tools[0].at("name") == "crm" &&
+                          loaded.turn.role == infernix::ChatRole::Tool &&
+                          loaded.turn.tool_call_id == "tsc_1" && loaded.turn.content.empty() &&
+                          loaded.turn.loaded_tools.size() == 1 &&
+                          loaded.turn.loaded_tools[0].name == "crm__list_open_orders" &&
+                          loaded.turn.loaded_tools[0].description ==
+                              "CRM tools for customer lookup.\n\nList open orders for a customer.",
+                      "a hosted search did not load the named namespace's deferred members");
+    const OpenAIToolSearchExecution nothing = execute_openai_tool_search(
+        request, ToolCall{.id = "tsc_2", .name = "tool_search", .arguments_json = R"({"paths":["x"]})"});
+    failures += check(nothing.tools.empty() && nothing.turn.loaded_tools.empty() &&
+                          nothing.turn.content.at(0).text == "No tools were loaded.",
+                      "a search for unknown paths did not say it loaded nothing");
+
+    // One response of two generations: the search, then a call of the loaded function.
+    GenerationOutcome first;
+    first.reasoning         = "I need the order tools.";
+    first.prompt_tokens     = 30;
+    first.completion_tokens = 8;
+    first.finish_reason     = infernix::FinishReason::StopToken;
+    first.tool_calls.push_back(
+        infernix::GeneratedToolCall{.name = "tool_search", .arguments_json = R"({"paths":["crm"]})"});
+    GenerationOutcome second;
+    second.prompt_tokens     = 60;
+    second.completion_tokens = 5;
+    second.finish_reason     = infernix::FinishReason::StopToken;
+    second.tool_calls.push_back(infernix::GeneratedToolCall{
+        .name = "crm__list_open_orders", .arguments_json = R"({"order_id":"c1"})"});
+    const OpenAIToolSearchExecution executed = execute_openai_tool_search(
+        request,
+        ToolCall{.id = "tsc_first", .name = "tool_search", .arguments_json = R"({"paths":["crm"]})"});
+    ServerToolRound round{.outcome = first, .calls = {}, .results = {executed.turn}};
+    const GenerationOutcome totals = combine_round_outcomes(std::span(&round, 1), second);
+    const std::vector<OpenAIResponsesRound> rounds{
+        OpenAIResponsesRound{.outcome = &first, .call_ids = {"tsc_first"}, .searches = {executed}},
+        OpenAIResponsesRound{.outcome = &second, .call_ids = {}, .searches = {}}};
+    const BuiltOpenAIResponse built =
+        make_openai_response_object("resp_search", 1, request, {}, rounds, totals, std::nullopt);
+    const nlohmann::json& output = built.body.at("output");
+    std::vector<std::string> types;
+    for (const nlohmann::json& item : output) { types.push_back(item.at("type").get<std::string>()); }
+    failures += check(types == std::vector<std::string>{"reasoning", "tool_search_call",
+                                                        "tool_search_output", "function_call"} &&
+                          output[1].at("id") == "tsc_first" && output[1].at("call_id").is_null() &&
+                          output[1].at("execution") == "server" &&
+                          output[1].at("arguments").at("paths")[0] == "crm" &&
+                          output[2].at("call_id").is_null() &&
+                          output[2].at("tools")[0].at("name") == "crm" &&
+                          output[3].at("name") == "list_open_orders" &&
+                          output[3].at("namespace") == "crm" &&
+                          built.body.at("status") == "completed",
+                      "the response did not show the hosted search between the generations");
+    failures += check(built.body.at("usage").at("input_tokens") == 90 &&
+                          built.body.at("usage").at("output_tokens") == 13,
+                      "response usage did not sum the generations");
+    failures += check(built.output_history.size() == 3 &&
+                          built.output_history[0].tool_calls.at(0).id == "tsc_first" &&
+                          built.output_history[1].role == infernix::ChatRole::Tool &&
+                          built.output_history[1].tool_call_id == "tsc_first" &&
+                          built.output_history[1].loaded_tools.size() == 1 &&
+                          built.output_history[2].tool_calls.at(0).name == "crm__list_open_orders",
+                      "the stored history does not hold both generations and the search");
+
+    // The client replays the output Items: they lower to the stored history, so the replay
+    // renders the tokens the continuation ran on.
+    Json replay        = hosted_search_body();
+    Json input         = Json::array({Json{{"type", "message"},
+                                           {"role", "user"},
+                                           {"content", "Which orders are open?"}}});
+    for (const nlohmann::json& item : output) { input.push_back(Json::parse(item.dump())); }
+    input.push_back(Json{{"type", "function_call_output"},
+                         {"call_id", output[3].at("call_id").get<std::string>()},
+                         {"output", "none"}});
+    replay["input"] = std::move(input);
+    OpenAIResponsesStore store(16, 1ULL << 20);
+    const OpenAIResponsesResolvedPrompt resolved = resolve_openai_responses_prompt(
+        parse_openai_responses_create_request(replay, limits()).prompt, store);
+    const std::vector<ChatTurn>& messages = resolved.generation.messages;
+    failures += check(messages.size() == 5 && messages[1].role == infernix::ChatRole::Assistant &&
+                          messages[1].reasoning_content == first.reasoning &&
+                          messages[1].tool_calls.at(0).name == "tool_search" &&
+                          messages[1].tool_calls.at(0).arguments_json == R"({"paths":["crm"]})" &&
+                          messages[2].tool_call_id == messages[1].tool_calls.at(0).id &&
+                          messages[2].loaded_tools.size() == 1 &&
+                          messages[2].loaded_tools[0].name == executed.turn.loaded_tools[0].name &&
+                          messages[2].loaded_tools[0].description ==
+                              executed.turn.loaded_tools[0].description &&
+                          messages[2].loaded_tools[0].input_schema_json ==
+                              executed.turn.loaded_tools[0].input_schema_json &&
+                          messages[3].tool_calls.at(0).name == "crm__list_open_orders",
+                      "replayed hosted search Items did not lower to the executed history");
+    return failures;
+}
+
+int test_client_tool_search_and_additional_tools() {
+    const Json client_search = {
+        {"type", "tool_search"},
+        {"execution", "client"},
+        {"description", "Find shipping tools."},
+        {"parameters", Json{{"type", "object"},
+                            {"properties", Json{{"goal", Json{{"type", "string"}}}}},
+                            {"required", Json::array({"goal"})}}}};
+    Json body     = {{"model", "m"}, {"input", "When does order 42 arrive?"}};
+    body["tools"] = Json::array({client_search});
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    int failures = check(request.prompt.tool_search && !request.prompt.tool_search->server &&
+                             request.prompt.generation.tools.size() == 1 &&
+                             request.prompt.generation.tools[0].description == "Find shipping tools." &&
+                             request.prompt.generation.tools[0].input_schema_json ==
+                                 client_search.at("parameters").dump(),
+                         "a client tool_search did not show its own description and schema");
+
+    GenerationOutcome outcome;
+    outcome.finish_reason = infernix::FinishReason::StopToken;
+    outcome.tool_calls.push_back(
+        infernix::GeneratedToolCall{.name = "tool_search", .arguments_json = R"({"goal":"eta"})"});
+    const BuiltOpenAIResponse built = make_openai_response_object("resp_client", 1, request, {}, outcome);
+    const nlohmann::json& call      = built.body.at("output").at(0);
+    failures += check(call.at("type") == "tool_search_call" && call.at("execution") == "client" &&
+                          call.at("call_id").get<std::string>().starts_with("call_") &&
+                          call.at("arguments").at("goal") == "eta" &&
+                          built.output_history.at(0).tool_calls.at(0).id ==
+                              call.at("call_id").get<std::string>(),
+                      "a client search call was not returned as a tool_search_call Item");
+
+    OpenAIResponsesCreateRequest stream_request = request;
+    stream_request.stream                       = true;
+    OpenAIResponsesEventStream stream("resp_client_stream", 1, stream_request, {});
+    (void)stream.start();
+    const OpenAIResponsesStreamFinish finished = stream.finish(outcome);
+    bool added = false;
+    std::string done_id;
+    for (const std::string& wire : finished.events_before_terminal) {
+        const Json event = parse_event(wire);
+        if (event.at("type") == "response.output_item.added") {
+            added = event.at("item").at("type") == "tool_search_call" &&
+                    event.at("item").at("status") == "in_progress";
+        }
+        if (event.at("type") == "response.output_item.done" &&
+            event.at("item").at("type") == "tool_search_call" &&
+            event.at("item").at("arguments").at("goal") == "eta") {
+            done_id = event.at("item").at("id").get<std::string>();
+        }
+    }
+    failures += check(added && done_id.starts_with("tsc_") &&
+                          finished.response.body.at("output").at(0).at("id").get<std::string>() ==
+                              done_id,
+                      "a streamed client search call was not emitted as its Item");
+
+    // The client answers with tool_search_output; the loaded function is callable afterwards.
+    Json answered     = body;
+    answered["input"] = Json::array(
+        {Json{{"type", "message"}, {"role", "user"}, {"content", "When does order 42 arrive?"}},
+         Json{{"type", "tool_search_call"},
+              {"execution", "client"},
+              {"call_id", "call_s1"},
+              {"status", "completed"},
+              {"arguments", Json{{"goal", "eta"}}}},
+         Json{{"type", "tool_search_output"},
+              {"execution", "client"},
+              {"call_id", "call_s1"},
+              {"status", "completed"},
+              {"tools", Json::array({deferred_function("get_shipping_eta", "Shipping ETA.")})}}});
+    OpenAIResponsesStore store(16, 1ULL << 20);
+    const OpenAIResponsesCreateRequest answered_request =
+        parse_openai_responses_create_request(answered, limits());
+    const OpenAIResponsesResolvedPrompt resolved =
+        resolve_openai_responses_prompt(answered_request.prompt, store);
+    const infernix::PromptInput prompt =
+        to_prompt_input(resolved.generation, ResolvedPromptSemantics{}, {});
+    failures += check(resolved.generation.messages.size() == 3 &&
+                          resolved.generation.messages[1].tool_calls.at(0).id == "call_s1" &&
+                          resolved.generation.messages[2].tool_call_id == "call_s1" &&
+                          resolved.generation.messages[2].loaded_tools.size() == 1 &&
+                          resolved.generation.tools.size() == 2 &&
+                          resolved.generation.tools[1].name == "get_shipping_eta" &&
+                          resolved.generation.tools[1].deferred &&
+                          prompt.options.tool_jsons.size() == 1 &&
+                          prompt.options.deferred_tool_jsons.size() == 1 &&
+                          prompt.messages[2].parts.back().text ==
+                              render_loaded_tools(resolved.generation.messages[2].loaded_tools) &&
+                          answered_request.tool_identities.contains("get_shipping_eta"),
+                      "a client tool_search_output did not load its function");
+
+    Json additional     = body;
+    additional["input"] = Json::array(
+        {Json{{"type", "message"}, {"role", "user"}, {"content", "x"}},
+         Json{{"type", "additional_tools"},
+              {"role", "developer"},
+              {"tools", Json::array({deferred_function("get_customer", "Look up a customer.")})}}});
+    const OpenAIResponsesResolvedPrompt added_tools = resolve_openai_responses_prompt(
+        parse_openai_responses_create_request(additional, limits()).prompt, store);
+    failures += check(added_tools.generation.messages.size() == 2 &&
+                          added_tools.generation.messages[1].role == infernix::ChatRole::Developer &&
+                          added_tools.generation.messages[1].content.empty() &&
+                          added_tools.generation.messages[1].loaded_tools.size() == 1 &&
+                          added_tools.generation.tools.back().name == "get_customer",
+                      "additional_tools did not load its tools at its position");
+
+    Json orphan     = answered;
+    orphan["input"] = Json::array({answered["input"][0], answered["input"][2]});
+    orphan["input"][1].erase("call_id");
+    orphan["input"][1]["execution"] = "server";
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(orphan, limits());
+                      }) == "invalid_tool_history",
+                      "a tool_search_output without its call was accepted");
+    Json no_call_id = answered;
+    no_call_id["input"][1].erase("call_id");
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(no_call_id, limits());
+                      }).param == "input",
+                      "a client tool_search_call without call_id was accepted");
+    Json empty_tools                       = additional;
+    empty_tools["input"][1]["tools"] = Json::array();
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(empty_tools, limits());
+                      }).param == "input",
+                      "an empty additional_tools Item was accepted");
+    return failures;
+}
+
 int test_previous_response_call_graph() {
     OpenAIResponsesStore store(16, 1ULL << 20);
     const OpenAIResponseContext context =
@@ -1571,6 +1872,8 @@ int main() {
     failures += test_custom_tools();
     failures += test_hosted_web_search_declaration();
     failures += test_explicit_rejections();
+    failures += test_deferred_tools_and_hosted_search();
+    failures += test_client_tool_search_and_additional_tools();
     failures += test_previous_response_call_graph();
     failures += test_response_object();
     failures += test_sse_sequence_and_failures();

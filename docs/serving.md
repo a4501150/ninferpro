@@ -891,8 +891,9 @@ sends its result back as a `custom_tool_call_output` Item.
 A hosted `web_search` declaration (`{"type":"web_search", ...}`, which Codex sends on every turn
 unless its configuration sets `web_search = "disabled"`) is accepted and echoed in the response's
 `tools`, but the model is not offered it, since Infernix runs no search; a `tool_choice` naming it is
-a 400. Other hosted tools, remote MCP tools, deferred loading, output schemas, and caller
-restrictions that exclude direct invocation remain unsupported.
+a 400. Other hosted tools, remote MCP tools, output schemas, and caller restrictions that exclude
+direct invocation remain unsupported. Deferred loading and the `tool_search` tool are described
+under [Deferred tools and tool search](#deferred-tools-and-tool-search).
 
 ### Response object and usage
 
@@ -1183,7 +1184,7 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
 ## Deferred tools and tool search
 
 Agent clients with large tool catalogs (many MCP servers) can mark tools `defer_loading:true` on
-Anthropic Messages. The client still sends every definition on every request, but the prompt's
+Anthropic Messages and OpenAI Responses. The client still sends every definition on every request, but the prompt's
 tool list leaves deferred tools out: the model finds them with a tool search, and a found tool's
 definition appears in the conversation at the search's result. Everything before that result
 (System prompt, listed tools, earlier turns) keeps its tokens as tools load, so the prefix cache
@@ -1286,6 +1287,40 @@ direct call to an undeclared name as a `tool_use` for the client to judge (Claud
 deferred MCP tool called this way) instead of turning it into text; with a tool search tool every
 deferred tool is declared, and a call outside the declared names stays text under the default
 parser.
+
+### OpenAI Responses
+
+Declare one `tool_search` tool. Without `execution`, or with `"execution":"server"`, the search is
+hosted: the tool's description lists what can be loaded, each namespace that has deferred members
+(with the namespace description) and each top-level deferred function or custom tool (with its
+description), and the model passes the names in `paths`. Infernix loads the named namespaces'
+deferred members and the named functions; unknown names load nothing. The response shows
+
+```json
+{"id": "tsc_…", "type": "tool_search_call", "execution": "server", "call_id": null,
+ "status": "completed", "arguments": {"paths": ["crm"]}}
+{"id": "tso_…", "type": "tool_search_output", "execution": "server", "call_id": null,
+ "status": "completed", "tools": [{"type": "namespace", "name": "crm", "tools": […]}]}
+```
+
+after the generation's other call Items, and the next generation's Items follow. A search Item has
+no events of its own beyond `response.output_item.added` and `.done`. A Response that reaches the
+generation limit, or the request's `max_tool_calls` hosted searches, ends `completed` after its last
+searches; one whose budget or context runs out ends `incomplete`.
+
+With `"execution":"client"`, the model sees the client's `description` and `parameters` (a default
+`query` string otherwise), and its call ends the Response as a `tool_search_call` Item carrying a
+`call_id`. The client answers with a `tool_search_output` Item of that `call_id` whose `tools` are the
+definitions to load; they need not appear in `tools`, and remain callable in later turns. An
+`additional_tools` Item (`role:"developer"`, non-empty `tools`) loads its tools at its own position,
+which renders there as a Developer-role message: the chat template treats Developer like System as
+an instruction role.
+
+`defer_loading:true` needs a `tool_search` tool (`tool_search_required`), and a request declares at
+most one. Hosted `tool_search_call`/`tool_search_output` Items without `call_id` pair in order. A
+Response stored for `previous_response_id` keeps its searches' results as history. The namespace of
+a namespaced tool that only a client `tool_search_output` declared is restored on output only while
+the request still carries that Item; afterwards its calls show the flattened `namespace__name`.
 
 ## Decisions
 
