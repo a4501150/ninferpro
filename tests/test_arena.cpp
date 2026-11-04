@@ -205,5 +205,28 @@ int main() {
     failures += expect_size(pinned.size(), 128, "pinned.size");
     std::memset(pinned.data(), 0x5a, pinned.size());
 
+    // A failed allocation reports itself exactly once: through its exception, with the CUDA error
+    // it left consumed (a process that recovered from the failed allocation must not have its next
+    // launch check abort on the stale error; closed PR #46). An impossible size fails without
+    // disturbing the context.
+    const auto consumed = [&](const char* label) {
+        if (cudaGetLastError() != cudaSuccess) {
+            ++failures;
+            std::cerr << label << " left its CUDA error unconsumed\n";
+        }
+    };
+    failures += expect_throws<std::runtime_error>(
+        [&] { const infernix::DeviceBuffer impossible(1ULL << 62U); (void)impossible; },
+        "impossible device buffer allocation");
+    consumed("device buffer allocation failure");
+    failures += expect_throws<std::runtime_error>(
+        [&] { const infernix::DeviceArena impossible(1ULL << 62U); (void)impossible; },
+        "impossible device arena allocation");
+    consumed("device arena allocation failure");
+    failures += expect_throws<std::runtime_error>(
+        [&] { const infernix::PinnedHostBuffer impossible(1ULL << 62U); (void)impossible; },
+        "impossible pinned host buffer allocation");
+    consumed("pinned host buffer allocation failure");
+
     return failures == 0 ? 0 : fail("arena test failed");
 }
