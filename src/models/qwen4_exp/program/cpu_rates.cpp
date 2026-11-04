@@ -1,4 +1,4 @@
-// The CPU expert team's rates (docs/maintainer/qwen3_8-flash-next-design.md §10.4): measured once at
+// The CPU expert team's rates (docs/maintainer/moe-offload-design.md §5.5): measured at
 // startup, for the configured workers, so the decode miss split and the prefill CPU split follow the
 // machine's CPU as they follow its link. A temporary team of the service's size computes rounds of jobs
 // on real records from the pinned banks, or the SSD tier's RAM copies (across layers, past the
@@ -6,14 +6,16 @@
 // the link copies records into the staging slots, since the GPU staging's DRAM reads compete with the
 // CPU's: one-column jobs (memory-bound: experts per second, decode's misses and the split's per-expert
 // cost) and kNarrowColumns-column jobs (the narrow route's widest: expert columns per second, the
-// split's per-column cost). Three batches of each, the best counts; about 60 ms.
+// split's per-column cost). Three batches of each, the best counts; about 60 ms a reading.
 //
 // The rates hold for the whole session, so they are taken on a quiet machine: an attempt during
 // which other processes used kQuietShare or more of the CPU (another program's build, a virus scan)
 // is repeated after a pause, for up to kRetryBudget, and the best rates of the attempts stand. With
 // every core loaded by another program the team reads about half its rate (i9-13900K, 6 workers:
 // ~10,500 against ~19,500 experts/s on synthetic records), which turned the decode divisor from 3
-// to 2 and slowed decode by a fifth for the whole session (design §10.4).
+// to 2 and slowed decode by a fifth for the whole session. Memory is also slow for some seconds
+// after the banks' load or the tier's fill, or after another process frees tens of GiB, so the
+// readings repeat until they settle (cpu_rates.h settle_cpu_rates; measure_cpu_rate_settled).
 
 #include "models/qwen4_exp/program/program_impl.h"
 
@@ -24,6 +26,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,11 +50,12 @@ constexpr auto kRetryBudget  = std::chrono::seconds(20);
 
 } // namespace
 
-void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
+std::optional<CpuRateReading> ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
     namespace moe      = ops::offloaded_moe;
     const auto& layers = parameters_.layers;
     const auto L       = static_cast<std::uint32_t>(layers.size());
     const auto E       = c_.moe.experts;
+    CpuRateReading reading;
     // The records the jobs read: the pinned banks, or the SSD tier's RAM copies once it is filled.
     const auto record_of = [&](std::uint32_t layer, std::uint32_t expert) -> const std::uint8_t* {
         const auto& bank = *layers[layer].moe.bank;
@@ -129,7 +133,6 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
         };
         // Attempts until one runs while other processes leave the CPU quiet, or the budget is spent.
         const auto began = std::chrono::steady_clock::now();
-        double expert_rate = 0.0, column_rate = 0.0;
         for (;;) {
             const HostCpuTimes before = host_cpu_times();
             const double experts      = rate(1, 0);
@@ -138,27 +141,38 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
             if (attempts == 0) { first_share = others; }
             last_share = others;
             ++attempts;
-            expert_rate = std::max(expert_rate, experts);
-            column_rate = std::max(column_rate, columns);
-            quiet       = others < kQuietShare;
+            reading.experts = std::max(reading.experts, experts);
+            reading.columns = std::max(reading.columns, columns);
+            quiet           = others < kQuietShare;
             if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
             std::this_thread::sleep_for(kRetryPause);
         }
-        cpu_expert_rate_ = expert_rate;
-        cpu_column_rate_ = column_rate;
         CUDA_CHECK(cudaStreamDestroy(stream));
+        reading.note = tier_ ? "measured on the SSD tier's RAM copies" : "measured";
+        char share[160];
+        if (attempts > 1) {
+            std::snprintf(share, sizeof(share), " after %d attempts: other processes used %.0f %% of the CPU at first, %.0f %% last",
+                          attempts, 100.0 * first_share, 100.0 * last_share);
+        } else {
+            std::snprintf(share, sizeof(share), "; other processes used %.0f %% of the CPU", 100.0 * last_share);
+        }
+        reading.note += share;
+        reading.busy_share = quiet ? -1.0 : last_share;
     }
-    std::string how = measured ? (tier_ ? "measured on the SSD tier's RAM copies" : "measured")
-                               : "reference: no expert records in RAM yet";
-    char share[160];
-    if (measured && attempts > 1) {
-        std::snprintf(share, sizeof(share), " after %d attempts: other processes used %.0f %% of the CPU at first, %.0f %% last",
-                      attempts, 100.0 * first_share, 100.0 * last_share);
-        how += share;
-    } else if (measured) {
-        std::snprintf(share, sizeof(share), "; other processes used %.0f %% of the CPU", 100.0 * last_share);
-        how += share;
+    return measured ? std::optional(reading) : std::nullopt;
+}
+
+// The settled rates (cpu_rates.h settle_cpu_rates) the decode miss split and the prefill CPU split
+// take, and their report.
+void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
+    const SettledCpuRates rates = settle_cpu_rates([&] { return measure_cpu_rate(record_stride); });
+    const bool measured         = !rates.readings.empty();
+    if (measured) {
+        cpu_expert_rate_ = rates.experts;
+        cpu_column_rate_ = rates.columns;
     }
+    const std::string how =
+        measured ? rates.note + rates.readings_text() : "reference: no expert records in RAM yet";
     // The split the channels take: the share form names its fixed shares, the divisor rule its d,
     // and the wide share its threshold.
     char kept[160];
@@ -177,9 +191,9 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
                   "the link: %s",
                   cpu_workers(), cpu_expert_rate_, cpu_column_rate_, how.c_str(), kept);
     diagnostic(text, DiagnosticLevel::Debug);
-    if (measured && !quiet) {
+    if (measured && rates.busy_share >= 0.0) {
         diagnostic("the CPU expert team's rates were measured while other processes kept the CPU busy (" +
-                       std::to_string(static_cast<int>(100.0 * last_share + 0.5)) +
+                       std::to_string(static_cast<int>(100.0 * rates.busy_share + 0.5)) +
                        " %); the decode miss split follows them for this session and may leave decode slower; "
                        "start the engine when the machine is quieter",
                    DiagnosticLevel::Warning);

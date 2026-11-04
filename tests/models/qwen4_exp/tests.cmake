@@ -13,6 +13,10 @@ infernix_add_test(infernix_qwen4_exp_host_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_tier.cpp"
   LIBRARIES infernix_offload)
 
+# The rule that settles the CPU expert team's measured rates, on scripted readings. Host only.
+infernix_add_test(infernix_qwen4_exp_cpu_rates_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_cpu_rates.cpp")
+
 infernix_add_test(infernix_qwen4_exp_ngram_hash_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_hash.cpp"
   LIBRARIES infernix_model_loading

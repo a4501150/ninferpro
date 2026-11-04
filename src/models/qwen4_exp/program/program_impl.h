@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen4_exp/program/cpu_rates.h"
 #include "models/qwen4_exp/program/program.h"
 
 #if defined(__GLIBC__)
@@ -1155,9 +1156,8 @@ public:
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
         const std::uint32_t assist_jobs = options_.cpu_assist_jobs;
         if (cpu_workers > 0 && cpu_jobs > 0) {
-            // The team's rate sets the decode miss split (design §10.5); the SSD tier's is measured
-            // once its RAM is filled (below).
-            if (!tier_) { measure_cpu_rate(record_stride); }
+            // The team's rate sets the decode miss split (design §10.5): the service starts on the
+            // reference rates, and its channels take the measured split after the warm start (below).
             // Decode and verification calls are CPU-served up to decode_columns; prefill calls up to
             // kAssistMaxColumns take the assist cap (wider chunks stream or stage on the GPU).
             const int decode_columns = std::max(ops::offloaded_moe::kMaxCpuColumns, lanes * max_width_);
@@ -1264,10 +1264,12 @@ public:
             }
         }
         warm_start_experts();
-        // The SSD tier has no records in RAM before its fill: the CPU team's rates are measured on its
-        // RAM copies now, so the decode miss divisor follows this record size and CPU, not the reference.
-        if (tier_ && cpu_service_) {
-            measure_cpu_rate(record_stride);
+        // The CPU team's rates, read until they settle (cpu_rates.cpp) on the pinned banks or the SSD
+        // tier's RAM copies (it has none before its fill), so the decode miss split follows this record
+        // size and CPU, not the reference. Both layouts measure here, after the warm start; the service
+        // starts on the reference rates and its channels take the measured divisor.
+        if (cpu_service_) {
+            measure_cpu_rate_settled(record_stride);
             for (auto& channel : experts.cpu) { channel.pcie_divisor = pcie_divisor(); }
         }
         if (!options_.route_trace.empty()) {
@@ -6297,12 +6299,16 @@ private:
     // For cpu_expert_workers workers, measured at startup while the link copies records (the staging's
     // DRAM reads compete with the CPU's): experts per second on one-column jobs (memory-bound, as
     // decode's misses are) and expert columns per second on 8-column jobs (the narrow route's widest).
-    // The decode miss divisor and the prefill CPU split both use them. The SSD tier measures them on
-    // its RAM copies once filled; until then (and without any host record) the reference rates stand
-    // (ProgramOptions::cpu_split_*_rate, the i9-13900K at 6 workers on NVFP4 records).
+    // The decode miss divisor and the prefill CPU split both use them. They are measured once the
+    // experts' warm start is done, on the pinned banks or the SSD tier's filled RAM copies, and
+    // repeat until they settle (cpu_rates.h); until then (and without any host record) the reference
+    // rates stand (ProgramOptions::cpu_split_*_rate, the i9-13900K at 6 workers on NVFP4 records).
     double cpu_expert_rate_ = 0.0; // 0 until measured
     double cpu_column_rate_ = 0.0;
-    void measure_cpu_rate(std::uint64_t record_stride);
+    // One reading (nullopt without expert records in RAM), and the readings until they settle
+    // (cpu_rates.h settle_cpu_rates) with their report.
+    [[nodiscard]] std::optional<CpuRateReading> measure_cpu_rate(std::uint64_t record_stride);
+    void measure_cpu_rate_settled(std::uint64_t record_stride);
     [[nodiscard]] double cpu_expert_rate() const noexcept {
         return cpu_expert_rate_ > 0.0 ? cpu_expert_rate_ : options_.cpu_split_expert_rate;
     }

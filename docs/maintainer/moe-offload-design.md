@@ -509,7 +509,15 @@ the warm-up keeps the device busy while the link copies. The CPU probe times the
 workers on one-column and eight-column jobs while the link copies records (the staging's
 DRAM reads compete), best batch per width; an attempt during which other processes used a
 quarter or more of the CPU repeats — a busy host halves the rate, which moves the decode
-divisor and costs a fifth of decode speed for a session. The measured link rescales the
+divisor and costs a fifth of decode speed for a session. The CPU readings repeat until they
+settle (`cpu_rates.h settle_cpu_rates`): a second reading 4 s after the first, a third 4 s
+later only if the second beat the first's experts/s by more than 10 %, at most three, the
+best of each rate standing — memory is slow for some seconds after the banks' load or the
+tier's fill, or after another process frees tens of GiB, and upstream measured a tier reading
+9,377 experts/s right after its fill and 18,942 5 s later (decode −26 % for the session on
+the low reading). Both layouts measure after the experts' warm start: the service starts on
+the reference rates and its channels take the measured divisor or share afterwards. The
+measured link rescales the
 family's bandwidth-dependent constants (the promotion interval, the split's width limit,
 restore rates); until records exist in RAM the family's reference rates stand. A fixed rate
 is injectable in tests.
