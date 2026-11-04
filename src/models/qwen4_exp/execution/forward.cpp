@@ -703,11 +703,21 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
             project(x, p.control, ab, work_, s, ops::LinearRoutes::Exact, fast_.column_invariant);
         }
     }
+    // A one-row pure verification call of at most kGdnReplayConvMaxWidth columns evaluates its
+    // convolution and gates inside the recurrence (gated_delta_net_replay_record_conv, the same
+    // bits as the composed kernels below). DFlash2 and MTP verify at most 8 columns; wider
+    // verifications (n-gram, wide trees), mixed calls and multi-row verification keep the composed
+    // path — on this GPU the fused kernel's redundant convolution reads scale with the row count
+    // and measured slower from two rows up (RTX PRO 6000, cold and warm, op-level), while at one
+    // row it measured 15-25 % faster at every width 2..16.
+    const bool replay_conv = batch.verify != nullptr && part == nullptr && batch.batch == 1 &&
+                             batch.width <= ops::kGdnReplayConvMaxWidth && NK == 16 && NV == 48 &&
+                             DK == 128 && DV == 128;
     // Verification and prefill chunks evaluate the gates once for their recurrence; decode evaluates
     // them inside the recurrent update, except a GGUF import's (its third input holds A itself), whose
     // decode takes them from gdn_gating_direct too. A mixed call's prefill part needs them.
     Tensor gate, beta;
-    if (batch.verify != nullptr || batch.width > 1 || g.a_direct || part != nullptr) {
+    if (!replay_conv && (batch.verify != nullptr || batch.width > 1 || g.a_direct || part != nullptr)) {
         gate = work_.alloc(DType::FP32, {NV, T});
         beta = work_.alloc(DType::FP32, {NV, T});
         if (g.a_direct) {
@@ -717,7 +727,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         }
     }
 
-    if (!fused_conv) {
+    if (!fused_conv && !replay_conv) {
         q = work_.alloc(DType::BF16, {KW, T});
         k = work_.alloc(DType::BF16, {KW, T});
         v = work_.alloc(DType::BF16, {VW, T});
@@ -737,6 +747,17 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
             // without changing them, and the recurrence's inputs are recorded for the commit fold.
             const std::int32_t Wd = width, B = rows;
             auto layer = state_.gdn->layer_view(index);
+            if (replay_conv) {
+                // The whole call is one verification (part == nullptr): the fused record kernel
+                // evaluates the convolution and gates itself, from the records' conv inputs and the
+                // control projection, without materializing q, k, v, g or beta.
+                Tensor o_rows = po.view({DV, NV, Wd, B});
+                ops::gated_delta_net_replay_record_conv(pqkv.view({C, Wd, B}), p.convolution, layer.conv,
+                                                        ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log,
+                                                        p.dt_bias, g.a_direct, scale, layer.recurrent, slots,
+                                                        records.key, records.value, records.gate, o_rows, s);
+                return;
+            }
             ops::causal_conv1d_silu_from_states_split(pqkv.view({C, Wd, B}), p.convolution, layer.conv, slots, pq, pk,
                                                       pv, s);
             Tensor o_rows = po.view({DV, NV, Wd, B});

@@ -1477,6 +1477,19 @@ cut). Speed, sampled decode: geomean +2.7 % on Dense8 INT8 (MTP 4, temperature 1
 top-k 20, 5 of 6 cells, 2026-10-17); IQ3_S math +18.8 %, story +22.4 %, code +4.1 % (2026-10-18);
 FP8 math +20.4 %, story +15.6 %, code −13.0 %.
 
+A one-row verification call of at most 16 columns runs its GDN layers' causal convolution, gates
+and recurrence record in one kernel (`gated_delta_net_replay_record_conv`): each CTA evaluates its
+heads' q, k and v channels from the replay records' convolution inputs and the live convolution
+history into shared memory — the arithmetic of `causal_conv1d_silu_from_states_split` — and its
+gates from the control projection — `gdn_gating`'s (`gdn_gating_direct`'s for a GGUF import's A) —
+so q, k, v, g and beta are never materialized and two kernels leave each layer's chain. The output
+and all three records are bit-equal to the composed kernels (the op test covers every width 2..16,
+both gate forms, eager and captured). On this GPU the fused kernel measured 15-25 % faster than the
+composed chain at one row (every width 2..16, cold and warm, op-level), but its redundant
+convolution reads scale with the row count and it measured slower from two rows up — so only
+one-row verifications take it; multi-row rounds, mixed calls and wider verifications (n-gram, wide
+trees) keep the composed kernels.
+
 Each request reports `SpeculativeStats`: rounds, drafted and accepted tokens, acceptance per
 position, n-gram rounds, fallback steps. The same observations drive the policies: the lane's
 per-position acceptance EWMA, the n-gram bucket EWMA, and DFlash2's decile calibration.
