@@ -13,6 +13,7 @@ add_library(infernix_serve STATIC
   anthropic_messages_request.cpp
   anthropic_messages_response.cpp
   anthropic_messages_http.cpp
+  anthropic_tool_search.cpp
   tool_search.cpp
   server_tools.cpp
   openai_responses_store.cpp
