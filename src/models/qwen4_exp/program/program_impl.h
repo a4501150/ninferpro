@@ -71,12 +71,14 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 namespace infernix::models::qwen4_exp {
@@ -1985,10 +1987,15 @@ public:
         // Host phases of a chunk for nsys attribution (the GPU side is in the CUDA trace).
         const nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                             static_cast<std::uint64_t>(width));
+        // A call wide enough to stream reads its n-gram rows behind the gate once it is enqueued
+        // (run_rows_behind); the others, and a call the stream turns down, read them first.
+        // Upstream measured this on FP4-Local from a volume (RTX 5090, 2026-10-30, three interleaved
+        // runs): pp16413 6,829 -> 6,999 tok/s, pp4096 2,727 -> 2,802.
+        const bool rows_behind = static_cast<bool>(expert_stream_) && width >= kStreamMinColumns;
         {
             const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
-                                               static_cast<std::uint64_t>(width));
-            stage_sequence(index, begin, width, lane.history);
+                                               static_cast<std::uint64_t>(rows_behind ? 0 : width));
+            stage_sequence(index, begin, width, lane.history, !rows_behind);
         }
         const auto chunk = stage_mtp_chunk(lane, index, begin, width);
         // A resumed lane's first call waits per layer for its restore; any call waits per layer for
@@ -1996,7 +2003,17 @@ public:
         next_waits_ = prefix_waits(lane);
         const bool streamed = !walk_.active && stream_chunk(width);
         score_column_       = begin;
-        run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width), streamed);
+        const execution::VisionInput* vision = stage_vision(lane, static_cast<std::uint32_t>(begin), width);
+        if (rows_behind && streamed) {
+            run_rows_behind(lane, begin, width, chunk ? &*chunk : nullptr, vision);
+        } else {
+            if (rows_behind) {
+                const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
+                                                   static_cast<std::uint64_t>(width));
+                stage_ngram(lane, lane.history, begin, width, 0);
+            }
+            run(1, width, 1, chunk ? &*chunk : nullptr, vision, streamed);
+        }
         if (last && !prefilling_besides(index)) {
             return_stream_lease();
             return_wide_work();
@@ -4667,9 +4684,18 @@ private:
     // `logit_columns` columns land in logits32_.
     void run(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
              const execution::MtpChunk* chunk = nullptr, const execution::VisionInput* vision = nullptr,
-             bool streamed = false) {
+             bool streamed = false, const execution::NgramRowGate* gate = nullptr) {
         const cudaStream_t s = device_.stream;
-        CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        if (gate != nullptr) {
+            // With `gate` the n-gram rows are not staged yet: a helper thread reads them (run_rows_behind)
+            // while this call runs, so the upload takes everything but them and the rows land behind
+            // the gate word (which precedes them in the layout, so it is already in place).
+            upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
+            upload_pinned(static_cast<std::byte*>(io_device_.p) + io_layout_.mtp_ids,
+                          host_io() + io_layout_.mtp_ids, io_layout_.bytes - io_layout_.mtp_ids, s);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        }
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this call
         residency_->before_round(s);
         // The ring's copies queue on the copy engine behind the io upload above. A call the CPU can
@@ -4678,7 +4704,7 @@ private:
         if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_); }
         const WideWork wide(*this, batch * width);
         try {
-            forward_call(batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
+            forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
             if (dflash2_) { dflash2_call_context(batch, width); }
         } catch (...) {
             // A failed call (an unreadable record, say) still returns the stream's slots: left
@@ -4690,6 +4716,41 @@ private:
         if (streamed) { expert_stream_->end(); }
         split_call_ = false;
         residency_->enqueue_route_download(s, batch * width);
+    }
+
+    // run() for a streamed prefill call staged without its n-gram rows: a helper thread reads them
+    // into the io layout and publishes the gate's word while this thread enqueues the call, so the
+    // GPU embeds and runs the layers before ple.layer (whose experts stream) during the read, where
+    // it otherwise waited for the whole read before the call's first kernel. The helper owns the
+    // row scratch (window_, row_ids_), the n-gram volume and the lane's n-gram counters until it is
+    // joined; this thread touches none of them meanwhile, and its own host waits (a split call's
+    // routing, the stream's bounce) cannot block the helper's publish. A failed read publishes zero
+    // rows (the call's results are discarded with its error). The same rows and the same arithmetic:
+    // no bit changes.
+    void run_rows_behind(Lane& lane, std::int32_t begin, std::int32_t width, const execution::MtpChunk* chunk,
+                         const execution::VisionInput* vision) {
+        const std::uint32_t word = next_gate_word();
+        const execution::NgramRowGate gate = row_gate();
+        std::exception_ptr failed;
+        std::thread reader([&, word] {
+            try {
+                const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
+                                                   static_cast<std::uint64_t>(width));
+                stage_ngram(lane, lane.history, begin, width, 0);
+            } catch (...) {
+                failed = std::current_exception();
+                std::memset(host_io() + io_layout_.ngram, 0, io_prefix(width) - io_layout_.ngram);
+            }
+            publish_pinned_word(gate_ready(), word);
+        });
+        try {
+            run(1, width, 1, chunk, vision, true, &gate);
+        } catch (...) {
+            reader.join();
+            throw;
+        }
+        reader.join();
+        if (failed) { std::rethrow_exception(failed); }
     }
 
     // ---- prefill expert streaming (design §13.3) ----
