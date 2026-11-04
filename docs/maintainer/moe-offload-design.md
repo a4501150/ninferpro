@@ -272,6 +272,11 @@ victims come from lazy min-heaps. The clock advances by decode tokens, accepted 
 tokens and `min(columns, 16)` per prefill chunk; the half-life is a family constant. A demand
 landing is admitted when it outranks the lowest resident; a prefetch landing at a margin
 above the victim's score; a VRAM victim is demotion-worthy at a margin above the RAM victim.
+Shadows leave most-used first, not in the residents' least-used order, and a use re-ranks the
+shadow's heap entry (`HostTier::victim_value`): a shadow saves a demotion only when VRAM evicts
+its expert, and VRAM evicts the least-used experts first, so dropping the least-used experts'
+shadows left nearly every VRAM victim without a copy — upstream measured 24,318 → 2,057 demotions
+a request on its Dense8 struct fixture (RTX 5090, 2026-10-29).
 
 **Slots and lists.** Pinned slots are carved into a demand ring, prefetch slots, a demotion
 list, bounce slots (with unpinned records) and the prefill stream's bounce. A slot is never a

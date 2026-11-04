@@ -211,6 +211,10 @@ private:
     enum class Victims : std::uint8_t { kShadow, kResident };
 
     [[nodiscard]] bool eligible(const Slot& s, Victims kind) const;
+    // A key's rank in its victim heap of `kind` (the lowest goes first).
+    [[nodiscard]] double victim_value(std::uint32_t key, Victims kind) const;
+    // Replaces an eligible shadow's victim heap entry after its key's use.
+    void rerank_shadow(std::uint32_t key);
     void push_victim(std::uint32_t slot);
     // The lowest-ranked eligible victim of `kind` (left in its heap), or -1.
     std::int32_t peek_victim(Victims kind);

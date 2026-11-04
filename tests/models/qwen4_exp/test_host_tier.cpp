@@ -235,6 +235,49 @@ void test_transitions() {
     tier.check();
 }
 
+// ---- shadows leave most-used first, and a use re-ranks a shadow's heap entry: a shadow saves a
+// demotion only when VRAM evicts its expert, which takes the least-used experts first, so the
+// least-used experts' shadows are the useless ones.
+void test_shadow_rank() {
+    HostTier tier(small_config());
+    for (std::uint32_t k = 0; k < 8; ++k) {
+        std::int32_t slot = -1;
+        check(tier.prefill(k, slot), "prefill");
+        const std::uint32_t one[] = {k};
+        tier.record_uses(0, one, static_cast<double>(k + 1)); // key k ranks at k + 1
+    }
+    // Keys 5 (rank 6) and 6 (rank 7) load into VRAM: their slots become shadows.
+    tier.queued(5);
+    tier.queued(6);
+    tier.promotion_issued(5);
+    tier.promotion_issued(6);
+    tier.promotion_completed(5, true);
+    tier.promotion_completed(6, true);
+    check(tier.shadow_count() == 2, "two shadows");
+    tier.begin_round(32);
+    {
+        const std::uint32_t used[] = {40};
+        tier.record_uses(1, used, 100.0);
+    }
+    const Landing landing{tier.ring()[0], tier.serial(tier.ring()[0]), 40};
+    check(tier.admit({&landing, 1}, false) == 1 && !tier.host_copy(6) && tier.host_copy(5),
+          "the most-used shadow leaves first");
+    tier.check();
+    // Key 7 (rank 8) becomes the other shadow; a use of key 5 re-ranks it above key 7.
+    tier.queued(7);
+    tier.promotion_issued(7);
+    tier.promotion_completed(7, true);
+    tier.begin_round(32);
+    {
+        const std::uint32_t used[] = {5};
+        tier.record_uses(1, used, 1000.0);
+    }
+    const Landing second{tier.ring()[0], tier.serial(tier.ring()[0]), 41};
+    check(tier.admit({&second, 1}, false) == 1 && !tier.host_copy(5) && tier.host_copy(7),
+          "a use re-ranks a shadow: the newly most-used one leaves first");
+    tier.check();
+}
+
 // ---- randomized: every admission's victim against a naive scan, the audit after every step
 void test_random() {
     HostTier::Config c;
@@ -284,8 +327,10 @@ void test_random() {
                     continue;
                 }
                 if (is_shadow != shadow) { continue; }
+                // Residents go least-used first, shadows most-used first (their experts are VRAM's last victims).
                 const double best = tier.lfu().value(tier.key(static_cast<std::uint32_t>(expected)));
-                if (v < best || (v == best && s < static_cast<std::uint32_t>(expected))) { expected = static_cast<std::int32_t>(s); }
+                const bool before = shadow ? v > best : v < best;
+                if (before || (v == best && s < static_cast<std::uint32_t>(expected))) { expected = static_cast<std::int32_t>(s); }
             }
             const std::uint32_t victim_key = expected >= 0 ? tier.key(static_cast<std::uint32_t>(expected)) : 0;
             const Landing l{slot, tier.serial(slot), key};
@@ -501,6 +546,7 @@ int main() {
     try {
         test_lfu();
         test_transitions();
+        test_shadow_rank();
         test_warm_fill();
         test_held();
         test_stream_pins();

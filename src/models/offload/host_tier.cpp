@@ -81,13 +81,20 @@ bool HostTier::eligible(const Slot& s, Victims kind) const {
            s.state == (kind == Victims::kShadow ? SlotState::kShadow : SlotState::kResident);
 }
 
+// Residents leave RAM least-used first. Shadows leave most-used first: a shadow saves a demotion only when its expert
+// leaves VRAM, which takes the least-used experts first, so dropping the least-used experts' shadows (as residents)
+// made nearly every VRAM victim a demotion (upstream Dense8 struct: 24,318 -> 2,057 demotions a request, 2026-10-29).
+double HostTier::victim_value(std::uint32_t key, Victims kind) const {
+    return kind == Victims::kShadow ? -lfu_.value(key) : lfu_.value(key);
+}
+
 void HostTier::push_victim(std::uint32_t slot) {
     Slot& s = slots_[slot];
     ++s.stamp;
     for (const auto kind : {Victims::kShadow, Victims::kResident}) {
         if (!eligible(s, kind)) { continue; }
         auto& heap = heap_[static_cast<int>(kind)];
-        heap.push_back({lfu_.value(s.key), slot, s.stamp});
+        heap.push_back({victim_value(s.key, kind), slot, s.stamp});
         std::push_heap(heap.begin(), heap.end(), [](const HeapEntry& a, const HeapEntry& b) {
             return heap_after(a.value, a.slot, b.value, b.slot);
         });
@@ -105,7 +112,7 @@ std::int32_t HostTier::peek_victim(Victims kind) {
             heap.pop_back();
             continue;
         }
-        const double v = lfu_.value(s.key);
+        const double v = victim_value(s.key, kind);
         if (top.value != v) { // used since it was pushed: re-rank
             std::pop_heap(heap.begin(), heap.end(), less);
             heap.back().value = v;
@@ -177,9 +184,21 @@ bool HostTier::hold(std::uint32_t key) {
 void HostTier::seed_uses(std::span<const std::uint32_t> counts, std::uint32_t cap) {
     if (counts.size() != config_.num_keys) { throw std::invalid_argument("HostTier: the seed counts have another key count"); }
     for (std::uint32_t key = 0; key < config_.num_keys; ++key) {
-        if (counts[key] != 0) { lfu_.use(key, static_cast<double>(std::min(counts[key], cap))); }
+        if (counts[key] != 0) {
+            lfu_.use(key, static_cast<double>(std::min(counts[key], cap)));
+            rerank_shadow(key);
+        }
     }
     // Residents' heap entries carry their old values; peek_victim re-ranks them when it meets them.
+}
+
+void HostTier::rerank_shadow(std::uint32_t key) {
+    // A use raises a shadow's rank (shadows leave most-used first), and peek_victim re-ranks lazily only entries that
+    // fell: the shadow's entry is replaced.
+    const std::int32_t slot = slot_of_[key];
+    if (slot >= 0 && eligible(slots_[static_cast<std::uint32_t>(slot)], Victims::kShadow)) {
+        push_victim(static_cast<std::uint32_t>(slot));
+    }
 }
 
 std::uint32_t HostTier::release_shadows() {
@@ -261,7 +280,10 @@ void HostTier::release_stream_pins() {
 
 void HostTier::record_uses(double dt, std::span<const std::uint32_t> keys, double weight) {
     lfu_.advance(dt);
-    for (const auto k : keys) { lfu_.use(k, weight); }
+    for (const auto k : keys) {
+        lfu_.use(k, weight);
+        rerank_shadow(k);
+    }
 }
 
 std::size_t HostTier::admit(std::span<const Landing> landings, bool prefetch) {
