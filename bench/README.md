@@ -795,6 +795,9 @@ vector are 516 for FP8, 288 for NVFP4, 402 for K8V4 (258-byte K plus 144-byte V)
 complete Op latency. Payload rates exclude repeated reads and do not measure DRAM bandwidth.
 Logical FLOPs do not model private operand conversion, padding, or additional quantization work;
 the benchmark therefore does not infer Tensor Core utilization from a storage-format label.
+Each case's second report line ends with `output_fnv`, the FNV-1a hash of the output after the
+timed calls (every call of a case writes the same output), so bits can be compared across builds
+and KV storages instead of inferred from timings.
 
 Use ordinary benchmark latency `t`, not profiler replay duration, for effective roofline fractions:
 `unique_kv_bytes / (t * peak_bandwidth)` and

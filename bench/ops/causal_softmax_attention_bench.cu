@@ -114,6 +114,7 @@ struct Result {
     std::size_t graph_nodes = 0, workspace_peak = 0;
     int graph_calls = 1;
     ops::CausalAttentionExecutionEnvelope envelope{};
+    std::uint64_t output_hash = 0; // FNV-1a of the output after the timed calls (bits across builds and storages)
 };
 
 [[noreturn]] void usage(const char* message) {
@@ -610,6 +611,16 @@ public:
         }
     }
 
+    // FNV-1a over the output's bytes (every call of a case writes the same output).
+    [[nodiscard]] std::uint64_t output_hash() const {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<unsigned char> bytes(output_.bytes);
+        CUDA_CHECK(cudaMemcpy(bytes.data(), output_.p, output_.bytes, cudaMemcpyDeviceToHost));
+        std::uint64_t hash = 0xCBF29CE484222325ULL;
+        for (const unsigned char byte : bytes) { hash = (hash ^ byte) * 0x100000001B3ULL; }
+        return hash;
+    }
+
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
 
     [[nodiscard]] ops::CausalAttentionExecutionEnvelope envelope() const { return envelope_; }
@@ -805,10 +816,10 @@ void report(const Result& result) {
     std::printf("  vectors K=%.0f V=%.0f bytes cache logical=%.0f physical=%.0f bytes "
                 "qk_flops=%.0f pv_flops=%.0f qk_full_op=%7.2f TFLOP/s "
                 "pv_full_op=%7.2f TFLOP/s unique_kv=%.0f bytes "
-                "unique_cache_rate=%8.1f GB/s\n",
+                "unique_cache_rate=%8.1f GB/s output_fnv=%016llx\n",
                 result.key_vector_bytes, result.value_vector_bytes, result.logical_cache_bytes,
                 result.physical_cache_bytes, result.qk_flops, result.pv_flops, qk_tflops, pv_tflops,
-                result.unique_kv_bytes, cache_gbps);
+                result.unique_kv_bytes, cache_gbps, static_cast<unsigned long long>(result.output_hash));
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -1065,6 +1076,7 @@ int main(int argc, char** argv) {
                                         result.timing.median_us /= result.graph_calls;
                                         result.timing.min_us /= result.graph_calls;
                                         result.timing.p95_us /= result.graph_calls;
+                                        result.output_hash = data.output_hash();
                                         report(result);
                                         results.push_back(result);
                                     }
