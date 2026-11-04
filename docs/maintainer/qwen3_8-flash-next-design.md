@@ -1363,6 +1363,14 @@ the argmax path) and also writes each draft's temperature-1 probability at its s
 back with the drafts. The block width is a runtime choice (K = `--draft-tokens`, 1..7, the widest
 column-invariant verification).
 
+The proposal head's top-16 over its 131,072 rows runs in two launches after its producer kernel: a
+selection kernel takes each column's 4,096-key slices of producer keys — a thread sorts its sixteen
+keys in registers (bitonic network) and warp and CTA butterflies keep the top sixteen of two sorted
+lists — and one warp per column then merges the slices' lists. No completion counters, so no clear
+kernel and no atomics, and the workspace carries only the producer keys and the slices' lists.
+Keys are unique (distinct ids), so the selected keys and their order are those of a full sort: the
+selection is bit-equal to a full stable sort whatever the merge tree, ties included.
+
 ### 11.4 Draft-length policy
 
 `--draft-tokens auto` chooses per round. K = 0 (a plain round) is always a candidate, so the
