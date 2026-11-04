@@ -21,6 +21,7 @@
 // sixteen 32 x 16 consumer warps. Entry-major x planes read through tensor maps made the GEMMs only
 // ~1.4 % faster and cost a per-entry x encoding (0.25 ms per 4K call) and 8x the x workspace.
 
+#include "ops/offloaded_sparse_moe/cuda/a16_limbs.cuh"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.cuh"
 
 namespace infernix::ops::offloaded_moe::wide {
@@ -71,10 +72,7 @@ __device__ __forceinline__ int a16_tile_row(int warp_n, int r, int tig) {
     return (ScheduleA16::kGroupsPerWarp * warp_n + (r >> 1)) * 16 + 8 * (r & 1) + 2 * tig;
 }
 
-// s += p * w in int64 (one IMAD.WIDE on the accumulator's own registers).
-__device__ __forceinline__ void fold(long long& s, int p, int w) {
-    asm("mad.wide.s32 %0, %1, %2, %0;" : "+l"(s) : "r"(p), "r"(w));
-}
+// fold is a16_limbs.cuh's (the limb planes and their helpers are shared with the narrow route).
 
 // Doubled E2M1 codes of row r (0..15) of a unit at k = 4q..4q+3, as four signed bytes.
 __device__ __forceinline__ unsigned a16_codes(const std::uint8_t* unit, int r, int q) {

@@ -124,9 +124,11 @@ struct ExpertsWorkspace {
     std::uint8_t* h_rows;         // [entries][kA16HRowBytes]: BF16 h, rewritten as limbs for wide entries
     std::int32_t* x_emax;         // [columns]: column exponent of each token's x
     std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h
-    // W4A16 narrow route (both wide routes): every token's x in its dp4a layout, encoded once per call
+    // W4A16 narrow routes (moe_layer.cu): the dp4a route's x of narrow calls (every token's
+    // A16Act rows) and the tensor-core kernels' jobs' gate/up CTA counts of wide calls
     std::uint8_t* x_acts;         // [columns][kA16XRowBytes]
     std::int32_t* x_acts_emax;    // [columns]
+    std::uint32_t* job_ctas;      // [max_jobs]
     // W4A16, residual A4 (h_rows holds the BF16 h)
     std::uint8_t* x_terms_plane;  // [entries][kXTermsRowBytes]
     std::uint8_t* x_token_terms;  // [columns][kXTermsRowBytes]: each token's terms, copied to its entries

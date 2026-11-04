@@ -178,9 +178,10 @@ private:
 };
 
 void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
-                moe::ExpertActivation activation = moe::ExpertActivation::kA4) {
+                moe::ExpertActivation activation = moe::ExpertActivation::kA4,
+                moe::WideA16 wide_a16 = moe::WideA16::kExact) {
     const bool a16 = activation == moe::ExpertActivation::kA16;
-    if (a16) { std::printf("--- W4A16 experts\n"); }
+    if (a16) { std::printf("--- W4A16 experts (%s workspace)\n", wide_a16 == moe::WideA16::kA4Residual ? "A4 residual" : "exact"); }
     std::mt19937 rng(seed);
     const std::size_t stride = moe::kRecordBytes;
     std::vector<fixtures::Expert> bank;
@@ -280,7 +281,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns, activation)),
+    cuda_check(cudaMalloc(&d_workspace,
+                          infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns, activation, wide_a16)),
                "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
@@ -503,6 +505,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                             .cpu = config.service != nullptr ? config.service->channel(0)
                                                                              : infernix::ops::MoeCpuChannel{}};
         source.activation           = activation;
+        source.wide_a16             = wide_a16;
         source.heartbeat_timeout_ns = config.fetch == Responder::Mode::kSilent ? kSilentHeartbeatTimeoutNs : kTestHeartbeatTimeoutNs;
         if (config.service != nullptr) {
             // The CPU wait warms these into L2 while the host works; no output may change.
@@ -1329,8 +1332,11 @@ int main() {
         test_tail_skip(48, 6, 10, 5, 403);  // MTP verification width: an expert skips only if every column ranks it low
         test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
         // W4A16 experts (§17.3): decode, verification, several columns per expert, many misses, and
-        // a short prompt's call (experts of more than eight columns on the narrow kernels). Calls of
-        // four columns take the one-column kernels and of five or more the multi-column ones.
+        // a short prompt's call. A call of at most kA16RowsMaxColumns (moe_layer.cu) columns runs
+        // the dp4a rows kernels, a wider one the tensor-core kernels: the routing boundary is
+        // covered at both sides, and the A4 residual workspace at call widths of both routes whose
+        // jobs are all narrow (its wide jobs are the residual route's, not the CPU engine's bits):
+        // the 132-column residual call keeps every job narrow at top-3.
         constexpr auto kA16 = moe::ExpertActivation::kA16;
         test_layer(12, 1, 10, 41, kA16);
         test_layer(24, 8, 10, 43, kA16);
@@ -1339,6 +1345,20 @@ int main() {
         test_layer(9, 12, 3, 71, kA16);
         test_layer(96, 10, 10, 59, kA16);
         test_layer(512, 512, 10, 61, kA16);
+        // The dp4a rows kernels' own shapes: 16- and 64-column calls (1-6 columns per job) and a
+        // call of about eight columns per job, then the routing boundary itself: 128 columns is
+        // the last width on them, 129 and 160 the tensor-core kernels'.
+        test_layer(96, 16, 10, 73, kA16);
+        test_layer(400, 64, 10, 79, kA16);
+        test_layer(9, 24, 3, 83, kA16);
+        test_layer(400, 128, 10, 105, kA16);
+        test_layer(400, 129, 10, 107, kA16);
+        test_layer(400, 160, 10, 109, kA16);
+        test_layer(512, 2048, 10, 89, kA16);
+        test_layer(12, 1, 10, 97, kA16, moe::WideA16::kA4Residual);
+        test_layer(9, 3, 3, 101, kA16, moe::WideA16::kA4Residual);
+        test_layer(24, 8, 10, 103, kA16, moe::WideA16::kA4Residual);
+        test_layer(512, 132, 3, 111, kA16, moe::WideA16::kA4Residual);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

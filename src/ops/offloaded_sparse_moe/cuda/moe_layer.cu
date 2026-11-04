@@ -7,7 +7,10 @@
 // so every weight unit is read once per pass of eight columns. Products are dp4a over doubled
 // E2M1 codes and the block sums are exact int64, so the outputs equal the CPU engine's bits.
 // Experts with more than eight columns in a call take the tensor-core wide route instead
-// (wide_expert.h); these kernels skip them.
+// (wide_expert.h); these kernels skip them. Experts stored without activation scales (W4A16,
+// §17.3) take the dp4a kernels below in calls of at most kA16RowsMaxColumns columns (decode,
+// verification) and the tensor-core kernels of narrow_a16_mma.cuh in wider ones; a GGUF import's
+// or block-FP8 bank runs its own exact kernels (ggml_expert.cuh, fp8_expert.cuh).
 
 #include "infernix/ops/offloaded_sparse_moe.h"
 
@@ -20,6 +23,7 @@
 #include "ops/ggml/ggml_bf16_tile.cuh"
 #include "ops/ggml/ggml_tile.cuh"
 #include "ops/fp8_block/fp8_exact.h"
+#include "ops/offloaded_sparse_moe/cuda/a16_limbs.cuh"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include <cuda_bf16.h>
@@ -1002,8 +1006,8 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
 // every product is three dp4a (signed codes times the unsigned lo and mid bytes and the signed hi
 // bytes of X), so P_b and the int64 row sums are the CPU engine's bit for bit. Gate/up CTAs write
 // h in BF16 to the entry's row of the workspace's h rows (wide_expert.h); down CTAs encode it under
-// its own column exponent.
-
+// its own column exponent. A call of at most kA16RowsMaxColumns columns runs these kernels; a wider
+// call's narrow jobs run the tensor-core kernels of narrow_a16_mma.cuh (included below).
 
 // An encoded A16 block in the layout the dp4a loop reads: four elements' bytes per word.
 struct A16Act {
@@ -1017,63 +1021,6 @@ __device__ __forceinline__ int dp4a_su(int a, std::uint32_t b, int c) {
     int d;
     asm("dp4a.s32.u32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
     return d;
-}
-
-// Encodes `n` <= Columns BF16 columns of `length` elements, column c at base(c), into acts
-// [c][length / 16] with their exponents in emax[c]. Every thread of the CTA calls it; it ends with
-// a barrier.
-template <int Columns, class Base>
-__device__ void encode_a16_columns(Base base, int n, int length, A16Act* acts, int* emax,
-                                   unsigned (&key)[kWarps][Columns]) {
-    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int vectors = length / 8; // uint4 loads of 8 elements
-    unsigned m[Columns];
-#pragma unroll
-    for (int c = 0; c < Columns; ++c) { m[c] = 0; }
-    for (int i = threadIdx.x; i < n * vectors; i += blockDim.x) {
-        const int c   = i / vectors;
-        const uint4 v = reinterpret_cast<const uint4*>(base(c))[i % vectors];
-        const unsigned words[4] = {v.x, v.y, v.z, v.w};
-        unsigned mm = 0;
-#pragma unroll
-        for (int w = 0; w < 4; ++w) { mm = max(mm, max(words[w] & 0x7FFFU, (words[w] >> 16) & 0x7FFFU)); }
-#pragma unroll
-        for (int cc = 0; cc < Columns; ++cc) {
-            if (cc == c) { m[cc] = max(m[cc], mm); }
-        }
-    }
-#pragma unroll
-    for (int c = 0; c < Columns; ++c) {
-        m[c] = __reduce_max_sync(0xFFFFFFFFU, m[c]);
-        if (lane == 0) { key[warp][c] = m[c]; }
-    }
-    __syncthreads();
-    if (static_cast<int>(threadIdx.x) < n) {
-        unsigned k = 0;
-        for (int w = 0; w < kWarps; ++w) { k = max(k, key[w][threadIdx.x]); }
-        emax[threadIdx.x] = k >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(k >> 7), 1);
-    }
-    __syncthreads();
-    const int blocks = length / 16;
-    for (int i = threadIdx.x; i < n * blocks; i += blockDim.x) {
-        const int c = i / blocks, b = i % blocks;
-        const int e = emax[c];
-        const auto* src = reinterpret_cast<const uint4*>(base(c) + 16 * b);
-        const uint4 v0 = src[0], v1 = src[1];
-        const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
-        A16Act out{};
-#pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const auto h  = static_cast<std::uint16_t>(j % 2 == 0 ? words[j / 2] & 0xFFFFU : words[j / 2] >> 16);
-            const auto xv = static_cast<std::uint32_t>(e == canon::kA16NonFinite ? 0 : canon::a16_value(h, e));
-            const int q = j / 4, s = 8 * (j % 4);
-            out.lo[q] |= (xv & 0xFFU) << s;
-            out.mid[q] |= ((xv >> 8) & 0xFFU) << s;
-            out.hi[q] = static_cast<std::int32_t>(static_cast<std::uint32_t>(out.hi[q]) | (((xv >> 16) & 0xFFU) << s));
-        }
-        acts[c * blocks + b] = out;
-    }
-    __syncthreads();
 }
 
 // The A16 narrow passes. Every token's x is encoded once per call (encode_x_acts_kernel) instead of
@@ -1408,18 +1355,34 @@ void launch_expert_pass_a16_rows(const MoeDispatch& dispatch, const MoeExpertSou
                                     flags, base, static_cast<const std::uint16_t*>(h_plane), outputs, phase));
 }
 
+// The dp4a rows kernels' call width. Calls of at most this many columns stay on them: the
+// tensor-core kernels' down pass measured 300-380 us/round slower at every decode and verification
+// width on the real model (T1 kernel table, RTX PRO 6000, production stopped) and their whole-op
+// time 0.9-12 % slower through T = 48 at the op bench (cold L2, frames, interleaved A/B, min of
+// 2x2 runs), the two level to T = 128. Wider calls (prefill chunks) run the tensor-core kernels
+// for their narrow jobs: level at 112-128 and 0.9-8 % faster from T = 160 on (T = 256 -7.9 %,
+// T = 1024 -5.8 %, min-of-mins; the mixed narrow/wide widths 56-192 wobble a few percent run to
+// run, so the boundary sits below the first width where the tensor-core kernels win outside
+// that wobble). The boundary table is in the commit message.
+constexpr int kA16RowsMaxColumns = 128;
+static_assert(kA16RowsMaxColumns >= kRouteDispatchColumns,
+              "the in-place route plan's fused kernel encodes the dp4a x at its whole width");
+
 #include "ops/offloaded_sparse_moe/cuda/ggml_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/fp8_expert.cuh"
+#include "ops/offloaded_sparse_moe/cuda/narrow_a16_mma.cuh"
 
-// One pass of the narrow kernels in the source's arithmetic. W4A4 and W4A16 jobs of any width take
-// the one-column kernels (one pass per column over the job's weights). A GGUF import's or
-// block-FP8 bank runs its own exact kernels.
+// One pass of the narrow kernels in the source's arithmetic. W4A4 jobs of any width take the
+// one-column kernels (one pass per column over the job's weights). W4A16 jobs take the dp4a rows
+// kernels in calls of at most kA16RowsMaxColumns columns and the tensor-core kernels in wider
+// ones. A GGUF import's or block-FP8 bank runs its own exact kernels.
 void launch_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
                  PassPhase phase = PassPhase::All) {
     // Wide calls (more than kMaxColumns columns) were planned by moe_experts.
-    const bool wide = columns_out / top_k > moe::kMaxColumns;
+    const int columns = columns_out / top_k;
+    const bool wide   = columns > moe::kMaxColumns;
     if (source.ggml.gate_up_format == QType::FP8_E4M3FN_B128) {
         launch_expert_pass_fp8(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
                                wide ? columns_out : 0);
@@ -1427,12 +1390,17 @@ void launch_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSour
     }
     if (ggml_bank(source)) {
         launch_pass_ggml(x, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
-                         wide ? columns_out : 0);
+                        wide ? columns_out : 0);
         return;
     }
     if (source.activation == moe::ExpertActivation::kA16) {
-        launch_expert_pass_a16_rows(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream,
-                                    phase);
+        if (columns <= kA16RowsMaxColumns) {
+            launch_expert_pass_a16_rows(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,
+                                        stream, phase);
+        } else {
+            launch_expert_pass_a16_nmma(columns, dispatch, source, top_k, job_records, flags, base, jobs, layout,
+                                        outputs, stream, phase);
+        }
         return;
     }
     launch_expert_pass(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks, columns_out, outputs,
@@ -2111,7 +2079,8 @@ MoeRoutePlan moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, M
                 "route plan needs the experts' BF16 x and a job capacity");
         const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1], x.ne[1],
                                                                source.activation, source.wide_a16);
-        CUDA_CHECK(pdl::launch_consumer({dim3(1 + columns), dim3(kDispatchThreads), 0, stream}, route_dispatch_resolve_kernel,
+        CUDA_CHECK(pdl::launch_consumer({dim3(1 + columns), dim3(kDispatchThreads), 0, stream},
+                                        route_dispatch_resolve_kernel,
                                         static_cast<const float*>(logits.data), experts, columns,
                                         static_cast<int>(top_k), static_cast<std::int32_t*>(routing.ids.data),
                                         static_cast<float*>(routing.weights.data),
@@ -2214,8 +2183,16 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     }
     const std::int32_t* flags = cpu ? cpu_flags : nullptr;
     // The A16 narrow route reads every token's encoded x, encoded once here (or by the in-place
-    // route plan), before any fork.
-    if (!ggml && source.activation == moe::ExpertActivation::kA16 && !in_place) { launch_encode_x_acts(x, layout, stream); }
+    // route plan), before any fork: the dp4a rows kernels' acts in calls of at most
+    // kA16RowsMaxColumns columns, the tensor-core kernels' limbs with the jobs' gate/up CTA counts
+    // in wider ones.
+    if (!ggml && source.activation == moe::ExpertActivation::kA16 && !in_place) {
+        if (x.ne[1] <= static_cast<std::int64_t>(kA16RowsMaxColumns)) {
+            launch_encode_x_acts(x, layout, stream);
+        } else {
+            launch_prepare_a16_nmma(x, static_cast<int>(max_jobs), layout, stream);
+        }
+    }
     // A ggml bank's gate/up kernels read every token's x limbs, encoded once here, before any fork.
     if (ggml) {
         launch_encode_x_ggml(x, layout, stream);

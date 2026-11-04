@@ -869,12 +869,17 @@ equal the CPU engine's bits wherever the expert ran. Instructions per layer call
 the gate/up pass and stages its weights before the PDL wait — only h, the pass's output, is read
 after it — for another +3.3 % plain, +2.3 % MTP.
 
-**W4A16** (`gate_up_rows_kernel_a16` / `down_rows_kernel_a16`, banks without stored activation
-scales): x is encoded once per call (`encode_x_acts_kernel`), a gate/up CTA takes one row group with
-its weights in registers (three CTAs per SM, 80 registers), and the products are exact dp4a over
-byte limbs with wrapping int32 partials (§17). One-column passes beat multi-column forms at every
-width measured — 1-3 columns per expert, 6-48 per call (RTX PRO 6000, 2026-10-21) — at 33 / 109 /
-191 µs per layer call at T = 1 / 6 / 12 (2026-10-24).
+**W4A16** (banks without stored activation scales) splits by call width. Calls of at most 128
+columns — every decode and verification width — run `gate_up_rows_kernel_a16` /
+`down_rows_kernel_a16`: x is encoded once per call (`encode_x_acts_kernel`), a gate/up CTA takes one
+row group with its weights in registers (three CTAs per SM, 80 registers), and the products are
+exact dp4a over byte limbs with wrapping int32 partials (§17), at 33 / 109 / 191 µs per layer call
+at T = 1 / 6 / 12 (2026-10-24); their down pass measured 300-380 µs/round faster than the
+tensor-core kernels' at the model's decode and verification widths (T1 kernel table, RTX PRO 6000,
+2026-11-03). Wider calls run the tensor-core narrow kernels (`narrow_a16_mma.cuh`) for their
+narrow jobs (§17.3): per 16-element block one m16n8k32 pair over A = [8 c | c] gives the exact
+int32 P_b for up to eight columns at once, 0.9-8 % faster than the dp4a kernels for the whole op
+from T = 160 on and level to T = 128 (op bench, cold L2, interleaved A/B, 2026-11-04).
 
 **Wide route** (a call of more than 8 columns, per-expert column count above 8): a block-scaled
 tensor-core grouped GEMM (`mma.kind::mxf4nvf4.block_scale`) with the same canonical A4 inputs; the
@@ -2639,11 +2644,21 @@ y   = bf16_rn( (fl32_rn(S) · 2^(emax − 157)) ⊗ m ),   m = fl32(1 / weight g
 m is stored in the record's tail (§6); the power-of-two scaling takes two exact steps, so a
 subnormal product rounds once; a non-finite column gives the canonical NaN (0x7FC0) in every row.
 The semantic boundaries are x (BF16) → A16 → gate/up → BF16 → SwiGLU → BF16 h → A16 → down → BF16
-y_e → combine. The byte limbs make every product a byte product: the GPU narrow kernels use dp4a
-(signed codes against unsigned lo/mid bytes and signed hi bytes); the CPU uses `vpmaddubsw` on lo
-and mid and biased codes (c2 + 12) against signed hi bytes, subtracting 12 · Σ hi per block — three
-byte products per weight instead of one, so the CPU's integer work per miss triples (§10.2) while
-the GPU narrow kernels stay bound by the record reads they share with A4.
+y_e → combine. The GPU narrow route splits by call width (moe_layer.cu): calls of at most 128
+columns — every decode and verification width — keep the register-streamed dp4a kernels (signed
+codes against the unsigned lo and mid bytes and the signed hi bytes of X, one column at a time
+against the weights a warp holds in registers; their down pass measured 300-380 µs/round faster
+than the tensor-core kernels' at the model's decode and verification widths, T1 kernel table, RTX
+PRO 6000, 2026-11-03). Wider calls — prefill chunks — run the tensor-core kernels
+(narrow_a16_mma.cuh) for their narrow jobs: x is encoded once per call into the wide route's limb
+rows, per 16-element block one m16n8k32 pair over A = [8 c | c] (the record's word gives both rows
+of a 16-row group) gives the exact int32 P_b for up to eight columns at once, and the job's last
+gate/up CTA rewrites its h as limbs for the down CTAs — the same exact int64 sums, on int8 tensor
+cores: 0.9-8 % faster than the dp4a kernels for the whole op from T = 160 on, level to T = 128 (op
+bench, cold L2, frames, interleaved A/B, min of 2x2 runs, 2026-11-04). The CPU keeps the byte
+limbs: `vpmaddubsw` on lo and mid and biased codes (c2 + 12) against signed hi bytes, subtracting
+12 · Σ hi per block — three byte products per weight instead of one, so the CPU's integer work per
+miss triples (§10.2).
 
 **Wide route** (`wide_expert_a16.cuh`, integer tensor cores). X is split as 2^14·H1 + 2^11·H0 +
 8·L1 + L0; per 16-element block, two `mma.m16n8k32` with B = [8·c2 | c2] give c2·X exactly in
