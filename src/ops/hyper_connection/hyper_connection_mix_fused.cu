@@ -497,7 +497,9 @@ __device__ __forceinline__ void bf16x8_bits_to_floats(const uint4& bits, float (
     v[0] = a.x, v[1] = a.y, v[2] = b.x, v[3] = b.y, v[4] = c.x, v[5] = c.y, v[6] = d.x, v[7] = d.y;
 }
 
-// K1a with v4's staging (see above): one row of W_down per warp, 8 warps per CTA. Shared Rn:
+// K1a with v4's staging (see above): one row of W_down per warp, 8 warps per CTA. A pass's 8 column
+// sums (the squares, and each row's dot products) reduce by one transposed butterfly each, 9 shuffles
+// for 8 x 5, with warp_sum's bits (see warp_sum8_transposed). Shared Rn:
 // [pass column][plane][kHidden / 2]. The four stream CTAs of a row block form a cluster: each keeps
 // its row sums in shared memory, and stream 0's CTA forms K1b's z = 0 + p0 + p1 + p2 + p3 from them
 // and writes m = SiLU(z / S) (in K1b's plane layout, [T][2][rank / 2]) and the injects once for the
@@ -569,12 +571,12 @@ __global__ __cluster_dims__(1, kStreams, 1) __launch_bounds__(kDownThreads, 1) v
                 }
             }
         }
-#pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
-            if (c < pass) {
-                const float total = warp_sum(sums[c]);
-                if (lane == 0) { scratch[warp][c] = total; }
-            }
+        // The pass's 8 column sums by one transposed butterfly (9 shuffles for 8 x 5): lane 4c holds column c's
+        // warp_sum, bit for bit (see warp_sum8_transposed); a column past the pass sums zeros and is not stored.
+        static_assert(kPassColumns == 8, "the transposed butterfly reduces eight values");
+        {
+            const float total = warp_sum8_transposed(sums, lane);
+            if ((lane & 3) == 0 && (lane >> 2) < pass) { scratch[warp][lane >> 2] = total; }
         }
         __syncthreads();
         if (static_cast<int>(threadIdx.x) < pass) {
@@ -645,15 +647,13 @@ __global__ __cluster_dims__(1, kStreams, 1) __launch_bounds__(kDownThreads, 1) v
                 }
             }
         }
+        // Each row's 8 column sums by one transposed butterfly: lane 4c stores column c (row_sums is
+        // shared and oversized; stream 0's CTA skips the rows past down_rows, so no row bound here).
 #pragma unroll
         for (int r = 0; r < RowsPerWarp; ++r) {
-#pragma unroll
-            for (int c = 0; c < kPassColumns; ++c) {
-                if (c < pass) {
-                    const float total = warp_sum(acc[r][c]);
-                    if (lane == 0) { row_sums[warp * RowsPerWarp + r][c0 + c] = total; }
-                }
-            }
+            const float total = warp_sum8_transposed(acc[r], lane);
+            const int c       = lane >> 2;
+            if ((lane & 3) == 0 && c < pass) { row_sums[warp * RowsPerWarp + r][c0 + c] = total; }
         }
         __syncthreads(); // the next pass overwrites rn
     }
