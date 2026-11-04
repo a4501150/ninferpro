@@ -62,6 +62,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
     ServeOptionArity{"--log-stats-panel"},
+    ServeOptionArity{"--log-file"},
     ServeOptionArity{"--max-request-mib"},
     ServeOptionArity{"--media-cache-mib"},
     ServeOptionArity{"--media-live-mib"},
@@ -607,6 +608,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             terminals only)\n"
            "  --log-level L              pretty stderr verbosity (trace|debug|info|warning|\n"
            "                             error|critical|off; default info)\n"
+           "  --log-file PATH            also append plain timestamped log records to PATH\n"
+           "                             beside the console (each written as it is logged)\n"
            "  --debug LIST               log the Engine's trace lines for these subsystems,\n"
            "                             comma-separated: prefix-cache, disk, scheduler,\n"
            "                             all (off by default; shown at any --log-level)\n"
@@ -822,6 +825,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.log_stats_panel = false;
             } else {
                 throw std::invalid_argument("--log-stats-panel accepts on or off");
+            }
+        } else if (arg == "--log-file") {
+            options.log_file = require_value("--log-file");
+            if (options.log_file.empty()) {
+                throw std::invalid_argument("--log-file needs a path");
             }
         } else if (arg == "--max-request-mib") {
             const std::uint64_t mib =

@@ -1297,6 +1297,7 @@ The Qwen3.8-Flash-Next expert options — `--experts`, `--expert-swap`, `--exper
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
+| `--log-file PATH` | duplicate the console log records to a plain timestamped file (appended, each record written through as it is logged, so a crash leaves every earlier record in it) beside, never instead of, the console; the file carries no logger-added colour or cursor control, and records that colour their own message under `--log-colours` (the serve panels) keep those escapes; a file that cannot be opened leaves the console logging, with a warning | none |
 | `--debug LIST` | log the Engine's trace lines for these subsystems at any log level, comma-separated: `prefix-cache` (captures, refusals, evictions, selections), `disk` (the prefix cache's Disk tier), `scheduler` (admissions, deferrals, pauses, restores), or `all` | off |
 | `--device N` | CUDA device index | `0` |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |

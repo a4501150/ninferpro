@@ -82,6 +82,18 @@ int main() {
     failures += check(missing_yarn_rejected, "missing serving YaRN factor accepted");
     failures += check(serve_usage_text("infernix-serve").find("--rope-yarn-factor") != std::string::npos,
                       "serving help omits YaRN");
+    // --log-file: duplicate console records to a plain timestamped file (console-only by default).
+    failures += check(parse({"infernix-serve", "model.ninfer"}).log_file.empty(),
+                      "--log-file must default to console-only");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--log-file", "logs/console.log"}).log_file ==
+                          "logs/console.log",
+                      "--log-file must set the duplicate path");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--log-file", ""}).empty(),
+                      "an empty --log-file path must be refused");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--log-file"}).empty(),
+                      "a missing --log-file value must be refused");
+    failures += check(serve_usage_text("infernix-serve").find("--log-file") != std::string::npos,
+                      "serving help must list --log-file");
     const auto archive = parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});
