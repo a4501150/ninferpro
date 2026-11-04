@@ -8,7 +8,10 @@
 // last completion) and the DFlash2 drafting; the summary gives the median and the range. Reads
 // INFERNIX_QWEN4_ARTIFACT, INFERNIX_QWEN4_DFLASH2 and INFERNIX_QWEN4_NGRAM (`make t2-bench`).
 //
-//   infernix_qwen4_exp_engine_bench [--concurrency C] [--tokens N] [--repeat R]
+//   infernix_qwen4_exp_engine_bench [--concurrency C] [--tokens N] [--repeat R] [--fast-path NAME]...
+//
+// --fast-path adds a candidate to the qualified selection (EngineOptions::fast_path_candidates), so
+// a candidate's end-to-end speed is measured before its gate.
 
 #include "infernix/engine.h"
 
@@ -27,8 +30,9 @@ namespace {
 constexpr std::size_t kMaxConcurrency = 8;
 
 infernix::EngineOptions production_options(const char* artifact, const char* ngram, const char* drafter,
-                                           std::uint32_t lanes) {
+                                           std::uint32_t lanes, const std::vector<infernix::FastPath>& candidates) {
     infernix::EngineOptions options;
+    options.fast_path_candidates = candidates;
     options.artifact_path = artifact;
     if (ngram != nullptr && *ngram != '\0') { options.ngram_volume_path = ngram; }
     options.kv_cache                      = infernix::KvCacheStorage::Fp8E4M3Row256;
@@ -111,11 +115,21 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::uint32_t concurrency = 6, tokens = 256, repeat = 3;
+    std::vector<infernix::FastPath> candidates;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (i + 1 >= argc) {
             std::fprintf(stderr, "%s needs a value\n", arg.c_str());
             return 2;
+        }
+        if (arg == "--fast-path") {
+            const auto path = infernix::parse_fast_path(argv[++i]);
+            if (!path) {
+                std::fprintf(stderr, "unknown fast path %s\n", argv[i]);
+                return 2;
+            }
+            candidates.push_back(*path);
+            continue;
         }
         const auto value = static_cast<std::uint32_t>(std::stoul(argv[++i]));
         if (arg == "--concurrency") {
@@ -135,9 +149,12 @@ int main(int argc, char** argv) {
     }
     try {
         const auto t0 = std::chrono::steady_clock::now();
-        infernix::Engine engine(production_options(artifact, ngram, drafter, concurrency));
+        infernix::Engine engine(production_options(artifact, ngram, drafter, concurrency, candidates));
         std::printf("engine started in %.1f s; %u concurrent requests of %u tokens\n",
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), concurrency, tokens);
+        std::string paths;
+        for (const std::string& name : engine.load_summary().fast_paths) { paths += (paths.empty() ? "" : ",") + name; }
+        std::printf("fast paths: %s\n", paths.empty() ? "none" : paths.c_str());
         std::mt19937_64 rng(std::random_device{}());
         print_set("warm-up", run_set(engine, concurrency, tokens, rng, "warm"));
         std::vector<double> speeds;
