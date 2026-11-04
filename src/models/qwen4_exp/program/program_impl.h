@@ -5496,6 +5496,12 @@ private:
                                                   token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p),
                                                   *work_, s);
         }
+        if (sparse) {
+            // The sparse acceptance leaves token counts to the caller (the greedy-draft Op counts each licensed token
+            // itself): each row's licensed tokens count before the next round's penalties.
+            ops::increment_licensed_token_counts(licensed, counts,
+                                                 static_cast<const ops::SamplingConfig*>(configs_.p), s);
+        }
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
         device_.synchronize();
@@ -5513,13 +5519,6 @@ private:
                 live_[static_cast<std::size_t>(b * W + j)]           = j <= A ? 1 : 0;
             }
             pending_counts_[b] = L;
-            if (sparse && lane.sampling.token_counts != nullptr) {
-                // The sparse acceptance leaves token counts to the caller (the greedy-draft Op counts
-                // each licensed token itself): count them before the next round's penalties.
-                Tensor ids(spec_device(spec_layout_.licensed) + static_cast<std::size_t>(b) * W, DType::I32, {L});
-                Tensor token_counts(lane.sampling.token_counts, DType::I32, {token_domain_});
-                ops::increment_token_counts(ids, token_counts, s);
-            }
             if (constrained) {
                 take_constraint_draws(lane, static_cast<std::size_t>(b * W),
                                       std::span<const std::int32_t>(&pending_tokens_[static_cast<std::size_t>(b * W)],
