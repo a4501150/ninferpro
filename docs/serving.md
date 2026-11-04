@@ -112,6 +112,10 @@ How failures end:
   the requests holding lanes and the paused requests, discards their state, logs `<what>: failed N
   running request(s); the Engine keeps serving`, and the Engine carries on with its queue;
   queued requests keep waiting. Recoveries have no consecutive limit.
+- An output decoder that cannot publish a request's committed output — a tool call the parameter
+  decoder refuses, a value past its nesting bound — fails that request only: its lane is
+  released, the request is answered with the error, `<what>: failed 1 request; the Engine keeps
+  serving` is logged, and the Engine keeps serving.
 - Any other exception on the worker, or a recovery that cannot complete (a binding or
   materialization in flight, or the Program's cleanup failing), fails every queued and running
   request and stops the Engine: `/health` then answers 503 and every request fails until the

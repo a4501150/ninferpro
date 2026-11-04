@@ -963,10 +963,10 @@ private:
     void complete_detached_cancelled(const std::shared_ptr<Request>& request) {
         try {
             complete_cancelled(request);
-        } catch (...) {
-            const std::exception_ptr error = std::current_exception();
-            complete_error(request, error);
-            throw;
+        } catch (const std::exception& error) {
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                               "%s: failed 1 request; the Engine keeps serving", error.what());
+            complete_error(request, std::current_exception());
         }
     }
 
@@ -974,6 +974,33 @@ private:
         slots_[lane].reset();
         request_admission_check();
         scheduler_.capacity_released();
+    }
+
+    // Publishes a resident request's committed preview. An output decoder that cannot publish it
+    // (a tool call the parameter decoder refuses, a value past its nesting bound) fails this
+    // request only: its lane is released unless the Program already released it, and the Engine
+    // keeps serving. Returns nothing once the request has been failed.
+    std::optional<PublishedOutput> commit_output(std::uint32_t lane,
+                                                 const std::shared_ptr<Request>& request,
+                                                 bool released) {
+        try {
+            return request->output.commit_preview();
+        } catch (const std::exception& error) {
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                               "%s: failed 1 request; the Engine keeps serving", error.what());
+            const std::exception_ptr failure = std::current_exception();
+            if (!released) {
+                auto aborted = instance_.program->abort(*request->sequence);
+                if (aborted.status != ConsumeStatus::Consumed) {
+                    throw std::logic_error("a request whose output failed could not be released");
+                }
+                request->generation_timings = aborted.timings;
+                request->speculative_stats  = std::move(aborted.speculative);
+            }
+            complete_error(request, failure);
+            remove_completed_slot(lane);
+            return std::nullopt;
+        }
     }
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
@@ -1051,9 +1078,11 @@ private:
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            append_output(request, request->output.commit_preview());
-            complete_success(request, FinishReason::Cancelled);
-            remove_completed_slot(lane);
+            if (auto published = commit_output(lane, request, true)) {
+                append_output(request, std::move(*published));
+                complete_success(request, FinishReason::Cancelled);
+                remove_completed_slot(lane);
+            }
             boundary = begin_host_phase();
             changed  = true;
         }
@@ -1316,9 +1345,10 @@ private:
                 }
                 if (!cancelled[row]) { request->budget->commit(accepted); }
                 update_recovery(request, cancelled[row]);
-                auto published = request->output.commit_preview();
-                auto timing    = record_committed_output(request, accepted);
-                append_output(request, std::move(published), std::move(timing), &phase);
+                auto published = commit_output(lane, request, cancelled[row]);
+                if (!published) { continue; }
+                auto timing = record_committed_output(request, accepted);
+                append_output(request, std::move(*published), std::move(timing), &phase);
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;
@@ -2197,10 +2227,12 @@ private:
             const std::uint32_t lane = membership.lanes[row];
             const auto& request      = slots_[lane];
             request->budget->commit(membership.row_stride);
-            auto timing = record_committed_output(request, membership.row_stride);
-            append_output(request, request->output.commit_preview(), std::move(timing), &phase);
-            update_recovery(request);
-            request->model_state = EngineRequestState::DecodeReady;
+            if (auto published = commit_output(lane, request, false)) {
+                auto timing = record_committed_output(request, membership.row_stride);
+                append_output(request, std::move(*published), std::move(timing), &phase);
+                update_recovery(request);
+                request->model_state = EngineRequestState::DecodeReady;
+            }
         }
         publish_runtime_stats();
     }
