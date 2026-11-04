@@ -624,7 +624,10 @@ to four times the limit; a longer prompt is not tokenized further and reads "mor
 A media preprocessing resource rejection
 returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
-resource errors.
+resource errors. A body whose JSON nests arrays or objects more than 256 levels deep is refused at
+parsing with HTTP 400 (`invalid_request_error`, "request body JSON nests arrays or objects deeper
+than 256 levels"). A tool call's `arguments` JSON string is held to the same bound at prompt
+preparation, for the same reason.
 
 ## OpenAI prompt caching
 

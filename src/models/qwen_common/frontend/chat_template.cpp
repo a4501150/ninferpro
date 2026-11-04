@@ -2,6 +2,7 @@
 
 #include "models/qwen_common/frontend/media_cache.h"
 #include "models/qwen_common/frontend/prompt_layout.h"
+#include "text/json_input.h"
 #include "text/unicode.h"
 
 #include <algorithm>
@@ -284,6 +285,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (!message.tool_calls.empty()) {
             value["tool_calls"] = Json::array();
             for (const auto& call : message.tool_calls) {
+                // A tool call's arguments arrive as a JSON string inside the request body, outside
+                // the body parser's nesting bound; parse them under the same bound, because this
+                // context is walked recursively when it becomes template input.
                 value["tool_calls"].push_back(
                     {{"id", call.id},
                      {"type", "function"},
@@ -291,7 +295,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                       {{"name", call.name},
                        {"arguments",
                         (call.arguments_json.empty() ? Json::object()
-                                                     : Json::parse(call.arguments_json))}}}});
+                                                     : text::parse_json_numbers(
+                                                           call.arguments_json).value)}}}});
             }
         }
         if (!message.tool_call_id.empty()) value["tool_call_id"] = message.tool_call_id;

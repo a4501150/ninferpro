@@ -9,6 +9,7 @@
 #include "models/qwen_common/frontend/tokenizer.h"
 #include "runtime/contract/execution.h"
 #include "runtime/prefix_cache/block_hash.h"
+#include "text/json_input.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -2175,6 +2176,37 @@ int test_tools_and_json_output() {
     return failures;
 }
 
+// A tool call's arguments arrive as a JSON string inside the request body, outside the body
+// parser's nesting bound: the template context walk must refuse what nests past that bound, not
+// overflow the worker stack (the request-side twin of the body guard, candidates QA-04).
+int test_tool_arguments_nesting_bound() {
+    int failures = 0;
+    const std::size_t bound = infernix::text::kMaxJsonNesting;
+    // The arguments object is one level, so `arrays` arrays inside it nest arrays + 1 deep.
+    for (const std::size_t arrays : {bound - 1, bound, std::size_t{100000}}) {
+        fi::ChatMessage message = chat_message(infernix::ChatRole::Assistant, "done");
+        fi::ToolCall call;
+        call.name           = "record";
+        call.arguments_json = "{\"a\":" + std::string(arrays, '[') + std::string(arrays, ']') + "}";
+        message.tool_calls.push_back(std::move(call));
+        bool refused    = false;
+        std::string reason;
+        try {
+            (void)render_chat({chat_message(infernix::ChatRole::User, "question"), message});
+        } catch (const std::invalid_argument& error) {
+            refused = true;
+            reason  = error.what();
+        }
+        failures += check(refused == (arrays + 1 > bound),
+                          "tool call arguments were refused within the nesting bound or accepted past it");
+        if (refused) {
+            failures += check(reason.find("deeper than 256 levels") != std::string::npos,
+                              "too-deep tool call arguments were not refused for their nesting");
+        }
+    }
+    return failures;
+}
+
 int test_structured_tool_output() {
     const Frontend frontend = make_frontend(resources());
 
@@ -3347,6 +3379,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_tools_and_json_output();
+    failures += test_tool_arguments_nesting_bound();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_open_reasoning_tool_recovery();
     failures += test_reasoning_split(frontend);
