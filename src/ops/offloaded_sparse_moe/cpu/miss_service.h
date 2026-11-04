@@ -37,6 +37,9 @@ public:
         int max_jobs    = 4;     // CPU-served experts per layer call, at most kMaxCpuJobs
         int max_columns = 64;    // calls with more columns stay on the GPU, at most kMaxCpuCallColumns
         int pcie_divisor = 3;    // misses / pcie_divisor stay on the GPU stage (0: none)
+        int pcie_share   = 0;    // a share in 256ths instead of the divisor rule (0: the rule; MoeCpuChannel)
+        int wide_share   = 0;    // calls of at least wide_share_from columns take this share instead (0: none)
+        int wide_share_from = 0; // the wide share's column threshold (0: none)
         int one_column_divisor = 0; // one-column calls' divisor instead (0: pcie_divisor)
         int max_job_columns = kMaxCpuColumns; // misses with more columns stay on the GPU
         int wide_from   = 0;     // calls of at least this many columns (0: none) take wide_jobs as their cap

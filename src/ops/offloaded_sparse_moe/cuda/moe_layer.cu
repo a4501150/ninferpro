@@ -1445,10 +1445,12 @@ void launch_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSour
 // reads of several jobs are in flight at once.
 constexpr int kWaitCtas = offloaded_moe::kMaxCpuJobs < 8 ? offloaded_moe::kMaxCpuJobs : 8;
 
-// One CTA picks the CPU jobs: of the call's M misses, want = min(cap, M - M / d) of
+// One CTA picks the CPU jobs: of the call's M misses, want = min(cap, M - kept) of
 // those with at most max_job_columns columns, the fewest-column ones first and, within a width, in
 // job order; cap is max_jobs, or wide_jobs for calls of at least wide_from columns (prefill
-// assist); d is pcie_divisor, or one_column_divisor (when set) in a one-column call (none for d = 0).
+// assist); the link keeps M / one_column_divisor in a one-column call (when set), else
+// (M * wide_share) >> 8 in a call of at least wide_share_from columns, else (M * pcie_share) >> 8
+// with a share, else M / pcie_divisor (none for 0).
 // Each thread ranks its jobs among their width with warp ballots, so no thread walks the
 // job list. The chosen jobs are marked in cpu_flags and listed in that order in call->job and the
 // request. The x columns they read are published compacted, in column order (the request names
@@ -1531,8 +1533,17 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         }
         const int one     = channel.one_column_divisor_device != nullptr && columns == 1 ? *channel.one_column_divisor_device
                                                                                          : channel.one_column_divisor;
-        const int divisor = columns == 1 && one > 0 ? one : channel.pcie_divisor;
-        const int want    = min(cap - n, divisor > 0 ? misses - misses / divisor : misses);
+        // The link keeps M / one_column_divisor in a one-column call (when set), else (M * wide_share) >> 8 in a
+        // call of at least wide_share_from columns, else (M * pcie_share) >> 8 with a share, else M / pcie_divisor
+        // (none for 0).
+        const bool by_one = columns == 1 && one > 0;
+        const bool wide   = channel.wide_share_from > 0 && columns >= channel.wide_share_from;
+        const int kept    = by_one                     ? misses / one
+                            : wide                     ? (misses * channel.wide_share) >> 8
+                            : channel.pcie_share > 0   ? (misses * channel.pcie_share) >> 8
+                            : channel.pcie_divisor > 0 ? misses / channel.pcie_divisor
+                                                       : 0;
+        const int want    = min(cap - n, misses - kept);
         int m = 0;
         for (int w = 1; w <= kWidths; ++w) {
             first_slot[kWidths + w] = n + m;

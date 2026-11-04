@@ -112,6 +112,16 @@ struct MoeCpuChannel {
     // misses / pcie_divisor of a call's misses stay on the GPU stage (0: the CPU takes up to
     // max_jobs of them), so the CPU and the PCIe stage share the call's misses.
     std::int32_t pcie_divisor           = 3;
+    // A share in 256ths of a decode call's host-memory misses the GPU stage keeps instead of the
+    // divisor rule ((misses * pcie_share) >> 8; 0: the divisor rule). A fixed family constant, not
+    // a measured rate: a measured share flipped calls' splits at floor(misses * share) between
+    // startups.
+    std::int32_t pcie_share             = 0;
+    // Calls of at least wide_share_from columns (0: none) keep (misses * wide_share) >> 8 instead:
+    // wide verification rounds, whose CPU experts cost less a column than the one-column rule
+    // implies (the cost past a CPU expert's first column is its compute).
+    std::int32_t wide_share             = 0;
+    std::int32_t wide_share_from        = 0;
     // One-column calls (plain decode) use this divisor instead (0: pcie_divisor). When
     // one_column_divisor_device is set, they read it there at execution instead (a device I32 the
     // caller rewrites between rounds, so captured graphs follow it: Qwen4Exp's plain decode by

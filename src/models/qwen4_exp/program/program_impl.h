@@ -1176,6 +1176,9 @@ public:
                     .max_jobs    = static_cast<int>(std::min<std::uint32_t>(cpu_jobs, ops::offloaded_moe::kMaxCpuJobs)),
                     .max_columns = assist ? kAssistMaxColumns : decode_columns,
                     .pcie_divisor = pcie_divisor(),
+                    .pcie_share   = pcie_share(),
+                    .wide_share      = wide_link_share().first,
+                    .wide_share_from = wide_link_share().second,
                     .one_column_divisor = one_column_divisor(),
                     .wide_from   = assist ? decode_columns + 1 : 0,
                     .wide_jobs   = assist ? static_cast<int>(std::min<std::uint32_t>(assist_jobs, ops::offloaded_moe::kMaxCpuJobs)) : 0,
@@ -6327,6 +6330,43 @@ private:
             static_cast<double>(parameters_.layers.front().moe.bank->planes.record_stride) / link_bytes_per_second_;
         return std::max(1, static_cast<int>(std::floor(1.65 + cpu_expert_rate() * record_seconds)));
     }
+
+    // The link's share in 256ths of a decode call's host-memory misses (MoeCpuChannel::pcie_share),
+    // and the wide calls' (wide_link_share): a CPU expert's cost past its first column is compute
+    // that the one-column rate the rules take hides, so wide verification rounds give the CPU more.
+    // Fixed family constants, not measured rates — a MEASURED fractional share flipped calls' splits
+    // at floor(M * share) between startups (3 workers: 100.8 against 107.5 tok/s, 2026-10-09), which
+    // is why the divisor rule above steps at a measured boundary instead. The constants are
+    // upstream's, derived on its host (i9-13900K, RTX 5090 over Gen5 x8, NVFP4 records, DFlash2
+    // auto, three interleaved pairs each): 67/256 in place of the divisor rule's 1/3 decoded its
+    // FP4-Local W4A16 struct fixture +6.3 % and short context +5.4 % (2026-10-30); 51/256 from
+    // eight columns added struct +2.5 %, conv +0.7 % on W4A16 and +4.3 %, after 16K +1.7 % against
+    // the divisor rule on W4A4 (2026-11-02). NOT re-derived on this machine's CPU (9950X3D2, Gen5
+    // x16): both need re-deriving at T3 in a RAM/SSD placement; they sit here as named constants
+    // for that. A positive cpu_pcie_divisor leaves every width on the divisor rule; banks other
+    // than NVFP4 keep the rule everywhere.
+    [[nodiscard]] int pcie_share() const noexcept {
+        if (options_.cpu_pcie_divisor > 0) { return 0; }
+        const auto& bank = *parameters_.layers.front().moe.bank;
+        return bank.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
+                       bank.planes.gate_up_format == QType::NVFP4_MUL
+                   ? kDecodeLinkShare256
+                   : 0;
+    }
+
+    // {share, from}: calls of at least `from` columns keep share/256 of the call's misses on the
+    // link (MoeCpuChannel::wide_share, wide_share_from); {0, 0}: every width takes pcie_share /
+    // pcie_divisor. Every NVFP4 bank (either activation): the wide rule replaces the bank's
+    // one-column rule in wide calls.
+    [[nodiscard]] std::pair<std::int32_t, std::int32_t> wide_link_share() const {
+        if (options_.cpu_pcie_divisor > 0 ||
+            parameters_.layers.front().moe.bank->planes.gate_up_format != QType::NVFP4_MUL) {
+            return {0, 0};
+        }
+        return {kWideLinkShare256, ops::offloaded_moe::kMaxColumns};
+    }
+    static constexpr std::int32_t kDecodeLinkShare256 = 67; // upstream's FP4-Local NVFP4 W4A16 banks
+    static constexpr std::int32_t kWideLinkShare256  = 51;  // upstream's, every NVFP4 bank
 
     // Without speculation, a GGUF import's one-column calls (plain decode) take the round's divisor
     // by context (plain_divisor; 1 until the first round sets it). 0 (pcie_divisor) for other banks,

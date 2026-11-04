@@ -519,7 +519,15 @@ host, Gen5 x8, 2026-10-09: at 6 workers `C·t = 1.5-1.7`, d = 3 best; at 3 and 2
 positive fixed divisor overrides the derivation, and one-column calls can take their own
 divisor — a device word the captured graphs read, which a Program rewrites between rounds.
 
-**Rejected:** fractional CPU share `1/(1+C·t)` (floor flips between startups);
+NVFP4 banks take a fixed **share form** instead of the divisor rule: W4A16 banks keep
+67/256 of a decode call's misses on the stage, and every NVFP4 bank keeps 51/256 in calls of
+at least eight columns — a CPU expert's cost past its first column is its compute, which the
+one-column rate the rules take hides, so wide verification rounds give the CPU more. The
+shares are fixed family constants, not measured rates; they are upstream's, derived on its
+host (i9-13900K, RTX 5090 over Gen5 x8, DFlash2 auto), and need re-deriving on this machine
+(9950X3D2, Gen5 x16) at T3 in a RAM/SSD placement.
+
+**Rejected:** a MEASURED fractional share `1/(1+C·t)` (floor flips between startups);
 `round(1 + C·t)` (the switch lands inside the startup noise); a divisor following the expert
 hit rate over eight-token windows (below the best fixed divisor at every length); a
 cost-based CPU/link split chosen per call while a cost model says it pays.
@@ -568,8 +576,9 @@ The CPU plan chooses the host-served jobs of a call from the dispatch alone:
 - SSD-only misses first — only the CPU can serve them without a fetch;
 - then host-memory misses by width, the fewest-column ones first, in job order;
 - up to the call's cap: the decode/verification job cap, or the prefill assist cap (§5.7);
-- the host share is `misses − misses / divisor`, so the CPU and the PCIe stage share a
-  call's misses (§5.6).
+- the host share is `misses − kept`, so the CPU and the PCIe stage share a
+  call's misses (`kept` is the divisor rule's `misses / d`, or the share
+  form's fixed share — §5.6).
 
 The fetch channel serves the SSD-only experts no CPU job takes (§4.7), moving them to the
 end of the job list by a stable partition, so no bit changes. While the device waits for the

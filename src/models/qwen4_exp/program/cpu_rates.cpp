@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -158,11 +159,23 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
         std::snprintf(share, sizeof(share), "; other processes used %.0f %% of the CPU", 100.0 * last_share);
         how += share;
     }
+    // The split the channels take: the share form names its fixed shares, the divisor rule its d,
+    // and the wide share its threshold.
+    char kept[160];
+    if (const int share = pcie_share(); share > 0) {
+        std::snprintf(kept, sizeof(kept), "%d/256", share);
+    } else {
+        std::snprintf(kept, sizeof(kept), "1/%d", pcie_divisor());
+    }
+    if (const auto [wide_share, wide_from] = wide_link_share(); wide_from > 0) {
+        const std::size_t used = std::strlen(kept);
+        std::snprintf(kept + used, sizeof(kept) - used, ", %d/256 from %d columns", wide_share, wide_from);
+    }
     char text[512];
     std::snprintf(text, sizeof(text),
                   "CPU expert team: %u workers, %.0f experts/s and %.0f expert columns/s (%s); decode misses kept on "
-                  "the link: 1/%d",
-                  cpu_workers(), cpu_expert_rate_, cpu_column_rate_, how.c_str(), pcie_divisor());
+                  "the link: %s",
+                  cpu_workers(), cpu_expert_rate_, cpu_column_rate_, how.c_str(), kept);
     diagnostic(text, DiagnosticLevel::Debug);
     if (measured && !quiet) {
         diagnostic("the CPU expert team's rates were measured while other processes kept the CPU busy (" +

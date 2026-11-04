@@ -151,6 +151,9 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
     out.max_jobs    = options_.max_jobs;
     out.max_columns  = options_.max_columns;
     out.pcie_divisor = options_.pcie_divisor;
+    out.pcie_share   = options_.pcie_share;
+    out.wide_share      = options_.wide_share;
+    out.wide_share_from = options_.wide_share_from;
     out.one_column_divisor = options_.one_column_divisor;
     out.max_job_columns = options_.max_job_columns;
     out.wide_from       = options_.wide_from;

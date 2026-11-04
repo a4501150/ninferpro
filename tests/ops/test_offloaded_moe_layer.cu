@@ -295,6 +295,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     // A GGUF import's decode split: one-column calls keep every miss on the link (d = 1), wider calls d = 2.
     moe::CpuMissService service_one(layers, {.workers = 6, .max_jobs = 16, .max_columns = 64, .pcie_divisor = 2,
                                              .one_column_divisor = 1, .cpus = {}, .activation = activation});
+    // The share-form decode split (design §5.6): 67/256 of a call's misses stay on the link, calls
+    // of at least eight columns 51/256.
+    moe::CpuMissService service_share(layers, {.workers = 6, .max_jobs = 16, .max_columns = 64, .pcie_divisor = 3,
+                                                .pcie_share = 67, .wide_share = 51,
+                                                .wide_share_from = moe::kMaxColumns, .cpus = {}, .activation = activation});
     // Prefill CPU assist (P7): calls of at least 9 columns take up to 256 CPU-served misses.
     moe::CpuMissService service_assist(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
                                                 .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .cpus = {}, .activation = activation});
@@ -311,11 +316,19 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                                  .pcie_divisor = 0, .cpus = {}, .activation = activation, .records = &copied});
     moe::CpuMissService service_ssd8(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation,
                                               .records = &copied});
-    // The CPU's share of the misses (design §8.6): want = min(cap, M - M / divisor) of the misses
-    // with at most max_job_columns columns, so the number served is min(want, eligible misses). The
-    // divisor is one_column_divisor (when set) in a one-column call.
-    const auto divisor_of = [&](const auto& channel) {
-        return columns == 1 && channel.one_column_divisor > 0 ? channel.one_column_divisor : channel.pcie_divisor;
+    // The CPU's share of the misses (design §8.6): want = min(cap, M - kept) of the misses
+    // with at most max_job_columns columns, so the number served is min(want, eligible misses).
+    // The link keeps kept = M / one_column_divisor in a one-column call (when set), else
+    // (M * wide_share) >> 8 in a call of at least wide_share_from columns, else (M * pcie_share) >> 8
+    // with a share, else M / pcie_divisor (none for 0).
+    const auto kept_of = [&](const auto& channel, int misses) {
+        const int one   = columns == 1 && channel.one_column_divisor > 0 ? channel.one_column_divisor : 0;
+        const bool wide = channel.wide_share_from > 0 && columns >= channel.wide_share_from;
+        return one > 0                    ? misses / one
+               : wide                    ? (misses * channel.wide_share) >> 8
+               : channel.pcie_share > 0 ? (misses * channel.pcie_share) >> 8
+               : channel.pcie_divisor > 0 ? misses / channel.pcie_divisor
+                                       : 0;
     };
     std::vector<int> expert_columns(experts, 0);
     for (const std::int32_t id : ids) { ++expert_columns[id]; }
@@ -364,8 +377,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         }
         const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
         const int take = std::min(cap, ssd_misses);
-        const int d    = divisor_of(channel);
-        const int want = std::min(cap - take, d > 0 ? misses - misses / d : misses);
+        const int want = std::min(cap - take, misses - kept_of(channel, misses));
         return take + std::min(want, eligible);
     };
     // Narrow SSD-only experts no CPU job takes (no service, a call wider than its columns, or past
@@ -402,8 +414,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         int misses = 0;
         for (const std::int32_t e : jobs) { misses += miss(e) ? 1 : 0; }
         const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
-        const int d    = divisor_of(channel);
-        const int want = std::min(cap, d > 0 ? misses - misses / d : misses);
+        const int want = std::min(cap, misses - kept_of(channel, misses));
         int n = 0;
         for (int width = 1; width <= channel.max_job_columns && n < want; ++width) {
             for (const std::int32_t e : jobs) {
@@ -434,6 +445,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true},
                                 Config{3, &service_all}, Config{64, &service_all, true}, Config{64, &service_narrow},
                                 Config{64, &service_narrow, true}, Config{64, &service_one}, Config{64, &service_one, true},
+                                Config{64, &service_share}, Config{3, &service_share}, Config{0, &service_share},
+                                Config{64, &service_share, true},
                                 Config{64, nullptr, true, true},
                                 Config{64, &service_narrow, true, true}, Config{3, nullptr, false, true},
                                 Config{64, &service_assist}, Config{3, &service_assist}, Config{0, &service_assist},
