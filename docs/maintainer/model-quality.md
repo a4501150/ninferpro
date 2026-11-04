@@ -2014,6 +2014,25 @@ the golden corpus). The FP64 checkpoint reference cannot read this artifact's ex
 orcarouter Uncensored export), so the model-level oracle is the 16-bit scoring route the gate
 uses — whose head arithmetic the construction now matches exactly.
 
+**FP32 logits for sampling, verification and readouts (2026-11-04, upstream `d33a0117`).** On
+Qwen3.8-Flash-Next the sampler, greedy argmax, DFlash2/MTP acceptance, constraint masks and prompt
+readouts read the head's FP32 logits; they read a BF16 copy before (`--logits-dtype bf16` keeps
+that route for comparison). The Forward and the head are unchanged: `t1` and `t1-exact` hashes
+stay. A BF16 copy collapses two logits within one BF16 step into a tie that the lower token id
+won; the golden corpus had one (prompt 4, token 43: logits 21.9002 and 21.8164, both 21.875 in
+BF16, now the true argmax 864 instead of 524), re-recorded by `t2-record`. Gate (recipe C, FP8
+KV, the full protocol of 6.5 with a fresh cache): every criterion passes; prefill is identical to
+the BF16 build's to every digit (scoring already read FP32), and the reference runs are
+identical. Teacher-forced decode against the same reference: KL 1.001e-2 -> 9.85e-3, TV 3.109e-2
+-> 3.048e-2, NLL 1.61683 -> 1.61671; free-running regret 1.035e-2 -> 9.43e-3 nats and
+reference-top disagreement 3.18 % -> 3.00 %. Teacher-forced top-1 disagreement rose 2.96 % ->
+3.80 %: the criterion counts agreement when the run's logprob of the reference's top token equals
+its best exactly, which under BF16 every within-one-step near-tie satisfied whichever token won
+(5 of its 1,891 disagreements are closer than 0.0625 nats, against 694 of FP32's 2,473); at gaps
+of 0.0625 or more FP32 disagrees at 1,779 positions against 1,886. Speed (T2-bench, five rotated
+runs of five sets each against the BF16 build): six requests 582.9 against 582.9 tok/s, one
+request 282.9 against 283.4; DFlash2 acceptance 43.8 % against 43.2 % and 60.6 % against 60.5 %.
+
 **35B-A3B Q8 shared-expert prefill (`4f0bb18f`, NInfer `610f79e9d`).** The Q8 gate/up and down
 prefill kernels of `Qwen3.6-35B-A3B` apply each 32-wide group's FP16 scale to the FP32 partial sum
 and pass the SiLU output as a BF16 high/low pair, where the old route rounded each code × scale to

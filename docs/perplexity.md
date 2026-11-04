@@ -47,7 +47,10 @@ KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`
 prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 visible keys, as
 `infernix-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
 `--use-original-nvfp4-prefill-kernel` score them with the original kernels and require the matching
-`--kv-dtype`. As in `infernix-serve`, the fast paths qualified for the artifact's configuration (its kernels and KV format) run
+`--kv-dtype`. `--logits-dtype fp32|bf16` selects the head's logits scoring reads (`fp32` by default,
+Qwen3.8-Flash-Next's head sums without a final rounding; `bf16` rounds each once, as Transformers
+returns them, for comparisons; the Qwen3.5 family's head writes BF16 only and refuses `fp32`).
+As in `infernix-serve`, the fast paths qualified for the artifact's configuration (its kernels and KV format) run
 unless `--disable-fast-paths` selects the exact route; `--a16-activations` always runs the exact
 route. `report.json` records the kernels as `original_int8_prefill_kernel` and
 `original_nvfp4_prefill_kernel`, and the fast paths that ran as `fast_paths`.

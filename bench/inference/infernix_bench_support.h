@@ -82,6 +82,7 @@ struct BenchOptions {
     std::vector<FastPath> fast_path_exclusions;
     std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    LogitsDtype logits_dtype    = LogitsDtype::FP32;
     SpeculativeOptions speculative;
     int device            = 0;
     bool use_cuda_graph   = true;
@@ -141,6 +142,7 @@ struct BenchEnvironment {
     std::optional<std::uint64_t> expert_ram_bytes;
     std::optional<std::uint64_t> expert_pin_bytes;
     KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
+    LogitsDtype logits_dtype          = LogitsDtype::FP32;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;
     bool decode_graph_primed                       = false;

@@ -49,6 +49,7 @@ int main(int argc, char** argv) {
         const bool strict_fresh   = argc == 5 && std::string(argv[4]) == "--strict-fresh";
         require(argc <= 5 && (argc != 5 || strict_fresh), "unsupported fixture arguments");
         infernix::EngineOptions options;
+        options.logits_dtype = infernix::LogitsDtype::BF16;
         options.artifact_path   = artifact;
         options.max_context     = 8192;
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(8192);

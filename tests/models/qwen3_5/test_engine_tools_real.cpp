@@ -400,6 +400,7 @@ int main(int argc, char** argv) {
         require(pressure_mode || mode == "graph" || mode == "eager" || mode == "basic",
                 "unknown test mode");
         infernix::EngineOptions options;
+        options.logits_dtype = infernix::LogitsDtype::BF16;
         options.artifact_path   = artifact;
         options.max_context     = pressure_mode ? 1024 : 1536;
         options.max_concurrency = argc > 3 ? std::stoul(argv[3]) : 2;

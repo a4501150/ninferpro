@@ -385,6 +385,9 @@ struct ProgramOptions {
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
+    // The head's logits the sampler, verification, constraints and the prompt readout read:
+    // FP32 (the default), or each sum rounded once to BF16 for comparisons (EngineOptions::logits_dtype).
+    bool bf16_logits = false;
     // The fast paths the Forward runs (fast_paths.h); all off on the exact route.
     execution::ForwardFastPaths fast_paths;
     std::filesystem::path ngram_volume;

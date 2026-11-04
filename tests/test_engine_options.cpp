@@ -1,5 +1,6 @@
 // Engine option combinations the Engine rejects before it reads any artifact.
 #include "infernix/engine.h"
+#include "runtime/engine/engine_options.h"
 
 #include <cuda_runtime.h>
 
@@ -153,6 +154,45 @@ int main() {
     }
     failures += check(!infernix::parse_fast_path("unknown").has_value(),
                       "an unknown fast path name parsed");
+    // --logits-dtype: Qwen3.8-Flash-Next takes either; the Qwen3.5 family's head writes BF16 only
+    // and refuses FP32 logits (as upstream refuses a head format that cannot produce them).
+    {
+        infernix::EngineOptions logits;
+        logits.artifact_path = "model.ninfer";
+        try {
+            infernix::runtime::validate_engine_options(logits, infernix::models::Architecture::Qwen4Exp);
+        } catch (const std::exception& error) {
+            failures += check(false, (std::string("Qwen4Exp rejected the default FP32 logits: ") +
+                                      error.what())
+                                         .c_str());
+        }
+        logits.logits_dtype = infernix::LogitsDtype::BF16;
+        try {
+            infernix::runtime::validate_engine_options(logits, infernix::models::Architecture::Qwen3_5);
+        } catch (const std::exception& error) {
+            failures += check(false, (std::string("Qwen3.5 rejected BF16 logits: ") + error.what())
+                                         .c_str());
+        }
+        logits.logits_dtype = infernix::LogitsDtype::FP32;
+        bool refused        = false;
+        std::string message;
+        try {
+            infernix::runtime::validate_engine_options(logits, infernix::models::Architecture::Qwen3_5);
+        } catch (const std::invalid_argument& error) {
+            refused = true;
+            message = error.what();
+        }
+        failures += check(refused && message.find("logits") != std::string::npos,
+                          "Qwen3.5 accepted FP32 head logits");
+        for (const auto architecture : {infernix::models::Architecture::Qwen3_5,
+                                        infernix::models::Architecture::Qwen3_5Moe}) {
+            bool moe_refused = false;
+            try {
+                infernix::runtime::validate_engine_options(logits, architecture);
+            } catch (const std::invalid_argument&) { moe_refused = true; }
+            failures += check(moe_refused, "a Qwen3.5-family architecture accepted FP32 head logits");
+        }
+    }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Engine option validation\n";
     return failures == 0 ? 0 : 1;
 }

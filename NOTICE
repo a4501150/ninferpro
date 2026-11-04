@@ -43,6 +43,11 @@ Modifications made in this product (summary; see README.md for details):
 - Tool-call grammar fixes: a call opener inside Markdown code is text, and the
   constraint grammar's reasoning section refuses an unquoted opener, so a call
   cannot start inside thinking and the turn cannot end there.
+- FP32 vocabulary-head logits on every Qwen3.8-Flash-Next route
+  (--logits-dtype fp32|bf16, default fp32: upstream d33a0117's port). The Qwen3.5
+  family keeps its BF16 head logits and refuses --logits-dtype fp32 (its head runs
+  through ops::linear, whose output is BF16 for every head format; upstream's
+  Qwen3.5 FP32 head needs kernel routes this fork has not ported).
 - Linux VRAM spill detection fix (no WDDM budget).
 - The fast-path quality gate runs its default role on the fast run's kernel set (the
   exact route on the width-routed kernels, EngineOptions::width_routed_kernels, where

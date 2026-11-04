@@ -64,6 +64,7 @@ int main(int argc, char** argv) {
         if (strict_fresh) { --argc; }
         const unsigned ngram_k = argc > 1 ? std::stoul(argv[1]) : 15U;
         infernix::EngineOptions options;
+        options.logits_dtype = infernix::LogitsDtype::BF16;
         options.artifact_path       = artifact;
         options.max_context         = 4096;
         options.kv_capacity         = infernix::KvCapacityPolicy::explicit_capacity(4096);

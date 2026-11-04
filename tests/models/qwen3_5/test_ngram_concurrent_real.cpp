@@ -125,6 +125,7 @@ infernix::PromptInput freeform_prompt(const std::string& text) {
 infernix::EngineOptions options_for(const char* artifact, const std::string& backend, unsigned width,
                                   unsigned concurrency) {
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path = artifact;
     // The context window is configurable so the test can run beside a live serve with reduced VRAM.
     unsigned max_context = 4096;

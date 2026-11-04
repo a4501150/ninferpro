@@ -51,6 +51,16 @@ enum class KvCacheStorage : std::uint8_t {
     Q4KeyVq2Value,
 };
 
+// The vocabulary head's logits (EngineOptions::logits_dtype), which the sampler, greedy argmax, draft
+// acceptance, constraints and scoring read.
+enum class LogitsDtype : std::uint8_t {
+    // The head's sums without a final rounding (the default).
+    FP32,
+    // Each logit rounded once to BF16, the dtype Hugging Face Transformers returns them in: near-equal
+    // logits become exact ties, which selection breaks by token id. For comparisons.
+    BF16,
+};
+
 // A fast path: a route whose arithmetic differs from the default route's, run only under
 // EngineOptions::fast_paths and only for the configurations it is qualified for
 // (docs/maintainer/model-quality.md section 6.7 lists each with its evidence).
@@ -660,6 +670,10 @@ struct EngineOptions {
     // (model-quality.md 6.2). Elsewhere it is refused.
     bool width_routed_kernels          = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // The head's logits on every route (--logits-dtype): FP32, or BF16 for comparisons with engines
+    // and references that round them; a startup choice (the round buffers and CUDA Graphs are planned
+    // for it).
+    LogitsDtype logits_dtype            = LogitsDtype::FP32;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

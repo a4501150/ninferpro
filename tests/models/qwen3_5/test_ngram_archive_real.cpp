@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
         const unsigned concurrency = argc > 3 ? static_cast<unsigned>(std::stoul(argv[3])) : 1U;
         require(concurrency >= 1 && concurrency <= 8, "concurrency must be in 1..8");
         infernix::EngineOptions options;
+        options.logits_dtype = infernix::LogitsDtype::BF16;
         options.artifact_path   = artifact;
         options.max_context     = 4096;
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(4096);

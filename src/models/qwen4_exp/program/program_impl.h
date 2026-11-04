@@ -322,6 +322,7 @@ struct DeviceLayout {
     // The vq2/k4v2 exact window of every KV layer and lane (prefix::KvWindowGeometry; zero otherwise).
     std::size_t window = 0;
     std::size_t logits32 = 0, logits16 = 0, token_counts = 0, work = 0, staging = 0;
+    // Causal scoring: the BF16 tile copy beside score_logits (ProgramOptions::bf16_logits).
     std::int32_t staging_slots = 0; // misses staged per pass of a layer's experts
     // The arena wide prefill calls swap in (columns above static_columns), lent from expert frames
     // while a prompt runs such calls; zero when the static arena covers every call.
@@ -345,7 +346,7 @@ struct DeviceLayout {
     std::optional<DFlash2Config> dflash2_config;
     // Causal scoring: the window's final residuals (BF16 [S*H, max_context]), one tile's FP32 logits
     // and its targets, log-probabilities and distributions (ProgramImpl::causal_score).
-    std::size_t score_residuals = 0, score_logits = 0, score_io = 0;
+    std::size_t score_residuals = 0, score_logits = 0, score_logits16 = 0, score_io = 0;
     ProgramDevicePlan bytes;
 };
 
@@ -593,12 +594,15 @@ public:
         if (d.io.block_rope + 12ULL * lanes > d.io.ngram || d.io.columns + 4ULL * columns > d.io.ngram) {
             throw std::logic_error("Qwen4Exp: decode io must precede the n-gram rows");
         }
+        // The head's FP32 logits, which the sampler, verification, constraints and the prompt
+        // readout read; with BF16 logits their BF16 rounding beside them.
         d.logits32     = sizeof(float) * c.vocab_size * lanes * W;
-        d.logits16     = 2ULL * c.vocab_size * lanes * W;
+        d.logits16     = o.bf16_logits ? 2ULL * c.vocab_size * lanes * W : 0;
         d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
         if (o.causal_scoring) {
             d.score_residuals = align(2ULL * width * o.max_context);
             d.score_logits    = align(sizeof(float) * c.vocab_size * kScoreTileColumns);
+            d.score_logits16  = o.bf16_logits ? align(2ULL * c.vocab_size * kScoreTileColumns) : 0;
             d.score_io        = align(4ULL * kScoreIoWords);
         }
 
@@ -939,6 +943,7 @@ public:
         if (options_.causal_scoring) {
             allocate(score_residuals_, plan_.score_residuals, allocated);
             allocate(score_logits_, plan_.score_logits, allocated);
+            allocate(score_logits16_, plan_.score_logits16, allocated);
             allocate(score_io_, plan_.score_io, allocated);
             score_host_ = PinnedHostBuffer(plan_.score_io);
         }
@@ -2195,8 +2200,9 @@ public:
             }
             if (head_saved_.p != nullptr) { fb.head_residual_out = head_saved_column(mixed_.lane); }
             fb.prefill_part = &part;
-            Tensor logits(logits32_.p, DType::FP32, {vocab_, D});
+            Tensor logits = head_logits(D);
             forward_->run(fb, logits);
+            round_logits(D, device_.stream);
             if (dflash2_) {
                 // A restore into the lane's ring or a copy-out of it lands first (dflash2_call_context).
                 dflash2_wait_copies(lane);
@@ -2271,10 +2277,14 @@ public:
         // Under MTP the drafter's saved column is the same final residual (finish copies column
         // T - 1 into both), so the image keeps it once.
         Tensor residual = mtp_ ? saved_column(index) : head_saved_column(index);
-        Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
+        Tensor logits   = head_logits(1);
         forward_->head_logits(residual, logits);
+        round_logits(1, device_.stream);
         const std::uint32_t rows[] = {index};
         const std::int32_t positions[] = {static_cast<std::int32_t>(lane.prompt_tokens) - 1};
+        // The readout reads the logits before the sampler's constraints mask them.
+        std::optional<PromptReadout> readout;
+        if (!lane.readout.empty()) { readout = read_prompt_frontier(lane); }
         sample(rows, positions);
         // No call reads the encode window (the snapshot's KV holds the image columns); the bind
         // completed only once the encode did, so the handoff returns here, as after a last call.
@@ -2283,7 +2293,7 @@ public:
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = 0;
         out.complete                = true;
-        if (!lane.readout.empty()) { out.readout = read_prompt_frontier(lane); }
+        if (readout) { out.readout = std::move(*readout); }
         const SequenceHandle handles[] = {handle(index)};
         out.timing.submit_host_ns = elapsed_ns(start);
         lane.prefill_ns += out.timing.submit_host_ns;
@@ -2325,8 +2335,9 @@ public:
         if (last) {
             const std::uint32_t lanes[] = {index};
             const std::int32_t positions[] = {begin + width - 1};
-            sample(lanes, positions);
+            // The readout reads the logits before the sampler's constraints mask them.
             if (!lane.readout.empty()) { out.readout = read_prompt_frontier(lane); }
+            sample(lanes, positions);
             {
                 const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                         static_cast<std::uint64_t>(width));
@@ -5175,6 +5186,23 @@ private:
         }
         Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
         forward_->run(fb, logits);
+        round_logits(logit_columns, device_.stream);
+    }
+
+    // The head's logits of `columns` columns as the Forward writes them: FP32 (logits32_).
+    Tensor head_logits(std::int32_t columns) { return Tensor(logits32_.p, DType::FP32, {vocab_, columns}); }
+    // The logits the sampler, verification, constraints and the prompt readout read, `columns`
+    // columns: FP32, or their BF16 rounding (ProgramOptions::bf16_logits).
+    Tensor read_logits(std::int32_t columns) {
+        if (options_.bf16_logits) { return Tensor(logits16_.p, DType::BF16, {vocab_, columns}); }
+        return Tensor(logits32_.p, DType::FP32, {vocab_, columns});
+    }
+    // BF16 logits: the head's FP32 sums of `columns` columns rounded once to BF16.
+    void round_logits(std::int32_t columns, cudaStream_t s) {
+        if (!options_.bf16_logits || columns == 0) { return; }
+        const Tensor wide(logits32_.p, DType::FP32, {vocab_, columns});
+        Tensor narrow(logits16_.p, DType::BF16, {vocab_, columns});
+        ops::cast_fp32_to_bf16(wide, narrow, s);
     }
 
     // A call's inputs as the Forward reads them from a staged io image at `base` (the io, or one
@@ -5325,10 +5353,9 @@ private:
             residency_->enqueue_route_download(s, batch * W);
         }
 
-        // Acceptance on the device, from BF16-rounded logits as in plain decode (design 17.7).
-        Tensor wide(logits32_.p, DType::FP32, {vocab_, batch * W});
-        Tensor narrow(logits16_.p, DType::BF16, {vocab_, batch * W});
-        ops::cast_fp32_to_bf16(wide, narrow, s);
+        // Acceptance on the device, from the logits plain decode samples (FP32, or BF16: design
+        // §17.7); the constraints mask them in place.
+        Tensor narrow = read_logits(batch * W);
         Tensor target(spec_device(spec_layout_.target), DType::I32, {batch * W});
         ops::argmax(narrow, target, token_domain_, s);
         const bool constrained = stage_constraints(lanes, W);
@@ -6149,15 +6176,13 @@ private:
         }
     }
 
-    // Samples the next token of each row from logits32_ (row b = column b) into pending_tokens_.
+    // Samples the next token of each row (row b = column b) into pending_tokens_.
     void sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
-        Tensor wide(logits32_.p, DType::FP32, {vocab_, batch});
-        Tensor narrow(logits16_.p, DType::BF16, {vocab_, batch});
-        // The sampler reads BF16 logits; BF16 and FP32 logits measured equal in perplexity
-        // (design §17.7).
-        ops::cast_fp32_to_bf16(wide, narrow, s);
+        // The sampler reads the FP32 logits, or their BF16 rounding (design §17.7); a constraint
+        // masks them in place (the prompt readout has read them first).
+        Tensor narrow = read_logits(batch);
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
         auto* sample_positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -6600,7 +6625,7 @@ private:
     // ---- causal scoring (score.cpp) ----
     // While a scored prompt prefills, each call's final residuals land in score_residuals_ at its
     // first position (score_column_: forward_call's; a layer walk's chunks carry their own).
-    DeviceBuffer score_residuals_, score_logits_, score_io_;
+    DeviceBuffer score_residuals_, score_logits_, score_logits16_, score_io_;
     PinnedHostBuffer score_host_{1};
     bool scoring_                = false;
     std::int32_t score_column_   = 0;

@@ -2,7 +2,8 @@
 // prompt is prefilled on lane 0 through the generation path itself (expert cache, SSD tier, expert
 // streaming and layer walks included), every call keeping its final residuals; the final mixer and the
 // LM head then run over the saved residuals in tiles of kScoreTileColumns, producing each target's
-// log-probability, the top_k distribution and the candidates' log-probabilities from FP32 logits.
+// log-probability, the top_k distribution and the candidates' log-probabilities from its logits
+// (FP32, or BF16: ProgramOptions::bf16_logits).
 
 #include "models/qwen4_exp/program/program_impl.h"
 
@@ -94,8 +95,17 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
                             static_cast<std::size_t>(columns) * per_position, host + candidates_at);
             }
             CUDA_CHECK(cudaMemcpyAsync(io, host, 4ULL * kScoreIoWords, cudaMemcpyHostToDevice, s));
-            Tensor logits(score_logits_.p, DType::FP32, {vocab_, columns});
-            forward_->head_logits(score_residuals(static_cast<std::int32_t>(first), columns), logits);
+            // The head's logits: FP32, or each FP32 sum rounded once to BF16.
+            const bool bf16 = options_.bf16_logits;
+            Tensor logits   = bf16 ? Tensor(score_logits16_.p, DType::BF16, {vocab_, columns})
+                                   : Tensor(score_logits_.p, DType::FP32, {vocab_, columns});
+            if (bf16) {
+                Tensor wide(score_logits_.p, DType::FP32, {vocab_, columns});
+                forward_->head_logits(score_residuals(static_cast<std::int32_t>(first), columns), wide);
+                ops::cast_fp32_to_bf16(wide, logits, s);
+            } else {
+                forward_->head_logits(score_residuals(static_cast<std::int32_t>(first), columns), logits);
+            }
             Tensor targets(io + targets_at, DType::I32, {1, columns});
             Tensor logprobs(io + logprobs_at, DType::FP32, {1, columns});
             ops::target_logprobs(logits, targets, token_domain_, logprobs, s);

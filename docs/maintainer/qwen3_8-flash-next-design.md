@@ -1477,7 +1477,8 @@ cost every 64 drafting rounds.
 
 ### 11.6 Verification and acceptance
 
-Acceptance runs on the device, from BF16-rounded logits exactly as plain decode samples (§17).
+Acceptance runs on the device, from the same logits plain decode samples (FP32, or BF16 under
+`--logits-dtype bf16`: §17.7).
 Greedy rows drafted deterministically (an MTP argmax round, every greedy DFlash2 row) take
 `speculative_accept_greedy_drafts`: the accepted prefix of the target-argmax matches, the target
 correction at the first mismatch, the bonus token when all accept. A round with a sampled row

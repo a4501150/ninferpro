@@ -217,7 +217,10 @@ relationship. Router loss coefficients and training-only outputs add no inferenc
 
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs
 the configured blocks in chunks. It preserves state and positions across chunks. Final offset
-RMSNorm and the full output head produce the target distribution. Ordinary decode repeats this
+RMSNorm and the full output head produce the target distribution: the head runs through `ops::linear`,
+whose output is BF16 for every head format, so this family's logits are BF16 and the Engine refuses
+`--logits-dtype fp32` for it (Qwen3.8-Flash-Next computes its head's FP32 sums natively and samples
+them). Ordinary decode repeats this
 schedule for one new token. CUDA Graph replay uses the same selected model implementation.
 
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the

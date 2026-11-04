@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/config/config_file.h"
+#include "product/logits_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -103,6 +104,7 @@ constexpr std::array kCliOptions{
     CliOption{"--expert-ram-mib"},
     CliOption{"--expert-pin-mib"},
     CliOption{"--kv-dtype"},
+    CliOption{"--logits-dtype"},
     CliOption{"--spec"},
     CliOption{"--draft-tokens"},
     CliOption{"--draft-model"},
@@ -174,7 +176,8 @@ std::string usage_text(const char* argv0) {
            " <model.infernix> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--spec mtp|dflash|dflash2 --draft-tokens "
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
+           "       [--spec mtp|dflash|dflash2 --draft-tokens "
            "N|auto]\n"
            "       [--draft-model FILE]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
@@ -252,6 +255,10 @@ std::string usage_text(const char* argv0) {
            "                           and other programs (auto: 1024 with a display on\n"
            "                           the GPU, else 256)\n"
            "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2\n"
+           "  --logits-dtype T         fp32 (default) | bf16: the head's logits the sampler,\n"
+           "                           greedy choice, draft acceptance and scoring read;\n"
+           "                           bf16 rounds each once, as Transformers returns them\n"
+           "                           (near-equal logits then tie), for comparisons\n"
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
@@ -453,6 +460,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
+        } else if (arg == "--logits-dtype") {
+            options.logits_dtype = product::parse_logits_dtype(value(arg));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {

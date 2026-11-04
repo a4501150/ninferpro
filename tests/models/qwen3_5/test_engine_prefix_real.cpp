@@ -15,6 +15,7 @@ namespace {
 
 infernix::EngineOptions engine_options(const char* artifact) {
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path                    = artifact;
     options.max_context                      = 4096;
     options.kv_capacity                      = infernix::KvCapacityPolicy::explicit_capacity(4096);
@@ -34,6 +35,7 @@ infernix::EngineOptions engine_options(const char* artifact) {
 
 infernix::EngineOptions anthropic_prefix_regression_engine_options(const char* artifact) {
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path                    = artifact;
     options.max_context                      = 2048;
     options.kv_capacity                      = infernix::KvCapacityPolicy::explicit_capacity(2048);
@@ -53,6 +55,7 @@ infernix::EngineOptions anthropic_prefix_regression_engine_options(const char* a
 
 infernix::EngineOptions shared_rewrite_materialization_engine_options(const char* artifact) {
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path                     = artifact;
     options.max_context                       = 100000;
     options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(100000);
@@ -71,6 +74,7 @@ infernix::EngineOptions shared_rewrite_materialization_engine_options(const char
 
 infernix::EngineOptions explicit_anchor_engine_options(const char* artifact) {
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path                     = artifact;
     options.max_context                       = 512;
     options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(512);
@@ -86,6 +90,7 @@ infernix::EngineOptions explicit_anchor_engine_options(const char* artifact) {
 
 infernix::EngineOptions concurrent_engine_options(const char* artifact) {
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path                     = artifact;
     options.max_context                       = 512;
     options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(4096);
@@ -1701,6 +1706,7 @@ int exercise_attention_integration(const char* artifact) {
     const auto drafts = static_cast<std::uint32_t>(std::stoul(std::string(setting(
         "INFERNIX_TEST_DRAFT_TOKENS", backend == infernix::SpeculativeBackend::Mtp ? "3" : "7"))));
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path                    = artifact;
     options.kv_cache                         = storage;
     options.max_context                      = 65536;

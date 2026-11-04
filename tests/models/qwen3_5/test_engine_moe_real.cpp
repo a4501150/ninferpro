@@ -12,6 +12,7 @@ namespace {
 
 infernix::EngineOptions engine_options(const char* artifact) {
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path             = artifact;
     options.max_context               = 4096;
     options.kv_capacity               = infernix::KvCapacityPolicy::explicit_capacity(4096);

@@ -2,6 +2,7 @@
 
 #include "models/offload/expert_placement.h"
 #include "product/config/config_file.h"
+#include "product/logits_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -93,6 +94,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-placement"},
     ServeOptionArity{"--expert-pin-mib"},
     ServeOptionArity{"--kv-dtype"},
+    ServeOptionArity{"--logits-dtype"},
     ServeOptionArity{"--spec"},
     ServeOptionArity{"--draft-tokens"},
     ServeOptionArity{"--draft-model"},
@@ -441,6 +443,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             default is 7\n"
            "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
            "                             vq2 | k4v2\n"
+           "  --logits-dtype T           fp32 (default) | bf16: the head's logits the sampler,\n"
+           "                             greedy choice, draft acceptance and constraints read;\n"
+           "                             bf16 rounds each once, as Transformers returns them\n"
+           "                             (near-equal logits then tie), for comparisons\n"
            "  --no-prefix-reuse          disable the prefix cache: every request starts from\n"
            "                             the root and a preempted request recovers by\n"
            "                             replay; cannot be combined with any option below\n"
@@ -1022,6 +1028,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--logits-dtype") {
+            options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));

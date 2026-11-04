@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
         const bool optimized = argc > 3 ? std::stoi(argv[3]) != 0 : true;
         const auto batch     = argc > 4 ? static_cast<unsigned>(std::stoul(argv[4])) : 8U;
         infernix::EngineOptions options;
+        options.logits_dtype = infernix::LogitsDtype::BF16;
         options.artifact_path   = artifact;
         options.max_context     = 2304;
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(2304 * batch);

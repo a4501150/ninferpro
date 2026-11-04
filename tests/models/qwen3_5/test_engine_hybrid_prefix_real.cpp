@@ -50,6 +50,7 @@ infernix::EngineOptions hybrid_options(const char* artifact, infernix::Speculati
                                      std::uint32_t kv_tokens, std::size_t host_bytes,
                                      std::uint32_t device_slots) {
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path        = artifact;
     options.max_context          = 4096;
     options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(kv_tokens);

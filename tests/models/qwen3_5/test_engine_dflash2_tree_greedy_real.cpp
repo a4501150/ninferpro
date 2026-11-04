@@ -68,6 +68,7 @@ int main(int argc, char** argv) {
         constexpr std::uint32_t kContext = 2048;
 
         infernix::EngineOptions options;
+        options.logits_dtype = infernix::LogitsDtype::BF16;
         options.artifact_path               = artifact;
         options.max_context                 = kContext;
         options.kv_capacity                 = infernix::KvCapacityPolicy::explicit_capacity(kContext);

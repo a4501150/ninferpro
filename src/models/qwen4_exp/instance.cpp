@@ -192,6 +192,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.prefill_chunk   = options.prefill_chunk;
     program_options.prefill_chunk_beside_decode = options.prefill_chunk_beside_decode;
     program_options.kv_cache        = options.kv_cache;
+    program_options.bf16_logits     = options.logits_dtype == LogitsDtype::BF16;
     program_options.diagnostics     = options.diagnostic_observer;
     program_options.kv_capacity_tokens =
         options.kv_capacity.mode == KvCapacityMode::Explicit ? options.kv_capacity.explicit_tokens : 0U;

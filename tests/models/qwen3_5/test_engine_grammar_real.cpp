@@ -149,6 +149,7 @@ int main(int argc, char** argv) {
     try {
         const std::string backend = argc > 1 ? argv[1] : "none";
         infernix::EngineOptions options;
+        options.logits_dtype = infernix::LogitsDtype::BF16;
         options.artifact_path   = artifact;
         options.max_context     = 1024;
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(2048);

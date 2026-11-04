@@ -84,6 +84,7 @@ int main() {
          {Configuration{1024, false}, Configuration{256, true}}) {
         const std::string name = "chunk " + std::to_string(configuration.prefill_chunk);
         infernix::EngineOptions options;
+        options.logits_dtype = infernix::LogitsDtype::BF16;
         options.artifact_path   = artifact;
         options.max_context     = kMaxContext;
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(4U * kMaxContext);

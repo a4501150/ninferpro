@@ -91,6 +91,7 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact,
                                      infernix::SpeculativeBackend selected,
                                      bool prefix_cache = false) {
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path        = artifact;
     options.max_context          = kCapacity;
     options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(kCapacity);

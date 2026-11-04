@@ -17,6 +17,7 @@ int main() {
     }
 
     infernix::EngineOptions options;
+    options.logits_dtype = infernix::LogitsDtype::BF16;
     options.artifact_path = artifact;
     options.purpose       = infernix::EnginePurpose::CausalScoring;
     options.max_context   = 2048;

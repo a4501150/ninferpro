@@ -270,6 +270,19 @@ int run_tests() {
     }
     const infernix::cli::Options nvfp4 =
         parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
+    failures += check(
+        parse({"infernix-cli", "model.ninfer", "--prompt", "hello"}).logits_dtype ==
+            infernix::LogitsDtype::FP32,
+        "CLI logits are not FP32 by default");
+    failures +=
+        check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--logits-dtype", "bf16"})
+                  .logits_dtype == infernix::LogitsDtype::BF16,
+              "--logits-dtype bf16 did not select BF16 logits");
+    failures += check(rejects([&] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "hello",
+                                       "--logits-dtype", "fp16"});
+                      }),
+                      "CLI accepted --logits-dtype fp16");
     failures += check(nvfp4.kv_cache == infernix::KvCacheStorage::Nvfp4Group16,
                       "--kv-dtype nvfp4 did not select group-16 NVFP4 KV");
     const infernix::cli::Options k8v4 =

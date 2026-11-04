@@ -78,6 +78,15 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument(
             "16-bit activations (the quality reference) run the exact route: disable fast paths");
     }
+    // Qwen3.5's head runs through ops::linear, whose output is BF16 for every head format, and its
+    // round buffers and CUDA Graphs are planned for BF16 logits; no FP32 head route exists for it
+    // (Qwen3.8-Flash-Next computes its head's FP32 sums natively). As upstream refuses a head
+    // format that cannot produce FP32 logits, the family refuses the dtype.
+    if (architecture != models::Architecture::Qwen4Exp && options.logits_dtype != LogitsDtype::BF16) {
+        throw std::invalid_argument(
+            "Qwen3.5/3.6/3.8 head logits are BF16; pass --logits-dtype bf16 (FP32 logits are "
+            "Qwen3.8-Flash-Next's)");
+    }
 }
 
 // The exact artifact, its execution signature, the KV and speculative formats, RoPE scaling, the

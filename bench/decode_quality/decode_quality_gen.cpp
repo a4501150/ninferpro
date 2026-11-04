@@ -24,7 +24,7 @@
 //                                  [first-segments=N] [path=NAME]...
 //                                  [no-path=NAME]...
 //                                  [draft-model=FILE [drafts=N] [auto] [full-head]] (Qwen3.8-Flash-Next DFlash2)
-//                                  [temperature=T]
+//                                  [temperature=T] [logits=fp32|bf16] (the head's logits; bf16 for comparisons)
 //                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
 //                                  [route-trace=FILE] (Qwen3.8-Flash-Next's route trace, route_trace.h)
 // Output, one line per segment: <corpus token offset> <prompt_tokens> <generated ids...>
@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> "
                      "<prompt_tokens> <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [exact] [width-routed] "
-                     "[first-segments=N] [path=NAME]... [no-path=NAME]... [kv=bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n";
+                     "[first-segments=N] [path=NAME]... [no-path=NAME]... [kv=bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [logits=fp32|bf16]\n";
         return 2;
     }
     try {
@@ -64,6 +64,7 @@ int main(int argc, char** argv) {
         float temperature    = 0.0F;
         std::optional<float> min_p;
         infernix::KvCacheStorage kv = infernix::KvCacheStorage::Int8Group64;
+        bool bf16_logits = false;
         for (int i = 7; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "ngram") {
@@ -99,6 +100,8 @@ int main(int argc, char** argv) {
                 paths.push_back(flag.substr(5));
             } else if (flag.starts_with("no-path=")) {
                 no_paths.push_back(flag.substr(8));
+            } else if (flag == "logits=fp32" || flag == "logits=bf16") {
+                bf16_logits = flag == "logits=bf16";
             } else if (flag.starts_with("kv=")) {
                 const std::string name = flag.substr(3);
                 if (name == "bf16") {
@@ -123,7 +126,7 @@ int main(int argc, char** argv) {
                 std::cerr << "unknown option " << flag
                           << " (ngram, mtp, auto, min-p=P, plain, exact, width-routed, first-segments=N, path=NAME, "
                              "draft-model=FILE, drafts=N, "
-                             "full-head, temperature=T, ngram-volume=FILE, route-trace=FILE, kv=NAME)\n";
+                             "full-head, temperature=T, ngram-volume=FILE, route-trace=FILE, kv=NAME, logits=fp32|bf16)\n";
                 return 2;
             }
         }
@@ -140,6 +143,7 @@ int main(int argc, char** argv) {
         options.artifact_path = argv[1];
         options.max_context   = (prompt_tokens + new_tokens + 64 + 127) / 128 * 128;
         options.kv_cache      = kv;
+        options.logits_dtype  = bf16_logits ? infernix::LogitsDtype::BF16 : infernix::LogitsDtype::FP32;
         options.max_concurrency                   = 1;
         options.prefill_chunk                     = 4096;
         options.speculative.backend               = infernix::SpeculativeBackend::DFlash2;

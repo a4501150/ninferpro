@@ -279,6 +279,10 @@ int test_cli_contract() {
                 {"infernix_bench", "--weights", "model.ninfer", "--prefill-chunk", "129"});
         },
         "misaligned prefill chunk");
+    failures += expect(
+        parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--logits-dtype", "bf16"})
+            .logits_dtype == infernix::LogitsDtype::BF16,
+        "BF16 logits");
     const qb::BenchOptions fp8 =
         parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
     failures += expect(fp8.kv_cache == infernix::KvCacheStorage::Fp8E4M3Row256, "FP8 KV");
