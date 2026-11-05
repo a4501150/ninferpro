@@ -187,13 +187,19 @@ struct MoeExpertSource {
     const std::uint8_t* host_records = nullptr;
     const std::uint8_t* const* host_table = nullptr;
     // Optional mapped word: a call that cannot serve an expert (an SSD-only record with no CPU job
-    // and no fetch channel, a record the host could not read, or a host whose heartbeat stopped)
+    // and no fetch channel, a record the host could not read, a host whose heartbeat stopped, or a
+    // per-job wait of the rows down pass past rows_wait_timeout_ns)
     // writes layer << 16 | code there (offloaded_moe::kError* or an errno); that call's outputs are
     // undefined and the caller must fail the round. The word is the caller's to clear.
     std::uint32_t* error = nullptr;
     // How long the CPU wait and the fetch poller wait on a heartbeat that stands still (GPU time)
     // before they write kErrorHostSilent / kErrorFetchSilent.
     std::uint64_t heartbeat_timeout_ns = offloaded_moe::kHeartbeatTimeoutNs;
+    // How long the rows kernels' down pass waits on its job's h-element count (GPU time) before it
+    // writes kErrorRowsWaitTimeout and leaves its outputs undefined. A gate/up job counts its
+    // elements in microseconds, so the bound only ends a wait whose producer never runs (an
+    // engine bug, not a slow round); tests shrink it to force the failure.
+    std::uint64_t rows_wait_timeout_ns = offloaded_moe::kRowsWaitTimeoutNs;
     std::uint64_t record_stride      = 0;
     const offloaded_moe::ExpertScales* scales = nullptr;
     // The layer's expert arithmetic: W4A4 with stored input scales (§17.2), or W4A16 for experts

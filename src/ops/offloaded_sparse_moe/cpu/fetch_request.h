@@ -22,9 +22,19 @@ inline constexpr int kMaxFetch = 512; // fetch-served experts per layer call (a 
 
 // Device-detected failure codes of a call's error word (layer << 16 | code). Host-reported failures
 // carry an errno value, all below 0x8000.
-inline constexpr std::uint32_t kErrorUnservedRecord = 0xFF01; // an SSD-only expert with no path to it
-inline constexpr std::uint32_t kErrorHostSilent     = 0xFF02; // the CPU service's heartbeat stopped during a wait
-inline constexpr std::uint32_t kErrorFetchSilent    = 0xFF03; // the fetch responder's heartbeat stopped during a wait
+inline constexpr std::uint32_t kErrorUnservedRecord  = 0xFF01; // an SSD-only expert with no path to it
+inline constexpr std::uint32_t kErrorHostSilent      = 0xFF02; // the CPU service's heartbeat stopped during a wait
+inline constexpr std::uint32_t kErrorFetchSilent     = 0xFF03; // the fetch responder's heartbeat stopped during a wait
+inline constexpr std::uint32_t kErrorRowsWaitTimeout = 0xFF04; // the rows down pass's per-job wait passed its bound
+
+// The bound of the rows kernels' per-job wait (moe_layer.cu, wait_job_h): a gate/up job counts its
+// h elements in microseconds, so a count that is still short of its target after this long (GPU
+// time) never completes — a producer bug (the gate/up pass no longer triggering its dependents
+// before it works, a lost clear of the counts), not a slow round — and the wait reports
+// kErrorRowsWaitTimeout and gives up instead of hanging the GPU. Like the heartbeat bound it
+// leaves room for OS-level stalls that delay a live grid: a whole layer call runs in milliseconds,
+// so no healthy round comes near it.
+inline constexpr std::uint64_t kRowsWaitTimeoutNs = 2000000000ULL;
 
 // A wait gives up when the host's heartbeat has not changed for this long (GPU time). A host thread
 // that died is reported at once through its own failure (CpuMissService::failure, the tier agent's);

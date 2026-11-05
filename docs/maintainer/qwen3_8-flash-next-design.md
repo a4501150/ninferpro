@@ -884,8 +884,11 @@ before encoding h — so a job's down CTAs run while other jobs' gate/up CTAs st
 PRO 6000, 2026-11-04: 1x1 −0.7 %, 6x1 −1.0 %, 1x4 −1.4 %, 1x8 −1.0 %; at twelve columns the two
 measured level and at eighteen the grid-wide wait won by 0.8 % — the down pass's earlier compute
 contends with the still-running gate/up CTAs for DRAM — so wider calls keep the grid-wide PDL
-wait). Wider calls run the tensor-core narrow kernels (`narrow_a16_mma.cuh`) for their
-narrow jobs (§17.3): per 16-element block one m16n8k32 pair over A = [8 c | c] gives the exact
+wait). The poll is bounded at 2 s (`kRowsWaitTimeoutNs`): a count that never reaches its target —
+a producer bug — writes `kErrorRowsWaitTimeout` to the call's error word and the down CTA leaves
+h unread, so the round fails instead of the GPU hanging. Wider calls run the tensor-core narrow
+kernels (`narrow_a16_mma.cuh`) for their narrow jobs (§17.3): per 16-element block one m16n8k32
+pair over A = [8 c | c] gives the exact
 int32 P_b for up to eight columns at once, 0.9-8 % faster than the dp4a kernels for the whole op
 from T = 160 on and level to T = 128 (op bench, cold L2, interleaved A/B, 2026-11-04).
 

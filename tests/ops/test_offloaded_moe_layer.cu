@@ -4,7 +4,8 @@
 // served by the host expert engine through the CPU miss channel
 // (docs/maintainer/qwen3_8-flash-next-design.md §8.6, §10.3, §17.2), and with SSD-only experts
 // (the SSD tier, §9.5) read through a RecordProvider by CPU jobs or fetched through the fetch
-// channel from a host responder, including its failure paths (host status, silent host).
+// channel from a host responder, including its failure paths (host status, silent host), and the
+// rows route's per-job wait past its bound (kErrorRowsWaitTimeout).
 //
 // Oracle: the CPU engine's output of each routed (column, expert) pair of the narrow route, bit
 // for bit; the narrow route's arithmetic is exact. Every output, the wide route's included (its own
@@ -762,6 +763,53 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         cudaFreeHost(cx);
         cudaFreeHost(request);
     }
+    // The rows route's per-job wait (wait_job_h) is bounded: a down CTA whose job's h-element count
+    // has not reached its target within rows_wait_timeout_ns reports kErrorRowsWaitTimeout through
+    // the call's error word and returns without reading h, so a producer bug fails the round
+    // (outputs undefined, as with the other faults) instead of hanging the GPU. The call is
+    // captured into a graph, as production replays it: only a captured launch makes the down pass
+    // a programmatic dependent of the still-running gate/up grid — an eager launch is
+    // stream-ordered behind the whole grid, and every poll reads a complete count. The shape (few
+    // experts, eight columns, top-3) gives every job about six columns, so the gate/up pass's
+    // per-column work outlasts the down CTA's first poll by far, and the 0 ns bound — no healthy
+    // gate/up job can complete a count within one tick of a clock a poll already found incomplete —
+    // fires at once; production's default (kRowsWaitTimeoutNs, 2 s) dwarfs the microseconds one
+    // gate/up job takes.
+    if (a16 && experts <= 6 && columns >= 8) {
+        infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+        cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
+        infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+                                            .frames        = d_frames,
+                                            .host_records  = host_device,
+                                            .record_stride = stride,
+                                            .scales        = d_scales};
+        source.activation           = activation;
+        source.cpu.layer            = 9; // names the call in its error word
+        source.rows_wait_timeout_ns = 0;
+        *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
+        source.error = error_device;
+        Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
+        Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
+        cudaStream_t stream = nullptr;
+        cudaGraph_t graph   = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        cuda_check(cudaGraphLaunch(exec, stream), "launch");
+        const cudaError_t status = cudaStreamSynchronize(stream);
+        const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
+        std::printf("rows per-job wait at a 0 ns bound (%d columns): %s, error word %#x\n", columns,
+                    cudaGetErrorString(status), error);
+        check(status == cudaSuccess && error == (9U << 16U | moe::kErrorRowsWaitTimeout),
+              "a per-job wait past its bound fails the call through its error word, without a hang");
+        cuda_check(cudaMemset(d_out, 0, 16), "a device that is still usable");
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+    }
     for (auto event : fork_events) { cudaEventDestroy(event); }
     cudaStreamDestroy(fork_stream);
     for (auto event : overlap_events) { cudaEventDestroy(event); }
@@ -1359,6 +1407,10 @@ int main() {
         test_layer(9, 3, 3, 101, kA16, moe::WideA16::kA4Residual);
         test_layer(24, 8, 10, 103, kA16, moe::WideA16::kA4Residual);
         test_layer(512, 132, 3, 111, kA16, moe::WideA16::kA4Residual);
+        // The rows per-job wait's bound (kErrorRowsWaitTimeout): four experts, eight columns, top-3
+        // — about six columns per job, so the gate/up pass's per-column tail outlasts the down
+        // CTA's first poll at a captured launch.
+        test_layer(4, 8, 3, 601, kA16);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

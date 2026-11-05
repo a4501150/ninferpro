@@ -1263,11 +1263,26 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
 // replaces the grid-wide PDL wait: a job's down CTAs proceed as soon as that job's h is complete,
 // while other jobs' gate/up CTAs still run, and this grid's completion still implies the gate/up
 // pass's writes — every job a down CTA served was fully counted before it proceeded.
-__device__ __forceinline__ void wait_job_h(const std::uint32_t* count, unsigned target) {
+// Bounded (kErrorRowsWaitTimeout, the DeviceFault convention — a trap would lose the context, and
+// on sm_120 one hung the driver until a power cycle): the fast path stays one acquire load, and
+// only a count found incomplete starts the clock. A count still short of its target after
+// source.rows_wait_timeout_ns never completes (a gate/up job counts its elements in
+// microseconds, so only a producer bug holds it back), so the wait reports the code through the
+// call's error word and returns false: the CTA leaves h unread — the round fails, its outputs
+// undefined as with the other faults — and the stream drains instead of the GPU hanging forever.
+__device__ __forceinline__ bool wait_job_h(const MoeExpertSource& source, const std::uint32_t* count,
+                                           unsigned target) {
     unsigned v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(count) : "memory");
+    if (v >= target) { return true; }
+    const std::uint64_t start = global_ns();
     do {
         asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(count) : "memory");
-        if (v >= target) { break; }
+        if (v >= target) { return true; }
+        if (global_ns() - start > source.rows_wait_timeout_ns) {
+            report_error(source, offloaded_moe::kErrorRowsWaitTimeout);
+            return false;
+        }
         __nanosleep(64);
     } while (true);
 }
@@ -1337,7 +1352,9 @@ struct DownRowShared16 {
 // most kA16PerJobWaitColumns columns the wait is the job's own element count (wait_job_h), not
 // the grid-wide PDL wait — a job's down CTAs proceed as soon as that job's h is complete, while
 // the other jobs' gate/up CTAs still run — because there the earlier start measured faster; in a
-// wider call both passes contend for the same DRAM and the whole-grid wait measured faster.
+// wider call both passes contend for the same DRAM and the whole-grid wait measured faster. The
+// per-job wait is bounded: past rows_wait_timeout_ns the CTA reports kErrorRowsWaitTimeout and
+// returns without reading h.
 __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
     down_rows_kernel_a16(MoeDispatch dispatch, MoeExpertSource source, int hidden,
                          const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
@@ -1370,10 +1387,12 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
     }
     if (per_job_wait) {
         if (record == nullptr) { return; }
+        __shared__ int h_ready; // wait_job_h's outcome, written by thread 0 and read past the barrier
         if (threadIdx.x == 0) {
-            wait_job_h(job_ctas + job, 8U * moe::kGateUpRowGroups * static_cast<unsigned>(count));
+            h_ready = wait_job_h(source, job_ctas + job, 8U * moe::kGateUpRowGroups * static_cast<unsigned>(count));
         }
         __syncthreads();
+        if (h_ready == 0) { return; } // the wait's bound passed: the call's error word fails the round
     } else {
         pdl::wait_for_dependencies();
         if (record == nullptr) { return; }
