@@ -1202,7 +1202,10 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm = *reinterpret_cast<GateUpRowShared16*>(smem_raw);
     // The down pass (a programmatic dependent in captured graphs) may launch and load its weights
-    // now: it reads h only after its job's count below is complete.
+    // now: it reads h only after its job's count below is complete. The trigger must stay first, on
+    // every path: a dependent grid launches only once every CTA of this grid has triggered or
+    // exited, so every CTA a spinning down CTA (wait_job_h) waits for is already resident. A trigger
+    // after the work would let down CTAs occupy SMs that unscheduled gate/up CTAs still need.
     pdl::trigger_dependents();
     const int job = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
