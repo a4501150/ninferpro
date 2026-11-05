@@ -776,8 +776,15 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     // fires at once; production's default (kRowsWaitTimeoutNs, 2 s) dwarfs the microseconds one
     // gate/up job takes.
     if (a16 && experts <= 6 && columns >= 8) {
-        infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
-        cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
+        cudaStream_t stream = nullptr;
+        cudaGraph_t graph   = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+        // The dispatch and the poison run on the capture stream: the graph replays on this
+        // non-blocking stream, which does not order against the legacy stream.
+        infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, stream);
+        cuda_check(cudaMemsetAsync(d_out, 0xFF, expected.size() * sizeof(std::uint16_t), stream),
+                   "cudaMemsetAsync");
         infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
                                             .frames        = d_frames,
                                             .host_records  = host_device,
@@ -790,10 +797,6 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         source.error = error_device;
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
-        cudaStream_t stream = nullptr;
-        cudaGraph_t graph   = nullptr;
-        cudaGraphExec_t exec = nullptr;
-        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
         cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
         infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, stream);
         cuda_check(cudaStreamEndCapture(stream, &graph), "capture");

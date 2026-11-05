@@ -351,7 +351,10 @@ void test_packed_recurrent(q36::RecurrentHostFormat format, infernix::DeviceCont
         }
         bits[0] = 0x3f800000U | (1U << (dropped - 1U));                      // tie, even: down
         bits[1] = 0x3f800000U | (1U << dropped) | (1U << (dropped - 1U));    // tie, odd: up
-        CUDA_CHECK(cudaMemcpy(state.data, bits.data(), state.bytes(), cudaMemcpyHostToDevice));
+        // On the pool's stream: the snapshot below copies on the non-blocking device stream, which
+        // a legacy-stream cudaMemcpy does not order against.
+        CUDA_CHECK(cudaMemcpyAsync(state.data, bits.data(), state.bytes(), cudaMemcpyHostToDevice,
+                                   device.stream));
     }
     pool.zero_slot(1, device.stream);
 

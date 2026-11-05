@@ -132,7 +132,11 @@ struct Case {
           gate(s.gated ? varied(std::size_t(s.d) * s.heads * t, 321) : DeviceBuffer()),
           output(std::size_t(s.d) * s.heads * t * 2), x(source.p, DType::BF16, {s.d, s.heads, t}),
           w(weight.p, DType::BF16, {s.d}), z(gate.p, DType::BF16, {s.d, s.heads, t}),
-          y(output.p, DType::BF16, {s.d, s.heads, t}) {}
+          y(output.p, DType::BF16, {s.d, s.heads, t}) {
+        // varied()'s pageable copies may still be in flight; the Op launches on the non-blocking
+        // bench stream, which does not order against the legacy stream.
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 
     void launch(DeviceExecutionView execution) {
         if (shape.gated)

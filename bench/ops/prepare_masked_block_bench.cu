@@ -157,6 +157,9 @@ public:
         CUDA_CHECK(cudaMemcpy(anchor_.p, &anchor, sizeof(anchor), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(length_.p, &length, sizeof(length), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(valid_.p, &valid, sizeof(valid), cudaMemcpyHostToDevice));
+        // The pageable copies may still be in flight; the Op launches on the non-blocking bench
+        // stream, which does not order against the legacy stream.
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     void launch(cudaStream_t stream) {

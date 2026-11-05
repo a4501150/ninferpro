@@ -110,7 +110,9 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
     };
     std::uint32_t round = 0;
     for (const std::size_t bytes : {std::size_t{2560}, std::size_t{12800}, kMaxBytes}) {
-        CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
+        // The stats clear runs on ctx.stream: a legacy-stream cudaMemset is not ordered against
+        // the gate that counts its waits on the non-blocking stream.
+        CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(std::uint64_t), ctx.stream));
         if (!produce(bytes, ++round, [&] {
                 infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, {}, ctx.stream);
             })) {
@@ -127,7 +129,7 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
     }
     // A published word passes at once and records no wait.
     {
-        CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
+        CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(std::uint64_t), ctx.stream));
         *expected_h = ++word;
         CUDA_CHECK(cudaMemcpyAsync(expected, expected_h, sizeof(std::uint32_t), cudaMemcpyHostToDevice, ctx.stream));
         fill(2560, ++round);
@@ -152,7 +154,7 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
         infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, {}, ctx.stream);
         CUDA_CHECK(cudaStreamEndCapture(ctx.stream, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
-        CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
+        CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(std::uint64_t), ctx.stream));
         for (int replay = 0; replay < 3; ++replay) {
             if (!produce(bytes, ++round, [&] { CUDA_CHECK(cudaGraphLaunch(exec, ctx.stream)); })) {
                 ++failures;
@@ -181,7 +183,7 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
         constexpr std::uint64_t kBoundNs   = 50ULL * 1000 * 1000;
         std::uint32_t* const fault         = expected_h + 1; // mapped pinned, beside the staged word
         *reinterpret_cast<volatile std::uint32_t*>(fault) = 0;
-        CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
+        CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(std::uint64_t), ctx.stream));
         CUDA_CHECK(cudaMemset(dst, 0x5a, bytes));
         *expected_h = ++word; // the host never publishes this round's word
         CUDA_CHECK(cudaMemcpyAsync(expected, expected_h, sizeof(std::uint32_t), cudaMemcpyHostToDevice, ctx.stream));

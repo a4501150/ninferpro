@@ -125,6 +125,9 @@ struct Case {
         CUDA_CHECK(cudaMemcpy(lanes.p, hl.data(), b * 4, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(starts.p, hs.data(), b * 4, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ends.p, he.data(), b * 4, cudaMemcpyHostToDevice));
+        // The pageable copies may still be in flight; the Op launches on the non-blocking bench
+        // stream, which does not order against the legacy stream.
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     void launch(cudaStream_t stream) { ops::prepare_ragged_prefix(x, l, s, e, y, p, n, stream); }

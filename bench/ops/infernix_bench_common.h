@@ -60,6 +60,9 @@ class SavedBuffer {
 public:
     explicit SavedBuffer(DeviceBuffer& buffer) : destination_(buffer.p), initial_(buffer.bytes) {
         CUDA_CHECK(cudaMemcpy(initial_.p, buffer.p, buffer.bytes, cudaMemcpyDeviceToDevice));
+        // The snapshot may still be in flight when the constructor returns; restore() reads it
+        // from the caller's non-blocking stream, which does not order against the legacy stream.
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
     void restore(cudaStream_t stream) const {

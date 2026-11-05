@@ -98,6 +98,9 @@ void run(int tokens, int candidate_block, bench::L2FlushBuffer* flush, int warmu
     const std::int32_t delta_value = -17;
     cudaMemcpy(source.p, host.data(), source.bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(delta.p, &delta_value, sizeof(delta_value), cudaMemcpyHostToDevice);
+    // The pageable copies may still be in flight; the cold-graph path launches on a non-blocking
+    // stream, which does not order against the legacy stream.
+    CUDA_CHECK(cudaDeviceSynchronize());
     Tensor tsource(source.p, DType::I32, {tokens});
     Tensor tdelta(delta.p, DType::I32, {1});
     Tensor tdestination(destination.p, DType::I32, {tokens});

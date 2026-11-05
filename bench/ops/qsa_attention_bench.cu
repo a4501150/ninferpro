@@ -209,6 +209,9 @@ struct Case {
         workspace_bytes = ops::qsa_attention_workspace_bytes(kGeometry, width, pages * kPage, storage);
         workspace       = DeviceBuffer(workspace_bytes);
         out             = DeviceBuffer(static_cast<std::size_t>(kD) * kHeads * width * 2);
+        // The uploads above may still be in flight; the Op launches on the non-blocking bench
+        // stream, which does not order against the legacy stream.
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     void attention(cudaStream_t s, ops::QsaAttentionRoute route) {
