@@ -61,7 +61,10 @@ its prefill speed does to the interleaving elsewhere.
 **Closed loop, identical observations.** Every observation the client sends (tool results, user
 messages, subagent reports, the post-compaction summary) is generated before the run from real
 files, diffs and history of this repository at a pinned commit (`AB_CORPUS_COMMIT`, default
-`e48a0d28`), so every arm receives byte-identical observations. The assistant turns are each
+`e48a0d28`), so every arm receives byte-identical observations. A corpus checkout without
+`CONTRIBUTING.md` (the ninferpro port dropped it) substitutes the repository README for that
+persona block; checkouts that have the file keep the original text, so pinned Infernix corpora
+are unchanged. The assistant turns are each
 arm's own streamed output (reasoning, content and tool calls), fed back as an agent client does;
 that is what makes the engine's private-endpoint reuse behave as in production. Observations
 answer the model's tool calls by id whatever it asked for, so every arm sees the same token

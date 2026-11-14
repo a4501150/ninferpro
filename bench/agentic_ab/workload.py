@@ -72,6 +72,14 @@ class Corpus:
             self._files[path] = _git("show", "%s:%s" % (self.commit, path)).replace("\r\n", "\n")
         return self._files[path]
 
+    def exists(self, path):
+        # A checkout without the file (the ninferpro port dropped CONTRIBUTING.md)
+        # falls back to the project's README for that persona block; checkouts that
+        # have it (the Infernix repo the A/B suite pins) keep the byte-identical text.
+        out = subprocess.run(["git", "-C", REPO, "cat-file", "-e",
+                               "%s:%s" % (self.commit, path)], capture_output=True)
+        return out.returncode == 0
+
     def lines(self, path):
         return self.text(path).split("\n")
 
@@ -503,7 +511,8 @@ def personas(c):
     """Return {name: {"system": str, "tools": [..]}} built from the pinned corpus."""
     agents = c.text("AGENTS.md")
     arch = c.text("docs/maintainer/engine-architecture.md")
-    contributing = c.text("CONTRIBUTING.md")
+    contributing = c.text("CONTRIBUTING.md") if c.exists("CONTRIBUTING.md") \
+        else c.text("README.md")
     cli = c.text("docs/cli.md")
     docmap = c.text("docs/README.md")
     opdev = c.text("docs/maintainer/op-development.md")
