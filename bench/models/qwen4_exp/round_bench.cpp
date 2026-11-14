@@ -7,22 +7,31 @@
 // the round's logits.
 //
 //   infernix_qwen4_exp_round_bench [--artifact PATH] [--ngram-volume PATH] [--shape RxW[,RxW...]]
-//       [--context N] [--replays N] [--kv bf16|int8|fp8|nvfp4|k8v4] [--experts N|all]
-//       [--accept K] [--sections] [--layers] [--exact] [--profile] [--check FILE | --record FILE]
+//       [--context N[xK][,N[xK]...]] [--prefill-chunk N] [--replays N] [--kv bf16|int8|fp8|nvfp4|k8v4]
+//       [--experts N|all] [--accept K] [--sections] [--layers] [--exact] [--profile]
+//       [--check FILE | --record FILE] [--report FILE] [--dram-gbs X]
 //       [--determinism N] [--no-fork] [--no-shared-stream] [--miss-route] [--staging-slots N]
 //       [--fast-path NAME]...
 //
 // A shape R x W is R rows of W columns: W = 1 a plain decode round, W >= 2 a verification round of
 // W - 1 drafts per row followed by the commit of K columns per row (--accept, default W). Each row
-// holds --context tokens (default 1024) before the round; all 8 lanes are prefilled, the round runs the first R. --experts N (default 64) reads the first N
+// holds its --context tokens before the round (default 1024): one value for every lane, or lane
+// contexts in lane order, N tokens for K lanes each, the last value filling the remaining lanes
+// (`131072,1024` puts one long lane beside seven short ones); all 8 lanes are prefilled in
+// --prefill-chunk calls (default 512), the round runs the first R. --experts N (default 64) reads the first N
 // records of every layer from the artifact and fills the other frames with copies of them, so every
 // expert still has its own frame (the same bytes moved per round) at a fraction of the read time;
 // --experts all reads every record (about 68 GB). The logits hash depends on that choice, on the KV
 // storage and on the fast paths (--exact runs the exact route), and is compared between builds with
 // the same options. --sections times each section (embedding, every layer's mixer and MoE halves, the
 // head) as its own graph; --layers prints them per layer. --profile brackets the timed replays with
-// cudaProfilerStart/Stop for tools/flash_next/t1_kernels.py. --check FILE fails (exit 2) when a shape's
+// cudaProfilerStart/Stop for tools/tiers/kernels.py. --check FILE fails (exit 2) when a shape's
 // hash differs from the one FILE records for the same artifact and options; --record FILE writes them.
+// Every plain shape also reports its speed of light: the bytes the round must move at least (the
+// dense weights the Forward reads, each distinct routed expert's record from one eager run's routes,
+// the KV each row's attention reads at least, each row's recurrent state read and written once)
+// over the device read rate measured at startup (--dram-gbs X overrides it), against the measured
+// round. --report FILE appends one JSON line per shape (docs/maintainer/round-bench.md).
 // Every shape replays N times (--determinism, default 2) from the same state and fails unless all
 // give the same bits. --no-fork and --no-shared-stream run the MoE's miss fork and the shared expert
 // in order on the main stream (to tell which overlap a nondeterminism needs). Every expert holds a
@@ -45,7 +54,10 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/dram_probe.h"
+#include "core/dtype.h"
 #include "core/gdn_replay_records.h"
+#include "core/ggml_format.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
@@ -128,12 +140,16 @@ struct Shape {
 struct Options {
     std::filesystem::path artifact, ngram;
     std::vector<Shape> shapes{{6, 1}, {6, 2}};
-    std::int32_t context = 1024, replays = 50, warmup = 5, accept = -1;
+    std::vector<std::int32_t> contexts; // kLanes entries: each lane's tokens before the round
+    std::int32_t prefill_chunk = kPrefillChunk;
+    std::int32_t replays = 50, warmup = 5, accept = -1;
     std::int32_t determinism = 2; // replays from the same state whose hashes must agree
     std::int32_t sample_experts = 64; // 0: every record
     std::string kv_name = "fp8";
     bool sections = false, layers = false, exact = false, profile = false;
     std::filesystem::path check, record; // golden hashes: compare with, or write into
+    std::filesystem::path report;        // JSON lines, one per shape
+    double dram_gbs = 0;                 // 0: measure the device read rate
     bool no_fork = false, no_shared_stream = false; // run the MoE fork / the shared expert in order
     std::int32_t staging_slots = 80;
     bool miss_route = false;
@@ -162,6 +178,43 @@ std::vector<Shape> parse_shapes(const std::string& text) {
     return out;
 }
 
+// --context N[xK][,N[xK]...]: lane contexts in lane order, K lanes each (default 1); the last value
+// fills the remaining lanes.
+std::vector<std::int32_t> parse_contexts(const std::string& text) {
+    std::vector<std::int32_t> out;
+    std::stringstream list(text);
+    std::string item;
+    while (std::getline(list, item, ',')) {
+        const auto x              = item.find('x');
+        const std::int32_t tokens = std::stoi(item.substr(0, x));
+        const std::int32_t lanes  = x == std::string::npos ? 1 : std::stoi(item.substr(x + 1));
+        if (tokens < 1 || lanes < 1) { throw std::invalid_argument("--context " + item + ": tokens and lanes must be positive"); }
+        out.insert(out.end(), static_cast<std::size_t>(lanes), tokens);
+    }
+    if (out.empty() || out.size() > static_cast<std::size_t>(kLanes)) {
+        throw std::invalid_argument("--context gives 1 to 8 lane contexts");
+    }
+    out.resize(kLanes, out.back());
+    return out;
+}
+
+// The lane contexts as one number when uniform, else run-length encoded ("131072,1024x7").
+std::string context_label(const std::vector<std::int32_t>& contexts) {
+    if (std::all_of(contexts.begin(), contexts.end(), [&](std::int32_t n) { return n == contexts.front(); })) {
+        return std::to_string(contexts.front());
+    }
+    std::string out;
+    for (std::size_t i = 0; i < contexts.size();) {
+        std::size_t j = i;
+        while (j < contexts.size() && contexts[j] == contexts[i]) { ++j; }
+        if (!out.empty()) { out += ','; }
+        out += std::to_string(contexts[i]);
+        if (j - i > 1) { out += 'x' + std::to_string(j - i); }
+        i = j;
+    }
+    return out;
+}
+
 Options parse(int argc, char** argv) {
     Options o;
     const char* home = std::getenv("HOME");
@@ -183,7 +236,13 @@ Options parse(int argc, char** argv) {
         } else if (arg == "--shape") {
             o.shapes = parse_shapes(value());
         } else if (arg == "--context") {
-            o.context = std::stoi(value());
+            o.contexts = parse_contexts(value());
+        } else if (arg == "--prefill-chunk") {
+            o.prefill_chunk = std::stoi(value());
+        } else if (arg == "--report") {
+            o.report = value();
+        } else if (arg == "--dram-gbs") {
+            o.dram_gbs = std::stod(value());
         } else if (arg == "--replays") {
             o.replays = std::max(1, std::stoi(value()));
         } else if (arg == "--kv") {
@@ -235,7 +294,8 @@ Options parse(int argc, char** argv) {
             throw std::invalid_argument("unknown option " + arg);
         }
     }
-    if (o.context < 1) { throw std::invalid_argument("--context must be positive"); }
+    if (o.contexts.empty()) { o.contexts.assign(kLanes, 1024); }
+    if (o.prefill_chunk < 1) { throw std::invalid_argument("--prefill-chunk must be positive"); }
     return o;
 }
 
@@ -326,14 +386,15 @@ struct ExpertFrames {
     }
 };
 
-// The Program's per-lane state, KV, verification records and streams for `rows` lanes of up to
-// `context` tokens.
+// The Program's per-lane state, KV, verification records and streams for one lane per entry of
+// `row_tokens`, each of up to that many tokens.
 struct Harness {
     Harness(const q4::execution::Parameters& parameters, DeviceContext& device, const ExpertFrames& frames,
-            std::int32_t context, std::int32_t columns, std::int32_t rows, std::int32_t max_width, KvCacheStorage storage,
+            std::span<const std::int32_t> row_tokens, std::int32_t columns, std::int32_t max_width, KvCacheStorage storage,
             q4::execution::ForwardFastPaths fast, bool no_fork, bool no_shared_stream, bool miss_route, std::int32_t staging_slots)
-        : config(parameters.model.config().text), rows(rows) {
+        : config(parameters.model.config().text), rows(static_cast<std::int32_t>(row_tokens.size())) {
         const auto& c = config;
+        const std::int32_t context = *std::max_element(row_tokens.begin(), row_tokens.end());
         LayoutBuilder builder;
         const LinearAttentionStatePoolSpec gdn_spec{
             .layers         = c.gdn_layers,
@@ -372,22 +433,34 @@ struct Harness {
             }
             geometry.planes.push_back({DType::BF16, di / r, 1});
         }
-        pages_per_row = (context + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        for (std::size_t i = 0; i < geometry.planes.size(); ++i) {
+            const auto& plane = geometry.planes[i];
+            const std::uint64_t bytes = dtype_size(plane.dtype) * static_cast<std::uint64_t>(plane.leading_extent) *
+                                        static_cast<std::uint64_t>(plane.head_extent);
+            // Each layer's planes end with its pooled index keys.
+            const bool pooled = (i + 1) % (geometry.planes.size() / c.attention_layers) == 0;
+            (pooled ? pooled_token_bytes : kv_token_bytes) += bytes;
+        }
+        std::uint32_t total_pages = 0, max_pages = 0;
+        for (const std::int32_t tokens : row_tokens) {
+            row_pages.push_back((tokens + kPagedKVPageSize - 1) / kPagedKVPageSize);
+            total_pages += static_cast<std::uint32_t>(row_pages.back());
+            max_pages = std::max(max_pages, static_cast<std::uint32_t>(row_pages.back()));
+        }
         LayoutBuilder kv_builder;
-        const auto pool_layout = plan_device_kv_page_pool(
-            kv_builder, {.page_group_count = static_cast<std::uint32_t>(pages_per_row * rows), .geometry = geometry});
-        const auto table_layout = plan_kv_execution_tables(
-            kv_builder, {.logical_page_capacity = static_cast<std::uint32_t>(pages_per_row), .table_rows = rows});
+        const auto pool_layout = plan_device_kv_page_pool(kv_builder, {.page_group_count = total_pages, .geometry = geometry});
+        const auto table_layout = plan_kv_execution_tables(kv_builder, {.logical_page_capacity = max_pages, .table_rows = rows});
         kv_backing = DeviceBuffer(kv_builder.finish(256));
         kv_backing.fill(0);
         pool   = std::make_unique<DeviceKVPagePool>(DeviceSpan{kv_backing.p, kv_backing.bytes}, pool_layout);
         tables = std::make_unique<KVExecutionTablePool>(DeviceSpan{kv_backing.p, kv_backing.bytes}, table_layout, *pool);
         for (std::int32_t row = 0; row < rows; ++row) {
-            auto reservation = pool->reserve(static_cast<std::uint32_t>(pages_per_row));
+            const auto n     = static_cast<std::uint32_t>(row_pages[static_cast<std::size_t>(row)]);
+            auto reservation = pool->reserve(n);
             if (!reservation) { throw std::runtime_error("KV pool too small"); }
             std::vector<DeviceKVPageLease> pages;
-            pages.reserve(static_cast<std::size_t>(pages_per_row));
-            pool->materialize(*reservation, static_cast<std::uint32_t>(pages_per_row), pages);
+            pages.reserve(n);
+            pool->materialize(*reservation, n, pages);
             row_leases.push_back(tables->acquire(row));
             tables->publish(row_leases.back().handle(), 0, pages, device.stream);
             page_leases.push_back(std::move(pages));
@@ -512,7 +585,10 @@ struct Harness {
     }
 
     const q4::TextConfig& config;
-    std::int32_t rows = 0, width = 0, span = 0, di = 0, r = 0, pages_per_row = 0;
+    std::int32_t rows = 0, width = 0, span = 0, di = 0, r = 0;
+    std::vector<std::int32_t> row_pages;
+    // Over all attention layers, per token: the K/V planes (codes and scales) and the pooled index keys.
+    std::uint64_t kv_token_bytes = 0, pooled_token_bytes = 0;
     DeviceBuffer state_backing, ple_backing, tails_backing, kv_backing, window_backing;
     DeviceBuffer records_backing, ple_records, qsa_records;
     DeviceBuffer staging, landing, landed; // the miss staging and landing tables (--staging-slots)
@@ -542,7 +618,7 @@ private:
     }
 };
 
-// Device copies of one call's inputs: `batch` rows of `width` columns from position `first`.
+// Device copies of one call's inputs: `batch` rows of `width` columns, row b from position firsts[b].
 struct Call {
     DeviceBuffer buffer;
     q4::execution::ForwardBatch batch;
@@ -550,7 +626,8 @@ struct Call {
 };
 
 Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std::vector<std::vector<std::int32_t>>& histories,
-               std::span<const std::int32_t> slots, std::int32_t first, std::int32_t width, bool every_column) {
+               std::span<const std::int32_t> slots, std::span<const std::int32_t> firsts, std::int32_t width,
+               bool every_column) {
     const auto batch           = static_cast<std::int32_t>(slots.size());
     const std::int32_t columns = batch * width;
     const q4::NgramHash hash(c.ple.ngram, 0);
@@ -562,6 +639,7 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     std::vector<std::byte> ngram(columns * heads * row_bytes);
     for (std::int32_t b = 0; b < batch; ++b) {
         const auto& history = histories[static_cast<std::size_t>(slots[b])];
+        const std::int32_t first = firsts[static_cast<std::size_t>(b)];
         std::vector<std::int32_t> padded(c.ple.ngram.ngram_size - 1, c.eos_token_id);
         padded.insert(padded.end(), history.begin(), history.begin() + first + width);
         std::vector<std::uint32_t> row_ids(static_cast<std::size_t>(width) * heads);
@@ -653,10 +731,140 @@ private:
     std::vector<cudaEvent_t> events_;
 };
 
+// The dense weights the Forward reads every round, whatever its width: every projection, norm and
+// convolution of the blocks, the final mixer and the head (each stored parent once). The token
+// embedding (host rows), the drafters and the routed experts are not dense reads.
+std::uint64_t dense_weight_bytes(const q4::execution::Parameters& p) {
+    std::set<const void*> seen;
+    std::uint64_t total = 0;
+    const auto weight = [&](const Weight& w) {
+        if (w.payload != nullptr && seen.insert(w.payload).second) { total += w.payload_bytes; }
+    };
+    const auto linear = [&](const q4::execution::LinearParameters& l) {
+        if (!l.is_ggml()) { return weight(l.weight); }
+        for (const auto& s : l.ggml) {
+            if (seen.insert(s.data).second) {
+                total += static_cast<std::uint64_t>(s.rows) * (static_cast<std::uint64_t>(l.weight.k) / ggml_block_elems(s.format)) *
+                         ggml_block_bytes(s.format);
+            }
+        }
+    };
+    const auto tensor = [&](const Tensor& t) {
+        if (t.data != nullptr && seen.insert(t.data).second) { total += t.bytes(); }
+    };
+    const auto mixer = [&](const q4::execution::HyperConnectionParameters& hc) {
+        tensor(hc.norm);
+        linear(hc.down);
+        linear(hc.up);
+    };
+    for (const auto& b : p.layers) {
+        mixer(b.attn_hc);
+        mixer(b.mlp_hc);
+        if (const auto* a = std::get_if<q4::execution::AttentionParameters>(&b.mixer)) {
+            linear(a->projection);
+            if (a->index_projection) { linear(*a->index_projection); }
+            for (const Tensor* t : {&a->query_norm, &a->key_norm, &a->index_query_norm, &a->index_key_norm}) { tensor(*t); }
+            linear(a->output);
+        } else {
+            const auto& g = std::get<q4::execution::GdnParameters>(b.mixer);
+            linear(g.projection);
+            linear(g.control);
+            for (const Tensor* t : {&g.a_log, &g.dt_bias, &g.convolution, &g.norm}) { tensor(*t); }
+            linear(g.output);
+        }
+        tensor(b.moe.router);
+        tensor(b.moe.shared_score);
+        linear(b.moe.shared_gate_up);
+        linear(b.moe.shared_down);
+        if (b.ple) {
+            linear(b.ple->projection);
+            for (const Tensor* t : {&b.ple->key_norm, &b.ple->query_norm, &b.ple->conv_norm, &b.ple->convolution}) { tensor(*t); }
+        }
+    }
+    mixer(p.final_mixer);
+    tensor(p.output_head);
+    if (p.output_head_q8) { linear(*p.output_head_q8); }
+    return total;
+}
+
+// The bytes one round must move at least (its speed of light, docs/maintainer/round-bench.md).
+struct RoundBytes {
+    double dense = 0, experts = 0, kv = 0, state = 0;
+    double distinct = 0; // routed experts per layer, mean
+    [[nodiscard]] double total() const noexcept { return dense + experts + kv + state; }
+};
+
+// What every shape's speed of light and report line need.
+struct Reporting {
+    std::uint64_t dense_bytes    = 0;
+    double read_bytes_per_second = 0;
+    std::ofstream report; // open with --report
+};
+
+// Dense weights; the distinct experts of one eager run's routes (outside the timed graph, from the
+// state the timed replays start from); per row the K/V of the tokens its attention selects at most
+// once (the whole context below the budget) and the pooled index keys of its whole context; per row
+// the recurrent state (GDN, PLE history, QSA tails) read and written once.
+RoundBytes round_bytes(const Options& o, const Shape& shape, Harness& h, const Call& call, Tensor& logits,
+                       DeviceContext& device, const q4::execution::Parameters& parameters, std::uint64_t dense) {
+    const auto& c        = h.config;
+    const std::int32_t T = shape.rows * shape.width;
+    const auto L         = static_cast<std::int32_t>(c.num_hidden_layers);
+    const auto K         = static_cast<std::int32_t>(c.moe.top_k);
+    DeviceBuffer route_buffer(static_cast<std::size_t>(L) * K * T * sizeof(std::int32_t));
+    std::vector<Tensor> routes;
+    for (std::int32_t l = 0; l < L; ++l) {
+        routes.emplace_back(static_cast<std::int32_t*>(route_buffer.p) + static_cast<std::size_t>(l) * K * T, DType::I32,
+                            std::initializer_list<std::int32_t>{K, T});
+    }
+    q4::execution::ForwardTap tap;
+    tap.routes = &routes;
+    h.restore(device.stream);
+    h.forward->run(call.batch, logits, &tap);
+    device.synchronize();
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(L) * K * T);
+    route_buffer.copy_to_host(ids.data(), route_buffer.bytes);
+
+    RoundBytes out;
+    out.dense = static_cast<double>(dense);
+    std::size_t distinct = 0;
+    for (std::int32_t l = 0; l < L; ++l) {
+        const auto first = ids.begin() + static_cast<std::ptrdiff_t>(l) * K * T;
+        const std::set<std::int32_t> layer(first, first + static_cast<std::ptrdiff_t>(K) * T);
+        distinct += layer.size();
+        out.experts += static_cast<double>(layer.size()) * static_cast<double>(parameters.layers[l].moe.bank->planes.record_stride);
+    }
+    out.distinct = static_cast<double>(distinct) / L;
+    const auto selected = static_cast<std::int64_t>(c.qsa.max_selected());
+    for (std::int32_t b = 0; b < shape.rows; ++b) {
+        const std::int64_t tokens = o.contexts[static_cast<std::size_t>(b)] + shape.width;
+        out.kv += static_cast<double>(std::min(tokens, selected)) * static_cast<double>(h.kv_token_bytes) +
+                  static_cast<double>(tokens) * static_cast<double>(h.pooled_token_bytes);
+    }
+    const double state_per_row =
+        static_cast<double>(h.state_backing.bytes + h.ple_backing.bytes + h.tails_backing.bytes) / h.rows;
+    out.state = 2.0 * shape.rows * state_per_row;
+    return out;
+}
+
+// The fields every report line starts with.
+std::string report_head(const Options& o, const Shape& shape) {
+    std::ostringstream line;
+    line << "{\"bench\":\"qwen4_exp\",\"shape\":\"" << shape.rows << 'x' << shape.width;
+    if (shape.prefill > 0) { line << '+' << shape.prefill; }
+    line << "\",\"rows\":" << shape.rows << ",\"width\":" << shape.width << ",\"prefill\":" << shape.prefill
+         << ",\"contexts\":[";
+    for (std::int32_t b = 0; b < shape.rows; ++b) { line << (b > 0 ? "," : "") << o.contexts[static_cast<std::size_t>(b)]; }
+    line << "],\"kv\":\"" << o.kv_name << "\",\"route\":\"" << (o.exact ? "exact" : "fast")
+         << "\",\"accept\":" << (o.accept < 0 ? shape.width : std::clamp(o.accept, 0, shape.width));
+    return line.str();
+}
+
 // One round shape: its graph, the commit of a verification round, timings, hashes and sections.
 // Returns the hashes ("logits state", hex).
 std::string run_shape(const Options& o, const Shape& shape, Harness& h, DeviceContext& device, const q4::NgramVolume& volume,
-               const std::vector<std::vector<std::int32_t>>& histories, const q4::execution::Parameters& parameters) {
+               const std::vector<std::vector<std::int32_t>>& histories, const q4::execution::Parameters& parameters,
+               Reporting& reporting) {
     const auto& c        = h.config;
     const cudaStream_t s = device.stream;
     const std::int32_t R = shape.rows, W = shape.width, T = R * W;
@@ -665,7 +873,7 @@ std::string run_shape(const Options& o, const Shape& shape, Harness& h, DeviceCo
     const std::int32_t accept = o.accept < 0 ? W : std::clamp(o.accept, 0, W);
     std::vector<std::int32_t> slots(static_cast<std::size_t>(R));
     std::iota(slots.begin(), slots.end(), 0);
-    Call call = make_call(c, volume, histories, slots, o.context, W, verify);
+    Call call = make_call(c, volume, histories, slots, std::span(o.contexts).first(static_cast<std::size_t>(R)), W, verify);
     call.batch.decode_round = true;
     q4::execution::ForwardVerify view;
     if (verify) {
@@ -729,6 +937,8 @@ std::string run_shape(const Options& o, const Shape& shape, Harness& h, DeviceCo
         top.push_back(static_cast<std::int32_t>(std::max_element(row, row + vocab) - row));
     }
 
+    const RoundBytes bytes = round_bytes(o, shape, h, call, logits, device, parameters, reporting.dense_bytes);
+
     // Warm-up: at least `warmup` replays and kWarmSeconds of them, so the clocks have settled.
     Timer timer(3);
     std::vector<double> forward_us, commit_us;
@@ -754,12 +964,27 @@ std::string run_shape(const Options& o, const Shape& shape, Harness& h, DeviceCo
     }
     if (o.profile) { check(cudaProfilerStop(), "cudaProfilerStop"); }
     const Stats f = summarize(forward_us), m = summarize(commit_us);
-    std::printf("\nshape %dx%d (%d columns, context %d%s)\n", R, W, T, o.context,
+    std::vector<std::int32_t> row_contexts(o.contexts.begin(), o.contexts.begin() + R);
+    std::printf("\nshape %dx%d (%d columns, context %s%s)\n", R, W, T, context_label(row_contexts).c_str(),
                 verify ? (", commit " + std::to_string(accept) + " per row").c_str() : "");
     std::printf("  forward graph  median %8.1f us   min %8.1f   mean %8.1f   (%d replays)\n", f.median, f.min, f.mean,
                 o.replays);
     if (verify) { std::printf("  commit         median %8.1f us   min %8.1f   mean %8.1f\n", m.median, m.min, m.mean); }
-    std::printf("  round          median %8.1f us\n", f.median + m.median);
+    const double round_us = f.median + (verify ? m.median : 0.0);
+    std::printf("  round          median %8.1f us\n", round_us);
+    const double gb = 1e-9, ideal_us = bytes.total() / reporting.read_bytes_per_second * 1e6;
+    std::printf("  bytes          dense %.3f GB  experts %.3f GB (%.1f per layer)  kv %.3f GB  state %.3f GB  = %.3f GB\n",
+                bytes.dense * gb, bytes.experts * gb, bytes.distinct, bytes.kv * gb, bytes.state * gb, bytes.total() * gb);
+    std::printf("  speed of light %8.1f us at %.0f GB/s read: the round takes %.2fx (%.0f%% of the read rate)\n", ideal_us,
+                reporting.read_bytes_per_second * gb, round_us / ideal_us, 100.0 * ideal_us / round_us);
+    if (reporting.report.is_open()) {
+        reporting.report << report_head(o, shape) << ",\"forward_us\":" << f.median << ",\"commit_us\":" << (verify ? m.median : 0.0)
+                         << ",\"round_us\":" << round_us << ",\"bytes\":{\"dense\":" << bytes.dense << ",\"experts\":" << bytes.experts
+                         << ",\"kv\":" << bytes.kv << ",\"state\":" << bytes.state << ",\"total\":" << bytes.total()
+                         << "},\"distinct_experts\":" << bytes.distinct << ",\"read_gbs\":" << reporting.read_bytes_per_second * gb
+                         << ",\"ideal_us\":" << ideal_us << "}\n";
+        reporting.report.flush();
+    }
     const bool stable = differing == 0;
     std::printf("  hash logits %016llx state %016llx   top-1:", static_cast<unsigned long long>(hashes[0][0]),
                 static_cast<unsigned long long>(hashes[0][1]));
@@ -854,7 +1079,8 @@ std::string run_shape(const Options& o, const Shape& shape, Harness& h, DeviceCo
 // today), against one mixed call over both. Returns the mixed call's hashes, or "" when they differ
 // from the separate calls' on the exact route.
 std::string run_mixed(const Options& o, const Shape& shape, Harness& h, DeviceContext& device,
-                      const q4::NgramVolume& volume, const std::vector<std::vector<std::int32_t>>& histories) {
+                      const q4::NgramVolume& volume, const std::vector<std::vector<std::int32_t>>& histories,
+                      Reporting& reporting) {
     const auto& c        = h.config;
     const cudaStream_t s = device.stream;
     const std::int32_t R = shape.rows, W = shape.width, P = shape.prefill, D = R * W, T = D + P;
@@ -864,8 +1090,9 @@ std::string run_mixed(const Options& o, const Shape& shape, Harness& h, DeviceCo
     std::vector<std::int32_t> slots(static_cast<std::size_t>(R));
     std::iota(slots.begin(), slots.end(), 0);
     const std::int32_t prefill_slot[] = {kLanes - 1};
-    Call decode  = make_call(c, volume, histories, slots, o.context, W, verify);
-    Call prefill = make_call(c, volume, histories, prefill_slot, o.context, P, false);
+    const std::span<const std::int32_t> contexts(o.contexts);
+    Call decode  = make_call(c, volume, histories, slots, contexts.first(static_cast<std::size_t>(R)), W, verify);
+    Call prefill = make_call(c, volume, histories, prefill_slot, contexts.subspan(static_cast<std::size_t>(kLanes - 1), 1), P, false);
     decode.batch.decode_round = true;
     q4::execution::ForwardVerify view;
     if (verify) {
@@ -1006,8 +1233,8 @@ std::string run_mixed(const Options& o, const Shape& shape, Harness& h, DeviceCo
         mixed_us.push_back(timer.us(0, 3));
     }
     const Stats r = summarize(round_us), k = summarize(chunk_us), m = summarize(mixed_us);
-    std::printf("\nshape %dx%d+%d (%d decode columns and a %d-token chunk, context %d%s)\n", R, W, P, D, P, o.context,
-                verify ? (", commit " + std::to_string(accept) + " per row").c_str() : "");
+    std::printf("\nshape %dx%d+%d (%d decode columns and a %d-token chunk, context %s%s)\n", R, W, P, D, P,
+                context_label(o.contexts).c_str(), verify ? (", commit " + std::to_string(accept) + " per row").c_str() : "");
     std::printf("  separate: round %8.1f us + chunk %8.1f us = %8.1f us\n", r.median, k.median, r.median + k.median);
     std::printf("  mixed:    %8.1f us   (%+.1f us, %+.1f%% against separate)\n", m.median,
                 m.median - (r.median + k.median), 100.0 * (m.median / (r.median + k.median) - 1.0));
@@ -1018,6 +1245,11 @@ std::string run_mixed(const Options& o, const Shape& shape, Harness& h, DeviceCo
     const bool equal = joint[0] == apart[0];
     std::printf("  mixed %s the separate calls (top-1 equal in %d of %d logit columns)\n",
                 equal ? "equals" : "DIFFERS from", agree, static_cast<std::int32_t>(logits.ne[1]));
+    if (reporting.report.is_open()) {
+        reporting.report << report_head(o, shape) << ",\"round_us\":" << r.median << ",\"chunk_us\":" << k.median
+                         << ",\"mixed_us\":" << m.median << "}\n";
+        reporting.report.flush();
+    }
     char value[40];
     std::snprintf(value, sizeof(value), "%016llx %016llx", static_cast<unsigned long long>(joint[0][0]),
                   static_cast<unsigned long long>(joint[0][1]));
@@ -1029,8 +1261,9 @@ std::string hash_key(const Options& o, const Shape& shape) {
     std::ostringstream key;
     key << o.artifact.filename().string() << ' ' << shape.rows << 'x' << shape.width;
     if (shape.prefill > 0) { key << '+' << shape.prefill; }
-    key << " context=" << o.context
-        << " kv=" << o.kv_name << " experts=" << (o.sample_experts == 0 ? std::string("all") : std::to_string(o.sample_experts))
+    key << " context=" << context_label(o.contexts);
+    if (o.prefill_chunk != kPrefillChunk) { key << " chunk=" << o.prefill_chunk; }
+    key << " kv=" << o.kv_name << " experts=" << (o.sample_experts == 0 ? std::string("all") : std::to_string(o.sample_experts))
         << ' ' << (o.exact ? "exact" : "fast") << " accept=" << (o.accept < 0 ? shape.width : std::clamp(o.accept, 0, shape.width));
     for (const FastPath path : o.fast_path_candidates) { key << " +" << fast_path_name(path); }
     for (const FastPath path : o.fast_path_exclusions) { key << " -" << fast_path_name(path); }
@@ -1071,10 +1304,24 @@ int main(int argc, char** argv) {
             max_columns = std::max(max_columns, s.rows * s.width + s.prefill);
             max_prefill = std::max(max_prefill, s.prefill);
         }
-        const std::int32_t context = o.context + std::max(max_width, max_prefill) + 1;
+        std::vector<std::int32_t> row_tokens;
+        for (const std::int32_t tokens : o.contexts) { row_tokens.push_back(tokens + std::max(max_width, max_prefill) + 1); }
 
         const auto t0 = std::chrono::steady_clock::now();
         DeviceContext device(0);
+        Reporting reporting;
+        if (o.dram_gbs > 0) {
+            reporting.read_bytes_per_second = o.dram_gbs * 1e9;
+        } else {
+            // Before anything else holds device memory: 1 GiB, eight times the L2.
+            reporting.read_bytes_per_second = measure_device_read_bytes_per_second(std::size_t{1} << 30, 10);
+        }
+        std::printf("device read rate: %.1f GB/s%s\n", reporting.read_bytes_per_second * 1e-9,
+                    o.dram_gbs > 0 ? " (--dram-gbs)" : " (measured)");
+        if (!o.report.empty()) {
+            reporting.report.open(o.report, std::ios::app);
+            if (!reporting.report) { throw std::runtime_error("cannot append to " + o.report.string()); }
+        }
         artifact::Reader reader(o.artifact);
         if (!q4::is_qwen4_exp(reader)) { throw std::invalid_argument(o.artifact.string() + " is not a Qwen4Exp artifact"); }
         models::LoadOptions load;
@@ -1083,8 +1330,9 @@ int main(int argc, char** argv) {
         device.synchronize();
         const q4::execution::Parameters parameters(*model);
         const auto& c = model->config().text;
-        std::printf("dense weights loaded in %.1f s (%.2f GiB device)\n", seconds_since(t0),
-                    model->storage_stats().device_capacity_bytes / 1073741824.0);
+        reporting.dense_bytes = dense_weight_bytes(parameters);
+        std::printf("dense weights loaded in %.1f s (%.2f GiB device, %.3f GB read per round)\n", seconds_since(t0),
+                    model->storage_stats().device_capacity_bytes / 1073741824.0, reporting.dense_bytes * 1e-9);
 
         EngineOptions engine;
         engine.fast_paths = !o.exact;
@@ -1101,7 +1349,7 @@ int main(int argc, char** argv) {
         std::printf("expert frames filled in %.1f s\n", seconds_since(t1));
 
         const q4::NgramVolume volume(o.ngram, q4::resolve_ngram_volume(o.ngram, c.ple));
-        Harness h(parameters, device, frames, context, std::max(max_columns, kPrefillChunk), rows, max_width, storage,
+        Harness h(parameters, device, frames, row_tokens, std::max(max_columns, o.prefill_chunk), max_width, storage,
                   selection.forward(), o.no_fork, o.no_shared_stream, o.miss_route, o.staging_slots);
 
         // Each row: its own slice of the corpus, prefilled in chunks.
@@ -1109,7 +1357,7 @@ int main(int argc, char** argv) {
         std::vector<std::vector<std::int32_t>> histories(static_cast<std::size_t>(rows));
         for (std::int32_t row = 0; row < rows; ++row) {
             const std::size_t start = static_cast<std::size_t>(row) * 4099 % corpus.size();
-            for (std::int32_t i = 0; i < context; ++i) {
+            for (std::int32_t i = 0; i < row_tokens[static_cast<std::size_t>(row)]; ++i) {
                 histories[static_cast<std::size_t>(row)].push_back(corpus[(start + i) % corpus.size()]);
             }
         }
@@ -1118,23 +1366,25 @@ int main(int argc, char** argv) {
         Tensor last(prefill_logits.p, DType::FP32, {static_cast<std::int32_t>(c.vocab_size), 1});
         for (std::int32_t row = 0; row < rows; ++row) {
             const std::int32_t slot[] = {row};
-            for (std::int32_t first = 0; first < o.context; first += kPrefillChunk) {
-                const std::int32_t n = std::min(kPrefillChunk, o.context - first);
-                Call call = make_call(c, volume, histories, slot, first, n, false);
+            const std::int32_t tokens = o.contexts[static_cast<std::size_t>(row)];
+            for (std::int32_t first = 0; first < tokens; first += o.prefill_chunk) {
+                const std::int32_t n        = std::min(o.prefill_chunk, tokens - first);
+                const std::int32_t firsts[] = {first};
+                Call call = make_call(c, volume, histories, slot, firsts, n, false);
                 h.forward->run(call.batch, last);
                 device.synchronize();
             }
         }
         h.save(device.stream);
         device.synchronize();
-        std::printf("prefilled %d rows x %d tokens in %.1f s\n", rows, o.context, seconds_since(t2));
+        std::printf("prefilled %d rows (context %s) in %.1f s\n", rows, context_label(o.contexts).c_str(), seconds_since(t2));
 
         const auto golden = o.check.empty() ? std::map<std::string, std::string>{} : read_hashes(o.check);
         auto recorded     = o.record.empty() ? std::map<std::string, std::string>{} : read_hashes(o.record);
         int mismatches = 0, missing = 0;
         for (const Shape& shape : o.shapes) {
-            const std::string hashes = shape.prefill > 0 ? run_mixed(o, shape, h, device, volume, histories)
-                                                         : run_shape(o, shape, h, device, volume, histories, parameters);
+            const std::string hashes = shape.prefill > 0 ? run_mixed(o, shape, h, device, volume, histories, reporting)
+                                                         : run_shape(o, shape, h, device, volume, histories, parameters, reporting);
             const std::string key    = hash_key(o, shape);
             if (!o.record.empty() && !hashes.empty()) { recorded[key] = hashes; }
             if (hashes.empty()) { ++mismatches; }

@@ -5091,6 +5091,8 @@ private:
         settle_round(); // a deferred update precedes the next forward
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
+        const nvtx::ScopedRange target(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
+                                       static_cast<std::uint64_t>(batch));
         replay(graphs_[static_cast<std::size_t>(batch - 1)],
                [&] { forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate, false, /*decode_round=*/true); });
         // The round that called this reads and releases its gate and downloads the route itself:
@@ -5409,10 +5411,14 @@ private:
             run_mixed(batch, W, &view);
         } else {
             const execution::NgramRowGate gate = row_gate();
-            replay(graph, [&] {
-                const execution::ForwardVerify view = verify_view(batch, W);
-                forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true);
-            });
+            {
+                const nvtx::ScopedRange target(nvtx::Name::DecodeDFlashTarget, nvtx::Category::Decode,
+                                               static_cast<std::uint64_t>(batch * W));
+                replay(graph, [&] {
+                    const execution::ForwardVerify view = verify_view(batch, W);
+                    forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true);
+                });
+            }
             // Nothing that can wait for the device sits between the gated launch and its publish
             // (the gate would deadlock): the rows are read and released before anything else queues.
             if (gated) {
@@ -5516,7 +5522,10 @@ private:
         }
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
-        device_.synchronize();
+        {
+            const nvtx::ScopedRange wait(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control);
+            device_.synchronize();
+        }
         check_device_error();
 
         const std::int32_t* licensed_host = spec_host(spec_layout_.licensed);
@@ -6278,7 +6287,10 @@ private:
                         ops::kSamplePurposeDecode, *work_, s);
         }
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_.data(), sampled_.p, 4ULL * batch, cudaMemcpyDeviceToHost, s));
-        device_.synchronize();
+        {
+            const nvtx::ScopedRange wait(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control);
+            device_.synchronize();
+        }
         check_device_error();
         const auto* tokens = static_cast<const std::int32_t*>(host_sampled_.data());
         for (std::int32_t b = 0; b < batch; ++b) { pending_tokens_[b] = tokens[b]; }

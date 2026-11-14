@@ -88,13 +88,17 @@ primes the decode graphs before warmups and measured repetitions.
 `infernix_qwen4_exp_round_bench` runs one generation round of each `--shape RxW` (R rows of W
 columns: W = 1 plain decode, W >= 2 verification followed by the commit) through the production
 Forward and its CUDA Graph, every routed expert in its own VRAM frame, without the Engine. It
-prefills all eight lanes from `fixtures/bench_corpus.ids`, then reports per shape the forward and
-commit device times, the logits and lane-state hashes, and with `--sections` each layer half as its
-own graph. A mixed shape `RxW+P` runs the round and a P-token prefill chunk of the eighth lane
+prefills all eight lanes from `fixtures/bench_corpus.ids` (`--context` takes one length or lane
+lengths, so one long lane can sit beside short ones), then reports per shape the forward and commit
+device times, the round's speed of light (the bytes it must move at least over the measured device
+read rate), the logits and lane-state hashes, and with `--sections` each layer half as its own
+graph; `--report FILE` appends the figures as JSON lines. A mixed shape `RxW+P` runs the round and a P-token prefill chunk of the eighth lane
 once as the round's graph followed by the chunk's call and once as one mixed call
 (`ForwardBatch::prefill_part`), and reports both device times; on the exact route it fails unless
-the two give the same bits. `make t1`, `make t1-exact`, `make t1-kernels` and `make t1-record`
-drive it (AGENTS.md "Iteration tiers"); the source header lists every option.
+the two give the same bits. `make t1`, `make t1-exact`, `make t1-kernels`, `make t1-sweep` and
+`make t1-record` drive it (AGENTS.md "Iteration tiers"); the source header lists every option and
+[the per-family contract](../docs/maintainer/round-bench.md) the options, report fields and byte
+model every family's round bench shares.
 
 `--profile` brackets the timed replays with `cudaProfilerStart`/`Stop`, so Nsight Compute can profile
 the decode kernels inside the round's graph:
@@ -112,7 +116,8 @@ difference below 1 %.
 production's options and `bench_infernix.py`'s concurrent phase: C requests at once (default 6) of N
 output tokens (default 256), one warm-up set and `--repeat` sets, each reported as aggregate tok/s
 with its DFlash2 drafting. It needs no server boot, so it measures the policy and host work that T1
-leaves out.
+leaves out; `make t2-step` runs it under Nsight Systems and splits each decode round into host
+phases, GPU idle time and GPU work by launch site (`tools/tiers/step.py`).
 
 ## CLI
 
@@ -458,7 +463,9 @@ Every ordinary sample is cold-cache: a 256 MiB L2 eviction read completes before
 interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
-behavior. The fixed RTX 5090 memory reference is `1792 GB/s` DRAM bandwidth. Tensor Core utilization
+behavior. The fixed memory reference is `1792 GB/s` DRAM bandwidth, the datasheet figure of both
+the RTX 5090 and the RTX PRO 6000 (the round bench measures the PRO 6000's streaming read rate at
+about 1764 GB/s). Tensor Core utilization
 is reported only for registered shape/policy/extent combinations with a known MMA profile; the
 activation policy alone does not identify that profile. MXFP8 with FP32 accumulation uses the
 `838 TFLOP/s` dense reference. `READ_%` additionally compares the same one-read model

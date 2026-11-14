@@ -17,6 +17,7 @@ add_library(infernix_core STATIC
   vmm_arena.cu
   device.cu
   direct_read_queue.cpp
+  dram_probe.cu
   dtype.cpp
   host_load.cpp
   host_memory.cpp

@@ -233,20 +233,26 @@ not run and their implications.
 
 Iterate at the lowest tier that can answer the question; a full server boot is for promotion only.
 Each tier is one command from the repository root (`Makefile`); every target takes the build lock,
-the memory cap and the GPU lock itself.
+the memory cap and the GPU lock itself. `FAMILY=<family>` (default `qwen4_exp`) selects a model
+family; what a family provides for the tiers, the speed-of-light model and the order of work for a
+family's decode are in [Decode profiling tiers](docs/maintainer/round-bench.md).
 
 | Tier | Command | What it establishes | Time |
 |---|---|---|---|
 | T0 | `make t0 [R=regex]` | unit, Op and contract tests: CTest without the `real` label | minutes |
-| T1 | `make t1 [SHAPE=1x1,6x1,1x4,6x2,6x3,6x2+1024]`, `make t1-exact`, `make t1-kernels [KSHAPE=6x2] [METRICS=1]` | one generation round of each shape on the real artifact through the production Forward and its CUDA Graph (`bench/models/qwen4_exp/round_bench.cpp`), and a mixed shape (`6x2+1024`: the round and a prefill chunk in one call, on the exact route equal to the two calls): device time, commit time, `--sections` per layer half, per-kernel table (with `METRICS=1` also the DRAM bandwidth each kernel leaves unused), and the logits and lane-state hashes against `bench/models/qwen4_exp/round_hashes.txt`; every shape also replays 2 or more times from one state and fails on differing bits (`--determinism N`) | about 10 s |
+| T1 | `make t1 [SHAPE=1x1,6x1,1x4,6x2,6x3,6x2+1024]`, `make t1-exact`, `make t1-kernels [KSHAPE=6x2] [METRICS=1]` | one generation round of each shape on the real artifact through the production Forward and its CUDA Graph (`bench/models/qwen4_exp/round_bench.cpp`), and a mixed shape (`6x2+1024`: the round and a prefill chunk in one call, on the exact route equal to the two calls): device time, commit time, the speed of light (bytes the round must move over the measured read rate), `--sections` per layer half, per-kernel table (with `METRICS=1` also the DRAM bandwidth each kernel leaves unused), and the logits and lane-state hashes against `bench/models/qwen4_exp/round_hashes.txt`; every shape also replays 2 or more times from one state and fails on differing bits (`--determinism N`) | about 10 s |
+| T1 sweep | `make t1-sweep [SWEEP_CONTEXTS="1024 131072,1024"]` | the T1 round and its speed of light against context length, uniform and skewed (one long lane beside short ones) | a few minutes |
 | T2 | `make t2`, `make t2-record` | start-up and correctness smoke test (`tests/models/qwen4_exp/test_smoke_real.cpp`): the public Engine in process with production's options on the real artifacts (six concurrent requests, DFlash2 drafting, prefix-cache resume, an expert-placement switch and back), then the exact route's greedy tokens against `tests/models/qwen4_exp/smoke_golden.txt`, alone, six in flight, beside a long prompt's mixed rounds, resumed and after the switch | about a minute |
 | T2 bench | `make t2-bench [ARGS="--repeat 5"]` | aggregate tok/s of six concurrent 256-token requests through the Engine in process (`bench/models/qwen4_exp/engine_bench.cpp`): the DFlash2 policy, host work and the Forward together, without a server boot | about a minute |
+| T2 step | `make t2-step` | the T2 bench under Nsight Systems: each decode round split into the Engine thread's phases (the drafter's proposal and wait, the target's launch and wait), GPU idle time by what the host was doing, and GPU work by launch site | a few minutes |
 | T3 | `make t3 ARGS=...` | promotion: `bench_infernix.py` and the quality gate against the server build; the only tier for policy behaviour that depends on live timing (the DFlash2 cost fit, placement swaps, scheduling) | many minutes |
+| T3 frontier | `make t3-frontier [ARGS="--concurrency 1,4,8"]` | one boot, a concurrency sweep of production-shaped agentic traffic (`bench/agentic_ab`): total output tok/s against per-user decode speed, and the best point at an SLA (`super-quant/scripts/bench_infernix_frontier.py`) | about 30 minutes at the defaults (five levels of 300 s) |
 
 - Kernel and Forward work: T1 for every change. A change meant to keep the bits must pass `make t1`
   and `make t1-exact` unchanged; an intended numerical change records new hashes with
   `make t1-record` in the same commit, and states why they changed. T1 leaves out the DFlash2
-  drafter, acceptance, sampling and host work; claim only Forward and commit time from it.
+  drafter, acceptance, sampling and host work; claim only Forward and commit time from it, and use
+  `make t2-step` for the rest of a decode step.
 - Op microbenchmarks (`build/bench/infernix_<op>_bench`) stay the tool for one Op's alternatives.
 - T1 and T2 place every expert in VRAM, so they need the GPU production uses: stop production first.
   A T1 nondeterminism is a bug to fix, not noise; `--determinism N`, `--no-fork` and

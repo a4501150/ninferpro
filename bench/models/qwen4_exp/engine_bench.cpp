@@ -9,11 +9,15 @@
 // INFERNIX_QWEN4_ARTIFACT, INFERNIX_QWEN4_DFLASH2 and INFERNIX_QWEN4_NGRAM (`make t2-bench`).
 //
 //   infernix_qwen4_exp_engine_bench [--concurrency C] [--tokens N] [--repeat R] [--fast-path NAME]...
+//       [--profile]
 //
 // --fast-path adds a candidate to the qualified selection (EngineOptions::fast_path_candidates), so
-// a candidate's end-to-end speed is measured before its gate.
+// a candidate's end-to-end speed is measured before its gate. --profile brackets the measured sets
+// (not the start-up or the warm-up) with cudaProfilerStart/Stop for tools/tiers/step.py.
 
 #include "infernix/engine.h"
+
+#include <cuda_profiler_api.h>
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +26,7 @@
 #include <cstdlib>
 #include <exception>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -115,9 +120,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::uint32_t concurrency = 6, tokens = 256, repeat = 3;
+    bool profile = false;
     std::vector<infernix::FastPath> candidates;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--profile") {
+            profile = true;
+            continue;
+        }
         if (i + 1 >= argc) {
             std::fprintf(stderr, "%s needs a value\n", arg.c_str());
             return 2;
@@ -158,11 +168,13 @@ int main(int argc, char** argv) {
         std::mt19937_64 rng(std::random_device{}());
         print_set("warm-up", run_set(engine, concurrency, tokens, rng, "warm"));
         std::vector<double> speeds;
+        if (profile && cudaProfilerStart() != cudaSuccess) { throw std::runtime_error("cudaProfilerStart failed"); }
         for (std::uint32_t r = 0; r < repeat; ++r) {
             const SetResult set = run_set(engine, concurrency, tokens, rng, "set");
             print_set(("set " + std::to_string(r + 1)).c_str(), set);
             speeds.push_back(set.tokens_per_second);
         }
+        if (profile) { cudaProfilerStop(); }
         std::sort(speeds.begin(), speeds.end());
         std::printf("aggregate: median %.1f tok/s, range %.1f-%.1f (%u sets)\n", speeds[speeds.size() / 2], speeds.front(),
                     speeds.back(), repeat);

@@ -29,7 +29,7 @@
 
 namespace infernix::bench {
 
-constexpr double kRooflineGBs = 1792.0; // RTX 5090 GDDR7 bandwidth roofline.
+constexpr double kRooflineGBs = 1792.0; // RTX 5090 and RTX PRO 6000: 512-bit GDDR7 at 28 Gbps.
 
 inline std::uint16_t f32_to_bf16(float f) {
     std::uint32_t u;

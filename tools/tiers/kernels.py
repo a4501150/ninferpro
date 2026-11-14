@@ -1,11 +1,12 @@
 """Per-kernel device time of one T1 round (AGENTS.md "Iteration tiers").
 
-Runs infernix_qwen4_exp_round_bench --profile under Nsight Systems for one shape, then splits the
-device time of the profiled replays between their kernels (time where several kernels overlap goes
-to each in equal shares, so the column sums to the busy time) and prints the per-round mean.
+Runs a model family's round bench (docs/maintainer/round-bench.md) with --profile under Nsight
+Systems for one shape, then splits the device time of the profiled replays between their kernels
+(time where several kernels overlap goes to each in equal shares, so the column sums to the busy
+time) and prints the per-round mean.
 
-    python3 tools/flash_next/t1_kernels.py [--shape 6x2] [--replays 20] [--top 25] [--gpu-metrics]
-        [--bench build/bench/infernix_qwen4_exp_round_bench] [-- extra bench arguments]
+    python3 tools/tiers/kernels.py --bench build/bench/infernix_<family>_round_bench [--shape 6x2]
+        [--replays 20] [--top 25] [--gpu-metrics] [-- extra bench arguments]
 
 --gpu-metrics also samples the GPU's counters (Nsight Systems GPU metrics, GB20x set, every 5 us)
 and reports where DRAM bandwidth goes unused: over the replays' busy time, each sample's period
@@ -136,7 +137,7 @@ def main() -> int:
     ap.add_argument("--keep", default=None, help="also copy the profile's SQLite export to this path")
     ap.add_argument("--gpu-metrics", action="store_true",
                     help="also sample GPU counters and report the DRAM bandwidth left unused, per kernel")
-    ap.add_argument("--bench", default="build/bench/infernix_qwen4_exp_round_bench")
+    ap.add_argument("--bench", required=True, help="the family's round bench binary")
     ap.add_argument("extra", nargs="*", help="further round-bench arguments (after --)")
     args = ap.parse_args()
     if "," in args.shape:
@@ -154,7 +155,8 @@ def main() -> int:
             sys.stderr.write(run.stdout + run.stderr)
             return run.returncode
         sys.stdout.write("".join(line + "\n" for line in run.stdout.splitlines()
-                                 if line.startswith(("shape", "  forward", "  commit", "  round", "  hash"))))
+                                 if line.startswith(("device read", "shape", "  forward", "  commit", "  round",
+                                                     "  bytes", "  speed of light", "  hash"))))
         subprocess.run(["nsys", "export", "--type", "sqlite", "-o", report + ".sqlite", "--force-overwrite=true",
                         report + ".nsys-rep"], check=True, capture_output=True)
         db = sqlite3.connect(report + ".sqlite")

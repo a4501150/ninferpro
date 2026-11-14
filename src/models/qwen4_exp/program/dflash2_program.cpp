@@ -44,6 +44,7 @@ void ProgramImpl::create_dflash2_drafter() {
 }
 
 void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const std::function<void()>& while_drafting) {
+    const nvtx::ScopedRange range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash, lanes.size());
     const cudaStream_t s = device_.stream;
     const auto batch     = static_cast<std::int32_t>(lanes.size());
     const std::int32_t K = dflash_k_, W = K + 1;
@@ -87,7 +88,10 @@ void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const st
         device_.flush();
         while_drafting();
     }
-    device_.synchronize();
+    {
+        const nvtx::ScopedRange wait(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control);
+        device_.synchronize();
+    }
     const auto* confidence = reinterpret_cast<const float*>(dflash_host(dflash_io_.confidence));
     for (std::int32_t b = 0; b < batch; ++b) {
         dflash_confident_[b] = K;
@@ -147,8 +151,12 @@ void ProgramImpl::dflash2_catch_up(std::span<const SequenceHandle> rows, std::in
         .slots     = Tensor(io + io_layout_.slots, DType::I32, {batch}),
         .min_count = 0,
         .max_count = static_cast<std::uint32_t>(W)};
-    replay(dflash_context_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)],
-           [&] { drafter_->materialize(call); });
+    {
+        const nvtx::ScopedRange range(nvtx::Name::DFlashContextAppend, nvtx::Category::DFlash,
+                                      static_cast<std::uint64_t>(W * batch));
+        replay(dflash_context_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)],
+               [&] { drafter_->materialize(call); });
+    }
     for (std::int32_t b = 0; b < batch; ++b) {
         Lane& lane = lanes_[ContractAccess::lane(rows[static_cast<std::size_t>(b)])];
         if (commit[b] > 0) { lane.dflash_frontier = lane.state_tokens; }
