@@ -705,6 +705,8 @@ ExpertPlacementReport to_report(const models::qwen4_exp::Program::ExpertPlacemen
     report.swap_hits      = status.swap_hits;
     report.swap_promotions = status.swap_promotions;
     report.swap_demotions  = status.swap_demotions;
+    report.swap_promotion_bytes = status.swap_promotion_bytes;
+    report.swap_demotion_bytes  = status.swap_demotion_bytes;
     report.swap_admitted   = status.swap_admitted;
     report.tier_shadows    = status.tier_shadows;
     report.kv_bytes        = status.kv_bytes;

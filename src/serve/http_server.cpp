@@ -533,8 +533,9 @@ void HttpServer::register_routes() {
                  });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         const auto stats = service_->runtime_stats();
+        const auto placement = service_->expert_placement_status();
         res.set_header("Cache-Control", "no-store");
-        res.set_content(metrics_.render(stats, service_->is_available()),
+        res.set_content(metrics_.render(stats, placement, service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
     });
     server_.Get(api_route_pattern(R"(/models/(.+))"),
@@ -644,9 +645,10 @@ void HttpServer::handle_expert_placement_get(const httplib::Request& req, httpli
                          {"host_available", report.host_available},
                          {"landing_slots", report.landing_slots},
                          {"swaps", {{"routed", report.swap_routed}, {"hits", report.swap_hits},
-                                    {"promotions", report.swap_promotions},
-                                    {"demotions", report.swap_demotions},
-                                    {"admitted", report.swap_admitted}}}}}}
+                                    {"promotions", report.swap_promotions}, {"demotions", report.swap_demotions},
+                                    {"admitted", report.swap_admitted},
+                                    {"promotion_bytes", report.swap_promotion_bytes},
+                                    {"demotion_bytes", report.swap_demotion_bytes}}}}}}
             .dump(),
         "application/json");
 }
@@ -776,6 +778,7 @@ void HttpServer::attach(GenerationService& service) {
     // memory_summary waits for the completed worker boundary, including warmup publication.
     const infernix::MemorySummary memory  = service.memory_summary();
     const infernix::RuntimeStats baseline = service.runtime_stats();
+    const infernix::ExpertPlacementReport placement_baseline = service.expert_placement_status();
     public_model_id_                    = resolve_public_model_id(options_, load.model_name);
     served_model_names_                 = resolve_served_model_names(options_, public_model_id_);
     model_metadata_                     = service.model_metadata();
@@ -785,7 +788,7 @@ void HttpServer::attach(GenerationService& service) {
     decide_labels_                      = build_decide_alphabet(
         [&service](std::string_view text) { return service.tokenize_text(text); });
     service_                            = &service;
-    metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
+    metrics_.configure(public_model_id_, service.engine_options(), memory, baseline, placement_baseline);
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load, memory);
 }

@@ -172,6 +172,13 @@ void EngineCore<Instance>::publish_runtime_stats() {
     if constexpr (requires { resources_.populate_runtime_stats(*instance_.program, snapshot); }) {
         resources_.populate_runtime_stats(*instance_.program, snapshot);
     }
+    // The decode path's CUDA graph executions (Qwen3.8-Flash-Next; other Programs have none).
+    if constexpr (requires { instance_.program->graph_execution_stats(); }) {
+        const auto graphs                 = instance_.program->graph_execution_stats();
+        snapshot.decode_graph_replays     = graphs.replays;
+        snapshot.decode_eager_executions  = graphs.eager;
+        snapshot.decode_graph_captures    = graphs.captures;
+    }
 
     {
         std::lock_guard lock(queue_mutex_);

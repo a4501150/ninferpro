@@ -47,11 +47,16 @@ void Metrics::Histogram::observe(double seconds) {
 }
 
 void Metrics::configure(std::string model, const EngineOptions& options,
-                        const MemorySummary& memory, RuntimeStats baseline) {
+                        const MemorySummary& memory, RuntimeStats baseline,
+                        const infernix::ExpertPlacementReport& placement_baseline) {
     model_    = std::move(model);
     options_  = options;
     memory_   = memory;
     baseline_ = baseline;
+    expert_cache_baseline_ = {.routed          = placement_baseline.swap_routed,
+                              .hits            = placement_baseline.swap_hits,
+                              .promotion_bytes = placement_baseline.swap_promotion_bytes,
+                              .demotion_bytes  = placement_baseline.swap_demotion_bytes};
     start_seconds_ =
         std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
@@ -80,6 +85,14 @@ void Metrics::done(const GenerationOutcome& outcome) {
     }
     requests_.duration.observe(outcome.metrics.total_seconds);
     requests_.queue.observe(outcome.metrics.engine_timing.queue_wait_seconds);
+    requests_.ngram_rounds          += outcome.metrics.ngram_rounds;
+    requests_.ngram_drafted_tokens  += outcome.metrics.ngram_drafted_tokens;
+    requests_.ngram_accepted_tokens += outcome.metrics.ngram_accepted_tokens;
+    const auto& accepted = outcome.metrics.speculative_accepted_per_position;
+    for (std::size_t position = 0; position < accepted.size() &&
+                                  position < requests_.accepted_positions.size(); ++position) {
+        requests_.accepted_positions[position] += accepted[position];
+    }
 }
 
 void Metrics::rejected() {
@@ -101,7 +114,8 @@ void Metrics::response_failed() {
     ++requests_.response_failures;
 }
 
-std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
+std::string Metrics::render(const RuntimeStats& stats, const infernix::ExpertPlacementReport& placement,
+                            bool ready) const {
     Requests requests;
     {
         std::lock_guard lock(mutex_);
@@ -183,6 +197,14 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     COUNTER(replayed_tokens, "replayed_tokens_total", "History tokens recomputed during recovery.");
     COUNTER(decode_rounds, "decode_rounds_total", "Decode batch executions.");
     COUNTER(decode_row_rounds, "decode_row_rounds_total", "Sum of decode batch sizes.");
+    COUNTER(mixed_rounds, "mixed_rounds_total",
+            "Decode rounds whose Forward also ran a prompt call (mixed rounds).");
+    COUNTER(decode_graph_replays, "decode_graph_replays_total",
+            "Decode-path CUDA graph bodies run by replaying a captured executable.");
+    COUNTER(decode_eager_executions, "decode_eager_executions_total",
+            "Decode-path CUDA graph bodies run eagerly (a shape's first round).");
+    COUNTER(decode_graph_captures, "decode_graph_captures_total",
+            "Decode-path CUDA graph bodies captured into a new graph, then launched.");
     COUNTER(preemptions, "preemptions_total", "Resource-pressure pauses.");
     COUNTER(snapshot_restores, "snapshot_restores_total",
             "Restores from a prefix-cache snapshot at the paused frontier.");
@@ -190,14 +212,48 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     COUNTER(root_selections, "root_selections_total", "Initial bindings without prefix reuse.");
     COUNTER(prefix_selections, "prefix_selections_total",
             "Initial bindings from a prefix-cache snapshot.");
-    COUNTER(speculative_rounds, "spec_decode_rounds_total",
-            "Native speculative verification rounds.");
-    COUNTER(speculative_draft_tokens, "spec_decode_draft_tokens_total",
-            "Draft tokens evaluated by native verification.");
-    COUNTER(speculative_accepted_tokens, "spec_decode_accepted_tokens_total",
-            "Draft tokens accepted by native verification.");
-    COUNTER(speculative_fallback_steps, "spec_decode_fallback_steps_total",
-            "Speculative fallback steps without drafts.");
+    // Native speculative work, labeled by the engine's own drafter names: the configured neural
+    // backend live from Engine counters, and n-gram copy proposals aggregated at request
+    // settlement (beside the neural backend, or alone on Qwen3.8-Flash-Next).
+    const char* backend = product::speculative_backend_name(options_.speculative.backend);
+    header("spec_decode_rounds_total", "counter",
+           "Native speculative verification rounds, by drafter backend.");
+    out << "infernix_spec_decode_rounds_total{backend=\"" << backend << "\"} "
+        << stats.speculative_rounds - baseline_.speculative_rounds << '\n'
+        << "infernix_spec_decode_rounds_total{backend=\"ngram\"} " << requests.ngram_rounds << '\n';
+    header("spec_decode_draft_tokens_total", "counter",
+           "Draft tokens evaluated by native verification, by drafter backend.");
+    out << "infernix_spec_decode_draft_tokens_total{backend=\"" << backend << "\"} "
+        << stats.speculative_draft_tokens - baseline_.speculative_draft_tokens << '\n'
+        << "infernix_spec_decode_draft_tokens_total{backend=\"ngram\"} "
+        << requests.ngram_drafted_tokens << '\n';
+    header("spec_decode_accepted_tokens_total", "counter",
+           "Draft tokens accepted by native verification, by drafter backend.");
+    out << "infernix_spec_decode_accepted_tokens_total{backend=\"" << backend << "\"} "
+        << stats.speculative_accepted_tokens - baseline_.speculative_accepted_tokens << '\n'
+        << "infernix_spec_decode_accepted_tokens_total{backend=\"ngram\"} "
+        << requests.ngram_accepted_tokens << '\n';
+    header("spec_decode_fallback_steps_total", "counter",
+           "Speculative fallback steps without drafts, by drafter backend.");
+    out << "infernix_spec_decode_fallback_steps_total{backend=\"" << backend << "\"} "
+        << stats.speculative_fallback_steps - baseline_.speculative_fallback_steps << '\n';
+    // The acceptance-length distribution aggregated across requests: rounds whose accepted
+    // sequence reached each draft position (position 1 is the first draft token), so adjacent
+    // counters differ by the rounds that stopped exactly between them. Emitted up to the
+    // widest verification the options allow; absent without speculative decoding.
+    const std::uint32_t draft_window =
+        std::max(product::speculative_verify_drafts(options_.speculative),
+                 options_.speculative.ngram_draft_tokens);
+    if (draft_window != 0) {
+        const std::size_t positions =
+            std::min<std::size_t>(draft_window, requests.accepted_positions.size());
+        header("spec_decode_accepted_positions_total", "counter",
+               "Rounds whose accepted sequence reached each draft position.");
+        for (std::size_t position = 0; position < positions; ++position) {
+            out << "infernix_spec_decode_accepted_positions_total{position=\"" << position + 1
+                << "\"} " << requests.accepted_positions[position] << '\n';
+        }
+    }
     GAUGE(hybrid_snapshots, "prefix_cache_snapshots", "Snapshots in the prefix cache.");
     GAUGE(hybrid_tree_blocks, "prefix_cache_blocks", "KV blocks in the prefix cache's tree.");
     GAUGE(hybrid_cached_blocks, "prefix_cache_device_blocks", "Tree blocks with a Device copy.");
@@ -274,6 +330,43 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     counter("device_wait_seconds_total", stats.host_work.device_wait_ns * 1e-9,
             baseline_.host_work.device_wait_ns * 1e-9,
             "Engine wall time waiting for device work, not kernel time.");
+    // The decode/prefill/control class split of the same worker time: each class's host time is a
+    // subset of the exclusive phases above, and the three classes partition them.
+    header("phase_work_seconds_total", "counter",
+           "Host work and device waits split by decode, prefill and control class.");
+    const auto phase_work = [&](std::string_view phase, std::uint64_t host_ns, std::uint64_t host_baseline_ns,
+                                 std::uint64_t wait_ns, std::uint64_t wait_baseline_ns) {
+        out << "infernix_phase_work_seconds_total{phase=\"" << phase << "\",work=\"host\"} "
+            << static_cast<double>(host_ns - host_baseline_ns) * 1e-9 << '\n'
+            << "infernix_phase_work_seconds_total{phase=\"" << phase
+            << "\",work=\"device_wait\"} "
+            << static_cast<double>(wait_ns - wait_baseline_ns) * 1e-9 << '\n';
+    };
+    phase_work("decode", stats.host_work.decode_host_ns, baseline_.host_work.decode_host_ns,
+               stats.host_work.decode_device_wait_ns, baseline_.host_work.decode_device_wait_ns);
+    phase_work("prefill", stats.host_work.prefill_host_ns, baseline_.host_work.prefill_host_ns,
+               stats.host_work.prefill_device_wait_ns, baseline_.host_work.prefill_device_wait_ns);
+    phase_work("control", stats.host_work.control_host_ns, baseline_.host_work.control_host_ns,
+               stats.host_work.control_device_wait_ns, baseline_.host_work.control_device_wait_ns);
+    // The routed-expert cache (Qwen3.8-Flash-Next): aggregate uses, hits and the bytes its
+    // promotions and demotions copied, absolute counters less the startup warmup's baseline.
+    if (placement.supported) {
+        header("expert_cache_routed_total", "counter",
+               "Routed (layer, expert) uses, whether or not a VRAM frame held the expert.");
+        out << "infernix_expert_cache_routed_total "
+            << placement.swap_routed - expert_cache_baseline_.routed << '\n';
+        header("expert_cache_hits_total", "counter", "Of the routed uses, those a VRAM frame served.");
+        out << "infernix_expert_cache_hits_total "
+            << placement.swap_hits - expert_cache_baseline_.hits << '\n';
+        header("expert_cache_promotion_bytes_total", "counter",
+               "Bytes copied into VRAM frames by issued promotions (warm-start seeds excluded).");
+        out << "infernix_expert_cache_promotion_bytes_total "
+            << placement.swap_promotion_bytes - expert_cache_baseline_.promotion_bytes << '\n';
+        header("expert_cache_demotion_bytes_total", "counter",
+               "Bytes copied out to the RAM tier by demotions.");
+        out << "infernix_expert_cache_demotion_bytes_total "
+            << placement.swap_demotion_bytes - expert_cache_baseline_.demotion_bytes << '\n';
+    }
     header("requests_total", "counter",
            "Generation attempts entering preparation, by terminal outcome.");
     for (const auto& [outcome, count] : std::array{

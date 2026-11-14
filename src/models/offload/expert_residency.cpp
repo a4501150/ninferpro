@@ -402,6 +402,7 @@ void ExpertResidency::demote_or_drop(Pool& pool, const std::vector<Command>& com
         demotions_.push_back({key, frame, slot, done});
         demoting_[key] = 1;
         ++stats_.demotions;
+        stats_.demotion_bytes += pool.pitch;
     }
 }
 
@@ -794,6 +795,8 @@ std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t
         loaded += pool.controller->seed(ranked, counts, pool.commands);
         take_loads(pool.commands);
     }
+    // The seeds' copies are not promotions, so their bytes leave the promotion bytes.
+    for (const auto& command : load_commands_) { stats_.promotion_bytes -= host_strides_[command.key / experts_]; }
     issue_loads(compute);
     stats_.promotions -= loaded; // issue_loads counted them; they are seeds, not promotions
     stats_.seeded += loaded;
@@ -953,7 +956,10 @@ void ExpertResidency::take_loads(std::vector<Command>& commands) {
 
 void ExpertResidency::issue_loads(cudaStream_t compute) {
     std::vector<Batch::Load> loads;
-    for (const auto& command : load_commands_) { loads.push_back({command.key, command.frame, command.serial}); }
+    for (const auto& command : load_commands_) {
+        loads.push_back({command.key, command.frame, command.serial});
+        stats_.promotion_bytes += host_strides_[command.key / experts_];
+    }
     load_commands_.clear();
     if (loads.empty()) { return; }
     CUDA_CHECK(cudaEventRecord(table_ready_, compute));

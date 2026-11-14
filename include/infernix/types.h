@@ -1301,6 +1301,10 @@ struct ExpertPlacementReport {
     std::uint64_t swap_promotions = 0; // experts copied into VRAM frames
     std::uint64_t swap_demotions = 0;  // VRAM victims copied out to the RAM tier
     std::uint64_t swap_admitted = 0;   // records admitted into the RAM tier
+    // Bytes the promotions copied into VRAM frames and the demotions copied out to the RAM tier
+    // (the warm start's seed loads count as neither).
+    std::uint64_t swap_promotion_bytes = 0;
+    std::uint64_t swap_demotion_bytes  = 0;
 };
 
 struct MediaCacheSummary {
@@ -1800,6 +1804,13 @@ struct RuntimeStats {
     std::uint64_t decode_row_rounds         = 0;
     // Decode rounds whose Forward also ran a prompt call (Qwen3.8-Flash-Next's mixed rounds).
     std::uint64_t mixed_rounds              = 0;
+    // Decode-path CUDA graph executions (Qwen3.8-Flash-Next's decode, verification and drafter
+    // graphs; 0 for a Program without graphed decode): replays of a captured executable, bodies
+    // run eagerly (a shape's first round) and bodies captured into a new graph. A verified round
+    // replays several graphs, so these count bodies, not rounds.
+    std::uint64_t decode_graph_replays    = 0;
+    std::uint64_t decode_eager_executions = 0;
+    std::uint64_t decode_graph_captures   = 0;
     std::uint32_t running_requests          = 0;
     std::uint32_t prefilling_requests       = 0;
     std::uint32_t decode_ready_requests     = 0;

@@ -1699,7 +1699,10 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_prompt_tokens_total`, `infernix_prompt_tokens_cached_total` | Full input and reused tokens counted once on initial binding |
 | `infernix_prefill_tokens_total`, `infernix_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `infernix_generation_tokens_total`, `infernix_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
-| `infernix_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
+| `infernix_mixed_rounds_total` | Decode rounds whose Forward also ran a prompt call (prefill beside decode) |
+| `infernix_decode_{graph_replays,eager_executions,graph_captures}_total` | Decode-path CUDA graph bodies by how they ran: replayed from a captured executable, run eagerly (a shape's first round), or captured into a new graph. A verified round replays several graphs, so these count bodies, not rounds |
+| `infernix_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total{backend}` | Live native speculative work, labeled by the engine's own drafter backend names (`mtp`, `dflash`, `dflash2`; the neural counters are live, `ngram` copy proposals aggregate at request settlement) |
+| `infernix_spec_decode_accepted_positions_total{position}` | The acceptance-length distribution across settled requests: rounds whose accepted sequence reached each draft position (position 1 is the first draft token), up to the widest verification the options allow |
 | `infernix_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes; a snapshot restore resumed from a cache snapshot at the paused frontier |
 | `infernix_{root,prefix}_selections_total` | Initial bindings from the root and from a prefix-cache snapshot |
 | `infernix_prefix_cache_{snapshots,blocks,device_blocks,device_evictable_blocks,held_snapshots}`, `infernix_prefix_cache_host_{capacity,used}_bytes` | The prefix cache's contents and the Host tier's size and use |
@@ -1707,7 +1710,9 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_prefix_cache_host_{image_writes,block_writes,image_restores,block_restores,snapshot_evictions,backed_evictions,dead_reclaims}_total`, `infernix_prefix_cache_device_evictions_total`, `infernix_prefix_cache_held_host_refusals_total` | Host tier traffic and evictions; `backed_evictions` counts Host copies dropped because the Disk tier also holds them |
 | `infernix_prefix_cache_disk_{capacity,used}_bytes`, `infernix_prefix_cache_disk_{image_writes,block_writes,write_bytes,fetches,read_bytes,failures}_total` | The prefix cache's Disk tier (`--prefix-cache-disk`; zero without one): its size and use, what was written to it and read back, and failed transfers or images that no longer match their record |
 | `infernix_device_kv_{used,capacity}_pages`, `infernix_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; cached blocks and snapshots also occupy these pools |
+| `infernix_expert_cache_{routed,hits}_total`, `infernix_expert_cache_{promotion,demotion}_bytes_total` | The routed-expert cache (Qwen3.8-Flash-Next): aggregate routed uses and VRAM-frame hits, and the bytes promotions copied into VRAM and demotions copied out to the RAM tier; the series are present only when the model has an expert cache |
 | `infernix_host_work_seconds_total{phase}`, `infernix_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
+| `infernix_phase_work_seconds_total{phase,work}` | The same worker time split by decode, prefill and control class (`work="host"` or `"device_wait"`); each class's host time is a subset of the exclusive phases |
 | `infernix_constraint_requests_total{outcome}`, `infernix_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
 | `infernix_constraint_{prepare,mask,matcher}_seconds_total`, `infernix_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
 | `infernix_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |

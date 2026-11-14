@@ -64,6 +64,10 @@ bool Program::export_expert_placement(const std::filesystem::path& path, std::st
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 
+Program::GraphExecutionStats Program::graph_execution_stats() const noexcept {
+    return impl_->graph_execution_stats();
+}
+
 RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {
     return impl_->plan_request(std::move(prompt), options);
 }

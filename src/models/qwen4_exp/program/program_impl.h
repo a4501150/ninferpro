@@ -4027,6 +4027,8 @@ public:
             status.swap_hits      = stats.hits;
             status.swap_promotions = stats.promotions;
             status.swap_demotions  = stats.demotions;
+            status.swap_promotion_bytes = stats.promotion_bytes;
+            status.swap_demotion_bytes  = stats.demotion_bytes;
             if (tier_ != nullptr) { status.swap_admitted = tier_->stats().admitted; }
         }
         status.total_experts = c_.num_hidden_layers * c_.moe.experts;
@@ -5125,11 +5127,14 @@ private:
         const cudaStream_t s = device_.stream;
         follow_expert_route(graph);
         if (graph.executable.ready()) {
+            ++graph_replays_;
             graph.executable.launch(s);
         } else if (!graph.warmed) {
+            ++graph_eager_executions_;
             body();
             graph.warmed = true;
         } else {
+            ++graph_captures_;
             // A captured body bakes in whatever it reads by address: the arena *work_ points at and
             // the per-layer waits forward_call consumes. Neither may be a call's temporary.
             if (wide_active_ || !next_waits_[0].empty() || !next_waits_[1].empty()) {
@@ -5151,11 +5156,14 @@ private:
         const cudaStream_t s = device_.stream;
         follow_expert_route(graph);
         if (graph.executable.ready()) {
+            ++graph_replays_;
             graph.executable.launch(s);
         } else if (!graph.warmed) {
+            ++graph_eager_executions_;
             for (std::int32_t j = 0; j < steps; ++j) { body(j); }
             graph.warmed = true;
         } else {
+            ++graph_captures_;
             if (wide_active_ || !next_waits_[0].empty() || !next_waits_[1].empty()) {
                 throw std::logic_error("Qwen4Exp: a graph capture inside a wide call or with pending layer waits");
             }
@@ -6397,6 +6405,10 @@ private:
 
 public:
     [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept;
+    [[nodiscard]] Program::GraphExecutionStats graph_execution_stats() const noexcept {
+        return {.replays = graph_replays_, .eager = graph_eager_executions_,
+                .captures = graph_captures_};
+    }
 
 private:
     // The prompt's prefill calls from `frontier`, and with `taps` the prefix taps they realize. A
@@ -7099,6 +7111,13 @@ private:
     std::uint64_t verify_columns_ = 0;
     std::uint64_t verify_padded_  = 0;
     std::vector<std::array<std::uint64_t, 3>> verify_by_width_;
+
+    // The decode path's CUDA graph executions (replay/replay_gated; reported through
+    // graph_execution_stats): replays of a captured executable, bodies run eagerly (a shape's
+    // first round) and bodies captured into a new graph.
+    std::uint64_t graph_replays_          = 0;
+    std::uint64_t graph_eager_executions_ = 0;
+    std::uint64_t graph_captures_         = 0;
 
     // The neural drafter's most drafts per round (MTP's or DFlash2's), and whether a lane drafts.
     [[nodiscard]] std::int32_t neural_k() const noexcept { return mtp_ ? mtp_k_ : dflash_k_; }

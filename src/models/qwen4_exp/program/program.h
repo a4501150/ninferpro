@@ -594,6 +594,7 @@ public:
         // The swap counters (expert moves within the current counts; 0 with --expert-swap off):
         std::uint64_t swap_routed = 0, swap_hits = 0;
         std::uint64_t swap_promotions = 0, swap_demotions = 0, swap_admitted = 0;
+        std::uint64_t swap_promotion_bytes = 0, swap_demotion_bytes = 0;
     };
     [[nodiscard]] ExpertPlacementStatus expert_placement_status() const;
     // Applies a new placement between rounds (the next maintenance tick): the frame target and
@@ -663,6 +664,16 @@ public:
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
+
+    // Decode-path CUDA graph executions since Program start: bodies replayed from a captured
+    // executable, bodies run eagerly (a shape's first round), and bodies captured into a new graph.
+    // A verified round replays several graphs, so these count bodies, not rounds.
+    struct GraphExecutionStats {
+        std::uint64_t replays = 0;
+        std::uint64_t eager   = 0;
+        std::uint64_t captures = 0;
+    };
+    [[nodiscard]] GraphExecutionStats graph_execution_stats() const noexcept;
 
     // ---- execution units (design §15.7): a binding reserves the KV pages of its prompt (or
     // replay) plus one round; a decode or control unit grows the lane's pages to its next round, and

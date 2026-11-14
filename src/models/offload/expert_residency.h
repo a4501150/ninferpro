@@ -73,6 +73,8 @@ public:
         std::uint64_t landed         = 0; // staged misses landed in reserved frames and adopted (S4)
         std::uint64_t demotions      = 0; // SSD tier: VRAM victims copied to RAM (T4)
         std::uint64_t unpinned_promotions = 0; // SSD tier: promotions of unpinned records (bounced)
+        std::uint64_t promotion_bytes = 0; // bytes the issued promotions copied (their record strides)
+        std::uint64_t demotion_bytes  = 0; // bytes the demotions copied out (their frames' pitches)
     };
     // Landing frames per layer and round (moe-offload-design.md §4.4): free frames are reserved before a
     // decode or verification round, the round's forked MoE calls copy their first staged misses
