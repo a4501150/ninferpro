@@ -699,8 +699,8 @@ decision.
 ### 8.2 Tier bandwidths
 
 RAM is worth far more than SSD for experts that leave VRAM. Qwen3.8-Flash-Next on the RTX
-PRO 6000 (2026-10-30, one request, DFlash2, BF16 n-gram, FP8 KV): half the experts in RAM
-decode at 263 tok/s, half on SSD at 68; the same boot's all-VRAM placement at 380. Whole
+PRO 6000 (2026-11-14, commit `a17331cc4`, one request, DFlash2, BF16 n-gram, FP8 KV): half the
+experts in RAM decode at 257 tok/s, half on SSD at 63; the same boot's all-VRAM placement at 380. Whole
 SSD-record reads of Qwen3.8-Flash-Next's 2,764,800 B records from the artifact
 (`infernix_expert_read_probe --only reads`, unbuffered, machine idle):
 

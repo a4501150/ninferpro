@@ -74,22 +74,12 @@ bit-exactly and run in the source's activation formats; tensors kept in BF16 sta
 
 ### 1.3 Status and measured speeds
 
-The engine is in production on the RTX PRO 6000 (commit `e984e41`, 2026-10-30, `make t3`;
-production flags: DFlash2 drafter, BF16 n-gram volume, FP8 KV, 6 lanes, 262,144-token context,
-a RAM-only prefix cache — an 8 GiB Host tier, the Disk tier off since 2026-11-01). One server boot,
-placements switched at runtime; tok/s from the server's own request log. Workload definitions are
-in [performance.md](../performance.md).
-
-| Placement | Experts VRAM / RAM / SSD | Decode, 1 request | Decode, 30K context | Prefill, 30K | 6 requests, total |
-|---|---|---:|---:|---:|---:|
-| `vram=100%` | 24,576 / 0 / 0 | 380 | 333 | 13,700 | 541 |
-| `vram=65%,ram=15%,ssd=20%` | 15,974 / 3,658 / 4,944 | 232 | 220 | 9,750 | 380 |
-| `vram=50%,ram=50%` | 12,288 / 12,288 / 0 | 263 | 208 | 8,160 | 388 |
-| `vram=50%,ssd=50%` | 12,288 / 0 / 12,288 | 68 | 51 | 3,990 | 193 |
-
-Switching back to `vram=100%` at the end of the same boot measured 379 / 287 / 13,600 / 525, so a
-switch round trip leaves the engine whole. Switches take 1.7-8.6 s. RAM is worth far more than SSD
-for experts that leave VRAM: half the experts in RAM decode at 263 tok/s, half on SSD at 68.
+The engine is in production on the RTX PRO 6000 (production flags: DFlash2 drafter, BF16 n-gram
+volume, FP8 KV, 6 lanes, 262,144-token context, a RAM-only prefix cache — an 8 GiB Host tier, the
+Disk tier off since 2026-11-01). Its measured speeds per placement are the README's
+[Measured](../../README.md#measured) table; workload definitions are in
+[performance.md](../performance.md). A switch round trip leaves the engine whole, and RAM is worth
+far more than SSD for experts that leave VRAM.
 
 ### 1.4 Still-open risks
 

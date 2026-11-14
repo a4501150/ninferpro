@@ -481,8 +481,8 @@ interval. Reported effective bandwidth uses the encoded weight planes once, one 
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
 behavior. The fixed memory reference is `1792 GB/s` DRAM bandwidth, the datasheet figure of both
-the RTX 5090 and the RTX PRO 6000 (the round bench measures the PRO 6000's streaming read rate at
-about 1764 GB/s). Tensor Core utilization
+the RTX 5090 and the RTX PRO 6000; the actual streaming read rate depends on the card's memory
+clock, and the round bench measures it at startup. Tensor Core utilization
 is reported only for registered shape/policy/extent combinations with a known MMA profile; the
 activation policy alone does not identify that profile. MXFP8 with FP32 accumulation uses the
 `838 TFLOP/s` dense reference. `READ_%` additionally compares the same one-read model

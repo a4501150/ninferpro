@@ -337,8 +337,8 @@ Gen5 x16; 89 GB of host RAM; an AMD Ryzen 9 9950X3D2 host (16 cores / 32 threads
 VNNI and BF16, `lscpu` 2026-11-02), whose E3A16 expert cost M0 measures before any constant
 depends on it; one Gen5 NVMe (T710) holding the models, measured at 6.36 GB/s at queue depth 1 and
 13.35 GB/s at depth 8 on Flash-Next's 2.76 MB records (2026-11-02, MoE §8.2). Its rate at this
-family's 9 MiB records is unmeasured; M0's probe (§23) measures it. The shared tier's placement matrix measured on this card (Flash-Next, 2026-10-30) is
-MoE §8.2's: half the experts in RAM decode at 263 tok/s, half on SSD at 68, against 380
+family's 9 MiB records is unmeasured; M0's probe (§23) measures it. The shared tier's placement matrix measured on this card (Flash-Next, 2026-11-14) is
+MoE §8.2's: half the experts in RAM decode at 257 tok/s, half on SSD at 63, against 380
 all-VRAM, one request each.
 
 **RTX 5090 machine** (measured 2026-10-10 unless marked; tools named per row):

@@ -345,12 +345,13 @@ VRAM left free, and whether it fits. A switch is validated before anything moves
 limit, the pinned keys, the RAM target beside the tier's lists) and applied at the next round
 boundary; `GET` reports the counts, bytes, KV, free VRAM and RAM, the fill's progress, the swap
 counters and the last switch's outcome (`last_switch`), so a switch that cannot be reached (a
-grow while another program holds the VRAM) says so and the server keeps serving. Switches
-measured 1.7-8.6 s (RTX PRO 6000, 2026-10-30); a switch back to `vram=100%` left the engine whole.
+grow while another program holds the VRAM) says so and the server keeps serving. Switches take
+a few seconds on the RTX PRO 6000, and a switch back to `vram=100%` leaves the engine whole (the
+README's [Measured](../README.md#measured) table).
 
-**What each tier costs.** The measured table in [Performance](#performance) shows it on the
-RTX PRO 6000 (2026-10-30): RAM is worth far more than SSD for experts that leave VRAM — half
-the experts in RAM decode at 263 tok/s, half on SSD at 68.
+**What each tier costs.** The README's [Measured](../README.md#measured) table shows it on the
+RTX PRO 6000: RAM is worth far more than SSD for experts that leave VRAM — half the experts in
+RAM decode at about four times the speed of half on SSD.
 
 **Policy is the client's.** The engine provides the mechanism; it does not choose shares, react
 to other programs' memory use, or keep headroom heuristics for the placement. A policy such as
@@ -587,22 +588,9 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
 
 ## Performance
 
-**RTX PRO 6000 Blackwell** (orcarouter recipe C artifact, BF16 n-gram volume, DFlash2 drafter,
-FP8 KV, 6 lanes, 262,144-token context, no Disk prefix cache; commit `e984e41`, 2026-10-30,
-`make t3`; one server boot, placements switched at runtime; tok/s from the server's request
-log; process VRAM 90.3 / 68.2 / 58.7 GiB and process RAM 12.8 / 23.6 / 45.8 / 14.2 GiB at
-`vram=100%` / `65%,15%,20%` / the 50 % rows):
-
-| Placement | Experts VRAM / RAM / SSD | Decode, 1 request | Decode, 30K context | Prefill, 30K | 6 requests, total |
-|---|---|---:|---:|---:|---:|
-| `vram=100%` | 24,576 / 0 / 0 | 380 | 333 | 13,700 | 541 |
-| `vram=65%,ram=15%,ssd=20%` | 15,974 / 3,658 / 4,944 | 232 | 220 | 9,750 | 380 |
-| `vram=50%,ram=50%` | 12,288 / 12,288 / 0 | 263 | 208 | 8,160 | 388 |
-| `vram=50%,ssd=50%` | 12,288 / 0 / 12,288 | 68 | 51 | 3,990 | 193 |
-
-Switching back to `vram=100%` at the end of the same boot measured 379 / 287 / 13,600 / 525.
-Workload definitions, the `make t3` command and the per-tier process VRAM split are in
-[performance.md](performance.md) and the README's [Measured](../README.md#measured) table.
+**RTX PRO 6000 Blackwell**: the README's [Measured](../README.md#measured) table (a placement
+matrix in one server boot, with the GPU settings and commit it was measured at); workload
+definitions and the `make t3` command are in [performance.md](performance.md).
 
 **RTX 5090** (Infernix-era measurements, 2026-10-07 and earlier, on an artifact converted from
 `RadixArk/Qwen3.8-Flash-Next-NVFP4`, PCIe 5.0 x8, i9-13900K, recipe B, INT8 KV, one request;

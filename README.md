@@ -39,29 +39,33 @@ The binaries keep their Infernix names (`infernix-serve`, `infernix`, `infernix-
 
 ## Measured
 
-RTX PRO 6000 Blackwell, orcarouter Qwen3.8-Flash-Next-Uncensored-NVFP4 (recipe C conversion), BF16
-n-gram volume, DFlash2 drafter, FP8 KV, 6 lanes, 262,144-token context, no Disk prefix cache. One
-server boot, placements switched at runtime in the order shown; speeds are tok/s from the server's
-own request log (commit `e984e41`, 2026-10-30, `make t3`). [Performance](docs/performance.md)
-defines each column's workload.
+RTX PRO 6000 Blackwell (core undervolted to 2,865 MHz at 925 mV, memory offset +6,000: 16,365 MHz
+under CUDA), orcarouter Qwen3.8-Flash-Next-Uncensored-NVFP4 (recipe C conversion), BF16 n-gram
+volume, DFlash2 drafter, FP8 KV, 6 lanes, 262,144-token context, no Disk prefix cache. One server
+boot, placements switched at runtime in the order shown; speeds are tok/s from the server's own
+request log (commit `a17331cc4`, 2026-11-14, `make t3`). [Performance](docs/performance.md) defines
+each column's workload.
 
 | Placement | VRAM / RAM / SSD experts | Process VRAM, GiB (experts / KV / other) | Process RAM | Decode, 1 request | Decode at 30K context | Prefill, 30K | 6 requests, total |
 |---|---|---|---|---|---|---|---|
-| `vram=100%` | 24,576 / 0 / 0 | 90.3 (63.3 / 19.3 / 7.7) | 12.8 GiB | 380 | 333 | 13,700 | 541 |
-| `vram=65%,ram=15%,ssd=20%` | 15,974 / 3,658 / 4,944 | 68.2 (41.2 / 19.3 / 7.7) | 23.6 GiB | 232 | 220 | 9,750 | 380 |
-| `vram=50%,ram=50%` | 12,288 / 12,288 / 0 | 58.7 (31.7 / 19.3 / 7.8) | 45.8 GiB | 263 | 208 | 8,160 | 388 |
-| `vram=50%,ssd=50%` | 12,288 / 0 / 12,288 | 58.7 (31.7 / 19.3 / 7.8) | 14.2 GiB | 68 | 51 | 3,990 | 193 |
+| `vram=100%` | 24,576 / 0 / 0 | 90.3 (63.3 / 19.3 / 7.7) | 12.8 GiB | 380 | 308 | 11,800 | 473 |
+| `vram=65%,ram=15%,ssd=20%` | 15,974 / 3,657 / 4,945 | 68.2 (41.2 / 19.3 / 7.7) | 23.6 GiB | 227 | 194 | 7,670 | 393 |
+| `vram=50%,ram=50%` | 12,288 / 12,288 / 0 | 58.7 (31.7 / 19.3 / 7.7) | 45.8 GiB | 257 | 209 | 6,030 | 426 |
+| `vram=50%,ssd=50%` | 12,288 / 1 / 12,287 | 58.7 (31.7 / 19.3 / 7.7) | 14.2 GiB | 63 | 54 | 2,580 | 200 |
 
-Switching back to `vram=100%` at the end of the same boot measured 379 / 287 / 13,600 / 525. The
-30K-context decode moves with DFlash2 acceptance (69.5 % in the first row, 64.2 % in the last), and
-a second boot's `vram=100%` row measured 289 there. The benchmark flags the
-`vram=65%,ram=15%,ssd=20%` row as disturbed (its measured pass decoded slower than its warm pass)
-in two boots; the second measured 242 / 196 / 9,750 / 400.
+Switching back to `vram=100%` at the end of the same boot measured 383 / 306 / 11,800 / 541. Six
+requests' total moves with DFlash2 acceptance and timing: three boots of this commit measured 473-541
+at `vram=100%`, and 30K-context decode 306-324. The benchmark flags the `vram=65%,ram=15%,ssd=20%`
+row as disturbed (its measured pass decoded slower than its warm pass), as it has in earlier boots.
 
-Switches take 1.7-8.6 s; growing back to `vram=100%` took 4.2 s. Process RAM at `vram=100%` is the
+Prefill is lower than at `e984e41` (2026-10-30: 13,700 / 9,750 / 8,160 / 3,990 down the same
+column); `6b6762f61` (2026-11-04) already measured about 12,000 at `vram=100%`, so the change came
+between those commits, not from the GPU settings.
+
+Switches take 1.6-6.8 s; growing back to `vram=100%` took 4.1 s. Process RAM at `vram=100%` is the
 8 GiB prefix-cache host tier (`--host-context-mib`) plus about 4.8 GiB of engine heap. RAM is worth
-far more than SSD for experts that leave VRAM: half the experts in RAM decode at 263 tok/s, half on
-SSD at 68.
+far more than SSD for experts that leave VRAM: half the experts in RAM decode at 257 tok/s, half on
+SSD at 63.
 
 ## Build
 
