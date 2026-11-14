@@ -624,7 +624,9 @@ computed by the CPU as they land.
 - Lookahead is off (the default, §11.5). With ≈ 10 SSD reads per token its ceiling is the gap to
   the no-SSD column below, of which Maya's 40-45 % predictability could recover part.
 
-M0 commits the model as `tools/glm5_next/decode_model.py` with its inputs.
+Once the family's round bench exists, its speed of light carries this model as measured bytes
+(`round_bytes`, [Decode profiling tiers](round-bench.md)) and the two must agree; no separate model
+script is kept.
 
 Plain decode, tok/s (model):
 
@@ -2227,7 +2229,7 @@ probes join the maintainer probe suite (the shape of `tools/flash_next_probe/`).
 | **M3** | Ops | EXL3 codec; `exl3` Linear (decode, prompt and transposed routes); `offloaded_sparse_moe` `exl3_mul1` on the GPU and the CPU (AVX-VNNI); GLM routing; `mhc`; `kda_input_prep` and replay; `dsa_indexer`; `mla_sparse_attention`; per-volume reading | Every §20.1 qualification passes |
 | **M4** | Artifacts and functional model | The recipe and both official entries, the supplement fetch, volumes, restripe, `verify_artifact`; Engine, CLI, bench, CausalScoring with one volume and the existing tiers; the two reference forwards; the registry value and engine arm | Every tensor round-trips bit-exactly; §20.2 checks; execution gate (§20.3); the quantization-quality report for both artifacts; first end-to-end numbers, both machines |
 | **M5** | Tiers at GLM scale | Striped reading on two volumes, landing ring, partial-record consumption, lookahead, M1's policies, promotion sweep, CPU worker and core-type sweep, warm start, prompt seeding, the unpinned sub-tier where the pin room binds | §20.4 invariance and fault tests; decode with two volumes ≥ 1.15× one; Must decode target |
-| **M6** | Decode speed | §9.3 budget kernels and fusions, EXL3 decode ALU check against ExLlamaV3's GEMV, stall-time warming; nsys attribution of one token | Per-kernel times against the budget; anything > 30 % over gets ncu before M7 |
+| **M6** | Decode speed | §9.3 budget kernels and fusions, EXL3 decode ALU check against ExLlamaV3's GEMV, stall-time warming; `make t1` speed of light, `make t1 SWEEP=1`, `make t1 PROFILE=1` and `make t2-bench PROFILE=1` ([Decode profiling tiers](round-bench.md)) | Per-kernel times against the budget; anything > 30 % over gets ncu before M7 |
 | **M7** | Speculation | MTP drafter (MikeRoz: bounded experts, index sharing, draft head), cost model, n-gram (both) | Default chosen by measurement; never slower than plain beyond noise |
 | **M7a** | Approximate mode | §9.8: router rule, scopes, maps, weight threshold, static rule, cache crediting, prefix tags, labelling; band-sensitivity table on the default EXL3 artifact; replayed-residency KL evaluation | Mode off is bit-identical to a build without it; keep map all-8 equals exact; presets meet the §9.8 gates; KL and speed published per preset |
 | **M8** | Prefill and long context | Walk with expert groups, E3A16 wide and prompt routes at speed, indexer and attention prompt kernels, KV formats, the KV host tier above 128K, permission gates | Prefill Must target; 128K decode ≥ 85 % of 4K |

@@ -28,8 +28,13 @@ equal acceptance; the GPU also drives the desktop, so such a row is not comparab
 `vram=100%` row repeats the first one after every switch and shows whether switching left the engine
 slower.
 
-The tiers below `make t3` (Forward time, the in-process engine bench) and their scopes are in
-[AGENTS.md](../AGENTS.md#iteration-tiers). Their numbers are not comparable with this table.
+`make t3-frontier` measures the same server differently: one boot, production-shaped agentic
+traffic at each concurrency level, total output tok/s against the per-user decode speed, and the
+best point at an SLA; its tables go to `~/src/super-quant/results/infernix_frontier_<commit>.*`.
+
+The tiers below `make t3` (Forward time and its speed of light, the in-process engine bench and its
+decode-step split) and their scopes are in [AGENTS.md](../AGENTS.md#iteration-tiers) and
+[Decode profiling tiers](maintainer/round-bench.md). Their numbers are not comparable with this table.
 
 ## Inherited Infernix measurements
 

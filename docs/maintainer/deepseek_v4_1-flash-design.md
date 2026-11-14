@@ -602,8 +602,9 @@ standing lessons (FN §3.4). They hold here; these change weight:
 
 ## 5. Performance model
 
-The script is kept with this design's working notes; M0 commits it as
-`tools/deepseek_v41/decode_model.py`.
+The script is kept with this design's working notes. Once the family's round bench exists (M4), its
+speed of light carries this model as measured bytes (`round_bytes`,
+[Decode profiling tiers](round-bench.md)) and the two must agree; no separate model script is kept.
 
 ### 5.1 Per-token work at C = 1, plain decode
 
@@ -2103,7 +2104,7 @@ Converter: `--recipe deepseek_v4_1_flash` (or an official entry, §7.1) with `--
 | **M3** | Ops | MX8 codec; `fp8_e4m3fn_b32_e8m0` Linear; MXFP4 and NVFP4 experts with MX8 on the GPU and the CPU; router; `csa_compressor`, `csa_indexer`, `csa_attention`; `mhc`; `engram`; DSpark Ops; the MXFP4-against-NVFP4 kernel timings (decision c) | Every §20.1 qualification passes; the timing table recorded |
 | **M4** | Artifact and functional model | Recipe and official entries, the streaming converter with its disk planner, MX recovery, volumes, restripe, `verify_artifact`; Engine, CLI, bench and CausalScoring with one volume; both prompt rules; the reference forwards | Every tensor round-trips; §20.2 checks; the execution gates for both rules; the §20.3 reports; first end-to-end numbers on both machines |
 | **M5** | Tiers at scale | Three volumes (RTX 5090 machine) and the single-NVMe + stripe A/B (RTX PRO 6000), landing ring, partial records, M1's policies, promotion sweep, CPU sweep, unpinned records, warm start, lookahead A/B, the MXFP4 and NVFP4 artifacts end to end | §20.5 invariance and fault tests; decode Must targets on both machines; three volumes ≥ 1.8× one |
-| **M6** | Decode speed | §9.3's kernels and fusions, stall-time warming; nsys attribution of one token | Per-kernel times against the budget; anything > 30 % over gets ncu before M7 |
+| **M6** | Decode speed | §9.3's kernels and fusions, stall-time warming; `make t1` speed of light, `make t1 SWEEP=1`, `make t1 PROFILE=1` and `make t2-bench PROFILE=1` ([Decode profiling tiers](round-bench.md)) | Per-kernel times against the budget; anything > 30 % over gets ncu before M7 |
 | **M7** | Speculation | DSpark drafter (bounded experts, Markov and confidence heads), the cost model with σ and confidence, n-gram proposals; the resident DSpark-bank form on the RTX PRO 6000 | Default chosen by measurement; never slower than plain beyond noise |
 | **M7a** | Approximate mode | §9.8 | Mode off bit-identical to a build without it; presets meet the gates |
 | **M8** | Prompts and long context | 128K walk spans, prompt kernels, the CPU decoder replay, the full rule's suffix, indexer prompt scoring, 1M context | Prompt Must targets; decode at 128K ≥ 90 % of 4K |

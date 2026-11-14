@@ -817,8 +817,8 @@ The unused-bandwidth share moves little across shapes — 34.2 % at 1 x 1, 31.7 
 1 x 4, 35.5 % at 6 x 2, 38.8 % at 6 x 3 (2026-10-31) — but the largest pool moves with the width: at
 6 x 3 the hyper-connection pair holds 2.1 ms of the 7.5 ms unused beside the wide projections; at
 1 x 1 the dense FP8 GEMV and the composed GDN kernel lead, and the routed down pass falls to 41.8 %
-DRAM (40 CTAs per job at low occupancy, the per-CTA dependency chain exposed). `make t1-kernels
-KSHAPE=S METRICS=1` publishes this table for any shape.
+DRAM (40 CTAs per job at low occupancy, the per-CTA dependency chain exposed). `make t1 PROFILE=1
+SHAPE=S METRICS=1` publishes this table for any shape.
 
 ### 8.4 Router, route and CPU plan
 
@@ -988,7 +988,7 @@ The remaining bandwidth pools, by the 2026-10-31 atlas (§8.3):
 | Item | Why it lost (hardware, date) |
 |---|---|
 | Lookahead prefetch of next-layer experts by the router | Never built; the host cache policy (§9) and the CPU wait's L2 warming cover the same window |
-| The 2026-10-03 kernel plan (K1-K7b, byte budgets at 1.5 TB/s) | Superseded by the built chain; `t1-kernels` measures the real round (2026-10-22) |
+| The 2026-10-03 kernel plan (K1-K7b, byte budgets at 1.5 TB/s) | Superseded by the built chain; `make t1 PROFILE=1` measures the real round (2026-10-22) and `make t1` its speed of light |
 | Pipelined decode (chained drafting; a round committed ahead into a spare state slot) | tg512 MTP +1 %, code decode −0.3 %, ~420 lines (RTX 5090, 2026-10-05/06) |
 | Weight self-prefetch at kernel start | Bulk prefetches compete with the kernel's own ordered stream: NVFP4 A16 T = 1 34.1 → 43.8 µs (+29 %, RTX 5090, 2026-10-12) |
 | HC weights prefetched by the down partials | −0.3 to −0.7 % end to end; K1b already fetches during K1a (RTX 5090, 2026-10-17) |

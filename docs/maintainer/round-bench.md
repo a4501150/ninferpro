@@ -12,10 +12,10 @@ order to use the tiers in when bringing up or tuning a family's decode.
 | Piece | Path | Used by |
 |---|---|---|
 | Settings | `bench/models/<family>/tiers.mk` | the Makefile: `ARTIFACT` and the family's other artifacts, `MODEL_ENV` (the environment its real-artifact tests and Engine bench read), `ROUND_ARGS` (the round bench's artifact arguments), `T1_FAST` and `T1_EXACT` (the golden shapes), `SWEEP_SHAPE`, `SWEEP_CONTEXTS`, `SWEEP_CHUNK` |
-| Round bench | `infernix_<family>_round_bench`, `bench/models/<family>/round_bench.cpp` | `t1`, `t1-exact`, `t1-record`, `t1-kernels`, `t1-sweep` |
+| Round bench | `infernix_<family>_round_bench`, `bench/models/<family>/round_bench.cpp` | `t1` (and its `SWEEP=1` and `PROFILE=1` modes), `t1-exact`, `t1-record` |
 | Golden hashes | `bench/models/<family>/round_hashes.txt` | `t1`, `t1-exact`, `t1-record` |
 | Smoke test | `infernix_<family>_smoke_real_test`, golden tokens in `tests/models/<family>/smoke_golden.txt` | `t2`, `t2-record` |
-| Engine bench | `infernix_<family>_engine_bench` | `t2-bench`, `t2-step` |
+| Engine bench | `infernix_<family>_engine_bench` | `t2-bench` (and its `PROFILE=1` mode) |
 
 `qwen4_exp` meets the whole contract. `qwen3_5`'s MTP and DFlash round benches predate it: they
 drive the Program rather than the Forward and implement none of the options below, so the tier
@@ -36,7 +36,7 @@ every routed expert resident, without the Engine. Options every family's round b
 | `--check FILE`, `--record FILE` | compare with, or record, the golden hashes of the logits and the lane state |
 | `--determinism N` | replay each shape N times from one state; differing bits fail the run |
 | `--sections` | each section (embedding, every layer's mixer and MoE halves, the head) as its own graph |
-| `--profile` | bracket the timed replays with `cudaProfilerStart`/`Stop` (`t1-kernels`) |
+| `--profile` | bracket the timed replays with `cudaProfilerStart`/`Stop` (`make t1 PROFILE=1`) |
 | `--report FILE` | append one JSON line per shape (below) |
 | `--dram-gbs X` | use X GB/s instead of the measured device read rate |
 
@@ -81,28 +81,32 @@ The public Engine in process with production's options: C concurrent requests of
 tokens, one warm-up set, then `--repeat` sets (`--concurrency`, `--tokens`, `--repeat`,
 `--fast-path`). `--profile` brackets the measured sets with `cudaProfilerStart`/`Stop`.
 
-`t2-step` runs it under Nsight Systems through `tools/tiers/step.py`, which needs only the ranges
-every Program already emits through the runtime: the Engine's `decode` range per round and the
-runtime's `program.submit`, `device.wait` and `program.post`. It splits each round's window (one
-`decode` start to the next) into host phases, GPU idle time by what the Engine thread was doing,
-and GPU busy time by launch site (the NVTX path open where each kernel, copy or graph was
-launched), so the target graph and a drafter's calls separate by the ranges the family emits. A
-family that wants a finer split names its phases with `nvtx::ScopedRange`.
+`make t2-bench PROFILE=1` runs one set under Nsight Systems through `tools/tiers/step.py`. It splits
+each round's window (one Engine `decode` range's start to the next) into the Engine thread's time
+by the innermost range open below `decode`, GPU idle time by what that thread was doing, and GPU
+busy time by launch site (the NVTX path open where each kernel, copy or graph was launched). The
+split is only as fine as the ranges the Program opens around its graph launches and device waits:
+ranges inside the Forward or a drafter are live only while a graph is captured, so a replayed
+graph's kernels go to the path around its launch. A family's Program names its phases with
+`nvtx::ScopedRange`; `qwen4_exp` opens `dflash.proposal`, `dflash.context_append`,
+`decode.dflash.target` and `decode.ordinary.submit` around its launches and
+`decode.dflash.wait` and `decode.ordinary.wait` around its waits.
 
 ## Order of work for a family's decode
 
 1. `make t1`: the round time and its speed of light per golden shape. Compare the byte classes with
    the design's budget; a class larger than designed is a binding or layout question, not a kernel
    one.
-2. `make t1-sweep`: the same against context length and skewed lanes (one long lane beside short
+2. `make t1 SWEEP=1`: the same against context length and skewed lanes (one long lane beside short
    ones). The `vs first` column is the cost of context; a class that grows with context and a
    ratio that grows with it point at the attention or the selection.
-3. `make t1-kernels KSHAPE=<worst ratio> METRICS=1`: which kernels hold the time and where DRAM
+3. `make t1 PROFILE=1 SHAPE=<worst ratio> METRICS=1`: which kernels hold the time and where DRAM
    bandwidth goes unused; then Nsight Compute on one kernel (bench/README.md).
-4. `make t2-step`: what T1 leaves out. Host phases and GPU idle per round bound what host work,
+4. `make t2-bench PROFILE=1`: what T1 leaves out. Host phases and GPU idle per round bound what host work,
    scheduling and launch overlap can save; drafter sites against the target graph price the
    drafting.
 5. `make t3`, then `make t3-frontier` (production-shaped agentic traffic from `bench/agentic_ab` at
    each concurrency level in one boot: total throughput against per-user decode speed, the best
    point at an SLA) for policy that depends on live timing; live counters for the same questions
-   are on `/metrics` (docs/serving.md).
+   are on `/metrics` (docs/serving.md). The serving benchmarks and where each lives are listed in
+   bench/README.md.

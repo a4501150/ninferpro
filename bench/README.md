@@ -19,6 +19,19 @@ TTFT, cold prefill and output rates. It and the decode-saturation suite of
 README table comes from `make t3` instead ([Performance](../docs/performance.md)). The older serve A/B rig
 under [`ab/`](ab/README.md) predates the `e31bc99b` merge.
 
+Serving benchmarks against a live server, and why each lives where it does: the ones that boot
+production's server read its flags from `~/src/super-quant/configs/<model>/model.env`, so they
+live in super-quant beside that file; the workloads and the client tools that take a server address
+live here.
+
+| Benchmark | Location | Measures |
+|---|---|---|
+| `make t3` | super-quant `scripts/bench_infernix.py` | promotion: fixed phases per expert placement, from the server's `req#N done` lines |
+| `make t3-frontier` | super-quant `scripts/bench_infernix_frontier.py` (imports `bench_infernix.py` and this directory's `agentic_ab`) | the throughput / per-user decode-speed frontier over concurrency, agentic or synthetic long-beside-short traffic |
+| agentic A/B | [`agentic_ab/`](agentic_ab/README.md) | two servers on the same production-shaped closed-loop traffic |
+| decode saturation, corpus makespan | `tools/bench/run_serve_concurrency.py` | per-concurrency decode curves against any server; the reproduction command of the published Qwen3.5-family tables |
+| TTFT campaign | [`tools/bench/ttft/`](../tools/bench/ttft/README.md) | public-HTTP latency, streaming gaps, prefix reuse, preemption |
+
 ## Benchmark inputs
 
 Synthetic numerical inputs use reproducible pseudorandom values with distinct operand seeds,
@@ -83,7 +96,12 @@ token count exact. All requests disable prefix reuse. When CUDA Graph is enabled
 contains decode work, a public generation batch with the selected grammar/concurrency settings
 primes the decode graphs before warmups and measured repetitions.
 
-## Qwen3.8-Flash-Next round harness (T1)
+## Model round and Engine benches (T1, T2)
+
+Every model family provides a round bench and an Engine bench under `bench/models/<family>/`; the
+tier targets run them for `FAMILY=<family>`, and [the per-family
+contract](../docs/maintainer/round-bench.md) gives the options, report fields and byte model they
+share. Qwen3.8-Flash-Next's (`qwen4_exp`) are below.
 
 `infernix_qwen4_exp_round_bench` runs one generation round of each `--shape RxW` (R rows of W
 columns: W = 1 plain decode, W >= 2 verification followed by the commit) through the production
@@ -92,13 +110,12 @@ prefills all eight lanes from `fixtures/bench_corpus.ids` (`--context` takes one
 lengths, so one long lane can sit beside short ones), then reports per shape the forward and commit
 device times, the round's speed of light (the bytes it must move at least over the measured device
 read rate), the logits and lane-state hashes, and with `--sections` each layer half as its own
-graph; `--report FILE` appends the figures as JSON lines. A mixed shape `RxW+P` runs the round and a P-token prefill chunk of the eighth lane
-once as the round's graph followed by the chunk's call and once as one mixed call
+graph; `--report FILE` appends the figures as JSON lines. A mixed shape `RxW+P` runs the round and
+a P-token prefill chunk of the eighth lane once as the round's graph followed by the chunk's call and once as one mixed call
 (`ForwardBatch::prefill_part`), and reports both device times; on the exact route it fails unless
-the two give the same bits. `make t1`, `make t1-exact`, `make t1-kernels`, `make t1-sweep` and
-`make t1-record` drive it (AGENTS.md "Iteration tiers"); the source header lists every option and
-[the per-family contract](../docs/maintainer/round-bench.md) the options, report fields and byte
-model every family's round bench shares.
+the two give the same bits. `make t1` (with `SWEEP=1` against context length, with `PROFILE=1`
+per kernel), `make t1-exact` and `make t1-record` drive it (AGENTS.md "Iteration tiers"); the
+source header lists every option.
 
 `--profile` brackets the timed replays with `cudaProfilerStart`/`Stop`, so Nsight Compute can profile
 the decode kernels inside the round's graph:
@@ -107,8 +124,8 @@ the decode kernels inside the round's graph:
 --determinism 1 --profile`. Keep the clock and cache options: with Nsight Compute's defaults (base
 clocks, L2 flushed before every kernel) the A16 gate/up rows kernel showed 53 % of DRAM bandwidth,
 against about 75 % in the round. Nsight Compute also runs kernels one at a time, so a programmatic
-dependent's time there leaves out its overlap with the kernel before it; `make t1-kernels` gives the
-in-graph view. Round times of one build differ by up to about 0.5 % between runs (1 x 1: 5,117 and
+dependent's time there leaves out its overlap with the kernel before it; `make t1 PROFILE=1` gives
+the in-graph view. Round times of one build differ by up to about 0.5 % between runs (1 x 1: 5,117 and
 5,140 us on 2026-10-25), so compare builds in alternating runs of one session before reading a
 difference below 1 %.
 
@@ -116,8 +133,8 @@ difference below 1 %.
 production's options and `bench_infernix.py`'s concurrent phase: C requests at once (default 6) of N
 output tokens (default 256), one warm-up set and `--repeat` sets, each reported as aggregate tok/s
 with its DFlash2 drafting. It needs no server boot, so it measures the policy and host work that T1
-leaves out; `make t2-step` runs it under Nsight Systems and splits each decode round into host
-phases, GPU idle time and GPU work by launch site (`tools/tiers/step.py`).
+leaves out; `make t2-bench PROFILE=1` runs one set under Nsight Systems and splits each decode
+round into host phases, GPU idle time and GPU work by launch site (`tools/tiers/step.py`).
 
 ## CLI
 
