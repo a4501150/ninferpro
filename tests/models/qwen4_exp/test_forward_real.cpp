@@ -9,6 +9,7 @@
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --head-equality [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --split-equality [--kv KV]
+//   infernix_qwen4_exp_forward_real_test --work-peak [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
 //
@@ -16,7 +17,9 @@
 // head_logits on the same residual column byte for byte (the head width-invariance gather-before-
 // mix gives finish). With --cpu-columns the test checks that calls the Program serves with the CPU expert service
 // (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
-// bit for bit (check_cpu_columns).
+// bit for bit (check_cpu_columns). With --work-peak the test checks the workspace contract
+// (check_work_peak): Forward::workspace_bytes bounds the arena's real peak at every prefill width,
+// on the exact route and the selected fast paths, with generated ids (no token list needed).
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
 // options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
 // instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
@@ -123,8 +126,8 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
 // resident experts (every expert is read zero-copy from the pinned bank).
 struct Harness {
     Harness(const q4::execution::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
-            std::int32_t rows, KvCacheStorage storage)
-        : config(parameters.model.config().text), exact_route(exact_route_of(parameters, storage)) {
+            std::int32_t rows, KvCacheStorage storage, bool fast = false)
+        : config(parameters.model.config().text), exact_route(route_of(parameters, storage, fast)) {
         const auto& c = config;
         LayoutBuilder builder;
         const LinearAttentionStatePoolSpec gdn_spec{
@@ -230,7 +233,8 @@ struct Harness {
         for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
             experts.frames.push_back(static_cast<const std::int32_t*>(frames_backing.p) + l * c.moe.experts);
         }
-        work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context, storage);
+        work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context, storage,
+                                                                 wide_of(exact_route));
         work          = std::make_unique<WorkspaceArena>(work_capacity);
         state_view    = state;
         kv_view       = kv;
@@ -249,12 +253,22 @@ struct Harness {
                                                         exact_route);
     }
 
-    // The artifact's exact route at this KV format (the Engine's --disable-fast-paths selection).
-    static q4::execution::ForwardFastPaths exact_route_of(const q4::execution::Parameters& parameters,
-                                                         KvCacheStorage storage) {
+    // The wide experts' route under these flags (the Program's wide_a16: the artifact's bank format
+    // decides the fast path's selection, so the flags alone pick the variant).
+    static ops::offloaded_moe::WideA16 wide_of(const q4::execution::ForwardFastPaths& flags) {
+        if (flags.expert_a4_residual) { return ops::offloaded_moe::WideA16::kA4Residual; }
+        return ops::has_route(flags.dense_routes, ops::LinearRoutes::GgmlBf16Wide)
+                   ? ops::offloaded_moe::WideA16::kGgmlBf16
+                   : ops::offloaded_moe::WideA16::kExact;
+    }
+
+    // The artifact's route at this KV format: the Engine's --disable-fast-paths selection, or the
+    // selected fast paths' (the Engine's default) with `fast`.
+    static q4::execution::ForwardFastPaths route_of(const q4::execution::Parameters& parameters,
+                                                   KvCacheStorage storage, bool fast = false) {
         infernix::EngineOptions options;
         options.kv_cache   = storage;
-        options.fast_paths = false;
+        options.fast_paths = fast;
         return q4::select_fast_paths(parameters, options).forward();
     }
 
@@ -509,6 +523,60 @@ bool check_head_equality(const q4::execution::Parameters& parameters, DeviceCont
     return ok;
 }
 
+// The workspace contract: Forward::workspace_bytes, which sizes the arena every prefill call swaps
+// in (the Program's wide work) and the static arena, bounds the arena's real peak of a call of the
+// same width — the arena throws on overflow, so an estimate below a call's demand fails loudly in
+// production. Runs one call at every width production prefills at, at the start of the context and
+// deep in it (the QSA attention workspace grows with the context), on the exact route and the
+// selected fast paths (whose GDN chunk scratch and wide experts' residual A4 layout are demands the
+// exact route does not make), and reports each call's planned capacity against its measured peak.
+// The check is about memory, not bits, so the ids are generated.
+bool check_work_peak(const q4::execution::Parameters& parameters, DeviceContext& device,
+                     const q4::NgramVolume& volume, KvCacheStorage kv) {
+    const auto& c = parameters.model.config().text;
+    // Room for the widest chunk and a deep call after it; 64-aligned like a call grid.
+    constexpr std::int32_t kColumns = 40960, kDeepWidth = 4096;
+    std::vector<std::int32_t> tokens(static_cast<std::size_t>(kColumns));
+    std::uint64_t state = 0x9E3779B97F4A7C15ULL; // one fixed LCG: deterministic, no fixture file
+    for (auto& token : tokens) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        token = static_cast<std::int32_t>((state >> 33) % c.vocab_size);
+    }
+    const std::int32_t context = (kColumns + 63) / 64 * 64;
+    const std::int32_t widths[] = {1, 2, 512, 2048, 4096, 8192, 16384};
+    const auto V = static_cast<std::int32_t>(c.vocab_size);
+    bool ok = true;
+    for (const bool fast : {false, true}) {
+        // The wide experts' route under the same selection the Program sizes its work with.
+        const auto flags    = Harness::route_of(parameters, kv, fast);
+        const auto wide_a16 = Harness::wide_of(flags);
+        Harness harness(parameters, device, context, widths[std::size(widths) - 1], 1, kv, fast);
+        DeviceBuffer logits(static_cast<std::size_t>(V) * sizeof(float));
+        const auto check_call = [&](std::int32_t first, std::int32_t width) {
+            auto call = make_call(c, volume, {tokens}, first, width, {0}, {0});
+            Tensor out(logits.p, DType::FP32, {V, 1});
+            harness.forward->run(call.batch, out);
+            device.synchronize();
+            const std::size_t planned =
+                q4::execution::Forward::workspace_bytes(c, width, context, kv, wide_a16);
+            const std::size_t peak = harness.work->peak_used();
+            std::printf("%s route, %5d columns at %6d: planned %4zu MiB, peak %4zu MiB, headroom %.0f%%\n",
+                        fast ? "fast " : "exact", width, first, planned >> 20, peak >> 20,
+                        planned >= peak ? 100.0 * double(planned - peak) / double(peak) : -100.0);
+            if (peak > planned) {
+                std::printf("FAIL: the %d-column call's real peak exceeds the planned workspace\n", width);
+                ok = false;
+            }
+            harness.work->reset_peak();
+        };
+        for (const std::int32_t width : widths) { check_call(0, width); }
+        check_call(kColumns - kDeepWidth, kDeepWidth);
+    }
+    std::printf(ok ? "the planned workspace bounds every call's real peak\n"
+                   : "FAIL: a call outgrew its planned workspace\n");
+    return ok;
+}
+
 // Forward-level decomposition equality on the real artifact through the exact route: the same
 // prompt prefilled as one call against calls split at an off-grid point (1003), at 16-aligned
 // points (1024; the production tail tap (n-1)/16*16), and against prefill followed by decode of
@@ -720,6 +788,9 @@ int main(int argc, char** argv) {
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
+        // --work-peak runs on generated ids: it needs no token list, and takes --kv alone.
+        bool work_peak = false;
+        KvCacheStorage work_peak_kv = KvCacheStorage::BFloat16;
         std::vector<Job> jobs;
         models::LoadOptions load; // --rope-yarn-factor F (anywhere): the model's YaRN factor
         for (int i = 1; i < argc; ++i) {
@@ -732,6 +803,14 @@ int main(int argc, char** argv) {
             if (arg.rfind("--", 0) != 0) {
                 jobs.push_back(Job{parse_tokens(arg)});
                 if (jobs.back().tokens.size() < 2) { throw std::invalid_argument("pass at least two tokens"); }
+                continue;
+            }
+            if (arg == "--work-peak") {
+                work_peak = true;
+                continue;
+            }
+            if (arg == "--kv" && work_peak && jobs.empty()) {
+                work_peak_kv = infernix::test::parse_kv_cache_storage(argv[++i]);
                 continue;
             }
             if (arg == "--cpu-columns") {
@@ -774,7 +853,7 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown option " + arg);
             }
         }
-        const bool scoring = !jobs.front().dump_path.empty();
+        const bool scoring = !jobs.empty() && !jobs.front().dump_path.empty();
         for (const Job& job : jobs) {
             if (job.dump_path.empty() != !scoring || (jobs.size() > 1 && job.dump_path.empty())) {
                 throw std::invalid_argument("several token lists are scored only, each with its own --dump-logits");
@@ -802,6 +881,9 @@ int main(int argc, char** argv) {
             ngram_env != nullptr ? std::filesystem::path(ngram_env) : q4::default_ngram_volume(artifact_env);
         const q4::NgramVolume volume(volume_path, q4::resolve_ngram_volume(volume_path, c.ple));
         const std::size_t vocab = c.vocab_size;
+        if (work_peak) {
+            return check_work_peak(parameters, device, volume, work_peak_kv) ? 0 : 1;
+        }
         if (scoring) {
             // Teacher-forced scoring: chunked prefill of each whole text in slot 0 of its own harness.
             for (const Job& job : jobs) {

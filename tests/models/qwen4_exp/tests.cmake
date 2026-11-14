@@ -33,6 +33,15 @@ infernix_add_test(infernix_qwen4_exp_forward_real_test
   LIBRARIES infernix_model_runtime)
 set_tests_properties(infernix_qwen4_exp_forward_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# The workspace contract on the real artifact (INFERNIX_QWEN4_ARTIFACT): Forward::workspace_bytes
+# bounds the arena's real peak at every prefill width, on the exact route and the selected fast
+# paths, with generated ids.
+infernix_add_test(infernix_qwen4_exp_forward_work_peak_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_forward_real.cpp"
+  ARGS "--work-peak"
+  LIBRARIES infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_forward_work_peak_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # Causal scoring through the Engine against the Forward's teacher-forced logits (a --dump-logits
 # reference of the same ids). Skips without INFERNIX_QWEN4_ARTIFACT and its arguments.
 infernix_add_test(infernix_qwen4_exp_score_real_test
