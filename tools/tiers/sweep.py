@@ -7,7 +7,7 @@ row and in aggregate at the committed tokens per row, the bytes by class, and th
 against the same shape at the first context (the slowdown long contexts cost).
 
     python3 tools/tiers/sweep.py --bench build/bench/infernix_<family>_round_bench \
-        [--shape 1x1,6x1,6x3] [--context 1024 --context 32768 --context 131072,1024 ...]
+        --context 1024 --context 32768 --context 131072,1024 ... [--shape 1x1,6x1,6x3]
         [--out FILE.jsonl] [-- extra bench arguments]
 
 A context spec is the bench's --context value: one length for every lane, or lane lengths in lane
@@ -24,9 +24,6 @@ import os
 import subprocess
 import sys
 import tempfile
-
-DEFAULT_CONTEXTS = ["1024", "8192", "32768", "131072x6,1024"]
-
 
 def run_point(bench: str, shape: str, context: str, extra: list[str]) -> tuple[list[dict], str]:
     with tempfile.TemporaryDirectory() as tmp:
@@ -47,13 +44,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bench", required=True, help="the family's round bench binary")
     ap.add_argument("--shape", default="1x1,6x1,6x3", help="round shapes, as the bench's --shape (plain shapes only)")
-    ap.add_argument("--context", action="append", help=f"a context spec; repeatable (default {' '.join(DEFAULT_CONTEXTS)})")
+    ap.add_argument("--context", action="append", required=True, help="a context spec; repeatable")
     ap.add_argument("--out", help="also write every report line, with its context spec, to this JSON-lines file")
     ap.add_argument("extra", nargs="*", help="further round-bench arguments (after --)")
     args = ap.parse_args()
     if "+" in args.shape:
         ap.error("mixed shapes have no speed of light; sweep plain shapes")
-    contexts = args.context or DEFAULT_CONTEXTS
+    contexts = args.context
 
     records: list[dict] = []
     for context in contexts:
@@ -66,23 +63,25 @@ def main() -> int:
         with open(args.out, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
+    records = [r for r in records if "bytes" in r]  # mixed shapes carry no speed of light
     if not records:
         print("no results", file=sys.stderr)
         return 1
 
-    first: dict[str, float] = {}
-    print(f"\nread rate {records[0]['read_gbs']:.0f} GB/s; speeds at the committed tokens per row (accept)")
-    print(f"{'shape':>6} {'context':>18} {'round us':>9} {'ideal us':>9} {'x ideal':>7} {'tok/s/row':>9} {'tok/s':>8}"
-          f" {'dense':>6} {'experts':>7} {'kv':>6} {'state':>6} {'GB':>6} {'vs first':>8}")
+    # Against the first context spec; each spec is its own boot, so each row shows its read rate.
+    base = {r["shape"]: r["round_us"] for r in records if r["context_spec"] == contexts[0]}
+    print("\nspeeds at the committed tokens per row (accept); 'vs first' against context " + contexts[0])
+    print(f"{'shape':>6} {'context':>18} {'round us':>9} {'ideal us':>9} {'x ideal':>7} {'GB/s':>5} {'tok/s/row':>9}"
+          f" {'tok/s':>8} {'dense':>6} {'experts':>7} {'kv':>6} {'state':>6} {'GB':>6} {'vs first':>8}")
     for shape in dict.fromkeys(r["shape"] for r in records):
         for r in (r for r in records if r["shape"] == shape):
             b = r["bytes"]
             per_row = r["accept"] / (r["round_us"] * 1e-6)
-            first.setdefault(shape, r["round_us"])
+            versus = f"{r['round_us'] / base[shape]:7.2f}x" if shape in base else f"{'-':>8}"
             print(f"{shape:>6} {r['context_spec']:>18} {r['round_us']:9.1f} {r['ideal_us']:9.1f} "
-                  f"{r['round_us'] / r['ideal_us']:7.2f} {per_row:9.1f} {per_row * r['rows']:8.1f} "
+                  f"{r['round_us'] / r['ideal_us']:7.2f} {r['read_gbs']:5.0f} {per_row:9.1f} {per_row * r['rows']:8.1f} "
                   f"{b['dense'] / 1e9:6.3f} {b['experts'] / 1e9:7.3f} {b['kv'] / 1e9:6.3f} {b['state'] / 1e9:6.3f} "
-                  f"{b['total'] / 1e9:6.3f} {r['round_us'] / first[shape]:7.2f}x")
+                  f"{b['total'] / 1e9:6.3f} {versus}")
     return 0
 
 

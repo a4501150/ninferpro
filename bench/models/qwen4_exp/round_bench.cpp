@@ -112,6 +112,7 @@ constexpr std::int32_t kPrefillChunk = 512;
 constexpr double kWarmSeconds       = 0.5;
 constexpr std::int32_t kLanes       = 8;
 constexpr std::int32_t kLandingSlots = 16; // ExpertResidency::kLandingSlots
+constexpr const char* kFamily          = "qwen4_exp";
 constexpr const char* kDefaultArtifact = "models/infernix/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix";
 constexpr const char* kDefaultNgram    = "models/infernix/Qwen3.8-Flash-Next-BF16.ngram";
 
@@ -421,31 +422,28 @@ struct Harness {
 
         const auto layout = paged_kv_storage_layout(storage, static_cast<std::int32_t>(c.attention.head_dim));
         KVPageGeometry geometry;
+        const auto add_plane = [&](DType dtype, std::int32_t extent, std::int32_t heads, std::uint64_t& per_token) {
+            geometry.planes.push_back({dtype, extent, heads});
+            per_token += dtype_size(dtype) * static_cast<std::uint64_t>(extent) * static_cast<std::uint64_t>(heads);
+        };
         for (std::uint32_t l = 0; l < c.attention_layers; ++l) {
             const auto kv_heads = static_cast<std::int32_t>(c.attention.kv_heads);
-            geometry.planes.push_back({layout.key.data_dtype, layout.key.data_leading_extent, kv_heads});
+            add_plane(layout.key.data_dtype, layout.key.data_leading_extent, kv_heads, kv_token_bytes);
             if (layout.key.has_scale()) {
-                geometry.planes.push_back({layout.key.scale_dtype, layout.key.scale_leading_extent, kv_heads});
+                add_plane(layout.key.scale_dtype, layout.key.scale_leading_extent, kv_heads, kv_token_bytes);
             }
-            geometry.planes.push_back({layout.value.data_dtype, layout.value.data_leading_extent, kv_heads});
+            add_plane(layout.value.data_dtype, layout.value.data_leading_extent, kv_heads, kv_token_bytes);
             if (layout.value.has_scale()) {
-                geometry.planes.push_back({layout.value.scale_dtype, layout.value.scale_leading_extent, kv_heads});
+                add_plane(layout.value.scale_dtype, layout.value.scale_leading_extent, kv_heads, kv_token_bytes);
             }
-            geometry.planes.push_back({DType::BF16, di / r, 1});
+            add_plane(DType::BF16, di / r, 1, pooled_token_bytes);
         }
-        for (std::size_t i = 0; i < geometry.planes.size(); ++i) {
-            const auto& plane = geometry.planes[i];
-            const std::uint64_t bytes = dtype_size(plane.dtype) * static_cast<std::uint64_t>(plane.leading_extent) *
-                                        static_cast<std::uint64_t>(plane.head_extent);
-            // Each layer's planes end with its pooled index keys.
-            const bool pooled = (i + 1) % (geometry.planes.size() / c.attention_layers) == 0;
-            (pooled ? pooled_token_bytes : kv_token_bytes) += bytes;
-        }
+        std::vector<std::uint32_t> row_pages;
         std::uint32_t total_pages = 0, max_pages = 0;
         for (const std::int32_t tokens : row_tokens) {
-            row_pages.push_back((tokens + kPagedKVPageSize - 1) / kPagedKVPageSize);
-            total_pages += static_cast<std::uint32_t>(row_pages.back());
-            max_pages = std::max(max_pages, static_cast<std::uint32_t>(row_pages.back()));
+            row_pages.push_back(static_cast<std::uint32_t>((tokens + kPagedKVPageSize - 1) / kPagedKVPageSize));
+            total_pages += row_pages.back();
+            max_pages = std::max(max_pages, row_pages.back());
         }
         LayoutBuilder kv_builder;
         const auto pool_layout = plan_device_kv_page_pool(kv_builder, {.page_group_count = total_pages, .geometry = geometry});
@@ -455,7 +453,7 @@ struct Harness {
         pool   = std::make_unique<DeviceKVPagePool>(DeviceSpan{kv_backing.p, kv_backing.bytes}, pool_layout);
         tables = std::make_unique<KVExecutionTablePool>(DeviceSpan{kv_backing.p, kv_backing.bytes}, table_layout, *pool);
         for (std::int32_t row = 0; row < rows; ++row) {
-            const auto n     = static_cast<std::uint32_t>(row_pages[static_cast<std::size_t>(row)]);
+            const std::uint32_t n = row_pages[static_cast<std::size_t>(row)];
             auto reservation = pool->reserve(n);
             if (!reservation) { throw std::runtime_error("KV pool too small"); }
             std::vector<DeviceKVPageLease> pages;
@@ -586,7 +584,6 @@ struct Harness {
 
     const q4::TextConfig& config;
     std::int32_t rows = 0, width = 0, span = 0, di = 0, r = 0;
-    std::vector<std::int32_t> row_pages;
     // Over all attention layers, per token: the K/V planes (codes and scales) and the pooled index keys.
     std::uint64_t kv_token_bytes = 0, pooled_token_bytes = 0;
     DeviceBuffer state_backing, ple_backing, tails_backing, kv_backing, window_backing;
@@ -794,12 +791,43 @@ struct RoundBytes {
     [[nodiscard]] double total() const noexcept { return dense + experts + kv + state; }
 };
 
+// The fields every report line starts with.
+std::string report_head(const Options& o, const Shape& shape) {
+    std::ostringstream line;
+    line << "{\"bench\":\"" << kFamily << "\",\"shape\":\"" << shape.rows << 'x' << shape.width;
+    if (shape.prefill > 0) { line << '+' << shape.prefill; }
+    line << "\",\"rows\":" << shape.rows << ",\"width\":" << shape.width << ",\"prefill\":" << shape.prefill
+         << ",\"contexts\":[";
+    for (std::int32_t b = 0; b < shape.rows; ++b) { line << (b > 0 ? "," : "") << o.contexts[static_cast<std::size_t>(b)]; }
+    line << "],\"kv\":\"" << o.kv_name << "\",\"route\":\"" << (o.exact ? "exact" : "fast")
+         << "\",\"accept\":" << (o.accept < 0 ? shape.width : std::clamp(o.accept, 0, shape.width));
+    return line.str();
+}
+
 // What every shape's speed of light and report line need.
 struct Reporting {
     std::uint64_t dense_bytes    = 0;
     double read_bytes_per_second = 0;
     std::ofstream report; // open with --report
+
+    // One report line: the head, then `fields` (",\"name\":value...").
+    void line(const Options& o, const Shape& shape, const std::string& fields) {
+        if (!report.is_open()) { return; }
+        report << report_head(o, shape) << fields << "}\n";
+        report.flush();
+    }
 };
+
+// The report's numbers: finite (the read rate is positive) and in the C locale's notation.
+std::string json_fields(std::initializer_list<std::pair<const char*, double>> fields) {
+    std::string out;
+    char value[64];
+    for (const auto& [name, number] : fields) {
+        std::snprintf(value, sizeof(value), "%.17g", number);
+        out += std::string(",\"") + name + "\":" + value;
+    }
+    return out;
+}
 
 // Dense weights; the distinct experts of one eager run's routes (outside the timed graph, from the
 // state the timed replays start from); per row the K/V of the tokens its attention selects at most
@@ -845,19 +873,6 @@ RoundBytes round_bytes(const Options& o, const Shape& shape, Harness& h, const C
         static_cast<double>(h.state_backing.bytes + h.ple_backing.bytes + h.tails_backing.bytes) / h.rows;
     out.state = 2.0 * shape.rows * state_per_row;
     return out;
-}
-
-// The fields every report line starts with.
-std::string report_head(const Options& o, const Shape& shape) {
-    std::ostringstream line;
-    line << "{\"bench\":\"qwen4_exp\",\"shape\":\"" << shape.rows << 'x' << shape.width;
-    if (shape.prefill > 0) { line << '+' << shape.prefill; }
-    line << "\",\"rows\":" << shape.rows << ",\"width\":" << shape.width << ",\"prefill\":" << shape.prefill
-         << ",\"contexts\":[";
-    for (std::int32_t b = 0; b < shape.rows; ++b) { line << (b > 0 ? "," : "") << o.contexts[static_cast<std::size_t>(b)]; }
-    line << "],\"kv\":\"" << o.kv_name << "\",\"route\":\"" << (o.exact ? "exact" : "fast")
-         << "\",\"accept\":" << (o.accept < 0 ? shape.width : std::clamp(o.accept, 0, shape.width));
-    return line.str();
 }
 
 // One round shape: its graph, the commit of a verification round, timings, hashes and sections.
@@ -977,14 +992,15 @@ std::string run_shape(const Options& o, const Shape& shape, Harness& h, DeviceCo
                 bytes.dense * gb, bytes.experts * gb, bytes.distinct, bytes.kv * gb, bytes.state * gb, bytes.total() * gb);
     std::printf("  speed of light %8.1f us at %.0f GB/s read: the round takes %.2fx (%.0f%% of the read rate)\n", ideal_us,
                 reporting.read_bytes_per_second * gb, round_us / ideal_us, 100.0 * ideal_us / round_us);
-    if (reporting.report.is_open()) {
-        reporting.report << report_head(o, shape) << ",\"forward_us\":" << f.median << ",\"commit_us\":" << (verify ? m.median : 0.0)
-                         << ",\"round_us\":" << round_us << ",\"bytes\":{\"dense\":" << bytes.dense << ",\"experts\":" << bytes.experts
-                         << ",\"kv\":" << bytes.kv << ",\"state\":" << bytes.state << ",\"total\":" << bytes.total()
-                         << "},\"distinct_experts\":" << bytes.distinct << ",\"read_gbs\":" << reporting.read_bytes_per_second * gb
-                         << ",\"ideal_us\":" << ideal_us << "}\n";
-        reporting.report.flush();
-    }
+    std::string byte_fields = json_fields({{"dense", bytes.dense}, {"experts", bytes.experts}, {"kv", bytes.kv},
+                                           {"state", bytes.state}, {"total", bytes.total()}});
+    byte_fields.erase(0, 1); // the object's first member takes no comma
+    reporting.line(o, shape,
+                   json_fields({{"forward_us", f.median}, {"commit_us", verify ? m.median : 0.0}, {"round_us", round_us}}) +
+                       ",\"bytes\":{" + byte_fields + "}" +
+                       json_fields({{"distinct_experts", bytes.distinct},
+                                    {"read_gbs", reporting.read_bytes_per_second * gb},
+                                    {"ideal_us", ideal_us}}));
     const bool stable = differing == 0;
     std::printf("  hash logits %016llx state %016llx   top-1:", static_cast<unsigned long long>(hashes[0][0]),
                 static_cast<unsigned long long>(hashes[0][1]));
@@ -1245,11 +1261,7 @@ std::string run_mixed(const Options& o, const Shape& shape, Harness& h, DeviceCo
     const bool equal = joint[0] == apart[0];
     std::printf("  mixed %s the separate calls (top-1 equal in %d of %d logit columns)\n",
                 equal ? "equals" : "DIFFERS from", agree, static_cast<std::int32_t>(logits.ne[1]));
-    if (reporting.report.is_open()) {
-        reporting.report << report_head(o, shape) << ",\"round_us\":" << r.median << ",\"chunk_us\":" << k.median
-                         << ",\"mixed_us\":" << m.median << "}\n";
-        reporting.report.flush();
-    }
+    reporting.line(o, shape, json_fields({{"round_us", r.median}, {"chunk_us", k.median}, {"mixed_us", m.median}}));
     char value[40];
     std::snprintf(value, sizeof(value), "%016llx %016llx", static_cast<unsigned long long>(joint[0][0]),
                   static_cast<unsigned long long>(joint[0][1]));
@@ -1316,6 +1328,7 @@ int main(int argc, char** argv) {
             // Before anything else holds device memory: 1 GiB, eight times the L2.
             reporting.read_bytes_per_second = measure_device_read_bytes_per_second(std::size_t{1} << 30, 10);
         }
+        if (!(reporting.read_bytes_per_second > 0)) { throw std::runtime_error("the device read rate is not positive"); }
         std::printf("device read rate: %.1f GB/s%s\n", reporting.read_bytes_per_second * 1e-9,
                     o.dram_gbs > 0 ? " (--dram-gbs)" : " (measured)");
         if (!o.report.empty()) {

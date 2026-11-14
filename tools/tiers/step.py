@@ -24,14 +24,15 @@ from __future__ import annotations
 
 import argparse
 import bisect
-import os
+import itertools
 import shutil
 import sqlite3
 import statistics
-import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+
+import nsys
 
 BETWEEN = "(between rounds)"
 
@@ -76,28 +77,35 @@ def stack_paths(ranges: list[tuple[int, int, str, int]], times: list[int]) -> li
     return out
 
 
+ACTIVITY_TABLES = (("CUPTI_ACTIVITY_KIND_KERNEL", None), ("CUPTI_ACTIVITY_KIND_MEMCPY", "[memcpy]"),
+                   ("CUPTI_ACTIVITY_KIND_MEMSET", "[memset]"))
+
+
 def gpu_activity(db: sqlite3.Connection) -> list[tuple[int, int, int, str]]:
     """Every kernel, copy and set: (start, end, correlationId, name)."""
     names = dict(db.execute("select id, value from StringIds"))
     have = tables(db)
     out = []
-    if "CUPTI_ACTIVITY_KIND_KERNEL" in have:
-        for start, end, corr, short in db.execute(
-                "select start, end, correlationId, shortName from CUPTI_ACTIVITY_KIND_KERNEL"):
-            out.append((start, end, corr, names.get(short, "?")))
-    for table, label in (("CUPTI_ACTIVITY_KIND_MEMCPY", "[memcpy]"), ("CUPTI_ACTIVITY_KIND_MEMSET", "[memset]")):
-        if table in have:
+    for table, label in ACTIVITY_TABLES:
+        if table not in have:
+            continue
+        if label is None:
+            query = f"select start, end, correlationId, shortName from {table}"
+            out += [(s, e, c, names.get(n, "?")) for s, e, c, n in db.execute(query)]
+        else:
             out += [(s, e, c, label) for s, e, c in db.execute(f"select start, end, correlationId from {table}")]
     out.sort()
     return out
 
 
-def launch_sites(db: sqlite3.Connection, ranges: dict[int, list], correlations: set[int]) -> dict[int, str]:
+def launch_sites(db: sqlite3.Connection, ranges: dict[int, list]) -> dict[int, str]:
     """correlationId -> the NVTX path open on the launching thread at the launch call."""
+    have = tables(db)
+    launched = " union ".join(f"select correlationId from {t}" for t, _ in ACTIVITY_TABLES if t in have)
     calls: dict[int, list[tuple[int, int]]] = defaultdict(list)
-    for start, tid, corr in db.execute("select start, globalTid, correlationId from CUPTI_ACTIVITY_KIND_RUNTIME"):
-        if corr in correlations:
-            calls[tid].append((start, corr))
+    for start, tid, corr in db.execute("select start, globalTid, correlationId from CUPTI_ACTIVITY_KIND_RUNTIME "
+                                       f"where correlationId in ({launched})"):
+        calls[tid].append((start, corr))
     out = {}
     for tid, items in calls.items():
         items.sort()
@@ -130,29 +138,6 @@ def overlap(a: list[tuple[int, int]], b: list[tuple[int, int]]) -> int:
     return total
 
 
-def shares(items: list[tuple[int, int, str]], lo: int, hi: int) -> dict[str, float]:
-    """Time of [lo, hi) covered by `items`, each instant split equally between the labels active."""
-    events = []
-    for s, e, label in items:
-        s, e = max(s, lo), min(e, hi)
-        if s < e:
-            events += [(s, 1, label), (e, -1, label)]
-    events.sort()
-    active: dict[str, int] = defaultdict(int)
-    out: dict[str, float] = defaultdict(float)
-    last = None
-    for t, delta, label in events:
-        if last is not None and active:
-            k = sum(active.values())
-            for name, count in active.items():
-                out[name] += (t - last) * count / k
-        last = t
-        active[label] += delta
-        if active[label] == 0:
-            del active[label]
-    return out
-
-
 def host_segments(nested: list[tuple[int, int, str, int]], start: int, end: int, hi: int,
                   depth: int) -> list[tuple[int, int, str]]:
     """Disjoint segments of [start, hi): inside the round each labelled by the path of the ranges
@@ -165,8 +150,8 @@ def host_segments(nested: list[tuple[int, int, str, int]], start: int, end: int,
             last = t
         if opening:
             stack.append(name)
-        elif name in stack:
-            del stack[len(stack) - 1 - stack[::-1].index(name)]
+        else:
+            stack.pop()  # push/pop ranges nest, so the closing one is the innermost
     if end > last:
         out.append((last, end, "(decode)"))
     if hi > end:
@@ -188,8 +173,10 @@ def analyse(db: sqlite3.Connection, top: int, kernels: int, depth: int) -> int:
     engine_starts = [r[0] for r in engine]
     prefills = union([(s, e) for s, e, n, _ in engine if n == "prefill" or n.startswith("prefill.")])
     activity = gpu_activity(db)
-    sites = launch_sites(db, ranges, {a[2] for a in activity})
+    sites = launch_sites(db, ranges)
     starts = [a[0] for a in activity]
+    # The latest end so far: the first activity still running at t is at bisect_right(reach, t).
+    reach = list(itertools.accumulate((a[1] for a in activity), max))
 
     host: dict[str, float] = defaultdict(float)
     idle_by: dict[str, float] = defaultdict(float)
@@ -211,11 +198,10 @@ def analyse(db: sqlite3.Connection, top: int, kernels: int, depth: int) -> int:
         for s, e, label in segments:
             host[label] += e - s
         # GPU: the activity that starts or runs inside the window.
-        first = max(0, bisect.bisect_left(starts, lo) - 64)
-        window = [a for a in activity[first:bisect.bisect_left(starts, hi)] if a[1] > lo]
+        window = [a for a in activity[bisect.bisect_right(reach, lo):bisect.bisect_left(starts, hi)] if a[1] > lo]
         busy = union([(max(s, lo), min(e, hi)) for s, e, _, _ in window])
         busies.append(sum(e - s for s, e in busy))
-        for label, t in shares([(s, e, sites.get(c, "(unknown)")) for s, e, c, _ in window], lo, hi).items():
+        for label, t in nsys.shares([(s, e, sites.get(c, "(unknown)")) for s, e, c, _ in window], lo, hi)[0].items():
             site_time[label] += t
         if kernels:
             for s, e, c, name in window:
@@ -283,20 +269,15 @@ def main() -> int:
     if not args.command:
         ap.error("give a command after --, or --sqlite")
     with tempfile.TemporaryDirectory() as tmp:
-        report = os.path.join(tmp, "step")
-        command = ["nsys", "profile", "--trace=cuda,nvtx", "--cuda-graph-trace=node",
-                   "--capture-range=cudaProfilerApi", "--capture-range-end=stop", "-o", report,
-                   "--force-overwrite=true", *args.command]
-        run = subprocess.run(command, capture_output=True, text=True)
-        sys.stdout.write("".join(line + "\n" for line in run.stdout.splitlines() if not line.startswith(("Collecting", "Generating", "Processing", "Capture", "  "))))
-        if run.returncode != 0:
+        run, export = nsys.capture(args.command, tmp, "step")
+        sys.stdout.write("".join(line + "\n" for line in run.stdout.splitlines()
+                                 if not line.startswith(("Collecting", "Generating", "Processing", "Capture", "  "))))
+        if not export:
             sys.stderr.write(run.stderr)
             return run.returncode
-        subprocess.run(["nsys", "export", "--type", "sqlite", "-o", report + ".sqlite", "--force-overwrite=true",
-                        report + ".nsys-rep"], check=True, capture_output=True)
         if args.keep:
-            shutil.copyfile(report + ".sqlite", args.keep)
-        with sqlite3.connect(report + ".sqlite") as db:
+            shutil.copyfile(export, args.keep)
+        with sqlite3.connect(export) as db:
             return analyse(db, args.top, args.kernels, args.depth)
 
 

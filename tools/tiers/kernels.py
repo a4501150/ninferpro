@@ -23,38 +23,19 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
-import os
 import shutil
 import sqlite3
-import subprocess
 import sys
 import tempfile
 from collections import defaultdict
 
+import nsys
+
 
 def exclusive_times(db: sqlite3.Connection) -> tuple[dict[str, float], float]:
     names = dict(db.execute("select id, value from StringIds"))
-    rows = db.execute("select start, end, shortName from CUPTI_ACTIVITY_KIND_KERNEL").fetchall()
-    events = []
-    for start, end, name in rows:
-        events.append((start, 1, names[name]))
-        events.append((end, -1, names[name]))
-    events.sort()
-    active: dict[str, int] = defaultdict(int)
-    shares: dict[str, float] = defaultdict(float)
-    busy = 0.0
-    last = None
-    for t, delta, name in events:
-        if last is not None and active:
-            k = sum(active.values())
-            busy += t - last
-            for n, count in active.items():
-                shares[n] += (t - last) * count / k
-        last = t
-        active[name] += delta
-        if active[name] == 0:
-            del active[name]
-    return shares, busy
+    return nsys.shares([(s, e, names[n]) for s, e, n in
+                        db.execute("select start, end, shortName from CUPTI_ACTIVITY_KIND_KERNEL")])
 
 
 METRIC_PERIOD_NS = 5000  # --gpu-metrics-frequency 200000
@@ -143,23 +124,17 @@ def main() -> int:
     if "," in args.shape:
         ap.error("one shape per profile")
     with tempfile.TemporaryDirectory() as tmp:
-        report = os.path.join(tmp, "t1")
         metrics = ["--gpu-metrics-devices=0", "--gpu-metrics-set=gb20x",
                    f"--gpu-metrics-frequency={1_000_000_000 // METRIC_PERIOD_NS}"] if args.gpu_metrics else []
-        command = ["nsys", "profile", "--trace=cuda,nvtx", "--cuda-graph-trace=node", *metrics,
-                   "--capture-range=cudaProfilerApi", "--capture-range-end=stop", "-o", report,
-                   "--force-overwrite=true", args.bench, "--profile", "--shape", args.shape,
-                   "--replays", str(args.replays), *args.extra]
-        run = subprocess.run(command, capture_output=True, text=True)
-        if run.returncode != 0:
+        run, export = nsys.capture([args.bench, "--profile", "--shape", args.shape, "--replays", str(args.replays),
+                                    *args.extra], tmp, "t1", metrics)
+        if not export:
             sys.stderr.write(run.stdout + run.stderr)
             return run.returncode
         sys.stdout.write("".join(line + "\n" for line in run.stdout.splitlines()
                                  if line.startswith(("device read", "shape", "  forward", "  commit", "  round",
                                                      "  bytes", "  speed of light", "  hash"))))
-        subprocess.run(["nsys", "export", "--type", "sqlite", "-o", report + ".sqlite", "--force-overwrite=true",
-                        report + ".nsys-rep"], check=True, capture_output=True)
-        db = sqlite3.connect(report + ".sqlite")
+        db = sqlite3.connect(export)
         shares, busy = exclusive_times(db)
         metrics_text = ""
         if args.gpu_metrics:
@@ -168,7 +143,7 @@ def main() -> int:
                 metrics_text = text.getvalue()
         db.close()
         if args.keep:
-            shutil.copyfile(report + ".sqlite", args.keep)
+            shutil.copyfile(export, args.keep)
     rounds = args.replays
     print(f"\nkernels per round ({rounds} profiled replays; overlapping time split between kernels)")
     for name, t in sorted(shares.items(), key=lambda item: -item[1])[: args.top]:
