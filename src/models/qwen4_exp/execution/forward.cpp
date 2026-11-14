@@ -203,123 +203,35 @@ ops::LinearRoutes Forward::dense_routes() const noexcept {
 
 std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::int32_t max_context,
                                      KvCacheStorage storage, ops::offloaded_moe::WideA16 wide_a16) {
-    // The workspace a call of `columns` columns needs at its peak: the residual that lives across
-    // the whole call plus the largest of the phases the call runs. Every phase below opens its own
-    // scope on the arena and rolls back before a later phase allocates (embed, the PLE's scope
-    // inside a layer, each hyper-connection mix's op scope, the GDN recurrence's chunk scratch, each
-    // attention part's scope, the shared expert's gate/up scope, the finish's MTP sub-chunks and
-    // head), so the peak is the residual plus a maximum, not a sum. One phase is the layer's own
-    // frame: the arena is a bump allocator, so a layer's injects, mixes, its token mixer's tensors
-    // and its MoE's buffers are all still live together when the shared expert runs — the widest
-    // point of a GDN layer, which holds more rows than a QSA one at every width. The op scratch
-    // terms stay the ops' own capacity queries; the projections take none on the native formats
-    // (a GGUF import encodes its inputs, covered by the ggml terms).
-    const std::size_t t = static_cast<std::size_t>(std::max(columns, 1));
+    const std::size_t t = static_cast<std::size_t>(columns);
     const std::size_t h = c.hidden_size, w = c.residual_width(), k = c.moe.top_k;
-    const std::size_t s = c.hc.streams, rank = c.hc.rank, bf = 2;
-    const auto align = [](std::size_t bytes) { return (bytes + 255) / 256 * 256; }; // per allocation
-    const auto plane = [align](std::size_t rows, std::size_t width, std::size_t bytes) {
-        return align(rows * width * bytes);
-    };
-    const auto ggml = [align, t](std::int32_t input_rows) {
-        return align(ops::ggml_linear_workspace_bytes(input_rows, dim(t)));
-    };
-
-    // A hyper-connection mix's op scope at `n` columns: the composed route's normalized, z (the
-    // down rows with the injects), m and u planes — u only where the up+collapse fusion does not
-    // serve the weights, and the fused narrow route's FP32 split-K partials — beside them, and a
-    // GGUF import's encoding of its input columns.
-    const auto mix_scope = [&](std::size_t n) {
-        return plane(w, n, bf) + plane(w, n, bf) + plane(rank + s, n, bf) + plane(rank, n, bf) +
-               plane(s * (rank + s), n, 4) + (c.ggml_weights ? ggml(dim(w)) : 0) + 5 * 256;
-    };
-
-    // The MoE's frame at `n` columns: the router logits, the routing, the dispatch, the routed
-    // experts' outputs and workspace, the shared expert's product and output, its gate/up scope
-    // (a composed weight format; Q8's fused swiglu allocates none) and the combine's y (a layer
-    // walk's un-fused call; a fused inject keeps none).
-    const auto moe = [&](std::size_t n) {
-        const std::size_t e = k * n, jobs = std::min<std::size_t>(c.moe.experts, e);
-        std::size_t bytes = plane(c.moe.experts + 1, n, 4) +          // the router logits
-                            align((2 * k + 1) * n * 4) +              // the routing ids, weights, shared gate
-                            ops::moe_dispatch_bytes(dim(c.moe.experts), dim(e)) + plane(h, e, bf) + // outputs
-                            ops::moe_experts_workspace_bytes(dim(jobs), dim(e), dim(n), expert_activation(c),
-                                                             wide_a16) +
-                            plane(c.moe.shared_intermediate, n, bf) + // the shared expert's product
-                            plane(h, n, bf) +                          // and output
-                            2 * plane(c.moe.shared_intermediate, n, bf) + // its gate/up scope
-                            plane(h, n, bf);                           // the combine's y
-        if (c.ggml_weights) { // the shared expert's projections encode their inputs
-            bytes += ggml(dim(h)) + ggml(dim(c.moe.shared_intermediate));
-        }
-        return bytes + 10 * 256;
-    };
-
-    // embed: the token embedding's rows the stream expand reads.
-    const std::size_t embed = plane(h, t, bf) + 256;
-
-    // The PLE injection's scope (before the layer's mixes): the embedded rows, the projection's
-    // split output, and the gated and normalized planes.
-    const std::size_t ple = plane(c.ple.embed_dim, t, bf) + plane(w + h, t, bf) + plane(w, t, bf) +
-                            plane(h, t, bf) + 2 * plane(w, t, bf) +
-                            (c.ggml_weights ? ggml(dim(c.ple.embed_dim)) : 0) + 6 * 256;
-
-    // One QSA block's attention at `n` columns: the projections' six outputs, the attend scope
-    // (the exact route's normalized q and k, and the attention workspace the op's own query sizes)
-    // and the output gate's projection.
-    const auto qsa_part = [&](std::size_t n) {
-        const std::size_t qw = c.attention.query_width(), kw = c.attention.key_width();
-        const std::size_t ih = c.qsa.index_heads * c.qsa.index_head_dim, id = c.qsa.index_head_dim;
-        return plane(qw, n, bf) * 2 +                    // q, gate
-               plane(kw, n, bf) * 2 +                    // k, v
-               plane(ih, n, bf) + plane(id, n, bf) +     // the index query and key
-               plane(qw, n, bf) +                       // out
-               plane(c.attention.heads * c.attention.head_dim, n, bf) + // the exact route's normalized q
-               plane(kw, n, bf) +                       // and k (the attend scope's other rows)
-               align(ops::qsa_attention_workspace_bytes(qsa_geometry(c), dim(n), max_context, storage)) +
-               plane(h, n, bf) +                         // the output projection's y
-               (c.ggml_weights ? ggml(dim(h)) : 0) + 9 * 256;
-    };
-
-    // A QSA layer's frame: the injects and the attention mix's x, the attention block (a mixed
-    // call's parts attend in sequence, each in its own scope, so its widest part bounds them), the
-    // mlp mix's x, and the MoE — all live together at the shared expert.
-    const std::size_t qsa_layer = plane(s, t, 4) + plane(h, t, bf) + qsa_part(t) + plane(h, t, bf) +
-                                  mix_scope(t) + moe(t);
-
-    // A GDN layer's frame: the injects, the attention mix's x, the block's projections (qkv, z and
-    // the control rows; the gates at wide calls; q, k, v and the recurrence's output rows), the
-    // mixer's y, the mlp mix's x, and the MoE.
-    const std::size_t gdn_before = // live while the recurrence's chunk scratch is carved
-        plane(s, t, 4) + plane(h, t, bf) + plane(c.gdn.conv_channels(), t, bf) + plane(c.gdn.value_width(), t, bf) +
-        plane(2 * c.gdn.value_heads, t, bf) + 2 * plane(c.gdn.value_heads, t, 4) +
-        2 * plane(c.gdn.key_width(), t, bf) + 2 * plane(c.gdn.value_width(), t, bf);
-    const std::size_t gdn_layer =
-        std::max(gdn_before + align(ops::gated_delta_net_workspace_capacity_bytes(dim(c.gdn.key_heads),
-                                                                                   dim(c.gdn.value_heads), 1,
-                                                                                   dim(t))), // the recurrence
-                 gdn_before + plane(c.gdn.value_width(), t, bf) +      // the normalized output rows
-                     plane(h, t, bf) * 2 +                            // the mixer's y, the mlp mix's x
-                     mix_scope(t) + moe(t)) +
-        (c.ggml_weights ? ggml(dim(h)) + ggml(dim(c.gdn.value_width())) : 0); // the control/output encodings
-
-    // finish: the MTP chunk's sub-chunk scope (rows and the block's own tensors at at most
-    // kMtpChunkColumns columns; kv-only, so no MoE or head), or the head at the call's width (a
-    // scored call's logit columns span it): the gathered columns, the final mix's scope and x, and
-    // the head's rows.
-    const std::size_t mtp_n = std::min(t, static_cast<std::size_t>(kMtpChunkColumns));
-    const std::size_t mtp_chunk = 3 * plane(w, mtp_n, bf) + // rows, the block's hidden norm and residual
-                                  3 * plane(h, mtp_n, bf) + // the embedding, its norm and projection
-                                  plane(s, mtp_n, 4) + plane(h, mtp_n, bf) + // the injects, the mix's x
-                                  qsa_part(mtp_n) + mix_scope(mtp_n) +
-                                  (c.ggml_weights ? ggml(dim(h)) + ggml(dim(w)) : 0) + 11 * 256;
-    const std::size_t head = plane(w, t, bf) + mix_scope(t) + 2 * plane(h, t, bf) +
-                             (c.ggml_weights ? ggml(dim(w)) + ggml(dim(h)) : 0) + 4 * 256;
-
-    const std::size_t phase = std::max({embed, ple, std::max(qsa_layer, gdn_layer), std::max(mtp_chunk, head)});
-    // The residual that lives across the call, the largest phase, and the slack the op capacity
-    // queries above already carry per allocation (256 B each) plus one lump.
-    return plane(w, t, bf) + phase + (64ULL << 20);
+    const std::size_t bf = 2;
+    std::size_t bytes = 0;
+    bytes += w * t * bf * 3;                                  // residual, normalized, mix logits
+    bytes += (c.hc.rank + c.hc.streams) * t * (bf + 4) + c.hc.rank * t * bf;
+    bytes += h * t * bf * 4;                                  // x, y, embedding, final
+    bytes += std::size_t(c.ple.embed_dim) * t * bf * 2 + (w + h) * t * bf + w * t * bf * 2;
+    bytes += std::size_t(c.gdn.conv_channels()) * t * bf * 2 + std::size_t(c.gdn.value_width()) * t * bf * 4;
+    bytes += std::size_t(c.gdn.value_heads) * t * (bf + 4) * 2;
+    const std::size_t qkv = 2 * std::size_t(c.attention.query_width()) + 2 * c.attention.key_width() +
+                            std::size_t(c.qsa.index_heads + 1) * c.qsa.index_head_dim;
+    bytes += qkv * t * bf * 2 + std::size_t(c.attention.query_width()) * t * bf * 2;
+    bytes += ops::qsa_attention_workspace_bytes(qsa_geometry(c), columns, max_context, storage);
+    bytes += (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4;           // FP32 router logits, routing
+    bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
+    bytes += h * k * t * bf + ops::moe_experts_workspace_bytes(dim(c.moe.experts), dim(k * t), std::max(columns, 1),
+                                                               expert_activation(c), wide_a16);
+    bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * bf * 3;
+    // Linear and GDN scratch (chunked recurrence), plus alignment slack per allocation.
+    bytes += ops::gated_delta_net_workspace_capacity_bytes(dim(c.gdn.key_heads), dim(c.gdn.value_heads), 1,
+                                                           std::max(columns, 1));
+    // A GGUF import's projections encode their input columns (K up to the GDN/QSA value width).
+    if (c.ggml_weights) {
+        const std::int32_t k = dim(std::max<std::size_t>({h, std::size_t(c.gdn.value_width()), std::size_t(c.attention.query_width())}));
+        bytes += ops::ggml_linear_workspace_bytes(k, std::max(columns, 1));
+    }
+    bytes += 64ULL << 20;
+    return bytes;
 }
 
 void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
