@@ -9,6 +9,7 @@
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --head-equality [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --split-equality [--kv KV]
+//   infernix_qwen4_exp_forward_real_test --work-peak [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
 //
@@ -16,7 +17,13 @@
 // head_logits on the same residual column byte for byte (the head width-invariance gather-before-
 // mix gives finish). With --cpu-columns the test checks that calls the Program serves with the CPU expert service
 // (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
-// bit for bit (check_cpu_columns).
+// bit for bit (check_cpu_columns). With --work-peak the test checks the workspace contract
+// (check_work_peak): Forward::workspace_bytes bounds the arena's real peak at every prefill width,
+// on the exact route and the selected fast paths, with generated ids (no token list needed),
+// then the same contract on the tier placements (check_work_peak_tiers): a mixed frame table
+// with the RAM tier's host pointer tables, staging slots, the decode fork and the landing
+// frames -- the Program's tier-mode MoE configuration -- whose logits must equal the zero-copy
+// bank forward's bit for bit while the peak stays under the plan.
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
 // options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
 // instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
@@ -42,6 +49,7 @@
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
+#include "models/offload/expert_residency.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "models/qwen4_exp/program/fast_paths.h"
@@ -123,8 +131,8 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
 // resident experts (every expert is read zero-copy from the pinned bank).
 struct Harness {
     Harness(const q4::execution::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
-            std::int32_t rows, KvCacheStorage storage)
-        : config(parameters.model.config().text), exact_route(exact_route_of(parameters, storage)) {
+            std::int32_t rows, KvCacheStorage storage, bool fast = false)
+        : config(parameters.model.config().text), exact_route(route_of(parameters, storage, fast)) {
         const auto& c = config;
         LayoutBuilder builder;
         const LinearAttentionStatePoolSpec gdn_spec{
@@ -230,7 +238,8 @@ struct Harness {
         for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
             experts.frames.push_back(static_cast<const std::int32_t*>(frames_backing.p) + l * c.moe.experts);
         }
-        work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context, storage);
+        work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context, storage,
+                                                                 wide_of(exact_route));
         work          = std::make_unique<WorkspaceArena>(work_capacity);
         state_view    = state;
         kv_view       = kv;
@@ -249,12 +258,22 @@ struct Harness {
                                                         exact_route);
     }
 
-    // The artifact's exact route at this KV format (the Engine's --disable-fast-paths selection).
-    static q4::execution::ForwardFastPaths exact_route_of(const q4::execution::Parameters& parameters,
-                                                         KvCacheStorage storage) {
+    // The wide experts' route under these flags (the Program's wide_a16: the artifact's bank format
+    // decides the fast path's selection, so the flags alone pick the variant).
+    static ops::offloaded_moe::WideA16 wide_of(const q4::execution::ForwardFastPaths& flags) {
+        if (flags.expert_a4_residual) { return ops::offloaded_moe::WideA16::kA4Residual; }
+        return ops::has_route(flags.dense_routes, ops::LinearRoutes::GgmlBf16Wide)
+                   ? ops::offloaded_moe::WideA16::kGgmlBf16
+                   : ops::offloaded_moe::WideA16::kExact;
+    }
+
+    // The artifact's route at this KV format: the Engine's --disable-fast-paths selection, or the
+    // selected fast paths' (the Engine's default) with `fast`.
+    static q4::execution::ForwardFastPaths route_of(const q4::execution::Parameters& parameters,
+                                                   KvCacheStorage storage, bool fast = false) {
         infernix::EngineOptions options;
         options.kv_cache   = storage;
-        options.fast_paths = false;
+        options.fast_paths = fast;
         return q4::select_fast_paths(parameters, options).forward();
     }
 
@@ -509,6 +528,246 @@ bool check_head_equality(const q4::execution::Parameters& parameters, DeviceCont
     return ok;
 }
 
+// The workspace contract: Forward::workspace_bytes, which sizes the arena every prefill call swaps
+// in (the Program's wide work) and the static arena, bounds the arena's real peak of a call of the
+// same width — the arena throws on overflow, so an estimate below a call's demand fails loudly in
+// production. Runs one call at every width production prefills at, at the start of the context and
+// deep in it (the QSA attention workspace grows with the context), on the exact route and the
+// selected fast paths (whose GDN chunk scratch and wide experts' residual A4 layout are demands the
+// exact route does not make), and reports each call's planned capacity against its measured peak.
+// The check is about memory, not bits, so the ids are generated.
+// Generated ids for the workspace checks: one fixed LCG (deterministic, no fixture file).
+std::vector<std::int32_t> lcg_tokens(std::int32_t vocab, std::int32_t count) {
+    std::vector<std::int32_t> tokens(static_cast<std::size_t>(count));
+    std::uint64_t state = 0x9E3779B97F4A7C15ULL;
+    for (auto& token : tokens) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        token = static_cast<std::int32_t>((state >> 33) % static_cast<std::uint64_t>(vocab));
+    }
+    return tokens;
+}
+
+bool check_work_peak(const q4::execution::Parameters& parameters, DeviceContext& device,
+                     const q4::NgramVolume& volume, KvCacheStorage kv) {
+    const auto& c = parameters.model.config().text;
+    // Room for the widest chunk and a deep call after it; 64-aligned like a call grid.
+    constexpr std::int32_t kColumns = 40960, kDeepWidth = 4096;
+    const auto tokens = lcg_tokens(static_cast<std::int32_t>(c.vocab_size), kColumns);
+    const std::int32_t context = (kColumns + 63) / 64 * 64;
+    const std::int32_t widths[] = {1, 2, 512, 2048, 4096, 8192, 16384};
+    const auto V = static_cast<std::int32_t>(c.vocab_size);
+    bool ok = true;
+    for (const bool fast : {false, true}) {
+        // The wide experts' route under the same selection the Program sizes its work with.
+        const auto flags    = Harness::route_of(parameters, kv, fast);
+        const auto wide_a16 = Harness::wide_of(flags);
+        Harness harness(parameters, device, context, widths[std::size(widths) - 1], 1, kv, fast);
+        DeviceBuffer logits(static_cast<std::size_t>(V) * sizeof(float));
+        const auto check_call = [&](std::int32_t first, std::int32_t width) {
+            auto call = make_call(c, volume, {tokens}, first, width, {0}, {0});
+            Tensor out(logits.p, DType::FP32, {V, 1});
+            harness.forward->run(call.batch, out);
+            device.synchronize();
+            const std::size_t planned =
+                q4::execution::Forward::workspace_bytes(c, width, context, kv, wide_a16);
+            const std::size_t peak = harness.work->peak_used();
+            std::printf("%s route, %5d columns at %6d: planned %4zu MiB, peak %4zu MiB, headroom %.0f%%\n",
+                        fast ? "fast " : "exact", width, first, planned >> 20, peak >> 20,
+                        planned >= peak ? 100.0 * double(planned - peak) / double(peak) : -100.0);
+            if (peak > planned) {
+                std::printf("FAIL: the %d-column call's real peak exceeds the planned workspace\n", width);
+                ok = false;
+            }
+            harness.work->reset_peak();
+        };
+        for (const std::int32_t width : widths) { check_call(0, width); }
+        check_call(kColumns - kDeepWidth, kDeepWidth);
+    }
+    std::printf(ok ? "the planned workspace bounds every call's real peak\n"
+                   : "FAIL: a call outgrew its planned workspace\n");
+    return ok;
+}
+
+// The same workspace contract on the tier placements (design §9.1: the RAM and SSD tiers): a
+// mixed frame table (three of every eight experts of every layer held in device frames at the
+// bank's pitch, the rest misses), the tier's host pointer tables replacing the pinned bank (the
+// MoE source's tier branch: the bank's records go null and the misses read the table's pointers
+// zero-copy), staging slots with the prefill overlap stream, the decode fork's shared stream and
+// the landing frames its misses promote into -- the Program's tier-mode MoE configuration, the
+// frames standing in for the expert cache's at the same pitch. Every expert stays servable
+// (framed, or named by the tier table), so each call's logits must equal the zero-copy bank
+// forward's bit for bit (the framed, staged, landed and forked passes run the same arithmetic per
+// expert) while the shared arena's real peak stays under the plan at every width, on the exact
+// route and the selected fast paths: the tiers add no call-lifetime buffer the plan may miss.
+// The resident forward runs row 0, the tier placement row 1, the same call history on each.
+bool check_work_peak_tiers(const q4::execution::Parameters& parameters, DeviceContext& device,
+                           const q4::NgramVolume& volume, KvCacheStorage kv) {
+    const auto& c = parameters.model.config().text;
+    constexpr std::int32_t kColumns = 40960, kDeepWidth = 4096;
+    const auto tokens               = lcg_tokens(static_cast<std::int32_t>(c.vocab_size), kColumns);
+    const std::int32_t context      = (kColumns + 63) / 64 * 64;
+    const std::int32_t widths[]     = {1, 2, 512, 2048, 4096, 8192, 16384};
+    const auto V                    = static_cast<std::int32_t>(c.vocab_size);
+    const auto L                    = static_cast<std::uint32_t>(c.num_hidden_layers);
+    const auto E                    = static_cast<std::uint32_t>(c.moe.experts);
+    std::uint64_t stride            = 0;
+    std::vector<const std::uint8_t*> bank_host, bank_mapped; // per layer: its bank's host and
+    // zero-copy records (each layer's bank is its own allocation)
+    for (const auto& layer : parameters.layers) {
+        const auto& planes = layer.moe.bank->planes;
+        bank_host.push_back(reinterpret_cast<const std::uint8_t*>(planes.records));
+        bank_mapped.push_back(reinterpret_cast<const std::uint8_t*>(planes.device_records));
+        if (stride == 0) {
+            stride = planes.record_stride;
+        } else if (planes.record_stride != stride) {
+            throw std::runtime_error("the expert banks' record strides differ");
+        }
+    }
+    // Three of every eight experts per layer in frames, the last sixteen of a layer's frames held
+    // out as the landing frames its decode misses promote into (the Program's
+    // min(kLandingSlots, frames) reservation).
+    constexpr std::uint32_t kFramedModulo = 8, kFramedShare = 3;
+    const auto framed_of = [&](std::uint32_t e) { return e % kFramedModulo < kFramedShare; };
+    std::uint32_t framed = 0;
+    for (std::uint32_t e = 0; e < E; ++e) { framed += framed_of(e) ? 1U : 0U; }
+    // The pool holds the framed experts' slots first, then the landing frames beyond them (free
+    // frames the Program reserves; a promotion writes its record there without evicting a resident).
+    const std::uint32_t landing_slots =
+        std::min<std::uint32_t>(infernix::models::offload::ExpertResidency::kLandingSlots, framed);
+    const std::uint32_t pool_slots = framed + landing_slots;
+    DeviceBuffer frames_pool(static_cast<std::size_t>(L) * pool_slots * stride);
+    std::vector<std::int32_t> table_host(static_cast<std::size_t>(L) * E, -1);
+    for (std::uint32_t l = 0; l < L; ++l) {
+        std::uint32_t slot = 0;
+        for (std::uint32_t e = 0; e < E; ++e) {
+            if (!framed_of(e)) { continue; }
+            table_host[static_cast<std::size_t>(l) * E + e] = static_cast<std::int32_t>(slot);
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(frames_pool.p) +
+                                           (static_cast<std::size_t>(l) * pool_slots + slot) * stride,
+                                       bank_host[l] + static_cast<std::size_t>(e) * stride, stride,
+                                       cudaMemcpyHostToDevice, device.stream));
+            ++slot;
+        }
+    }
+    DeviceBuffer frames_table(table_host.size() * sizeof(std::int32_t));
+    frames_table.copy_from_host(table_host.data(), table_host.size() * sizeof(std::int32_t));
+    std::vector<std::int32_t> landing_host(static_cast<std::size_t>(L) * landing_slots);
+    for (std::uint32_t l = 0; l < L; ++l) {
+        for (std::uint32_t i = 0; i < landing_slots; ++i) {
+            landing_host[static_cast<std::size_t>(l) * landing_slots + i] =
+                static_cast<std::int32_t>(framed + i);
+        }
+    }
+    DeviceBuffer landing_table(landing_host.size() * sizeof(std::int32_t));
+    landing_table.copy_from_host(landing_host.data(), landing_host.size() * sizeof(std::int32_t));
+    DeviceBuffer landed_log(landing_host.size() * sizeof(std::int32_t));
+    landed_log.fill(0);
+    // The tier's pointer table: every key's record in its layer's pinned bank, as the device reads it.
+    std::vector<const std::uint8_t*> tier_host(static_cast<std::size_t>(L) * E);
+    for (std::uint32_t l = 0; l < L; ++l) {
+        for (std::uint32_t e = 0; e < E; ++e) {
+            tier_host[static_cast<std::size_t>(l) * E + e] = bank_mapped[l] + static_cast<std::size_t>(e) * stride;
+        }
+    }
+    std::vector<DeviceBuffer> tier_tables(L);
+    std::vector<const std::uint8_t* const*> tier_tables_device(L);
+    for (std::uint32_t l = 0; l < L; ++l) {
+        tier_tables[l] = DeviceBuffer(static_cast<std::size_t>(E) * sizeof(const std::uint8_t*));
+        tier_tables[l].copy_from_host(tier_host.data() + static_cast<std::size_t>(l) * E,
+                                      static_cast<std::size_t>(E) * sizeof(const std::uint8_t*));
+        tier_tables_device[l] = static_cast<const std::uint8_t* const*>(tier_tables[l].p);
+    }
+    constexpr std::int32_t kStagingSlots = 64; // the Program's staging slot count (plan_.staging_slots)
+    DeviceBuffer staging(static_cast<std::size_t>(kStagingSlots) * stride);
+    cudaStream_t overlap = nullptr, shared = nullptr;
+    std::array<cudaEvent_t, 5> events{};
+    std::array<cudaEvent_t, 4> shared_events{};
+    check(cudaStreamCreateWithFlags(&overlap, cudaStreamNonBlocking), "cudaStreamCreate");
+    check(cudaStreamCreateWithFlags(&shared, cudaStreamNonBlocking), "cudaStreamCreate");
+    for (auto& event : events) { check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "cudaEventCreate"); }
+    for (auto& event : shared_events) { check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "cudaEventCreate"); }
+    device.synchronize();
+    bool ok = true;
+    for (const bool fast : {false, true}) {
+        const auto flags    = Harness::route_of(parameters, kv, fast);
+        const auto wide_a16 = Harness::wide_of(flags);
+        Harness harness(parameters, device, context, widths[std::size(widths) - 1], 2, kv, fast);
+        auto sources        = harness.experts_view;
+        sources.frame_bases.assign(L, nullptr);
+        sources.frame_pitches.assign(L, stride);
+        sources.frames.assign(L, nullptr);
+        for (std::uint32_t l = 0; l < L; ++l) {
+            sources.frame_bases[l] = static_cast<const std::uint8_t*>(frames_pool.p) +
+                                    static_cast<std::size_t>(l) * pool_slots * stride;
+            sources.frames[l]     = static_cast<const std::int32_t*>(frames_table.p) + static_cast<std::size_t>(l) * E;
+        }
+        sources.staging_base   = static_cast<std::uint8_t*>(staging.p);
+        sources.staging_slots  = kStagingSlots;
+        sources.overlap_stream = overlap;
+        sources.overlap_events = events;
+        sources.shared_stream  = shared;
+        sources.shared_events  = shared_events;
+        sources.landing        = static_cast<const std::int32_t*>(landing_table.p);
+        sources.landed         = static_cast<std::int32_t*>(landed_log.p);
+        sources.landing_slots  = static_cast<std::int32_t>(landing_slots);
+        sources.host_tables    = tier_tables_device;
+        sources.fetch          = {};
+        sources.cpu            = {};
+        sources.resident       = false;
+        const auto tier        = harness.forward_with(parameters, device, std::move(sources), context);
+        DeviceBuffer logits(static_cast<std::size_t>(V) * sizeof(float));
+        const auto run = [&](q4::execution::Forward& forward, std::int32_t row, std::int32_t first,
+                             std::int32_t width) {
+            auto call = make_call(c, volume, {tokens}, first, width, {row}, {row});
+            Tensor out(logits.p, DType::FP32, {V, 1});
+            forward.run(call.batch, out);
+            device.synchronize();
+            return to_float(logits, static_cast<std::size_t>(V));
+        };
+        const auto check_width = [&](std::int32_t first, std::int32_t width) {
+            const auto expected = run(*harness.forward, 0, first, width); // row 0: the zero-copy bank
+            harness.work->reset_peak();
+            bool grew           = false;
+            std::vector<float> served;
+            try {
+                served = run(*tier, 1, first, width); // row 1: the tier placement
+            } catch (const std::bad_alloc&) {
+                grew = true; // the arena refused the tier path more than the plan holds
+            }
+            const std::size_t planned = q4::execution::Forward::workspace_bytes(c, width, context, kv, wide_a16);
+            const std::size_t peak    = harness.work->peak_used();
+            const bool same           = !grew && expected == served;
+            std::string delta;
+            if (!grew && !same) {
+                std::size_t at = expected.size();
+                float max_abs = 0;
+                for (std::size_t i = 0; i < expected.size(); ++i) {
+                    if (expected[i] != served[i] && at == expected.size()) { at = i; }
+                    max_abs = std::max(max_abs, std::fabs(expected[i] - served[i]));
+                }
+                char text[96];
+                std::snprintf(text, sizeof(text), " (first diff at %zu, max |delta| %.4g, expected %.4g)",
+                              at, static_cast<double>(max_abs), static_cast<double>(expected[at]));
+                delta = text;
+            }
+            const std::string verdict =
+                grew ? "exceeded the plan" : (same ? "equal" : ("DIFFER" + delta));
+            std::printf("%s route, %5d columns at %6d: planned %4zu MiB, tier peak %4zu MiB, headroom %.0f%%, "
+                        "logits %s\n",
+                        fast ? "fast " : "exact", width, first, planned >> 20, peak >> 20,
+                        planned >= peak ? 100.0 * double(planned - peak) / double(peak) : -100.0,
+                        verdict.c_str());
+            if (grew || peak > planned || !same) { ok = false; }
+            harness.work->reset_peak();
+        };
+        for (const std::int32_t width : widths) { check_width(0, width); }
+        check_width(kColumns - kDeepWidth, kDeepWidth);
+    }
+    std::printf(ok ? "the planned workspace bounds every tier-placement call's real peak, the logits equal\n"
+                   : "FAIL: a tier-placement call outgrew its planned workspace or served different bits\n");
+    return ok;
+}
+
 // Forward-level decomposition equality on the real artifact through the exact route: the same
 // prompt prefilled as one call against calls split at an off-grid point (1003), at 16-aligned
 // points (1024; the production tail tap (n-1)/16*16), and against prefill followed by decode of
@@ -720,6 +979,9 @@ int main(int argc, char** argv) {
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
+        // --work-peak runs on generated ids: it needs no token list, and takes --kv alone.
+        bool work_peak = false;
+        KvCacheStorage work_peak_kv = KvCacheStorage::BFloat16;
         std::vector<Job> jobs;
         models::LoadOptions load; // --rope-yarn-factor F (anywhere): the model's YaRN factor
         for (int i = 1; i < argc; ++i) {
@@ -732,6 +994,14 @@ int main(int argc, char** argv) {
             if (arg.rfind("--", 0) != 0) {
                 jobs.push_back(Job{parse_tokens(arg)});
                 if (jobs.back().tokens.size() < 2) { throw std::invalid_argument("pass at least two tokens"); }
+                continue;
+            }
+            if (arg == "--work-peak") {
+                work_peak = true;
+                continue;
+            }
+            if (arg == "--kv" && work_peak && jobs.empty()) {
+                work_peak_kv = infernix::test::parse_kv_cache_storage(argv[++i]);
                 continue;
             }
             if (arg == "--cpu-columns") {
@@ -774,7 +1044,7 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown option " + arg);
             }
         }
-        const bool scoring = !jobs.front().dump_path.empty();
+        const bool scoring = !jobs.empty() && !jobs.front().dump_path.empty();
         for (const Job& job : jobs) {
             if (job.dump_path.empty() != !scoring || (jobs.size() > 1 && job.dump_path.empty())) {
                 throw std::invalid_argument("several token lists are scored only, each with its own --dump-logits");
@@ -802,6 +1072,11 @@ int main(int argc, char** argv) {
             ngram_env != nullptr ? std::filesystem::path(ngram_env) : q4::default_ngram_volume(artifact_env);
         const q4::NgramVolume volume(volume_path, q4::resolve_ngram_volume(volume_path, c.ple));
         const std::size_t vocab = c.vocab_size;
+        if (work_peak) {
+            const bool resident = check_work_peak(parameters, device, volume, work_peak_kv);
+            const bool tiers    = check_work_peak_tiers(parameters, device, volume, work_peak_kv);
+            return resident && tiers ? 0 : 1;
+        }
         if (scoring) {
             // Teacher-forced scoring: chunked prefill of each whole text in slot 0 of its own harness.
             for (const Job& job : jobs) {
