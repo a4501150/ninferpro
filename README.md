@@ -62,7 +62,7 @@ Prefill is back near `e984e41` (2026-10-30: 13,700 / 9,750 / 8,160 / 3,990 down 
 since `4dfc42a4c` sized the wide workspace by its liveness peak: at 6 lanes the resident placement's
 chunk halves to 4,096 tokens instead of 2,048.
 
-Switches take 1.6-6.8 s; growing back to `vram=100%` took 4.1 s. Process RAM at `vram=100%` is the
+Switches take 1.6-6.9 s; growing back to `vram=100%` took 4.2 s. Process RAM at `vram=100%` is the
 8 GiB prefix-cache host tier (`--host-context-mib`) plus about 4.8 GiB of engine heap. RAM is worth
 far more than SSD for experts that leave VRAM: half the experts in RAM decode at 264 tok/s, half on
 SSD at 70.

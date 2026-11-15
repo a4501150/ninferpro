@@ -25,10 +25,10 @@
 #                                mixed-length traffic, throughput against per-user decode speed
 
 BUILD     ?= build
-# A build peaks near 1.75 GiB per nvcc job; MEM caps the whole build (an unbounded one has run the
-# host out of memory). Lower both when production holds experts in host RAM.
+# A compile job peaks near 1.75 GiB and a debug-info link several more; MEM caps the whole build
+# (an unbounded one has run the host out of memory). Eight jobs leave half the cores to production.
 JOBS      ?= 8
-MEM       ?= 24G
+MEM       ?= 64G
 ARGS      ?=
 R         ?=
 LOCKS     := $(HOME)/.cache/super-quant
