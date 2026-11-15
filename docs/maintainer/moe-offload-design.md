@@ -163,6 +163,14 @@ stream before the next round; the promotions' copies run on a copy stream that f
 that table update, so no kernel can read a frame while it is overwritten. Outputs are
 placement-invariant (§2), so the round a promotion lands in does not change any result.
 
+**Open: one frame-index fault.** On 2026-11-14 a T3 matrix (commit `e8fd9bf90`, booted at
+`vram=100%`, then 65/15/20 and 50/50) died with Xid 31: a kernel read at the frame pool's base +
+0x1000171F pitches (frame 5919, which existed at 50/50, with bit 28 set), at a prefix-cache resume
+right after a RAM-tier settle released 80 shadow slots. No frame table, landing table or move
+list produces such a value; 36 replays of the sequence, nine more matrices and the tier-placement
+workspace test did not reproduce it. A recurrence's Xid address against the startup `device
+address map` line names the frame index again.
+
 ### 4.3 Replacement and admission: LFRU
 
 **Score.** `f / (now − last + 1)`, with `f` a global per-key use count kept for every routed

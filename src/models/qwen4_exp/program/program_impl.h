@@ -1034,6 +1034,16 @@ public:
         if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
             throw std::runtime_error(spill_message(spilled));
         }
+        {
+            // A device fault (the kernel log's Xid 31 address) maps to its buffer, and inside the
+            // frame pools to a frame index, from this line.
+            char line[256];
+            std::snprintf(line, sizeof(line), "; workspace %p +%zu, staging %p +%zu, KV %p +%zu, GDN state %p +%zu",
+                          work_->base(), work_capacity_, staging_.p, staging_.bytes,
+                          kv_vmm_ ? kv_vmm_->base() : kv_backing_.p, static_cast<std::size_t>(plan_.kv),
+                          state_backing_.p, state_backing_.bytes);
+            diagnostic("device address map: " + residency_->address_map() + line, DiagnosticLevel::Info);
+        }
         CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.stream, cudaStreamNonBlocking));
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
@@ -5000,13 +5010,15 @@ private:
                     const cudaStream_t writers[] = {device_.stream};
                     work_lease_ = residency_->lend(wide_work_, device_.stream, writers);
                 } else {
-                    diagnostic("the prefill workspace could not be lent from the expert cache; " +
-                                   std::to_string(wide_work_ >> 20) + " MiB are allocated for the prompt",
-                               DiagnosticLevel::Warning);
                     // The cache shrank under VRAM pressure: a failed allocation fails this prompt's
                     // requests, not the Engine.
                     try {
                         wide_fallback_ = DeviceBuffer(wide_work_);
+                        char where[64];
+                        std::snprintf(where, sizeof(where), " at %p", wide_fallback_.p);
+                        diagnostic("the prefill workspace could not be lent from the expert cache; " +
+                                       std::to_string(wide_work_ >> 20) + " MiB are allocated for the prompt" + where,
+                                   DiagnosticLevel::Warning);
                     } catch (const std::exception& error) {
                         throw runtime::RecoverableExecutionError(
                             "the prefill workspace (" + std::to_string(wide_work_ >> 20) +

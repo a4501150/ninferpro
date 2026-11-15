@@ -52,6 +52,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace infernix::models::offload {
@@ -221,6 +222,9 @@ public:
     // Where layer `layer`'s frames are: frame f at frame_base(layer) + f * frame_pitch(layer).
     [[nodiscard]] const std::uint8_t* frame_base(std::uint32_t layer) const noexcept;
     [[nodiscard]] std::uint64_t frame_pitch(std::uint32_t layer) const noexcept;
+    // Each pool's address range and pitch, for the startup log: a device fault's address there
+    // gives its frame index, (address - base) / pitch.
+    [[nodiscard]] std::string address_map() const;
     // The average frame's bytes (average_frame_bytes of the layers' strides).
     [[nodiscard]] std::uint64_t frame_bytes() const noexcept { return frame_bytes_; }
     [[nodiscard]] const std::int32_t* table(std::uint32_t layer) const noexcept;

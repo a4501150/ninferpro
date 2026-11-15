@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -143,6 +144,18 @@ const std::uint8_t* ExpertResidency::frame_base(std::uint32_t layer) const noexc
 
 std::uint64_t ExpertResidency::frame_pitch(std::uint32_t layer) const noexcept {
     return pools_[pool_of_layer_[layer]].pitch;
+}
+
+std::string ExpertResidency::address_map() const {
+    std::string out;
+    for (const auto& pool : pools_) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "%sframes %p +%zu pitch %llu", out.empty() ? "" : ", ",
+                      static_cast<const void*>(pool.base()), pool.arena ? pool.arena->reserved_bytes() : pool.memory.bytes,
+                      static_cast<unsigned long long>(pool.pitch));
+        out += line;
+    }
+    return out;
 }
 
 std::uint32_t ExpertResidency::frames() const noexcept {

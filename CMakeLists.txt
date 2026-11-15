@@ -43,6 +43,11 @@ endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+if(NOT MSVC)
+  # Host debug info at full optimization (the code is the same; device code carries -lineinfo):
+  # a crash's core dump and backtrace resolve to source lines.
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-g> $<$<COMPILE_LANGUAGE:CUDA>:-g>)
+endif()
 
 if(CMAKE_GENERATOR MATCHES "Ninja")
   set_property(GLOBAL PROPERTY JOB_POOLS infernix_link=1)

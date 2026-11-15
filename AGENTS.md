@@ -343,6 +343,11 @@ The machine: Ubuntu 26.04, kernel 7.0, one RTX PRO 6000 Blackwell (SM120, 96 GB)
 - Artifacts: `~/models/infernix/` (`README.local.md` records the conversion commands). Select them
   by explicit path, never glob order, modification time, or unqualified "latest". Source
   checkpoints live in `~/.cache/huggingface`.
+- Device faults: the kernel log's Xid 31 line (`journalctl -k | grep Xid`) names the faulting
+  engine (GRAPHICS: a kernel's load or store; CE: a copy) and the address. The server log's
+  startup `device address map` line maps the address to its buffer; inside an expert frame pool,
+  frame index = (address - base) / pitch. Host code builds with `-g` and device code with
+  `-lineinfo`, so a core dump or backtrace resolves to source lines.
 - Processes: track PIDs. Never use `pkill -f` or `pgrep -f` (the pattern matches the calling shell),
   and every script that starts a server kills it before waiting on it.
 - Python: the converter uses Python 3.11 from `.venv-convert/`; the system `python3` is 3.14.
