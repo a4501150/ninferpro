@@ -43,29 +43,29 @@ RTX PRO 6000 Blackwell (core undervolted to 2,865 MHz at 925 mV, memory offset +
 under CUDA), orcarouter Qwen3.8-Flash-Next-Uncensored-NVFP4 (recipe C conversion), BF16 n-gram
 volume, DFlash2 drafter, FP8 KV, 6 lanes, 262,144-token context, no Disk prefix cache. One server
 boot, placements switched at runtime in the order shown; speeds are tok/s from the server's own
-request log (commit `a17331cc4`, 2026-11-14, `make t3`). [Performance](docs/performance.md) defines
+request log (commit `11dbea95c`, 2026-11-14, `make t3`). [Performance](docs/performance.md) defines
 each column's workload.
 
 | Placement | VRAM / RAM / SSD experts | Process VRAM, GiB (experts / KV / other) | Process RAM | Decode, 1 request | Decode at 30K context | Prefill, 30K | 6 requests, total |
 |---|---|---|---|---|---|---|---|
-| `vram=100%` | 24,576 / 0 / 0 | 90.3 (63.3 / 19.3 / 7.7) | 12.8 GiB | 380 | 308 | 11,800 | 473 |
-| `vram=65%,ram=15%,ssd=20%` | 15,974 / 3,657 / 4,945 | 68.2 (41.2 / 19.3 / 7.7) | 23.6 GiB | 227 | 194 | 7,670 | 393 |
-| `vram=50%,ram=50%` | 12,288 / 12,288 / 0 | 58.7 (31.7 / 19.3 / 7.7) | 45.8 GiB | 257 | 209 | 6,030 | 426 |
-| `vram=50%,ssd=50%` | 12,288 / 1 / 12,287 | 58.7 (31.7 / 19.3 / 7.7) | 14.2 GiB | 63 | 54 | 2,580 | 200 |
+| `vram=100%` | 24,576 / 0 / 0 | 90.2 (63.3 / 19.3 / 7.6) | 12.8 GiB | 384 | 331 | 12,900 | 522 |
+| `vram=65%,ram=15%,ssd=20%` | 15,974 / 3,647 / 4,955 | 68.1 (41.2 / 19.3 / 7.6) | 23.6 GiB | 234 | 222 | 9,320 | 357 |
+| `vram=50%,ram=50%` | 12,288 / 12,288 / 0 | 58.6 (31.7 / 19.3 / 7.6) | 45.8 GiB | 264 | 243 | 7,960 | 406 |
+| `vram=50%,ssd=50%` | 12,288 / 1 / 12,287 | 58.6 (31.7 / 19.3 / 7.6) | 14.2 GiB | 70 | 70 | 3,940 | 182 |
 
-Switching back to `vram=100%` at the end of the same boot measured 383 / 306 / 11,800 / 541. Six
-requests' total moves with DFlash2 acceptance and timing: three boots of this commit measured 473-541
-at `vram=100%`, and 30K-context decode 306-324. The benchmark flags the `vram=65%,ram=15%,ssd=20%`
-row as disturbed (its measured pass decoded slower than its warm pass), as it has in earlier boots.
+Switching back to `vram=100%` at the end of the same boot measured 380 / 319 / 12,900 / 523. Six
+requests' total moves with DFlash2 acceptance and timing (473-541 over three boots of `a17331cc4`).
+The benchmark flags the `vram=65%,ram=15%,ssd=20%` row as disturbed (its measured pass decoded
+slower than its warm pass), as it has in earlier boots.
 
-Prefill is lower than at `e984e41` (2026-10-30: 13,700 / 9,750 / 8,160 / 3,990 down the same
-column); `6b6762f61` (2026-11-04) already measured about 12,000 at `vram=100%`, so the change came
-between those commits, not from the GPU settings.
+Prefill is back near `e984e41` (2026-10-30: 13,700 / 9,750 / 8,160 / 3,990 down the same column)
+since `4dfc42a4c` sized the wide workspace by its liveness peak: at 6 lanes the resident placement's
+chunk halves to 4,096 tokens instead of 2,048.
 
 Switches take 1.6-6.8 s; growing back to `vram=100%` took 4.1 s. Process RAM at `vram=100%` is the
 8 GiB prefix-cache host tier (`--host-context-mib`) plus about 4.8 GiB of engine heap. RAM is worth
-far more than SSD for experts that leave VRAM: half the experts in RAM decode at 257 tok/s, half on
-SSD at 63.
+far more than SSD for experts that leave VRAM: half the experts in RAM decode at 264 tok/s, half on
+SSD at 70.
 
 ## Build
 
