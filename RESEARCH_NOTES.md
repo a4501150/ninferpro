@@ -784,3 +784,36 @@ where it is used, both with the loops left unrolled — does not reduce the spil
 its spill traffic is far cheaper than losing that schedule, so the loops stay as they are. The whole
 opportunity is bounded anyway: the near-spill-free 8-bit form is only 2.8 % faster per layer than
 the FP16 one, and part of that gap is its different Tensor Core rate rather than the spills.
+
+## Hyper-connection mix pair: scheduling and occupancy variants (not adopted)
+
+RTX PRO 6000, Q8 mixer, `infernix_hyper_connection_bench` (a graph of 48 calls with distinct weights;
+per call, median of 50-100 replays), main `b3a4e2265`, 2026-11-17. Baseline per call: 8.56 us at
+T 2, 11.09 at T 6, 12.61 at T 8, 16.12 at T 12, 22.14 at T 18, 25.63 at T 24; the weights alone take
+about 4.3 us at 90 % of the read rate. All variants below kept the output hashes at every T.
+
+Per-CTA `%globaltimer` marks inside the graph (relative to the down kernel's first wait release,
+medians) show where a call goes. At T 2: residual load and sum of squares 1.25 us, norm and Rn
+staging 0.55 us, dot products 1.2 us, the two cluster barriers and m 0.9 us; the up kernel's wait
+releases about 1 us after the last down CTA exits, then its own work takes 1.4 us. Each kernel
+starts only as the previous one's CTAs exit (down about 0.4 us before its wait releases, up at the
+median down exit): at 208-230 registers per thread neither fits beside the other on an SM. Dropping
+the down kernel's weight loads entirely (wrong outputs, timing only) saved just 0.4 us per call at
+T 2, so the weight stream is not what holds the chain; its dependent steps are. At T 18 the down
+kernel's dot products are shared-memory bound (each Rn float read feeds one row's FMA), and the
+three 8-column passes run in series.
+
+| Variant | T 2 | T 6 | T 18 | Why it lost |
+|---|---:|---:|---:|---|
+| `__launch_bounds__(256, 2)` on both v4 kernels (entry triggers) | 18.08 | 27.12 | 63.55 | 128 registers spill in the main path; dependents cascade at entry |
+| same, triggers moved after each kernel's dot products | 20.21 | 29.04 | 62.46 | the cascade is gone, the spills remain (dots 2 -> 8.5 us at T 6) |
+| up weights decoded after the wait, not before it | 9.11 | 11.59 | 22.46 | the release comes earlier, the dots later |
+| down CTAs prefetch the up weights into L2 before their wait | 9.07 | 11.50 | 22.72 | the up wait releases evenly; the down residual load doubles behind the prefetch |
+| down v4 with two rows per warp (16 rows, 84 CTAs) | 10.39 | 14.74 | 35.53 | 140 spill instructions, half the CTAs |
+| down v4 with 7 rows per CTA (188 CTAs) and up v4 with 7 warps (183 CTAs) | 10.66 | 15.08 | 34.36 | 47 four-CTA clusters exceed the 46 the device runs at once: a second wave |
+| up v4 with 7 warps (183 CTAs) alone | 8.57 | 11.17 | 22.18 | within noise |
+
+What remains is a redesign rather than a retune: weights staged through shared memory (TMA bulk
+copies) so both kernels fit beside a neighbour without spills, with dependents triggered once each
+kernel's weights are consumed; and for wide calls, more Rn reuse per shared-memory read within the
+same per-row, lane-chunk summation order.
