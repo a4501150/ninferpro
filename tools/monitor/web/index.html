@@ -1,0 +1,70 @@
+<!doctype html>
+<!-- Adapted from Basalt's status page (https://github.com/jesdga95/basalt, serve/web/),
+     Copyright (c) 2026 Jesús Gulfo, MIT License; see tools/monitor/LICENSE.basalt. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>infernix monitor</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="app.css">
+<script defer src="app.js"></script>
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand"><span class="wordmark">infernix</span></div>
+  <span class="model" id="model"></span>
+  <span class="grow"></span>
+  <span class="state" id="state" data-s="offline">Connecting</span>
+  <span class="where" id="host"></span>
+</header>
+
+<main class="lay">
+  <aside class="a-side sb" aria-label="Hardware">
+    <div class="sb-h">GPUs<span>Charts · Last 60 s</span></div>
+    <div class="sb-gpus" id="gpus"></div>
+    <div class="sb-sys">
+      <div class="sb-h">System<span id="cpu-name"></span></div>
+      <div class="sb-body" id="sys"></div>
+    </div>
+    <div class="sb-exp">
+      <div class="sb-h">Experts<span id="exp-note">Placement</span></div>
+      <div class="sb-body" id="experts"></div>
+    </div>
+  </aside>
+
+  <section class="a-hero card" aria-label="Speed">
+    <div class="hd"><b>Speed</b><span>Last 60 s</span></div>
+    <div class="trio">
+      <div class="dec">
+        <div class="k" id="dec-k">Decode</div>
+        <div class="v big" id="dec-v">-</div>
+        <div class="cw" id="dec-chart"></div>
+      </div>
+      <div class="pre">
+        <div class="k" id="pre-k">Prefill</div>
+        <div class="v mid" id="pre-v">-</div>
+        <div class="pcw" id="pre-chart"></div>
+        <div class="pst">
+          <div><span>Last prompt</span><span id="pre-last">-</span></div>
+          <div><span>Prefix cache hit</span><b id="pre-hit">-</b></div>
+        </div>
+      </div>
+    </div>
+    <div class="hfoot"><div id="foot-dec"></div><div id="foot-pre"></div></div>
+  </section>
+
+  <section class="a-main card" aria-label="Requests and engine">
+    <div class="tabs" role="tablist" id="tabs"></div>
+    <div class="pane" id="pane" role="tabpanel"></div>
+  </section>
+
+  <section class="a-logs card" aria-label="Logs">
+    <div class="hd lh"><b>Logs</b><span id="log-count"></span></div>
+    <div class="logs" id="log" role="log" aria-live="off" tabindex="0"></div>
+  </section>
+</main>
+
+</body>
+</html>

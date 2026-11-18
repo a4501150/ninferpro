@@ -1,0 +1,25 @@
+# Writes OUT, a header holding each web file as a raw string literal, so infernix-monitor serves
+# its page without files beside the binary. Run as: cmake -DOUT=... -DWEB_DIR=... -P embed_web.cmake
+
+set(delimiter "infernix_web")
+set(content "// Generated from tools/monitor/web by embed_web.cmake; do not edit.\n#pragma once\n\n#include <string_view>\n\nnamespace infernix::monitor::web {\n\n")
+foreach(pair "kIndexHtml=index.html" "kAppJs=app.js" "kAppCss=app.css")
+  string(REPLACE "=" ";" parts "${pair}")
+  list(GET parts 0 name)
+  list(GET parts 1 file)
+  file(READ "${WEB_DIR}/${file}" text)
+  string(FIND "${text}" ")${delimiter}\"" clash)
+  if(NOT clash EQUAL -1)
+    message(FATAL_ERROR "${file} contains the raw-string delimiter )${delimiter}\"")
+  endif()
+  string(APPEND content "inline constexpr std::string_view ${name} = R\"${delimiter}(${text})${delimiter}\";\n\n")
+endforeach()
+string(APPEND content "} // namespace infernix::monitor::web\n")
+# Rewrite only on change, so an unchanged page does not recompile main.cpp.
+set(previous "")
+if(EXISTS "${OUT}")
+  file(READ "${OUT}" previous)
+endif()
+if(NOT "${previous}" STREQUAL "${content}")
+  file(WRITE "${OUT}" "${content}")
+endif()

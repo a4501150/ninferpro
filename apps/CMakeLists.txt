@@ -57,3 +57,5 @@ target_link_libraries(infernix-perplexity PRIVATE
 add_dependencies(infernix-perplexity infernix_build_id_stamp)
 target_sources(infernix-perplexity PRIVATE ${INFERNIX_BUILD_ID_HEADER})
 infernix_stage_runtime_dlls(infernix-perplexity)
+
+include(${PROJECT_SOURCE_DIR}/tools/monitor/monitor.cmake)

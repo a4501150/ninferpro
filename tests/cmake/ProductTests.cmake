@@ -64,6 +64,11 @@ infernix_add_test(infernix_request_log_test
 infernix_add_test(infernix_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics.cpp"
   LIBRARIES infernix_serve)
+if(TARGET infernix_monitor_core)
+  infernix_add_test(infernix_monitor_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_monitor.cpp"
+    LIBRARIES infernix_monitor_core)
+endif()
 infernix_add_test(infernix_console_stats_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_console_stats.cpp"
   LIBRARIES infernix_serve infernix_product_logging)

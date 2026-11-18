@@ -62,6 +62,9 @@ Modifications made in this product (summary; see README.md for details):
   families share lives in src/models/qwen_common/; the runtime engine keeps only
   family-neutral code (src/runtime/engine/engine_options.* holds the shared
   artifact-free checks and defaults, and the registry detects the artifact architecture).
+- infernix-monitor (tools/monitor), a live status page for the server; its page is
+  adapted from Basalt (https://github.com/jesdga95/basalt, MIT License; the notice is
+  kept in tools/monitor/LICENSE.basalt and the copied files).
 
 Third-party components keep their own licenses; see third_party/ and
 packaging/windows/THIRD_PARTY_NOTICES.md.
