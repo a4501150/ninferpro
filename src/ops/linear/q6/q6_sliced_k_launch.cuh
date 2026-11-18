@@ -5,7 +5,8 @@
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q6/q6_operands.h"
-#include "ops/linear/q6/q6_a16_sliced_k_mma.cuh"
+#include "ops/linear/q6/q6_schedule.cuh"
+#include "ops/linear/rowsplit/a16_sliced_k_mma.cuh"
 
 namespace infernix::ops::detail {
 
@@ -26,13 +27,17 @@ void launch_q6_a16_sliced_k_mma(const Q6LinearOperands& operands, Output output,
                                   (Schedule::kKWarps * sizeof(__half)) ==
                               0;
         if (full) {
-            q6_a16_sliced_k_mma_kernel<Schedule, true><<<grid, Schedule::kThreads, 0, stream>>>(
-                x, operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
-                operands.k, count, operands.padded_k, offset);
+            rowsplit_a16_sliced_k_mma_kernel_no_row_policy<
+                Schedule, Q6RowSplitFormat, true, true, Output, Epilogue,
+                RowSplitIdentityRows<Schedule::kBlockRows>><<<grid, Schedule::kThreads, 0, stream>>>(
+                    x, operands.codes, operands.high, operands.scales, output, epilogue,
+                    operands.rows, operands.k, count, operands.padded_k, offset);
         } else {
-            q6_a16_sliced_k_mma_kernel<Schedule, false><<<grid, Schedule::kThreads, 0, stream>>>(
-                x, operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
-                operands.k, count, operands.padded_k, offset);
+            rowsplit_a16_sliced_k_mma_kernel_no_row_policy<
+                Schedule, Q6RowSplitFormat, false, false, Output, Epilogue,
+                RowSplitIdentityRows<Schedule::kBlockRows>><<<grid, Schedule::kThreads, 0, stream>>>(
+                    x, operands.codes, operands.high, operands.scales, output, epilogue,
+                    operands.rows, operands.k, count, operands.padded_k, offset);
         }
         CUDA_CHECK(cudaGetLastError());
     });

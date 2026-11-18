@@ -13,8 +13,9 @@ file that no longer exists, and are easy to describe wrongly, which has already 
 branch's own documents. Both were used by the two Q4/Q5 input projections, and they are not the same
 shape. Their dataflows live on, generalized to R rows per CTA and `WarpsPerRow` warps per row, in
 `src/ops/linear/q5/q5_a16_direct_simt.cuh` (`q5_a16_direct_simt_kernel`, direct global loads, the
-split-2/split-4 dataflow) and `src/ops/linear/q5/q5_a16_simt.cuh` (`q5_a16_simt_kernel`, the weight
-planes staged per warp through cp.async, `q5_simt_issue_stage` / `q5_simt_consume_stage`).
+split-2/split-4 dataflow) and `src/ops/linear/rowsplit/a16_simt.cuh` (`rowsplit_a16_simt_kernel` with
+`Q5RowSplitFormat`, the weight planes staged per warp through cp.async, `rowsplit_simt_issue_stage` /
+`rowsplit_simt_consume_stage`).
 
 **split4** (measured as `q5_rowsplit_gemm_simt_split4_kernel`): **one CTA owns one output row** (`row = blockIdx.x`),
 and **its four warps split the K dimension**: `chunk = threadIdx.x >> 5` selects the warp's K quarter, each

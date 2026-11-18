@@ -5,7 +5,8 @@
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q4/q4_operands.h"
-#include "ops/linear/q4/q4_a16_mma.cuh"
+#include "ops/linear/q4/q4_schedule.cuh"
+#include "ops/linear/rowsplit/a16_mma.cuh"
 
 namespace infernix::ops::detail {
 
@@ -24,13 +25,15 @@ void launch_q4_a16_mma(const Q4LinearOperands& operands, Output output, Epilogue
                           count % Schedule::kBlockTokens == 0 && operands.k == operands.padded_k &&
                           operands.k % Schedule::kBlockK == 0;
         if (full) {
-            q4_a16_mma_kernel<Schedule, true><<<grid, Schedule::kThreads, 0, stream>>>(
-                x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
-                count, operands.padded_k, offset);
+            rowsplit_a16_mma_kernel_no_high<Schedule, Q4RowSplitFormat, true, Output, Epilogue>
+                <<<grid, Schedule::kThreads, 0, stream>>>(
+                    x, operands.codes, operands.scales, output, epilogue, operands.rows,
+                    operands.k, count, operands.padded_k, offset);
         } else {
-            q4_a16_mma_kernel<Schedule, false><<<grid, Schedule::kThreads, 0, stream>>>(
-                x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
-                count, operands.padded_k, offset);
+            rowsplit_a16_mma_kernel_no_high<Schedule, Q4RowSplitFormat, false, Output, Epilogue>
+                <<<grid, Schedule::kThreads, 0, stream>>>(
+                    x, operands.codes, operands.scales, output, epilogue, operands.rows,
+                    operands.k, count, operands.padded_k, offset);
         }
         CUDA_CHECK(cudaGetLastError());
     });

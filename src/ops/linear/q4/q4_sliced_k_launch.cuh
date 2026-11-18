@@ -5,11 +5,12 @@
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q4/q4_operands.h"
-#include "ops/linear/q4/q4_a16_sliced_k_mma.cuh"
+#include "ops/linear/q4/q4_schedule.cuh"
+#include "ops/linear/rowsplit/a16_sliced_k_mma.cuh"
 
 namespace infernix::ops::detail {
 template <class Schedule, class Output, class Epilogue,
-          class RowPolicy = Q4IdentityRows<Schedule::kBlockRows>>
+          class RowPolicy = RowSplitIdentityRows<Schedule::kBlockRows>>
 void launch_q4_a16_sliced_k_mma(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
                                 cudaStream_t stream, RowPolicy row_policy = {},
                                 pdl::Dependency dependency = pdl::Dependency::Serialized) {
@@ -34,9 +35,11 @@ void launch_q4_a16_sliced_k_mma(const Q4LinearOperands& operands, Output output,
             CUDA_CHECK(pdl::launch_with(
                 dependency,
                 {grid, dim3(Schedule::kThreads), 0, stream},
-                q4_a16_sliced_k_mma_kernel<Schedule, Full, FullTokens, Output, Epilogue, RowPolicy>,
-                x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
-                count, operands.padded_k, offset, row_policy));
+                rowsplit_a16_sliced_k_mma_kernel_no_high<Schedule, Q4RowSplitFormat, Full,
+                                                          FullTokens, Output, Epilogue,
+                                                          RowPolicy>,
+                x, operands.codes, operands.scales, output, epilogue, operands.rows,
+                operands.k, count, operands.padded_k, offset, row_policy));
         };
         if (full && full_tokens)
             launch.template operator()<true, true>();

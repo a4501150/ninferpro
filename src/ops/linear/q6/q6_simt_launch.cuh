@@ -5,7 +5,9 @@
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q6/q6_operands.h"
-#include "ops/linear/q6/q6_a16_simt.cuh"
+#include "ops/linear/q6/q6_schedule.cuh"
+#include "ops/linear/rowsplit/a16_simt.cuh"
+#include "ops/linear/rowsplit/format_trait.cuh"
 
 namespace infernix::ops::detail {
 
@@ -17,7 +19,8 @@ void launch_q6_a16_simt(const Q6LinearOperands& operands, Output output, Epilogu
         const dim3 grid(static_cast<unsigned>(div_up(operands.rows, Schedule::kBlockRows)),
                         static_cast<unsigned>(div_up(count, Schedule::kBlockTokens)));
         const auto* x = operands.x + static_cast<std::int64_t>(offset) * operands.k;
-        q6_a16_simt_kernel<Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+        rowsplit_a16_simt_kernel<Schedule, Q6RowSplitFormat, false, false, Output, Epilogue>
+            <<<grid, Schedule::kThreads, 0, stream>>>(
             x, operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
             operands.k, count, operands.padded_k, offset);
         CUDA_CHECK(cudaGetLastError());

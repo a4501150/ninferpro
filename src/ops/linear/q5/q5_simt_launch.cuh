@@ -2,7 +2,8 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
-#include "ops/linear/q5/q5_a16_simt.cuh"
+#include "ops/linear/q5/q5_schedule.cuh"
+#include "ops/linear/rowsplit/a16_simt.cuh"
 #include "ops/linear/q5/q5_a16_direct_simt.cuh"
 #include "ops/linear/q5/q5_operands.h"
 
@@ -18,11 +19,13 @@ void launch_q5_a16_simt_slice(const Q5LinearOperands& operands, Output output, E
     if constexpr (Dependent) {
         CUDA_CHECK(pdl::launch_dependent(
             {grid, block, 0, stream},
-            q5_a16_simt_kernel<Schedule, Full, FullK, Output, Epilogue, TriggerPdl, JoinPdl>, x,
-            operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
+            rowsplit_a16_simt_kernel<Schedule, Q5RowSplitFormat, Full, FullK, Output, Epilogue,
+                                     TriggerPdl, JoinPdl>,
+            x, operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
             operands.k, tokens, operands.padded_k, token_begin));
     } else {
-        q5_a16_simt_kernel<Schedule, Full, FullK, Output, Epilogue, TriggerPdl, JoinPdl>
+        rowsplit_a16_simt_kernel<Schedule, Q5RowSplitFormat, Full, FullK, Output, Epilogue,
+                                 TriggerPdl, JoinPdl>
             <<<grid, block, 0, stream>>>(x, operands.codes, operands.high, operands.scales, output,
                                          epilogue, operands.rows, operands.k, tokens,
                                          operands.padded_k, token_begin);

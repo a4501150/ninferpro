@@ -4,11 +4,12 @@
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q5/q5_operands.h"
-#include "ops/linear/q5/q5_a16_sliced_k_mma.cuh"
+#include "ops/linear/q5/q5_schedule.cuh"
+#include "ops/linear/rowsplit/a16_sliced_k_mma.cuh"
 
 namespace infernix::ops::detail {
 template <class Schedule, class Output, class Epilogue,
-          class RowPolicy = Q5IdentityRows<Schedule::kBlockRows>>
+          class RowPolicy = RowSplitIdentityRows<Schedule::kBlockRows>>
 void launch_q5_a16_sliced_k_mma(const Q5LinearOperands& operands, Output output, Epilogue epilogue,
                                 cudaStream_t stream, RowPolicy row_policy = {}) {
     validate_q5_operands(operands);
@@ -30,7 +31,8 @@ void launch_q5_a16_sliced_k_mma(const Q5LinearOperands& operands, Output output,
                               0;
         const bool full_tokens = count % Schedule::kTokenCapacity == 0;
         const auto launch      = [&]<bool Full, bool FullTokens>() {
-            q5_a16_sliced_k_mma_kernel<Schedule, Full, FullTokens>
+            rowsplit_a16_sliced_k_mma_kernel<Schedule, Q5RowSplitFormat, Full, FullTokens,
+                                             Output, Epilogue, RowPolicy>
                 <<<grid, Schedule::kThreads, 0, stream>>>(
                     x, operands.codes, operands.high, operands.scales, output, epilogue,
                     operands.rows, operands.k, count, operands.padded_k, offset, row_policy);
