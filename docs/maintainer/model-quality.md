@@ -1604,7 +1604,8 @@ and recomputes the previous output) or admission (whole extents held without `pr
   12,813 tok/s against two terms' 13,818 / 14,036 / 13,773 (-7.0 to -7.4 %) and the exact route's
   8,932 / 9,620 / 9,466 (+35 to +43 %); the wide expert call at 1,024 / 4,096 / 16,384 columns
   1,715 / 2,390-2,510 / 7,050 us against 1,616 / 1,990 / 5,348 (a third MMA per weight tile; three
-  terms still fit two CTAs per SM). Records: `results/quality/gate-2026-11-02`.
+  terms still fit two CTAs per SM). Records: `results/quality/gate-2026-11-02` (README, scored
+  outputs and scripts; the per-run data was removed once 2026-11-03 superseded the gate).
 - **Two terms (2026-10-15/16, the record below):** op test mean relative L2 0.31-0.41 % per case,
   worst entry 2.0 % (bounds 2^-7 and 2^-5 then).
 - **Artifact:** orcarouter Qwen3.8-Flash-Next Uncensored NVFP4, converted with recipe C (FP8 dense,
