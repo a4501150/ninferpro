@@ -23,22 +23,21 @@ template <class Schedule>
 struct RowSplitSimtStaging<Schedule, true> {
     alignas(16) uint4 codes[Schedule::kWarps][Schedule::kStages][Schedule::kCodeVecsPerStage];
     alignas(16) uint4 high[Schedule::kWarps][Schedule::kStages][Schedule::kHighVecsPerStage];
-    alignas(16) std::uint32_t
-        scales[Schedule::kWarps][Schedule::kStages][Schedule::kScalePairsPerStage];
+    alignas(16)
+        std::uint32_t scales[Schedule::kWarps][Schedule::kStages][Schedule::kScalePairsPerStage];
 };
 
 template <class Schedule>
 struct RowSplitSimtStaging<Schedule, false> {
     alignas(16) uint4 codes[Schedule::kWarps][Schedule::kStages][Schedule::kCodeVecsPerStage];
-    alignas(16) std::uint32_t
-        scales[Schedule::kWarps][Schedule::kStages][Schedule::kScalePairsPerStage];
+    alignas(16)
+        std::uint32_t scales[Schedule::kWarps][Schedule::kStages][Schedule::kScalePairsPerStage];
 };
 
 // The staged high plane of one warp pipeline slot, or null for formats without
 // one; unused by those formats' decode.
 template <bool HasHigh, class Staging>
-__device__ __forceinline__ uint4* rowsplit_simt_high_plane(Staging& staging, int warp,
-                                                                int slot) {
+__device__ __forceinline__ uint4* rowsplit_simt_high_plane(Staging& staging, int warp, int slot) {
     if constexpr (HasHigh) {
         return staging.high[warp][slot];
     } else {
@@ -98,14 +97,14 @@ __device__ __forceinline__ void rowsplit_simt_issue_stage(
                 shared_high[pair] = uint4{0, 0, 0, 0};
         }
     } else if constexpr (Format::kHasHigh) {
-        const int active_high_vecs =
-            FullStage ? Schedule::kHighVecsPerStage
-                      : active_groups * Format::Storage::kHighBytesPerGroup /
-                            static_cast<int>(sizeof(uint4));
+        const int active_high_vecs = FullStage
+                                         ? Schedule::kHighVecsPerStage
+                                         : active_groups * Format::Storage::kHighBytesPerGroup /
+                                               static_cast<int>(sizeof(uint4));
         for (int vec = lane; vec < Schedule::kHighVecsPerStage; vec += 32) {
             if (FullStage || vec < active_high_vecs) {
-                rowsplit_simt_copy_code<Schedule>(
-                    &shared_high[vec], stage_high + static_cast<std::int64_t>(vec) * 16);
+                rowsplit_simt_copy_code<Schedule>(&shared_high[vec],
+                                                  stage_high + static_cast<std::int64_t>(vec) * 16);
             } else {
                 shared_high[vec] = uint4{0u, 0u, 0u, 0u};
             }
@@ -134,18 +133,21 @@ __device__ __forceinline__ void rowsplit_simt_consume_stage(
 
 #pragma unroll
     for (int phase = 0; phase < kCodePhases; ++phase) {
-        const int group        = phase * Format::kSimtGroupsPerPhase + (lane >> Format::kSimtLaneGroupShift);
+        const int group =
+            phase * Format::kSimtGroupsPerPhase + (lane >> Format::kSimtLaneGroupShift);
         const int stage_groups = FullStage ? Schedule::kGroupsPerWarpStage : active_groups;
         if (group < stage_groups) {
             const typename Format::SimtCodes packed =
-                reinterpret_cast<const typename Format::SimtCodes*>(shared_codes)[phase * 32 + lane];
-            const auto high_bits = Format::simt_preload_high(shared_high, phase, lane);
+                reinterpret_cast<const typename Format::SimtCodes*>(
+                    shared_codes)[phase * 32 + lane];
+            const auto high_bits           = Format::simt_preload_high(shared_high, phase, lane);
             const std::uint32_t scale_pair = shared_scales[group >> 1];
             const std::uint16_t scale_bits =
                 static_cast<std::uint16_t>(scale_pair >> ((group & 1) * 16));
 
             float weights[8];
-            Format::simt_decode_eight(shared_high, high_bits, packed, scale_bits, phase, lane, weights);
+            Format::simt_decode_eight(shared_high, high_bits, packed, scale_bits, phase, lane,
+                                      weights);
 
             const std::int64_t xk = static_cast<std::int64_t>(stage) * Schedule::kStageK +
                                     static_cast<std::int64_t>(phase) * 256 + lane * 8;
@@ -177,8 +179,7 @@ __device__ __forceinline__ void rowsplit_simt_consume_stage(
 template <class Schedule, class Format, bool Full, bool FullK, class Output, class Epilogue,
           bool TriggerPdl, bool JoinPdl>
 __device__ __forceinline__ void rowsplit_a16_simt_body(
-    int tid,
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    int tid, const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
     Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin) {
     static_assert(std::is_same_v<typename Schedule::RowSplitFormat, Format>);
@@ -215,34 +216,38 @@ __device__ __forceinline__ void rowsplit_a16_simt_body(
         group_begin     = (pairs * split / W) * 2;
         groups          = row < rows ? (pairs * (split + 1) / W) * 2 - group_begin : 0;
     }
-    const int stages          = FullK ? groups / G : (groups + G - 1) / G;
-    const int token0          = static_cast<int>(blockIdx.y) * T;
-    const int active_tokens   = Full ? T : min(T, tokens - token0);
-    const std::int64_t group0 = static_cast<std::int64_t>(safe_row) * (padded_k / Format::Storage::kGroupK) + group_begin;
-    const auto* code_row      = codes + group0 * 32;
-    const auto* high_row      = [&] {
+    const int stages        = FullK ? groups / G : (groups + G - 1) / G;
+    const int token0        = static_cast<int>(blockIdx.y) * T;
+    const int active_tokens = Full ? T : min(T, tokens - token0);
+    const std::int64_t group0 =
+        static_cast<std::int64_t>(safe_row) * (padded_k / Format::Storage::kGroupK) + group_begin;
+    const auto* code_row = codes + group0 * 32;
+    const auto* high_row = [&] {
         if constexpr (Format::kHasHigh)
             return high + group0 * Format::Storage::kHighBytesPerGroup;
         else
             return static_cast<const std::uint8_t*>(nullptr);
     }();
-    const auto* scale_row     = scales + group0 * 2;
-    const auto* warp_x        = x + group_begin * Format::Storage::kGroupK;
-    auto& stage_codes         = shared.staging.codes;
-    auto& stage_scales        = shared.staging.scales;
-    float acc[T]              = {};
+    const auto* scale_row = scales + group0 * 2;
+    const auto* warp_x    = x + group_begin * Format::Storage::kGroupK;
+    auto& stage_codes     = shared.staging.codes;
+    auto& stage_scales    = shared.staging.scales;
+    float acc[T]          = {};
 #pragma unroll
     for (int prefetch = 0; prefetch < S - 1; ++prefetch) {
         if (prefetch < stages) {
             if constexpr (Format::kSimtScalesBeforeHigh) {
-                uint4* const slot_codes             = stage_codes[warp][prefetch];
-                std::uint32_t* const slot_scales    = stage_scales[warp][prefetch];
+                uint4* const slot_codes          = stage_codes[warp][prefetch];
+                std::uint32_t* const slot_scales = stage_scales[warp][prefetch];
                 rowsplit_simt_issue_stage<Schedule, Format, FullK>(
-                    slot_codes, rowsplit_simt_high_plane<Format::kHasHigh>(shared.staging, warp, prefetch),
-                    slot_scales, code_row, high_row, scale_row, prefetch, min(G, groups - prefetch * G), lane);
+                    slot_codes,
+                    rowsplit_simt_high_plane<Format::kHasHigh>(shared.staging, warp, prefetch),
+                    slot_scales, code_row, high_row, scale_row, prefetch,
+                    min(G, groups - prefetch * G), lane);
             } else {
                 rowsplit_simt_issue_stage<Schedule, Format, FullK>(
-                    stage_codes[warp][prefetch], rowsplit_simt_high_plane<Format::kHasHigh>(shared.staging, warp, prefetch),
+                    stage_codes[warp][prefetch],
+                    rowsplit_simt_high_plane<Format::kHasHigh>(shared.staging, warp, prefetch),
                     stage_scales[warp][prefetch], code_row, high_row, scale_row, prefetch,
                     min(G, groups - prefetch * G), lane);
             }
@@ -255,11 +260,13 @@ __device__ __forceinline__ void rowsplit_a16_simt_body(
         const int fetch = stage + S - 1;
         if (fetch < stages) {
             if constexpr (Format::kSimtScalesBeforeHigh) {
-                uint4* const slot_codes             = stage_codes[warp][fetch % S];
-                std::uint32_t* const slot_scales    = stage_scales[warp][fetch % S];
+                uint4* const slot_codes          = stage_codes[warp][fetch % S];
+                std::uint32_t* const slot_scales = stage_scales[warp][fetch % S];
                 rowsplit_simt_issue_stage<Schedule, Format, FullK>(
-                    slot_codes, rowsplit_simt_high_plane<Format::kHasHigh>(shared.staging, warp, fetch % S),
-                    slot_scales, code_row, high_row, scale_row, fetch, min(G, groups - fetch * G), lane);
+                    slot_codes,
+                    rowsplit_simt_high_plane<Format::kHasHigh>(shared.staging, warp, fetch % S),
+                    slot_scales, code_row, high_row, scale_row, fetch, min(G, groups - fetch * G),
+                    lane);
             } else {
                 rowsplit_simt_issue_stage<Schedule, Format, FullK>(
                     stage_codes[warp][fetch % S],
@@ -299,13 +306,13 @@ __device__ __forceinline__ void rowsplit_a16_simt_body(
                 if ((kGroupK >= 64 || lane < kGroupK / 2) && kk < k) {
                     float w0, w1;
                     Format::simt_remainder_pair(codes, high, scales,
-                                                std::int64_t(row) * (padded_k / kGroupK) + group, lane,
-                                                w0, w1);
+                                                std::int64_t(row) * (padded_k / kGroupK) + group,
+                                                lane, w0, w1);
 #pragma unroll
                     for (int token = 0; token < T; ++token) {
                         if (Full || token < active_tokens) {
                             const auto index = std::int64_t(token0 + token) * k + kk;
-                            acc[token] = fmaf(w0, __bfloat162float(x[index]), acc[token]);
+                            acc[token]       = fmaf(w0, __bfloat162float(x[index]), acc[token]);
                             if (kk + 1 < k)
                                 acc[token] = fmaf(w1, __bfloat162float(x[index + 1]), acc[token]);
                         }
@@ -337,8 +344,7 @@ __device__ __forceinline__ void rowsplit_a16_simt_body(
                     for (int part = 1; part < W; ++part)
                         sums[token] += shared.partial[local_row][part][token];
                 }
-                linear_finish_row(output, epilogue, row, token_begin + token0, sums,
-                                  active_tokens);
+                linear_finish_row(output, epilogue, row, token_begin + token0, sums, active_tokens);
             }
         } else if (lane == 0) {
             linear_finish_row(output, epilogue, row, token_begin + token0, sums, active_tokens);
@@ -381,27 +387,34 @@ __device__ __forceinline__ void rowsplit_a16_simt_body(
 // parameter list, so the compiled parameter layout is unchanged.
 template <class Schedule, class Format, bool Full, bool FullK, class Output, class Epilogue,
           bool TriggerPdl = false, bool JoinPdl = false>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
-rowsplit_a16_simt_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-                         const std::uint8_t* __restrict__ high,
-                         const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue,
-                         int rows, int k, int tokens, int padded_k, int token_begin) {
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void rowsplit_a16_simt_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
+    Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin) {
     static_assert(Format::kHasHigh);
     rowsplit_a16_simt_body<Schedule, Format, Full, FullK, Output, Epilogue, TriggerPdl, JoinPdl>(
-        static_cast<int>(threadIdx.x), x, codes, high, scales, output, epilogue, rows, k, tokens, padded_k, token_begin);
+        static_cast<int>(threadIdx.x), x, codes, high, scales, output, epilogue, rows, k, tokens,
+        padded_k, token_begin);
 }
 
 template <class Schedule, class Format, bool Full, bool FullK, class Output, class Epilogue,
           bool TriggerPdl = false, bool JoinPdl = false>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
-rowsplit_a16_simt_kernel_no_high(const __nv_bfloat16* __restrict__ x,
-                                 const std::uint8_t* __restrict__ codes,
-                                 const std::uint8_t* __restrict__ scales, Output output,
-                                 Epilogue epilogue, int rows, int k, int tokens, int padded_k,
-                                 int token_begin) {
+__global__ __launch_bounds__(
+    Schedule::kThreads,
+    Schedule::
+        kMinBlocksPerSm) void rowsplit_a16_simt_kernel_no_high(const __nv_bfloat16* __restrict__ x,
+                                                               const std::
+                                                                   uint8_t* __restrict__ codes,
+                                                               const std::
+                                                                   uint8_t* __restrict__ scales,
+                                                               Output output, Epilogue epilogue,
+                                                               int rows, int k, int tokens,
+                                                               int padded_k, int token_begin) {
     static_assert(!Format::kHasHigh);
     rowsplit_a16_simt_body<Schedule, Format, Full, FullK, Output, Epilogue, TriggerPdl, JoinPdl>(
-        static_cast<int>(threadIdx.x), x, codes, nullptr, scales, output, epilogue, rows, k, tokens, padded_k, token_begin);
+        static_cast<int>(threadIdx.x), x, codes, nullptr, scales, output, epilogue, rows, k, tokens,
+        padded_k, token_begin);
 }
 
 } // namespace infernix::ops::detail

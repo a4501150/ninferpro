@@ -51,8 +51,7 @@ struct RowSplitSlicedStaging<false, S, R, W, T, 0> {
 template <class Schedule, class Format, bool Full, bool FullTokens, class Output, class Epilogue,
           class RowPolicy>
 __device__ __forceinline__ void rowsplit_a16_sliced_k_body(
-    int tid,
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    int tid, const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
     Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin,
     RowPolicy row_policy) {
@@ -68,8 +67,7 @@ __device__ __forceinline__ void rowsplit_a16_sliced_k_body(
     constexpr int NT = Schedule::kMmaTokens;
 
     union SharedStorage {
-        RowSplitSlicedStaging<Format::kHasHigh, S, R, W, T, Format::kHighBytesPerGroup>
-            staging;
+        RowSplitSlicedStaging<Format::kHasHigh, S, R, W, T, Format::kHighBytesPerGroup> staging;
         float partial[W][MT][NT][32][4];
     };
 
@@ -129,12 +127,11 @@ __device__ __forceinline__ void rowsplit_a16_sliced_k_body(
             }
         }
         for (int item = lane; item < Schedule::kTokenCapacity * 8; item += 32) {
-            const int token = item / 8;
-            const int k8    = (item % 8) * 8;
-            const bool valid =
-                (FullTokens || token0 + token < tokens) &&
-                Format::template sliced_x_group_valid<Full>(first_group, warp, groups, logical_k,
-                                                            k8);
+            const int token  = item / 8;
+            const int k8     = (item % 8) * 8;
+            const bool valid = (FullTokens || token0 + token < tokens) &&
+                               Format::template sliced_x_group_valid<Full>(first_group, warp,
+                                                                           groups, logical_k, k8);
             const std::int64_t index =
                 valid ? std::int64_t(token0 + token) * logical_k + (first_group + warp) * 64 + k8
                       : 0;
@@ -180,8 +177,8 @@ __device__ __forceinline__ void rowsplit_a16_sliced_k_body(
                     unsigned b0, b1;
                     ldmatrix_x2(
                         b0, b1,
-                        smem_addr(&shared.staging.x[slot][warp][br]
-                                                [rowsplit_sliced_k_swizzle(br, bk)]));
+                        smem_addr(
+                            &shared.staging.x[slot][warp][br][rowsplit_sliced_k_swizzle(br, bk)]));
                     mma_bf16(group_acc[mi][ni][0], group_acc[mi][ni][1], group_acc[mi][ni][2],
                              group_acc[mi][ni][3], a0, a1, a2, a3, b0, b1);
                 }
@@ -189,17 +186,15 @@ __device__ __forceinline__ void rowsplit_a16_sliced_k_body(
         }
 #pragma unroll
         for (int mi = 0; mi < MT; ++mi) {
-            const bool valid_group = Format::kSlicedScaleGuard
-                                         ? (Full || tile * W + warp < groups)
-                                         : true;
-            const float top        = !valid_group
-                                         ? 0.0f
-                                         : __half2float(__ushort_as_half(
-                                               shared.staging.scales[slot][mi * 16 + gid][warp]));
-            const float bottom     = !valid_group
-                                         ? 0.0f
-                                         : __half2float(__ushort_as_half(
-                                               shared.staging.scales[slot][mi * 16 + gid + 8][warp]));
+            const bool valid_group =
+                Format::kSlicedScaleGuard ? (Full || tile * W + warp < groups) : true;
+            const float top = !valid_group ? 0.0f
+                                           : __half2float(__ushort_as_half(
+                                                 shared.staging.scales[slot][mi * 16 + gid][warp]));
+            const float bottom = !valid_group
+                                     ? 0.0f
+                                     : __half2float(__ushort_as_half(
+                                           shared.staging.scales[slot][mi * 16 + gid + 8][warp]));
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 acc[mi][ni][0] = fmaf(group_acc[mi][ni][0], top, acc[mi][ni][0]);
@@ -285,8 +280,7 @@ __device__ __forceinline__ void rowsplit_a16_sliced_k_body(
                 const int r0        = row_begin + mi * 16 + gid;
                 const int t0        = token0 + ni * 8 + 2 * lid;
                 const int token_end = token_begin + min(tokens, token0 + Schedule::kTokenCapacity);
-                if constexpr (Format::kSlicedStoreFragment &&
-                              requires {
+                if constexpr (Format::kSlicedStoreFragment && requires {
                                   epilogue.store_fragment(output, r0, token_begin + t0, sum, rows,
                                                           token_end);
                               }) {
@@ -325,44 +319,50 @@ __device__ __forceinline__ void rowsplit_a16_sliced_k_body(
 // so the compiled parameter layout of every instantiation is unchanged.
 template <class Schedule, class Format, bool Full, bool FullTokens, class Output, class Epilogue,
           class RowPolicy>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void rowsplit_a16_sliced_k_mma_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
-    Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin,
-    RowPolicy row_policy) {
+__global__ __launch_bounds__(
+    Schedule::kThreads,
+    Schedule::
+        kMinBlocksPerSm) void rowsplit_a16_sliced_k_mma_kernel(const __nv_bfloat16* __restrict__ x,
+                                                               const std::
+                                                                   uint8_t* __restrict__ codes,
+                                                               const std::
+                                                                   uint8_t* __restrict__ high,
+                                                               const std::
+                                                                   uint8_t* __restrict__ scales,
+                                                               Output output, Epilogue epilogue,
+                                                               int rows, int k, int tokens,
+                                                               int padded_k, int token_begin,
+                                                               RowPolicy row_policy) {
     static_assert(Format::kHasHigh && Format::kSlicedRowPolicyParam);
     rowsplit_a16_sliced_k_body<Schedule, Format, Full, FullTokens, Output, Epilogue, RowPolicy>(
-        static_cast<int>(threadIdx.x), x, codes, high, scales, output, epilogue, rows, k, tokens, padded_k, token_begin,
-        row_policy);
+        static_cast<int>(threadIdx.x), x, codes, high, scales, output, epilogue, rows, k, tokens,
+        padded_k, token_begin, row_policy);
 }
 
 template <class Schedule, class Format, bool Full, bool FullTokens, class Output, class Epilogue,
           class RowPolicy>
 __global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
-rowsplit_a16_sliced_k_mma_kernel_no_high(
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void rowsplit_a16_sliced_k_mma_kernel_no_high(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue, int rows, int k,
     int tokens, int padded_k, int token_begin, RowPolicy row_policy) {
     static_assert(!Format::kHasHigh && Format::kSlicedRowPolicyParam);
     rowsplit_a16_sliced_k_body<Schedule, Format, Full, FullTokens, Output, Epilogue, RowPolicy>(
-        static_cast<int>(threadIdx.x), x, codes, nullptr, scales, output, epilogue, rows, k, tokens, padded_k, token_begin,
-        row_policy);
+        static_cast<int>(threadIdx.x), x, codes, nullptr, scales, output, epilogue, rows, k, tokens,
+        padded_k, token_begin, row_policy);
 }
 
 template <class Schedule, class Format, bool Full, bool FullTokens, class Output, class Epilogue,
           class RowPolicy>
 __global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
-rowsplit_a16_sliced_k_mma_kernel_no_row_policy(
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void rowsplit_a16_sliced_k_mma_kernel_no_row_policy(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
     Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin) {
     static_assert(Format::kHasHigh && !Format::kSlicedRowPolicyParam);
     rowsplit_a16_sliced_k_body<Schedule, Format, Full, FullTokens, Output, Epilogue, RowPolicy>(
-        static_cast<int>(threadIdx.x), x, codes, high, scales, output, epilogue, rows, k, tokens, padded_k, token_begin,
-        RowPolicy{});
+        static_cast<int>(threadIdx.x), x, codes, high, scales, output, epilogue, rows, k, tokens,
+        padded_k, token_begin, RowPolicy{});
 }
 
 } // namespace infernix::ops::detail

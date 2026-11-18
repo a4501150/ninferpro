@@ -6,7 +6,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_output.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/fp8/fp8_a16_simt.cuh"
-#include "ops/linear/fp8/fp8_a16_sliced_k_mma.cuh"
+#include "ops/linear/fp_a16/a16_sliced_k_mma.cuh"
 #include "ops/linear/fp8/fp8_a16_mma.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 

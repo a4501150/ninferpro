@@ -80,10 +80,10 @@ void rowsplit_a16_mma_body(
     __shared__ __align__(16) __nv_bfloat16 Bs[BS][BN * BK];
     __shared__ __align__(16) std::uint8_t Cr[S][BM * GPB * Format::Storage::kCodeBytesPerGroup];
     // Unreferenced, and so not allocated, for formats without a high plane.
-    __shared__ __align__(16) std::uint8_t
-        Hr[S][BM * GPB * (Format::kHasHigh ? Format::kHighBytesPerGroup : 1)];
+    __shared__ __align__(16)
+        std::uint8_t Hr[S][BM * GPB * (Format::kHasHigh ? Format::kHighBytesPerGroup : 1)];
     __shared__ __align__(16) std::uint8_t Sr[S][BM * GPB * SB];
-    using Shared = RowSplitMmaShared<Schedule, Format>;
+    using Shared        = RowSplitMmaShared<Schedule, Format>;
     const Shared shared = [&]() -> Shared {
         if constexpr (Format::kHasHigh) {
             return {As, Bs, Cr, Hr, Sr};
@@ -132,7 +132,8 @@ void rowsplit_a16_mma_body(
             const int k8        = item - local_col * (BK / 8);
             const int kk        = k0 + k8 * 8;
             const int col       = col0 + local_col;
-            auto* dst = &shared.Bs[stage][local_col * BK + rowsplit_mma_swizzle_k64(local_col, k8 * 8)];
+            auto* dst =
+                &shared.Bs[stage][local_col * BK + rowsplit_mma_swizzle_k64(local_col, k8 * 8)];
             if constexpr (kFull) {
                 cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
@@ -156,7 +157,8 @@ void rowsplit_a16_mma_body(
             const int local_row = row_group / GPB;
             const int group     = row_group - local_row * GPB;
             const int row       = row0 + local_row;
-            auto* dst = &shared.Cr[stage][row_group * Format::Storage::kCodeBytesPerGroup + half * 16];
+            auto* dst =
+                &shared.Cr[stage][row_group * Format::Storage::kCodeBytesPerGroup + half * 16];
             if constexpr (kFull) {
                 const std::int64_t group_index =
                     static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
@@ -164,12 +166,11 @@ void rowsplit_a16_mma_body(
                     dst, &codes[group_index * Format::Storage::kCodeBytesPerGroup + half * 16]);
             } else {
                 if (Format::kBoundGroups ? (row < rows && group0 + group < (k + 63) / 64)
-                                          : row < rows) {
+                                         : row < rows) {
                     const std::int64_t group_index =
                         static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
                     cp_async<16, Schedule::kWeightCache>(
-                        dst,
-                        &codes[group_index * Format::Storage::kCodeBytesPerGroup + half * 16]);
+                        dst, &codes[group_index * Format::Storage::kCodeBytesPerGroup + half * 16]);
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
@@ -196,8 +197,8 @@ void rowsplit_a16_mma_body(
                     const std::int64_t aligned_index =
                         static_cast<std::int64_t>(row) * groups_per_row + aligned_group;
                     if (aligned_group + 1 < groups_per_row) {
-                        cp_async<4>(
-                            dst, &scales[aligned_index * Format::Storage::kScaleBytesPerGroup]);
+                        cp_async<4>(dst,
+                                    &scales[aligned_index * Format::Storage::kScaleBytesPerGroup]);
                     } else {
                         *reinterpret_cast<std::uint16_t*>(dst) =
                             *reinterpret_cast<const std::uint16_t*>(
@@ -220,8 +221,7 @@ void rowsplit_a16_mma_body(
                             static_cast<std::int64_t>(row) * groups_per_row + aligned_group;
                         if (aligned_group + 1 < groups_per_row) {
                             cp_async<4>(
-                                dst,
-                                &scales[aligned_index * Format::Storage::kScaleBytesPerGroup]);
+                                dst, &scales[aligned_index * Format::Storage::kScaleBytesPerGroup]);
                         } else {
                             *reinterpret_cast<std::uint16_t*>(dst) =
                                 *reinterpret_cast<const std::uint16_t*>(
@@ -259,15 +259,14 @@ void rowsplit_a16_mma_body(
                 const int staged_group = local_row * GPB + group;
                 const std::uint8_t* scale_ptr =
                     &shared.Sr[stage][staged_group * SB +
-                                       (Schedule::kScaleLoadMode == RowSplitScaleLoad::Pair32
-                                            ? ((scale_group + group) & 1) *
-                                                  Format::Storage::kScaleBytesPerGroup
-                                            : 0)];
+                                      (Schedule::kScaleLoadMode == RowSplitScaleLoad::Pair32
+                                           ? ((scale_group + group) & 1) *
+                                                 Format::Storage::kScaleBytesPerGroup
+                                           : 0)];
                 const __nv_bfloat162 weights =
                     Format::mma_decode_pair(shared, stage, scale_ptr, staged_group, lane);
-                const int shared_col =
-                    rowsplit_mma_swizzle_k64(local_row,
-                                             group * Format::Storage::kGroupK + 2 * lane);
+                const int shared_col = rowsplit_mma_swizzle_k64(
+                    local_row, group * Format::Storage::kGroupK + 2 * lane);
                 store_vec(&dst[shared_col], weights);
             }
         }
@@ -307,7 +306,8 @@ void rowsplit_a16_mma_body(
             cp_commit();
         }
 
-        auto load_fragments = [&](int k_step, unsigned(&a_frag)[MT][4], unsigned(&b_frag)[NT][2]) {
+        auto load_fragments = [&](int k_step, unsigned (&a_frag)[MT][4],
+                                  unsigned (&b_frag)[NT][2]) {
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
                 const int row = warp_row * WM + mi * 16 + a_row_offset;
@@ -319,10 +319,9 @@ void rowsplit_a16_mma_body(
             for (int ni = 0; ni < NT; ++ni) {
                 const int row = warp_col * WN + ni * 8 + b_inner_row;
                 const int col = k_step + b_k_offset;
-                ldmatrix_x2(
-                    b_frag[ni][0], b_frag[ni][1],
-                    smem_addr(&shared.Bs[BS == 1 ? 0 : stage]
-                                       [row * BK + rowsplit_mma_swizzle_k64(row, col)]));
+                ldmatrix_x2(b_frag[ni][0], b_frag[ni][1],
+                            smem_addr(&shared.Bs[BS == 1 ? 0 : stage]
+                                                [row * BK + rowsplit_mma_swizzle_k64(row, col)]));
             }
         };
 
@@ -376,11 +375,10 @@ void rowsplit_a16_mma_body(
         }
     }
 
-    if constexpr (Format::kFinishTile &&
-                  requires {
-                      epilogue.template finish_tile<Schedule, Full>(
-                          output, shared.Bs[0], accum, row0, token_begin + col0, rows,
-                          token_begin + cols);
+    if constexpr (Format::kFinishTile && requires {
+                      epilogue.template finish_tile<Schedule, Full>(output, shared.Bs[0], accum,
+                                                                    row0, token_begin + col0, rows,
+                                                                    token_begin + cols);
                   }) {
         epilogue.template finish_tile<Schedule, Full>(output, shared.Bs[0], accum, row0,
                                                       token_begin + col0, rows, token_begin + cols);
@@ -425,7 +423,8 @@ void rowsplit_a16_mma_kernel(
     // clang-format on
     static_assert(Format::kHasHigh);
     rowsplit_a16_mma_body<Schedule, Format, Full, Output, Epilogue>(
-        static_cast<int>(threadIdx.x), x, codes, high, scales, output, epilogue, rows, k, cols, padded_k, token_begin);
+        static_cast<int>(threadIdx.x), x, codes, high, scales, output, epilogue, rows, k, cols,
+        padded_k, token_begin);
 }
 
 // clang-format off
@@ -443,7 +442,8 @@ void rowsplit_a16_mma_kernel_no_high(
     // clang-format on
     static_assert(!Format::kHasHigh);
     rowsplit_a16_mma_body<Schedule, Format, Full, Output, Epilogue>(
-        static_cast<int>(threadIdx.x), x, codes, nullptr, scales, output, epilogue, rows, k, cols, padded_k, token_begin);
+        static_cast<int>(threadIdx.x), x, codes, nullptr, scales, output, epilogue, rows, k, cols,
+        padded_k, token_begin);
 }
 
 } // namespace infernix::ops::detail

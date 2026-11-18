@@ -18,16 +18,15 @@ void launch_q8_a16_simt_slice(const Q8LinearOperands& operands, Output output, E
     if constexpr (Dependent) {
         CUDA_CHECK(pdl::launch_dependent(
             {grid, block, 0, stream},
-            rowsplit_a16_simt_kernel_no_high<Schedule, Q8RowSplitFormat, Full, FullK, Output, Epilogue,
-                                             TriggerPdl, JoinPdl>, x,
-            operands.codes, operands.scales, output, epilogue, operands.rows, operands.k, tokens,
+            rowsplit_a16_simt_kernel_no_high<Schedule, Q8RowSplitFormat, Full, FullK, Output,
+                                             Epilogue, TriggerPdl, JoinPdl>,
+            x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k, tokens,
             operands.padded_k, token_begin));
     } else {
         rowsplit_a16_simt_kernel_no_high<Schedule, Q8RowSplitFormat, Full, FullK, Output, Epilogue,
-                                             TriggerPdl, JoinPdl>
-            <<<grid, block, 0, stream>>>(x, operands.codes, operands.scales, output, epilogue,
-                                         operands.rows, operands.k, tokens, operands.padded_k,
-                                         token_begin);
+                                         TriggerPdl, JoinPdl><<<grid, block, 0, stream>>>(
+            x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k, tokens,
+            operands.padded_k, token_begin);
         CUDA_CHECK(cudaGetLastError());
     }
 }

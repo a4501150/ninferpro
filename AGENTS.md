@@ -161,8 +161,11 @@ A planned product change: load Hugging Face safetensors (BF16, FP8, ModelOpt NVF
 GGUF (Q4_K, Q8_0 and similar block formats) directly, next to `.infernix`. Until it lands, design
 for it: kernels take the weight format as a compile-time trait (tile load, scale handling, MMA
 variant) around shared grouping and scheduling, so a new stored format adds a trait, not a new
-kernel. A future loader maps each source format either to an existing trait or, once at load time,
-to a native layout; it never repacks per request.
+kernel. The RowSplit families (`src/ops/linear/rowsplit/`: Q4/Q5/Q6 SIMT, MMA and sliced-K, and Q8
+SIMT) and the FP8/NVFP4 A16 MMA and sliced-K kernels (`src/ops/linear/fp_a16/`) are built this way;
+their traits keep each format's compiled code unchanged, so check a trait change against the PTX or
+SASS of the instances it touches. A future loader maps each source format either to an existing
+trait or, once at load time, to a native layout; it never repacks per request.
 
 Detailed model/runtime responsibilities and source ownership are defined in
 [Engine architecture](docs/maintainer/engine-architecture.md). Read the relevant boundary before

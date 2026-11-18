@@ -78,9 +78,7 @@ struct Q4RowSplitFormat {
     static constexpr int kSimtGroupsPerPhase = 4;
     static constexpr int kSimtLaneGroupShift = 3;
 
-    static __device__ __forceinline__ int simt_vector_groups(int k) {
-        return k / Storage::kGroupK;
-    }
+    static __device__ __forceinline__ int simt_vector_groups(int k) { return k / Storage::kGroupK; }
 
     static __device__ __forceinline__ RowSplitNoHighBits simt_preload_high(const uint4*, int, int) {
         return {};
@@ -94,7 +92,7 @@ struct Q4RowSplitFormat {
 
     // The fully reduced row routes through linear_finish_row, so apply_row
     // epilogues are available to this format's SIMT consumers.
-    static constexpr bool kSimtApplyRow = true;
+    static constexpr bool kSimtApplyRow         = true;
     static constexpr bool kSimtScalesBeforeHigh = false;
     static constexpr bool kSimtHighByPairs      = false;
 
@@ -108,15 +106,18 @@ struct Q4RowSplitFormat {
     static constexpr bool kBoundGroups = false;
 
     template <class Staging>
-    static __device__ __forceinline__ __nv_bfloat162
-    mma_decode_pair(const Staging& staging, int stage, const std::uint8_t* scale_ptr,
-                    std::int64_t staged_group, int lane) {
+    static __device__ __forceinline__ __nv_bfloat162 mma_decode_pair(const Staging& staging,
+                                                                     int stage,
+                                                                     const std::uint8_t* scale_ptr,
+                                                                     std::int64_t staged_group,
+                                                                     int lane) {
         return Q4MmaDecodeAtom::decode_pair(staging.Cr[stage], scale_ptr, staged_group, lane);
     }
 
     // The single-buffered quant prefetch runs only while the quant ring is
     // deeper than the activation ring.
-    static __host__ __device__ constexpr bool mma_quant_prefetch(int activation_stages, int stages) {
+    static __host__ __device__ constexpr bool mma_quant_prefetch(int activation_stages,
+                                                                 int stages) {
         return activation_stages == 1 && activation_stages != stages;
     }
 
@@ -130,9 +131,8 @@ struct Q4RowSplitFormat {
     }
 
     template <bool Full>
-    static __device__ __forceinline__ bool sliced_x_group_valid(int first_group, int warp,
-                                                                int groups, int /*logical_k*/,
-                                                                int /*k8*/) {
+    static __device__ __forceinline__ bool
+    sliced_x_group_valid(int first_group, int warp, int groups, int /*logical_k*/, int /*k8*/) {
         return Full || first_group + warp < groups;
     }
 
@@ -147,7 +147,7 @@ struct Q4RowSplitFormat {
 
     // Streams its weights through the K loop: the kernel waits for the
     // producer first and lets dependents launch only once that loop is done.
-    static constexpr bool kSlicedPdl = true;
+    static constexpr bool kSlicedPdl            = true;
     static constexpr bool kSlicedRowPolicyParam = true;
 
     static constexpr bool kSlicedScaleGuard  = false;
@@ -201,10 +201,11 @@ struct Q5RowSplitFormat {
     // Warp zero decodes the K tail that no complete scale pair covers.
     static constexpr bool kScalarRemainder = true;
 
-    static __device__ __forceinline__ void
-    simt_remainder_pair(const std::uint8_t* codes, const std::uint8_t* high,
-                        const std::uint8_t* scales, std::int64_t group_index, int lane, float& w0,
-                        float& w1) {
+    static __device__ __forceinline__ void simt_remainder_pair(const std::uint8_t* codes,
+                                                               const std::uint8_t* high,
+                                                               const std::uint8_t* scales,
+                                                               std::int64_t group_index, int lane,
+                                                               float& w0, float& w1) {
         Q5ScalarDecodeAtom::load_pair(codes, high, scales, group_index, lane, w0, w1);
     }
 
@@ -216,10 +217,9 @@ struct Q5RowSplitFormat {
     // Q5 stages its high plane in group pairs, so one 16-byte zfill covers two
     // groups and an odd groups-per-tile count halves the transfer.
     template <class Schedule, bool Full, class Staging>
-    static __device__ __forceinline__ void mma_stage_high(Staging& staging, int stage,
-                                                          const std::uint8_t* high, int row0,
-                                                          int rows, int k, int groups_per_row,
-                                                          int group0, int tid) {
+    static __device__ __forceinline__ void
+    mma_stage_high(Staging& staging, int stage, const std::uint8_t* high, int row0, int rows, int k,
+                   int groups_per_row, int group0, int tid) {
         constexpr int BM  = Schedule::kBlockRows;
         constexpr int GPB = Schedule::kGroupsPerK;
 
@@ -238,14 +238,17 @@ struct Q5RowSplitFormat {
     }
 
     template <class Staging>
-    static __device__ __forceinline__ __nv_bfloat162
-    mma_decode_pair(const Staging& staging, int stage, const std::uint8_t* scale_ptr,
-                    std::int64_t staged_group, int lane) {
+    static __device__ __forceinline__ __nv_bfloat162 mma_decode_pair(const Staging& staging,
+                                                                     int stage,
+                                                                     const std::uint8_t* scale_ptr,
+                                                                     std::int64_t staged_group,
+                                                                     int lane) {
         return Q5MmaDecodeAtom::decode_pair(staging.Cr[stage], staging.Hr[stage], scale_ptr,
                                             staged_group, lane);
     }
 
-    static __host__ __device__ constexpr bool mma_quant_prefetch(int activation_stages, int stages) {
+    static __host__ __device__ constexpr bool mma_quant_prefetch(int activation_stages,
+                                                                 int stages) {
         return activation_stages == 1 && activation_stages != stages;
     }
 
@@ -260,9 +263,8 @@ struct Q5RowSplitFormat {
     }
 
     template <bool Full>
-    static __device__ __forceinline__ bool sliced_x_group_valid(int first_group, int warp,
-                                                                int /*groups*/, int logical_k,
-                                                                int k8) {
+    static __device__ __forceinline__ bool
+    sliced_x_group_valid(int first_group, int warp, int /*groups*/, int logical_k, int k8) {
         return Full || (first_group + warp) * 64 + k8 + 8 <= logical_k;
     }
 
@@ -270,8 +272,8 @@ struct Q5RowSplitFormat {
     template <class Schedule, bool Full, class Staging, class RowPolicy>
     static __device__ __forceinline__ void
     sliced_stage_high(Staging& shared, int slot, const std::uint8_t* high, int row_begin, int rows,
-                       int groups, int row_groups, int first_group, int tid,
-                       const RowPolicy& row_policy) {
+                      int groups, int row_groups, int first_group, int tid,
+                      const RowPolicy& row_policy) {
         constexpr int R = Schedule::kBlockRows;
         constexpr int W = Schedule::kKWarps;
 
@@ -299,11 +301,11 @@ struct Q5RowSplitFormat {
     // The store also bounds each token by the CTA's token capacity.
     static constexpr bool kSlicedCapacityGuard = true;
 
-    static constexpr bool kSlicedPdl          = false;
+    static constexpr bool kSlicedPdl            = false;
     static constexpr bool kSlicedRowPolicyParam = true;
-    static constexpr bool kSlicedScaleGuard   = true;
-    static constexpr bool kSlicedSyncRestage  = false;
-    static constexpr bool kSlicedStoreFragment = true;
+    static constexpr bool kSlicedScaleGuard     = true;
+    static constexpr bool kSlicedSyncRestage    = false;
+    static constexpr bool kSlicedStoreFragment  = true;
 };
 
 // A packed nibble plus a two-bit high plane and one fp16 scale per 64-element
@@ -321,9 +323,7 @@ struct Q6RowSplitFormat {
     static constexpr int kSimtGroupsPerPhase = 4;
     static constexpr int kSimtLaneGroupShift = 3;
 
-    static __device__ __forceinline__ int simt_vector_groups(int k) {
-        return k / Storage::kGroupK;
-    }
+    static __device__ __forceinline__ int simt_vector_groups(int k) { return k / Storage::kGroupK; }
 
     // The high-plane bits are read before the scale.
     static __device__ __forceinline__ std::uint16_t simt_preload_high(const uint4* staged_high,
@@ -333,13 +333,12 @@ struct Q6RowSplitFormat {
 
     static __device__ __forceinline__ void
     simt_decode_eight(const uint4* /*staged_high*/, std::uint16_t high_bits, std::uint32_t packed,
-                      std::uint16_t scale_bits, int /*phase*/, int /*lane*/,
-                      float (&weights)[8]) {
+                      std::uint16_t scale_bits, int /*phase*/, int /*lane*/, float (&weights)[8]) {
         Q6SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
     }
 
     // The reduced row finishes per token; no apply_row epilogue routing.
-    static constexpr bool kSimtApplyRow = false;
+    static constexpr bool kSimtApplyRow         = false;
     static constexpr bool kSimtScalesBeforeHigh = false;
     static constexpr bool kSimtHighByPairs      = false;
 
@@ -350,10 +349,9 @@ struct Q6RowSplitFormat {
     static constexpr bool kBoundGroups = false;
 
     template <class Schedule, bool Full, class Staging>
-    static __device__ __forceinline__ void mma_stage_high(Staging& staging, int stage,
-                                                          const std::uint8_t* high, int row0,
-                                                          int rows, int /*k*/, int groups_per_row,
-                                                          int group0, int tid) {
+    static __device__ __forceinline__ void
+    mma_stage_high(Staging& staging, int stage, const std::uint8_t* high, int row0, int rows,
+                   int /*k*/, int groups_per_row, int group0, int tid) {
         constexpr int BM  = Schedule::kBlockRows;
         constexpr int GPB = Schedule::kGroupsPerK;
 
@@ -381,15 +379,18 @@ struct Q6RowSplitFormat {
     }
 
     template <class Staging>
-    static __device__ __forceinline__ __nv_bfloat162
-    mma_decode_pair(const Staging& staging, int stage, const std::uint8_t* scale_ptr,
-                    std::int64_t staged_group, int lane) {
+    static __device__ __forceinline__ __nv_bfloat162 mma_decode_pair(const Staging& staging,
+                                                                     int stage,
+                                                                     const std::uint8_t* scale_ptr,
+                                                                     std::int64_t staged_group,
+                                                                     int lane) {
         return Q6MmaDecodeAtom::decode_pair(staging.Cr[stage], staging.Hr[stage], scale_ptr,
                                             staged_group, lane);
     }
 
     // The quant prefetch runs whenever activations are single-buffered.
-    static __host__ __device__ constexpr bool mma_quant_prefetch(int activation_stages, int /*stages*/) {
+    static __host__ __device__ constexpr bool mma_quant_prefetch(int activation_stages,
+                                                                 int /*stages*/) {
         return activation_stages == 1;
     }
 
@@ -402,9 +403,8 @@ struct Q6RowSplitFormat {
     }
 
     template <bool Full>
-    static __device__ __forceinline__ bool sliced_x_group_valid(int first_group, int warp,
-                                                                int groups, int /*logical_k*/,
-                                                                int /*k8*/) {
+    static __device__ __forceinline__ bool
+    sliced_x_group_valid(int first_group, int warp, int groups, int /*logical_k*/, int /*k8*/) {
         return Full || first_group + warp < groups;
     }
 
@@ -412,8 +412,8 @@ struct Q6RowSplitFormat {
     template <class Schedule, bool Full, class Staging, class RowPolicy>
     static __device__ __forceinline__ void
     sliced_stage_high(Staging& shared, int slot, const std::uint8_t* high, int row_begin, int rows,
-                       int groups, int row_groups, int first_group, int tid,
-                       const RowPolicy& /*row_policy*/) {
+                      int groups, int row_groups, int first_group, int tid,
+                      const RowPolicy& /*row_policy*/) {
         constexpr int R = Schedule::kBlockRows;
         constexpr int W = Schedule::kKWarps;
 
@@ -432,17 +432,16 @@ struct Q6RowSplitFormat {
     static __device__ __forceinline__ unsigned sliced_decode_pair(const Staging& staging, int slot,
                                                                   int row, int warp, int byte) {
         return q6_sliced_k_integer_pair(staging.codes[slot][row][warp][byte],
-                                        staging.high[slot][row][warp][byte / 2],
-                                        (byte & 1) * 4);
+                                        staging.high[slot][row][warp][byte / 2], (byte & 1) * 4);
     }
 
     // The token grid never splits a capacity, so the store only bounds row and
     // token by the runtime counts.
     static constexpr bool kSlicedCapacityGuard = false;
 
-    static constexpr bool kSlicedPdl           = false;
+    static constexpr bool kSlicedPdl            = false;
     static constexpr bool kSlicedRowPolicyParam = false;
-    static constexpr bool kSlicedScaleGuard    = false;
+    static constexpr bool kSlicedScaleGuard     = false;
     // Every tile drains the CTA before restaging and always closes the group.
     static constexpr bool kSlicedSyncRestage   = true;
     static constexpr bool kSlicedStoreFragment = false;
@@ -490,10 +489,11 @@ struct Q8RowSplitFormat {
     // Warp zero decodes the K tail that no complete scale pair covers.
     static constexpr bool kScalarRemainder = true;
 
-    static __device__ __forceinline__ void
-    simt_remainder_pair(const std::uint8_t* codes, const std::uint8_t* high,
-                        const std::uint8_t* scales, std::int64_t group_index, int lane, float& w0,
-                        float& w1) {
+    static __device__ __forceinline__ void simt_remainder_pair(const std::uint8_t* codes,
+                                                               const std::uint8_t* high,
+                                                               const std::uint8_t* scales,
+                                                               std::int64_t group_index, int lane,
+                                                               float& w0, float& w1) {
         Q8ScalarDecodeAtom::load_pair(codes, high, scales, group_index, lane, w0, w1);
     }
 };

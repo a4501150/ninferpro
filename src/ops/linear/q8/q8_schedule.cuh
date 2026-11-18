@@ -35,14 +35,15 @@ enum class Q8StreamX : std::uint8_t { Shared, Global };
 // Register-streamed decode schedule (q8_a16_stream.cuh). A warp holds RowsPerWarp rows and
 // KSplit warps share each row group, splitting K into contiguous scale-pair ranges; a CTA covers up
 // to MaxCols columns in passes of ColsPerPass over the register-resident weights.
-template <int K, int RowsPerWarp, int KSplit, int Warps, int MaxCols, int ColsPerPass, Q8StreamX XStage,
-          int MinBlocksPerSm>
+template <int K, int RowsPerWarp, int KSplit, int Warps, int MaxCols, int ColsPerPass,
+          Q8StreamX XStage, int MinBlocksPerSm>
 struct Q8A16StreamSchedule {
     static_assert(K > 0 && K % 64 == 0);
     static_assert(KSplit == 1 || KSplit == 2 || KSplit == 4 || KSplit == 8);
     static_assert(K % (64 * KSplit) == 0, "every K warp owns the same whole scale pairs");
     static_assert(RowsPerWarp > 0 && Warps > 0 && Warps % KSplit == 0);
-    static_assert(ColsPerPass > 0 && ColsPerPass <= 8 && MaxCols % ColsPerPass == 0 && MaxCols <= 16);
+    static_assert(ColsPerPass > 0 && ColsPerPass <= 8 && MaxCols % ColsPerPass == 0 &&
+                  MaxCols <= 16);
     static_assert(MinBlocksPerSm > 0);
     static constexpr int kK              = K;
     static constexpr int kRowsPerWarp    = RowsPerWarp;
@@ -59,10 +60,11 @@ struct Q8A16StreamSchedule {
     static constexpr int kWarpK          = K / KSplit;
     static constexpr int kChunks         = (kWarpK + 255) / 256;
     static constexpr int kXTileBytes     = XStage == Q8StreamX::Shared ? ColsPerPass * K * 2 : 0;
-    static constexpr int kPartialBytes   = KSplit > 1 ? kRowGroups * KSplit * RowsPerWarp * ColsPerPass * 4 : 0;
-    static constexpr int kSharedBytes    = (kXTileBytes + kPartialBytes + 15) / 16 * 16 > 0
-                                               ? (kXTileBytes + kPartialBytes + 15) / 16 * 16
-                                               : 16;
+    static constexpr int kPartialBytes =
+        KSplit > 1 ? kRowGroups * KSplit * RowsPerWarp * ColsPerPass * 4 : 0;
+    static constexpr int kSharedBytes = (kXTileBytes + kPartialBytes + 15) / 16 * 16 > 0
+                                            ? (kXTileBytes + kPartialBytes + 15) / 16 * 16
+                                            : 16;
     static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
 };
 
@@ -102,8 +104,8 @@ struct Q8A16MmaSchedule {
     static constexpr int kMmaKSteps         = BlockK / 16;
     static constexpr int kScaleCacheBytes   = 16;
     static constexpr int kSharedBytes       = BlockRows * BlockK * 3 +
-                                        ActivationStages * BlockTokens * BlockK * 2 +
-                                        BlockRows * kScaleCacheBytes;
+                                              ActivationStages * BlockTokens * BlockK * 2 +
+                                              BlockRows * kScaleCacheBytes;
     static_assert(BlockRows > 0 && BlockTokens > 0 && WarpRows > 0 && WarpTokens > 0);
     static_assert(BlockRows % WarpRows == 0 && BlockTokens % WarpTokens == 0);
     static_assert(WarpRows % 16 == 0 && WarpTokens % 8 == 0);
@@ -137,10 +139,9 @@ struct Q8A16SlicedKMmaSchedule {
     static_assert(StaticK == 0 || (StaticK > 0 && StaticK % (KWarps * 64) == 0));
     static_assert(RowTiles == 1 || RowTiles == 2);
     template <int K, int Capacity, bool Exact = false>
-    using with_problem =
-        Q8A16SlicedKMmaSchedule<BlockTokens, KWarps, Stages, MinBlocksPerSm, ScaleAccess,
-                                ActivationCache, WeightCache, ActivationStage, K, Capacity, Exact,
-                                RowTiles>;
+    using with_problem = Q8A16SlicedKMmaSchedule<BlockTokens, KWarps, Stages, MinBlocksPerSm,
+                                                 ScaleAccess, ActivationCache, WeightCache,
+                                                 ActivationStage, K, Capacity, Exact, RowTiles>;
     static constexpr int kRowTiles          = RowTiles;
     static constexpr int kBlockRows         = 16 * RowTiles;
     static constexpr int kBlockTokens       = BlockTokens;

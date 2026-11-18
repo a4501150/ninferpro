@@ -247,6 +247,7 @@ struct Nvfp4A16SlicedKMmaSchedule {
     static constexpr int kTileKPerWarp      = 64;
     static constexpr int kBlockK            = KWarps * kTileKPerWarp;
     static constexpr int kBlockRows         = 16;
+    static constexpr int kRowTiles          = 1;
     static constexpr int kRowsPerLoaderWarp = 16 / KWarps;
     static constexpr int kStagingBytes =
         Stages * (16 * (kBlockK / 2 + kBlockK / 16) + KWarps * TileTokens * 64 * 2);

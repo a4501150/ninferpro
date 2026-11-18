@@ -6,7 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_a16_gemv.cuh"
 #include "ops/linear/nvfp4/nvfp4_a16_simt.cuh"
 #include "ops/linear/nvfp4/nvfp4_a16_mma.cuh"
-#include "ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh"
+#include "ops/linear/fp_a16/a16_sliced_k_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_mma.cuh"
 
 namespace infernix::ops::detail {
@@ -81,7 +81,7 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
         throw std::invalid_argument(
             "NVFP4 sliced-K requires complete row/K tiles and matching tokens");
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
-    static constexpr auto kernel = nvfp4_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
+    static constexpr auto kernel = fp_a16_sliced_k_mma_kernel<Nvfp4A16Format, Schedule, Output, Epilogue, Rows>;
     const int bytes              = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
