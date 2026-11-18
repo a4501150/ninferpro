@@ -10,6 +10,7 @@
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
+#include "ops/linear/q8/q8_rowsplit_storage.cuh"
 
 #include <cstdint>
 
@@ -71,6 +72,11 @@ struct Q4RowSplitFormat {
     static constexpr int kHighBytesPerGroup = 0;
 
     // --- SIMT family ---
+
+    // Each lane decodes eight codes (one 32-bit word); a 32-lane phase covers four groups.
+    using SimtCodes                          = std::uint32_t;
+    static constexpr int kSimtGroupsPerPhase = 4;
+    static constexpr int kSimtLaneGroupShift = 3;
 
     static __device__ __forceinline__ int simt_vector_groups(int k) {
         return k / Storage::kGroupK;
@@ -160,6 +166,11 @@ struct Q5RowSplitFormat {
     static constexpr int kHighBytesPerGroup = Storage::kHighBytesPerGroup;
 
     // --- SIMT family ---
+
+    // Each lane decodes eight codes (one 32-bit word); a 32-lane phase covers four groups.
+    using SimtCodes                          = std::uint32_t;
+    static constexpr int kSimtGroupsPerPhase = 4;
+    static constexpr int kSimtLaneGroupShift = 3;
 
     // Only complete scale pairs run through the staged pipeline; the scalar
     // remainder below covers the tail.
@@ -305,6 +316,11 @@ struct Q6RowSplitFormat {
 
     // --- SIMT family ---
 
+    // Each lane decodes eight codes (one 32-bit word); a 32-lane phase covers four groups.
+    using SimtCodes                          = std::uint32_t;
+    static constexpr int kSimtGroupsPerPhase = 4;
+    static constexpr int kSimtLaneGroupShift = 3;
+
     static __device__ __forceinline__ int simt_vector_groups(int k) {
         return k / Storage::kGroupK;
     }
@@ -430,6 +446,56 @@ struct Q6RowSplitFormat {
     // Every tile drains the CTA before restaging and always closes the group.
     static constexpr bool kSlicedSyncRestage   = true;
     static constexpr bool kSlicedStoreFragment = false;
+};
+
+// One signed int8 code per element and one fp16 scale per 32-element group; no high-bit plane.
+// Only the SIMT family is shared: the Q8 MMA and sliced-K kernels keep their own pipelines.
+struct Q8RowSplitFormat {
+    using Storage = Q8RowSplitStorage;
+
+    static constexpr bool kHasHigh          = false;
+    static constexpr int kHighBytesPerGroup = 0;
+
+    // --- SIMT family ---
+
+    // Each lane decodes eight codes (two 32-bit words); a 32-lane phase covers eight groups.
+    using SimtCodes                          = uint2;
+    static constexpr int kSimtGroupsPerPhase = 8;
+    static constexpr int kSimtLaneGroupShift = 2;
+
+    // Only complete scale pairs (64 elements) run through the staged pipeline.
+    static __device__ __forceinline__ int simt_vector_groups(int k) {
+        return k % 8 == 0 ? (k / 64) * 2 : 0;
+    }
+
+    static __device__ __forceinline__ RowSplitNoHighBits simt_preload_high(const uint4*, int, int) {
+        return {};
+    }
+
+    static __device__ __forceinline__ void
+    simt_decode_eight(const uint4* /*staged_high*/, RowSplitNoHighBits, uint2 packed,
+                      std::uint16_t scale_bits, int /*phase*/, int /*lane*/, float (&weights)[8]) {
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            weights[i] = static_cast<float>(static_cast<std::int8_t>(
+                             (i < 4 ? packed.x : packed.y) >> ((i & 3) * 8))) *
+                         scale;
+    }
+
+    static constexpr bool kSimtApplyRow         = true;
+    static constexpr bool kSimtScalesBeforeHigh = false;
+    static constexpr bool kSimtHighByPairs      = false;
+
+    // Warp zero decodes the K tail that no complete scale pair covers.
+    static constexpr bool kScalarRemainder = true;
+
+    static __device__ __forceinline__ void
+    simt_remainder_pair(const std::uint8_t* codes, const std::uint8_t* high,
+                        const std::uint8_t* scales, std::int64_t group_index, int lane, float& w0,
+                        float& w1) {
+        Q8ScalarDecodeAtom::load_pair(codes, high, scales, group_index, lane, w0, w1);
+    }
 };
 
 } // namespace infernix::ops::detail

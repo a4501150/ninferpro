@@ -54,7 +54,8 @@ struct RowSplitA16SimtSchedule {
         GroupsPerWarpStage * Format::kHighBytesPerGroup /
         static_cast<int>(sizeof(uint4));
     static constexpr int kScalePairsPerStage = GroupsPerWarpStage / 2;
-    static constexpr int kCodePhases         = (GroupsPerWarpStage + 3) / 4;
+    static constexpr int kCodePhases =
+        (GroupsPerWarpStage + Format::kSimtGroupsPerPhase - 1) / Format::kSimtGroupsPerPhase;
     static constexpr int kStagingBytes =
         kWarps * Stages * GroupsPerWarpStage *
         (Format::Storage::kCodeBytesPerGroup + Format::kHighBytesPerGroup +

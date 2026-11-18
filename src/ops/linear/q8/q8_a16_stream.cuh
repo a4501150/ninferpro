@@ -14,7 +14,7 @@ namespace infernix::ops::detail {
 // and scale a warp's rows need is loaded into registers before the first FMA, so a warp keeps its
 // whole share of the weights in flight at once, and the rows of a warp share each x load.
 //
-// The per-(row, column) arithmetic is that of the SIMT route (q8_a16_simt.cuh) and the GEMV route:
+// The per-(row, column) arithmetic is that of the SIMT route (rowsplit/a16_simt.cuh) and the GEMV route:
 // lane l owns the 8-code chunks at k = 8l + 256m of its warp's K range, m increasing, each decoded
 // as float(code) * scale and accumulated with fmaf in k order; lane partials reduce with the same
 // shuffle tree; warps that split a row's K hold contiguous scale-pair ranges and their partials are

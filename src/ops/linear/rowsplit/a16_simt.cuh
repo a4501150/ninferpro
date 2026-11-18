@@ -134,11 +134,11 @@ __device__ __forceinline__ void rowsplit_simt_consume_stage(
 
 #pragma unroll
     for (int phase = 0; phase < kCodePhases; ++phase) {
-        const int group        = phase * 4 + (lane >> 3);
+        const int group        = phase * Format::kSimtGroupsPerPhase + (lane >> Format::kSimtLaneGroupShift);
         const int stage_groups = FullStage ? Schedule::kGroupsPerWarpStage : active_groups;
         if (group < stage_groups) {
-            const std::uint32_t packed =
-                reinterpret_cast<const std::uint32_t*>(shared_codes)[phase * 32 + lane];
+            const typename Format::SimtCodes packed =
+                reinterpret_cast<const typename Format::SimtCodes*>(shared_codes)[phase * 32 + lane];
             const auto high_bits = Format::simt_preload_high(shared_high, phase, lane);
             const std::uint32_t scale_pair = shared_scales[group >> 1];
             const std::uint16_t scale_bits =
@@ -218,7 +218,7 @@ __device__ __forceinline__ void rowsplit_a16_simt_body(
     const int stages          = FullK ? groups / G : (groups + G - 1) / G;
     const int token0          = static_cast<int>(blockIdx.y) * T;
     const int active_tokens   = Full ? T : min(T, tokens - token0);
-    const std::int64_t group0 = static_cast<std::int64_t>(safe_row) * (padded_k / 64) + group_begin;
+    const std::int64_t group0 = static_cast<std::int64_t>(safe_row) * (padded_k / Format::Storage::kGroupK) + group_begin;
     const auto* code_row      = codes + group0 * 32;
     const auto* high_row      = [&] {
         if constexpr (Format::kHasHigh)
@@ -227,7 +227,7 @@ __device__ __forceinline__ void rowsplit_a16_simt_body(
             return static_cast<const std::uint8_t*>(nullptr);
     }();
     const auto* scale_row     = scales + group0 * 2;
-    const auto* warp_x        = x + group_begin * 64;
+    const auto* warp_x        = x + group_begin * Format::Storage::kGroupK;
     auto& stage_codes         = shared.staging.codes;
     auto& stage_scales        = shared.staging.scales;
     float acc[T]              = {};
@@ -292,12 +292,14 @@ __device__ __forceinline__ void rowsplit_a16_simt_body(
     if constexpr (Format::kScalarRemainder) {
         // Warp zero owns the remainder; other K warps only own complete scale pairs.
         if (!FullK && split == 0 && row < rows) {
-            for (int group = vector_groups; group < (k + 63) / 64; ++group) {
-                const int kk = group * 64 + lane * 2;
-                if (kk < k) {
+            constexpr int kGroupK = Format::Storage::kGroupK;
+            for (int group = vector_groups; group < (k + kGroupK - 1) / kGroupK; ++group) {
+                const int kk = group * kGroupK + lane * 2;
+                // A group narrower than the warp's 64 elements leaves the upper lanes idle.
+                if ((kGroupK >= 64 || lane < kGroupK / 2) && kk < k) {
                     float w0, w1;
                     Format::simt_remainder_pair(codes, high, scales,
-                                                std::int64_t(row) * (padded_k / 64) + group, lane,
+                                                std::int64_t(row) * (padded_k / kGroupK) + group, lane,
                                                 w0, w1);
 #pragma unroll
                     for (int token = 0; token < T; ++token) {

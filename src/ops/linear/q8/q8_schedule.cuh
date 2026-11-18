@@ -2,41 +2,15 @@
 
 #include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_rowsplit_storage.cuh"
+#include "ops/linear/rowsplit/schedule.cuh"
 
 namespace infernix::ops::detail {
 
 template <int BlockRows, int BlockTokens, int WarpsPerRow, int GroupsPerWarpStage, int Stages,
           Cache CodeCache, int MinBlocksPerSm, bool Predicated = false>
-struct Q8A16SimtSchedule {
-    static_assert(BlockRows > 0 && BlockRows <= 32);
-    static_assert(BlockTokens > 0 && BlockTokens <= 8);
-    static_assert(WarpsPerRow == 1 || WarpsPerRow == 2 || WarpsPerRow == 4 || WarpsPerRow == 8);
-    static_assert(GroupsPerWarpStage > 0 && GroupsPerWarpStage % 2 == 0);
-    static_assert(Stages >= 2 && Stages <= 8);
-    static_assert(MinBlocksPerSm > 0);
-    static constexpr bool kPredicated        = Predicated;
-    static constexpr int kBlockRows          = BlockRows;
-    static constexpr int kBlockTokens        = BlockTokens;
-    static constexpr int kWarpsPerRow        = WarpsPerRow;
-    static constexpr int kGroupsPerWarpStage = GroupsPerWarpStage;
-    static constexpr int kStages             = Stages;
-    static constexpr Cache kCodeCache        = CodeCache;
-    static constexpr int kMinBlocksPerSm     = MinBlocksPerSm;
-    static constexpr int kWarps              = BlockRows * WarpsPerRow;
-    static constexpr int kThreads            = kWarps * 32;
-    static constexpr int kStageK             = GroupsPerWarpStage * Q8RowSplitStorage::kGroupK;
-    static constexpr int kCodeVecsPerStage   = GroupsPerWarpStage * 2;
-    static constexpr int kScalePairsPerStage = GroupsPerWarpStage / 2;
-    static constexpr int kCodePhases         = (GroupsPerWarpStage + 7) / 8;
-    static constexpr int kStagingBytes =
-        kWarps * Stages * GroupsPerWarpStage *
-        (Q8RowSplitStorage::kCodeBytesPerGroup + Q8RowSplitStorage::kScaleBytesPerGroup);
-    static constexpr int kPartialBytes = WarpsPerRow > 1 ? kWarps* BlockTokens * sizeof(float) : 0;
-    static constexpr int kSharedBytes =
-        ((kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes) + 15) / 16 * 16;
-    static_assert(kThreads <= 1024);
-    static_assert(kSharedBytes <= 48 * 1024, "Q8 SIMT shared memory exceeds 48 KiB");
-};
+using Q8A16SimtSchedule =
+    RowSplitA16SimtSchedule<Q8RowSplitFormat, BlockRows, BlockTokens, WarpsPerRow,
+                            GroupsPerWarpStage, Stages, CodeCache, MinBlocksPerSm, Predicated>;
 
 template <int BlockRows, int WarpsPerRow, int MinBlocksPerSm, int StaticK = 0, int Unroll = 8>
 struct Q8A16GemvSchedule {
