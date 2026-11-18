@@ -329,8 +329,21 @@ public:
         return Submission(*this, std::move(request));
     }
 
+    // execution_mutex_ for a caller outside the worker (status, export, placement requests).
+    // std::mutex is not fair and the worker relocks it at the start of every step, so without the
+    // waiter count such a call would wait until the Engine went idle; with it, it waits at most
+    // one step.
+    [[nodiscard]] std::unique_lock<std::mutex> lock_between_steps() const {
+        external_waiters_.fetch_add(1, std::memory_order_acq_rel);
+        struct Leave {
+            std::atomic<unsigned>& waiters;
+            ~Leave() { waiters.fetch_sub(1, std::memory_order_release); }
+        } leave{external_waiters_};
+        return std::unique_lock(execution_mutex_);
+    }
+
     [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
+        const auto lock = lock_between_steps();
         MemorySummary out                      = instance_.program->memory_summary();
         const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
         out.kv_capacity_mode                   = resolution.mode;
@@ -358,7 +371,7 @@ public:
 
     void reset_memory_peaks() noexcept {
         try {
-            std::scoped_lock lock(execution_mutex_);
+            const auto lock = lock_between_steps();
             instance_.program->reset_memory_peaks();
         } catch (...) {}
     }
@@ -369,7 +382,7 @@ public:
     [[nodiscard]] ExpertPlacementReport expert_placement_status() const {
         if constexpr (requires { instance_.expert_placement_status(); }) {
             try {
-                std::scoped_lock lock(execution_mutex_);
+                const auto lock = lock_between_steps();
                 return instance_.expert_placement_status();
             } catch (...) {
                 return {};
@@ -382,7 +395,7 @@ public:
     [[nodiscard]] bool request_expert_placement(const ExpertPlacementSwitch& request, std::string* error = nullptr) {
         if constexpr (requires { instance_.request_expert_placement(request, error); }) {
             try {
-                std::scoped_lock lock(execution_mutex_);
+                const auto lock = lock_between_steps();
                 return instance_.request_expert_placement(request, error);
             } catch (const std::exception& failure) {
                 if (error != nullptr) { *error = failure.what(); }
@@ -397,7 +410,7 @@ public:
     [[nodiscard]] bool export_expert_placement(const std::filesystem::path& path, std::string* error = nullptr) {
         if constexpr (requires { instance_.export_expert_placement(path, error); }) {
             try {
-                std::scoped_lock lock(execution_mutex_);
+                const auto lock = lock_between_steps();
                 return instance_.export_expert_placement(path, error);
             } catch (const std::exception& failure) {
                 if (error != nullptr) { *error = failure.what(); }
@@ -2471,6 +2484,8 @@ private:
                     return;
                 }
             }
+            // A status or admin call waiting for the lock goes first (lock_between_steps).
+            while (external_waiters_.load(std::memory_order_acquire) != 0) { std::this_thread::yield(); }
             std::unique_lock execution_lock(execution_mutex_);
             bool executed = false;
             // The step's phase boundaries, for the long-step warning.
@@ -2673,6 +2688,7 @@ private:
     DiagnosticObserver diagnostics_;
 
     mutable std::mutex execution_mutex_;
+    mutable std::atomic<unsigned> external_waiters_{0}; // see lock_between_steps
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
