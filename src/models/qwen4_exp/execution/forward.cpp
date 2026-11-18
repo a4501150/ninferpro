@@ -796,8 +796,8 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     // bits as the composed kernels below). DFlash2 and MTP verify at most 8 columns; wider
     // verifications (n-gram, wide trees), mixed calls and multi-row verification keep the composed
     // path — on this GPU the fused kernel's redundant convolution reads scale with the row count
-    // and measured slower from two rows up (RTX PRO 6000, cold and warm, op-level), while at one
-    // row it measured 15-25 % faster at every width 2..16.
+    // and it measured slower from two rows up, while at one row it measured faster at every width
+    // (design §11.6).
     const bool replay_conv = batch.verify != nullptr && part == nullptr && batch.batch == 1 &&
                              batch.width <= ops::kGdnReplayConvMaxWidth && NK == 16 && NV == 48 &&
                              DK == 128 && DV == 128;
@@ -1150,9 +1150,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     // While the host computes this call's misses, the CPU wait warms the next layer's weights into L2
     // in the order its dense chain reads them. A one-column call (plain decode) warms the chain up to
-    // 40 MiB: tg512 plain 121.8 -> 123.3 tok/s against the attention mixer and 16 MiB of input (32 MiB
-    // +0.7 %, 48-56 MiB alike, 64-80 MiB less). A wider call keeps that smaller set: under MTP the
-    // wait is shorter and 48-64 MiB measured 0.4-1.4 % slower (design §8.6). A GGUF import's
+    // 40 MiB, a wider call keeps the smaller set of both mixer projections and 16 MiB of the input
+    // (the per-size measurements are design §8.6). A GGUF import's
     // projections warm their segments in order.
     if (source.cpu.max_jobs > 0 && layer + 1 < config_.num_hidden_layers) {
         const auto& next = parameters_.layers[layer + 1];
@@ -1234,10 +1233,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     source.wide_a16 = wide_a16;
     // The routed experts' activation encoding needs x alone, so a side-stream call runs it beside
-    // the router and the route (it followed the route on the call's critical path, ~3 us a layer;
-    // upstream 2026-10-29: IQ3_S 16K decode 265.5 -> 267.7 tok/s, Dense8 flat). A call without one
+    // the router and the route (it followed the route on the call's critical path; the measured
+    // gains and the fork's own cost are design §8.3). A call without one
     // (W4A4, or one the in-place plan's fused kernel encodes) forks nothing: the fork and join
-    // alone cost Dense8 MTP decode 1.4 %.
+    // are not free (design §8.3).
     const bool early = side && ops::moe_experts_prepares(x, source, K, max_jobs, expert_ws.data, outputs);
     if (early) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[2], s));

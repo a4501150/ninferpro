@@ -30,9 +30,9 @@ struct Nvfp4A4Workspace {
 };
 
 // LinearPolicy::AllowA4Residual's term count. Two terms passed the decode gate with DFlash2 and
-// n-gram copies on the official 27B (TV excess 4.2e-5 against a 2.4e-3 budget, INT8 KV), and run
-// 1,787 / 1,217 / 887 tok/s there at one, two and four requests against three terms' 1,696 /
-// 1,074 / 783 (RTX 5090, 2026-10-14): a third term costs time the gate does not need.
+// n-gram copies on the official 27B (TV excess 4.2e-5 against a 2.4e-3 budget, INT8 KV; the gate
+// and the one/two/four-request tok/s against three terms are model-quality.md §6.7,
+// `batched-a4-residual-decode`): a third term costs time the gate does not need.
 inline constexpr int kNvfp4A4ResidualTerms = 2;
 
 inline std::size_t nvfp4_a4_checked_bytes(std::int32_t tokens, std::size_t bytes_per_token) {

@@ -11,9 +11,9 @@
 
 namespace infernix::ops::detail {
 namespace {
-// Qwen3.8-Flash-Next GDN q/k/v/z projection (packed): the register-streamed route up to 8 columns (5-28 %
-// faster than SIMT), the MMA tiles beyond (M1 sweep). K1: 2 row(s) per warp, x staged in shared memory per
-// pass.
+// Qwen3.8-Flash-Next GDN q/k/v/z projection (packed): the register-streamed route up to 8 columns, the MMA
+// tiles beyond (the sweep's measured winners are in RESEARCH_NOTES.md, "Q8 MMA tile choices"). K1: 2 row(s)
+// per warp, x staged in shared memory per pass.
 template <int MaxCols, int ColsPerPass>
 using Stream = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8StreamX::Shared, 2>;
 
@@ -38,9 +38,9 @@ void launch_routes(const Q8LinearOperands& operands, Output output, cudaStream_t
     if (tokens <= 8) return launch_decode_routes(operands, output, epilogue, stream);
     if (tokens <= 64) return launch_q8_a16_mma<q8_instances::MmaR32T64>(operands, output, epilogue, stream);
     if (tokens <= 96) return launch_q8_a16_mma<q8_instances::MmaR32T96>(operands, output, epilogue, stream);
-    // Beyond 96 columns (prefill chunks): the MMA tile sweep of 2026-10-05 (fn/rigs/layer/q8tiles2.bat,
-    // RTX 5090). Every MMA tile accumulates each output over K in the same order, so their bits are
-    // identical (checked at every swept point); only speed differs.
+    // Beyond 96 columns (prefill chunks): the swept MMA tiles (RESEARCH_NOTES.md, "Q8 MMA tile
+    // choices"). Every MMA tile accumulates each output over K in the same order, so their bits are
+    // identical; only speed differs.
     launch_q8_a16_mma<q8_instances::MmaR64T128>(operands, output, epilogue, stream);
 }
 

@@ -941,11 +941,9 @@ void ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute) {
     pool.commands.clear();
     // Decode rounds reserve landing frames for every layer from the scarcest pool (before_round). With
     // every expert in RAM, when the returned run lets them, the frames stay free and decode's misses
-    // land in them (NVFP4 Dense8, one pool: MTP 4 at 4K + 512 154.8 tok/s against 137.5 with the
-    // refill, plain equal to the refill-free route, 2026-10-17); when another pool has none to spare
-    // (a GGUF import's record sizes), landing reserves nothing and the loans' victims reload instead
-    // (IQ3_S: MTP 185.4 against 162.2, plain 129.0 against 115.7). The SSD tier reloads only victims
-    // with a RAM copy (`admissible_`) and still lands (FP8: 44.0-44.2 tok/s against 39.6-43.5 without).
+    // land in them; when another pool has none to spare (a GGUF import's record sizes), landing
+    // reserves nothing and the loans' victims reload instead. The SSD tier reloads only victims
+    // with a RAM copy (`admissible_`) and still lands (the per-artifact measurements are design §9.3).
     std::uint32_t landing = kLandingSlots;
     for (std::size_t p = 0; p < pools_.size(); ++p) {
         const std::uint32_t free = pools_[p].controller->free_frames() + (p == lease.pool ? lease.count : 0U);

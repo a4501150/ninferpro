@@ -8,18 +8,22 @@ boundary was: a complete public Op, a kernel inside it, or a one-side probe. The
 
 ## The two Q5 parent shapes
 
-These two shapes sit next to each other in `ops/linear/q5/q5_rowsplit_gemm_simt.cuh` and are easy to
-describe wrongly, which has already happened once in this branch's own documents. Both are used by the two
-Q4/Q5 input projections, and they are not the same shape.
+These two shapes were measured next to each other in `ops/linear/q5/q5_rowsplit_gemm_simt.cuh`, a
+file that no longer exists, and are easy to describe wrongly, which has already happened once in this
+branch's own documents. Both were used by the two Q4/Q5 input projections, and they are not the same
+shape. Their dataflows live on, generalized to R rows per CTA and `WarpsPerRow` warps per row, in
+`src/ops/linear/q5/q5_a16_direct_simt.cuh` (`q5_a16_direct_simt_kernel`, direct global loads, the
+split-2/split-4 dataflow) and `src/ops/linear/q5/q5_a16_simt.cuh` (`q5_a16_simt_kernel`, the weight
+planes staged per warp through cp.async, `q5_simt_issue_stage` / `q5_simt_consume_stage`).
 
-**split4** (`q5_rowsplit_gemm_simt_split4_kernel`): **one CTA owns one output row** (`row = blockIdx.x`),
+**split4** (measured as `q5_rowsplit_gemm_simt_split4_kernel`): **one CTA owns one output row** (`row = blockIdx.x`),
 and **its four warps split the K dimension**: `chunk = threadIdx.x >> 5` selects the warp's K quarter, each
 warp reduces its own partial sums with `warp_reduce_sum`, and the four partials meet in `s_part[4][kTt]`
 behind `__syncthreads()`. It stages no weights and no activations in shared memory - both the quantized
 weights and the activations are read from global memory. It is instantiated per exact column count
 (`kTt`), which is why it covers exactly the live columns.
 
-**c4 SIMT** (`q5_rowsplit_gemm_simt_kernel` with `kTt = 4`): **one output row per warp**, up to **four
+**c4 SIMT** (measured as `q5_rowsplit_gemm_simt_kernel` with `kTt = 4`): **one output row per warp**, up to **four
 columns** per column tile (`blockIdx.y` selects the tile), with the **quantized weight planes staged in
 shared memory** (`s_nib`, `s_hi`, `s_sc`, filled by `q5_simt_issue_slab` through a cp.async pipeline) and
 **activations read from the input tensor** (`q5_simt_consume_slab` reads `x0 + tt*k + xoff`). It does not
@@ -365,7 +369,10 @@ The variants were measured in two sweeps; 4,2,1,2 and 2,2,1,2, measured in both,
 
 Up to 48 columns the existing four-warp tile stays (two K warps are 0-2 % slower from 25 to 48
 columns); from 49 two K warps with a double-buffered stage are fastest at every width. Above 64
-columns the 96- and 128-column MMA schedules are unchanged.
+columns the 96- and 128-column MMA schedules are unchanged. (The routed sliced-K band's margins over
+the 64-column MMA schedule, measured on the RTX 5090: 17-21 % at 42-48 columns, 13-16 % at 49-56
+and 4-8 % at 57-64; the Qwen3.5 27B head's route table is
+[src/models/qwen3_5/shapes/fp8/n248320_k5120.cu](src/models/qwen3_5/shapes/fp8/n248320_k5120.cu).)
 
 ## NVFP4 MLP schedules at decode widths
 
@@ -725,7 +732,7 @@ H24 and H16 geometries, new threshold-0 build against the same commit's tiled ke
 512-768 visible keys, up to 1.6x faster from 1024, up to 3.4x at 8192, and up to 1.6x slower for
 256-512-column launches over an empty context, where the tiled kernel's narrower launch wins. A
 threshold of 768 keys is within 0.03 % of the per-shape best over the whole sweep in both
-geometries; 2048 costs 2.3-2.7 % of the total and up to 64 % in its worst cell (3584 columns over
+geometries; 2048 costs 2.3-2.7 % of the total and 56-64 % in its worst cell (3584 columns over
 512 keys, 2048 columns over none). 640 keys is marginally better for H24 but 11 % off best for
 H16 at 768 columns, so 768 is the joint choice.
 
@@ -813,7 +820,191 @@ three 8-column passes run in series.
 | down v4 with 7 rows per CTA (188 CTAs) and up v4 with 7 warps (183 CTAs) | 10.66 | 15.08 | 34.36 | 47 four-CTA clusters exceed the 46 the device runs at once: a second wave |
 | up v4 with 7 warps (183 CTAs) alone | 8.57 | 11.17 | 22.18 | within noise |
 
+Two earlier K1a variants, measured on the RTX 5090 with the Q8 mixer when v4's read scheduling was
+adopted (2026-10-16), lost the same way: two rows per warp in K1a (v4's other change) spilled
+120-160 bytes of stack and ran -0 to +20 % per call, and with the pass width a template argument
+and 4 warps per CTA it did not spill but was slower still (RTX PRO 6000, T 6: 17.9 us against
+12.7) — the kernel is latency bound, not shared-memory bound.
+
 What remains is a redesign rather than a retune: weights staged through shared memory (TMA bulk
 copies) so both kernels fit beside a neighbour without spills, with dependents triggered once each
 kernel's weights are consumed; and for wide calls, more Rn reuse per shared-memory read within the
 same per-row, lane-chunk summation order.
+
+
+## GGUF dense projections: route and tile history
+
+The exact GGUF projections (`src/ops/ggml/ggml_linear.cu`, `ggml_mma_rows.cuh`, `ggml_tile.cuh`) were
+chosen by the sweeps below; every route returns the same integers, so only speed differed. Unless a
+date says otherwise the numbers are from the RTX 5090 on the IQ3_S import (end-to-end arms are MTP 4 +
+n-gram 7 at a 4K prompt, two rotated rounds).
+
+- **Encoding.** Every rows CTA encoding a decode call's column into shared memory instead of the
+  separate `encode_kernel` measured 4 % slower end to end (98.0 -> 94.0 tok/s). `encode_column`'s
+  16-byte-load form measured 0.7 % faster end to end (2026-10-16).
+- **One launch per call.** Grouping a call's segments into one launch instead of one launch per
+  segment: the GDN q/k/v/z at one column 33.4 -> 23.0 us; end to end 196.1 -> 202.4 tok/s with the
+  mixed-format launches (2026-10-16). The mixed two-format launch itself measured 1.0 % faster end
+  to end than a launch per format (2026-10-16); with the staged weights 202.4 -> 206.7 tok/s.
+- **Narrow MMA warps.** At 5 columns (2026-10-12) four warps taking whole blocks beat eight, and
+  eight or sixteen taking 2- or 4-slice parts of a block, at every dense shape, the 1,280- and
+  2,560-row ones included. Staging the rows' units through shared memory by cp.async measured 2.1 %
+  faster end to end than 2-byte loads (2026-10-16); before it, the 5-column Q6_K call measured 31.9
+  us, 0.67 TB/s, stalled on the long scoreboard and the LSU queue (2026-10-14).
+- **Tiled addressing.** The tiled routes against the row-major ones (2026-10-16, the import's dense
+  calls weighted per token): -12 / -23 / -26 / -27 / -32 % at 1 / 2 / 4 / 5 / 8 columns; end to end
+  221.7-222.6 against 214.0-214.5 tok/s, plain decode 99.6-99.7 against 99.5-99.6. At one column
+  (2026-10-16): the GDN output projection (Q6_K) 13.0 us by rows against 15.5 by MMA, the head 295.5
+  against 297.5; a 6,144-row Q4_K matrix 11.1 by MMA against 13.3 by rows; GDN q/k/v/z 22.1 in one
+  MMA launch against 26.0 in a rows launch per format.
+- **Tiled launch shapes** (2026-10-16, 170 SMs, the dense calls at 1-8 columns, every shape): a
+  second wave of even two CTAs costs a call 25-30 % (GDN q/k/v/z, 1,024 tiles: 4 warps split 2, 512
+  CTAs against 510 resident, 28.8 us at one column; unsplit, 21.9); within one wave more warps help
+  small calls (128 tiles: split 8, 7.6 us; split 2, 10.0), while split 4 over 2.5 blocks a warp loses
+  to split 2 (384 tiles: 13.3 against 13.0 us).
+- **Expert banks stay on dp4a.** The MMA rows route at the expert banks' shapes (8 intermediates or
+  16 down rows per CTA of five warps) measured 45-65 % slower at 1 and 5 tokens and tg512 112.3
+  against 121.8 tok/s (2026-10-12); an expert gets 1-2 columns per call.
+- **Wide-call tiles.** Decoded planes against tiles that decode their raw rows in the loop, at 4,096
+  columns (2026-10-12): 15-34 % faster (Q6_K attn_qkv 3,912 -> 2,839 us). Q6_K and IQ4_NL tiles fit
+  two CTAs per SM (128 registers): Q6_K 3-6 % and IQ4_NL 14 % faster than one; Q4_K and Q5_K
+  (min-term accumulators) spill and run 60-70 % slower, IQ4_XS 9 % slower. 512-thread tiles against
+  256 at 4,096 columns (2026-10-14): Q5_K -2.4 %, Q4_K -3.6 %, IQ4_XS -4.1 % time; Q6_K +9-12 % and
+  IQ4_NL +3 %, which keep 256 at two CTAs per SM.
+- **Tile internals** (dense shapes at 512 columns, 2026-10-11): 32 x 128-column tiles re-read each
+  column's limbs per 32 rows and were bound by L2 throughput (66 % of peak). Folding the sub-scales
+  into two byte planes of the weights (6 MMAs per weight instead of 3 plus IMADs) was no faster, nor
+  at 4,096 columns with Q6_K planes at one CTA per SM (2026-10-13: prefill pp32768 4,090 against
+  4,093 tok/s; Q6_K projections -11 % to +1 %, the experts' calls mixed). Double-buffering the codes
+  so the next stage decodes beside this stage's MMAs (one barrier fewer per stage) was 3-5 % slower
+  for Q6_K, Q5_K and Q4_K at 4,096 columns (2026-10-12). A group-wise decoded plane for the experts'
+  tiles measured 2 % faster at 16,384 tokens and no faster end to end, where the layer walk's MoE
+  calls are 4,096-8,192 tokens (2026-10-12). In the weight-stationary tiles, decoding each stage
+  from global memory was 12 % of the IQ4_NL down tiles' stall samples (2026-10-14).
+- **Evict-first dense weights.** The dense weights' L2 evict-first cp.async policy measured MTP 4 +
+  n-gram 7 at 4K +0.5 %, both runs ahead (2026-10-16; the head's evict-first loads, +0.3 % MTP, are
+  in the Flash-Next design §8.3).
+
+## Offloaded MoE layer: removed expert-kernel forms
+
+Removed or rejected forms of the offloaded MoE layer's expert kernels
+(`src/ops/offloaded_sparse_moe/cuda/moe_layer.cu`); the routed forms' own numbers are the Flash-Next
+design §8.5.
+
+- **Selection chain.** The route key selection's 16-step compare chain, which the depth-4 tree over
+  the 16 candidates replaced, took most of the fused route kernel's cycles at decode widths; the
+  selections measured 7,400 -> 3,500 cycles of that kernel (upstream, 2026-10-29).
+- **Eight-column W4A4 form (removed 2026-10-11).** The one-column-at-a-time narrow kernels beat it
+  at op level (frames, cold L2, uniform routing) 1.26-2.3x at every width from 1 to 64 columns per
+  expert.
+- **Four-column A16 passes.** The A16 narrow passes computing one column at a time beat four-column
+  passes at op level (frames, cold L2) at every width measured - 1-3 columns per expert and 6-48
+  columns per call (RTX PRO 6000, 2026-10-21).
+- **A16 rows CTA shape** (decode route, frames, cold L2, RTX PRO 6000, 2026-10-24): with a row
+  pair's four quads per lane (one scale and one int64 product per unit) the passes took 33 / 109 /
+  191 us at T = 1 / 6 / 12; two CTAs per SM took 33 / 113 / 194, and a quad per lane 37 / 121 / 210.
+  A persistent variant (two CTAs per SM double-buffering each item's weights through shared memory)
+  was slower at T = 12 (234 us).
+
+## Q8 MMA tile choices
+
+The Q8 A16 route tables of Qwen3.8-Flash-Next (`src/models/qwen4_exp/shapes/q8/`, the shared
+schedules in `src/ops/linear/q8/q8_instances.cuh`); every MMA tile accumulates each output over K in
+the same order, so their bits are identical and only speed differs.
+
+- **M1 sweeps** (undated, RTX 5090): the register-streamed route against SIMT at up to 8 columns -
+  hyper-connection up [10240, 320] 8-24 % faster; PLE key/value [12800, 2560] 6-28 %; MTP attention
+  group [13952, 2560] 4-28 %; GDN q/k/v/z [16384, 2560] 5-28 %; the GDN and QSA output projections
+  [2560, 6144] keep SIMT (the streamed route measured 16-29 % slower). The final mixer down and
+  hyper-connection down + inject (n320 / n324, K 10240) take the register-streamed route at 1-3 and
+  9-64 columns, 2-7x faster than the MMA tile there, and the few-row SIMT route at 4-8.
+- **Prefill MMA tiles** (the tile sweep of 2026-10-05, `fn/rigs/layer/q8tiles2.bat`, RTX 5090):
+  beyond 96 columns the r32_t64 / r32_t96 / r64_t128 ladder. [324, 10240] up to 2,048 columns: the
+  single K chain holds every tile at 96-125 us; beyond it a tile runs one CTA per SM, so its time
+  steps up by 50-100 us wherever its CTA count passes a multiple of the RTX PRO 6000's 188 SMs, and
+  each range takes a tile not just past a step (2026-10-24: the fastest of four tiles in every
+  128-column step from 2048 to 16384, 1.01 times the fastest at worst; the 48 x 64 tile alone took
+  1.19 times as long in total and 1.35 at worst, 664 against 590 us at T = 16384).
+- **Sliced-K invariants** (2026-10-24, RTX PRO 6000): the 8-K-warp sliced-K contraction against the
+  MMA tiles' single K chain at T = 1 - [2560, 2560] 8.2 against 20.3 us (40 CTAs; the width route
+  8.0), at T = 2048 236 against 154 for the width route; [2560, 6144] 12.5 against 47.1 us (the
+  width route 14.3), at T = 2048 520 against 274; [1280, 2560] 5.2 against 20.2 us (20 CTAs; the
+  width route 5.9), draft widths only; [320, 10240] the MMA chain's 104 us. Beyond 128 columns
+  NInfer's route table for [2560, 6144] measured 1.0-1.45 times the exact routes (2026-10-15 sweep,
+  RTX 5090), so the exact routes serve them.
+- **The DFlash2 feature projection [2560, 12800]** (RTX PRO 6000 sweep of 2026-11-03, cold,
+  graph-timed, min/median of 60, production serving concurrently): the sliced-K schedules' 160 CTAs
+  of one 16-row tile at 8 columns 24.3 us against the runtime-shape SIMT route's 46.8; at 16
+  columns 26.4 against 129; 48: 48.9 against 129; 64: 63.5 against 124.9; 96: 86.0 against 133
+  (single stage - the double buffer stops paying once the kernel loops token blocks); 128: 110.4.
+  The r32_t64 MMA tile takes 256 columns (137 against the generic r32_t128's 139), r32_t96 384
+  (163.6 against 169.7) and r64_t128 beyond (176.1 / 286.7 / 569.3 at 512 / 1024 / 2048 against
+  190.5 / 376.4 / 720.9).
+- **Shared decode tile** (`MmaR64T8K128`, 2026-10-23 sweep, RTX PRO 6000): 28.7 against 38.9 us for
+  the 32 x 64 tile on the [12800, 2560] PLE projection at T = 1-16.
+- **Double-buffered weight stages in the fused add** (the attention output projection's
+  2560-row eight-column block): on the RTX PRO 6000 the cold op's min-of-360 drops 11.8-12.0 ->
+  10.2 us with the median pinned at the timer's 12.3 us quantum (2026-11-03); upstream measured
+  11.6-12.7 -> 11.0 on an RTX 5090 and found 16 K warps or four slower, and the MLP down projection
+  no faster with either change.
+- **Up-collapse tiles** (sweep of 2026-10-14, whole mixer, 8 Q8 layers, RTX 5090): T <= 128 takes
+  MmaR32T64, above MmaR64T128; every tile gives the same bits.
+
+## Flash-Next FP8 pair-route admission
+
+The `fp8-a8-pair` fast path's admission sweep (2026-10-15, RTX 5090; ratios are the pair route's
+time over the exact route's, cold L2, graph): [1280, 2560] 1.08-2.43 up to T = 1024, 0.69-1.00
+beyond; [13312, 2560] slower at T = 32, 80 and 96 (1.06-1.08), faster from 112 (0.65-0.89);
+[16384, 2560] faster at every swept width from 48 (0.70-0.93), slower at T = 32 (1.02); [2560, 640]
+1.03-1.61 up to T = 512, 0.73-0.90 beyond; [2560, 6144] 1.05-1.97 up to T = 512, 0.64-1.00 beyond
+except T = 1040-1088 (1.18-1.19). The registered admission boundaries and the later re-measured
+margins are [model-quality.md](docs/maintainer/model-quality.md) §6.7's `fp8-a8-pair` entry.
+
+## Add-bias launcher packs (replaced forms)
+
+The add-bias launcher's one 16-byte pack per thread over the whole tensor (RTX 5090, 2026-10-16)
+against the earlier per-row packs and the large-domain BF16x2 stream: [4304, 4096] 19.3 -> 15.1 us,
+[4304, 65536] 722.9 -> 649.2 us, [2048, 16384] -13 %, [3456, 65536] -2.6 %; launch-bound shapes
+unchanged.
+
+## LM-head tall mapping: the persistent variant
+
+A persistent variant of the projection head's tall mapping (one CTA per SM walking row pairs with
+the next pair's chunks in a second register buffer) was slower at every width, 705-1516 us at 1-16
+columns, against the routed pass form (`src/ops/projection_fp32/projection_fp32.cu`).
+
+## Router projection wide tiles: the 4 x 8 tile with widened operands
+
+The [513, 2560] router's earlier wide shape, a 4 x 8 tile with widened operands, took 360 / 1358 us
+at 4,096 / 16,384 columns (~30 TFLOP/s; RTX PRO 6000, 2026-10-24) before the routed 16 x 16 / 32 x 32
+tiles (their numbers are the Flash-Next design §8.4).
+
+## VQ2 grouped-kernel key tiles
+
+The VQ2 grouped attention kernel's tile choices (`src/ops/softmax_attention/dense/causal_cache/vq2/`):
+16-column CTAs beyond kVqWideTileMaxKeys visible keys lose to 8-column CTAs (W = 16 at 128K keys:
+421 against 359 us). A 64-key tile halves the number of tiles and their barriers, worth 7-11 % on
+vq2 where a block already has the SM to itself (the sixteen-column CTA, measured at 2-8K keys:
+W = 16 takes 1.71x INT8 against 1.89x at 32 keys, B = 1), and worth it nowhere else: an eight-column
+block loses its second CTA per SM to the extra shared memory and slows by 13-44 %, and single-token
+decode would lose it too.
+
+## K-split Q4 parent of the attention input projections
+
+Complete-op measurement of the Q4/Q5 attention input projections' K-split Q4 parent (both parents
+launched, all four outputs, one graph, one probe run per column count; the timing boundary is the
+complete public Op): 73.0-77.6 us at T = 9..12 against 100.1-105.7 us for the row-split SIMT that
+R0 used there and 107.8-108.3 us for the grouped form the resolver switches to at T = 13. The
+resolver boundary at 13 is right for the grouped-vs-row-split question, but the split form with a
+K-split Q4 parent is 24-29 % faster than both
+(`src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu`).
+
+## Sparse MoE small-T row split
+
+The small-T sparse MoE's Rows2 split is only a grid split - (hidden / Rows, tokens) - so it runs
+twice the blocks and has twice the parallelism to cover memory latency while the grid is small, and
+it re-reads the same per-expert activations in every block: +63 % L1 traffic, L2 flat
+(lts__t_bytes x1.004); dram__* is not exposed on the part. Those counters are from Q6 at T = 17;
+the kernel is codec-parametric, so the mechanism is assumed to carry to Q5, not measured there.
+Neither crossover value regresses at 1975 MHz or at 2810 MHz. Below the crossover the parallelism
+wins; above it only the cost is left (`src/ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp`).

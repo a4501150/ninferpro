@@ -2,9 +2,9 @@
 
 // The tensor-core narrow route of the exact ggml arithmetic (ops/ggml/ggml_linear.cu's
 // mma_rows_kernel, dense calls of 3-8 columns): a CTA owns 16 rows and up to eight encoded columns,
-// its warps taking K's blocks in turn. (The expert banks' narrow kernels stay on dp4a: this route,
-// 8 intermediates or 16 down rows per CTA of five warps, measured 45-65 % slower at 1 and 5 tokens
-// and tg512 112.3 against 121.8 tok/s, 2026-10-12; an expert gets 1-2 columns per call.)
+// its warps taking K's blocks in turn. (The expert banks' narrow kernels stay on dp4a: this route
+// measured much slower at the experts' 1-2 columns per call — RESEARCH_NOTES.md, "GGUF dense
+// projections".)
 //
 // Lane (g, t) decodes chunk t (elements 8t..8t+7, fast::chunk) of each slice of rows g and g + 8:
 // they are its k slots 4t.. and 16 + 4t.. of an m16n8k32 MMA, so column g's limb words 2t and 2t + 1
@@ -130,13 +130,12 @@ __device__ __forceinline__ void accumulate(I128 (&acc)[4], const std::uint8_t* w
 
 // ------------------------------------------------------------------------------ staged weights
 //
-// accumulate with the weights staged (single-format launches; mma_rows_kernel kStaged, end to end
-// 2.1 % faster than accumulate's 2-byte loads, 2026-10-16): the warp copies its next 256-element unit of the CTA's 16 rows
+// accumulate with the weights staged (single-format launches; measured faster end to end than
+// accumulate's 2-byte loads — RESEARCH_NOTES.md, "GGUF dense projections"): the warp copies its next 256-element unit of the CTA's 16 rows
 // (every row from its 16-byte aligned start) into its half of a double buffer by cp.async while it
 // decodes the current unit from shared memory (tile_chunk: the same integers as fast::chunk), so a
 // unit's loads are 16-byte copies in flight beside the previous unit's MMAs instead of 2-byte loads
-// in its own dependency chain (the 5-column Q6_K call measured 31.9 us, 0.67 TB/s, stalled on long
-// scoreboard and the LSU queue, 2026-10-14).
+// stalled in their own dependency chain on the long scoreboard and the LSU queue.
 constexpr int kUnitElems = 256;
 template <QType F>
 inline constexpr int kUnitBytes = kUnitElems / static_cast<int>(ggml_block_elems(F)) * static_cast<int>(ggml_block_bytes(F));

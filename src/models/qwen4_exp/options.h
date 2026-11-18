@@ -8,12 +8,9 @@
 
 namespace infernix::models::qwen4_exp {
 
-// The model's default prefill chunk. Its exact route split at 1,024, 4,096 and 12,288 tokens gave
-// identical bits (36 perplexity windows of 14,336 tokens; its calls split on the 16-token GDN grid
-// and its routes are column-invariant), and wide chunks prefill faster with no decode cost:
-// Dense8, INT8 KV, RTX 5090,
-// pp32768 9,639 -> 11,211 tok/s from 4,096 to 16,384 (pp65536 9,887 -> 11,268; 26 fewer expert
-// frames of ~8,560).
+// The model's default prefill chunk. Its exact route is chunk-invariant (its calls split on the
+// 16-token GDN grid and its routes are column-invariant), and wide chunks prefill faster with no
+// decode cost (the measured chunk sweep is design §13.1).
 constexpr std::uint32_t kPrefillChunk = 16384U;
 
 // While another request decodes, the model prefills in narrower calls: the engine runs one decode

@@ -146,11 +146,10 @@ __global__ void __launch_bounds__(Threads)
 // and x columns are staged with cp.async (three stages, one barrier per slice); a warp owns a
 // TileRows x TileColumns sub-tile and multiplies BF16 operands without widening them (fma8_bf16).
 // After the last slice each warp reduces its partials by the same butterfly, so the bits equal the
-// narrow kernels' (an output's summation still depends only on K).
-// [513, 2560] router, RTX PRO 6000 (2026-10-24): the earlier 4 x 8 tile with widened operands took
-// 360 / 1358 us at 4,096 / 16,384 columns (~30 TFLOP/s); the small shape below takes 8 us from 21 to
-// 64 columns (the narrow mappings 10-18 us) and 33 us at 512, the large one 195-209 / 743-778 us at
-// 4,096 / 16,384 (55-58 TFLOP/s; FHFMA.BF16 peaks at ~110).
+// narrow kernels' (an output's summation still depends only on K). The tile shapes and the
+// wide-call boundary they won by are measured in the design record (qwen3_8-flash-next-design.md
+// §8.4); the earlier 4 x 8 tile with widened operands is in RESEARCH_NOTES.md, "Router projection
+// wide tiles".
 template <int TileRows, int TileColumns, int RowWarps, int ColumnWarps, int Stages, int MinBlocks>
 struct WideShape {
     static constexpr int kTileRows    = TileRows; // per warp
@@ -166,19 +165,20 @@ struct WideShape {
     static_assert(Stages >= 2 && (TileRows * TileColumns) % 32 == 0);
     static_assert((kRows * 32) % kThreads == 0 && (kColumns * 32) % kThreads == 0);
 };
-// 16 x 16 tiles, two CTAs per SM, up to 512 columns; 32 x 32 tiles, one CTA per SM, beyond.
+// 16 x 16 tiles, two CTAs per SM, up to 512 columns; 32 x 32 tiles, one CTA per SM, beyond
+// (measured; see the note above).
 using WideSmall = WideShape<4, 8, 4, 2, 3, 2>;
 using WideLarge = WideShape<4, 16, 8, 2, 3, 1>;
 constexpr int kSliceChunks         = 32; // chunks per K slice: one per lane
 // Narrower calls keep the narrow mappings (same bits). In a round's graph the row mapping loads a
-// row's whole K before its dependency wait, which the wide kernel's two staged slices do not match:
-// T1 rounds of 18 columns took 0.6 % longer on the wide kernel, 20 and 21 tied, 22-48 ran 0.4-2.0 %
-// faster.
+// row's whole K before its dependency wait, which the wide kernel's two staged slices do not match,
+// so the boundary sits where the wide kernel starts to win (the measured crossover is in the design
+// record, qwen3_8-flash-next-design.md §8.4).
 constexpr int kWideMinColumns      = 21;
 constexpr int kWideLargeMinColumns = 513;
-// Calls up to this many columns give each warp one row (one CTA per four rows and eight columns): a
-// 12-column DFlash2 verification round's 513-row router took 27 us in the four-rows-per-warp mapping's
-// 34 CTAs (RTX PRO 6000, 2026-10-21). Same bits as the other mapping.
+// Calls up to this many columns give each warp one row (one CTA per four rows and eight columns),
+// which the verification-round widths measured fastest (qwen3_8-flash-next-design.md §8.4). Same
+// bits as the other mapping.
 constexpr int kRowMappingMaxColumns = 32;
 
 // The address of chunk `chunk` (8 elements) of output row `row`.
@@ -433,16 +433,16 @@ __global__ void projection_q4_kernel(const bf16* __restrict__ x, int k, int padd
 
 // Tall projections (vocabulary heads, ~250K rows) at verification widths. The narrow mapping stages
 // eight columns per CTA, so 9..16 columns read every weight twice, and it gives each warp one row at a
-// time, so each staged x chunk is widened again for every row: the BF16 head [248320, 2560] took
-// 1.04 ms at 8 columns and 1.5 ms at 9-16 against a 0.71 ms DRAM floor. Here a CTA stages all of a
+// time, so each staged x chunk is widened again for every row: the BF16 head [248320, 2560] ran far
+// over its DRAM floor there (the measured ms are in the design record, qwen3_8-flash-next-design.md
+// §8.4). Here a CTA stages all of a
 // pass's columns once, each warp preloads all of its two rows' chunks before the first FMA, and each x
 // chunk is widened once for both rows. Lane l still accumulates chunks l, l + 32, ... in order per
 // (row, column) and the warp reduces by the same butterfly, so the bits equal the narrow kernels' at
 // every width. A pass holds up to 16 columns, or 17..19 in one pass of a wider body; wider calls run
 // balanced passes, each reading the weights once, where the narrow mapping read them once per eight
-// columns (q8_g32_fp16 [248320, 2560], RTX PRO 6000, 2026-10-24: 18 / 24 / 32 columns 1871 / 2107 /
-// 2801 -> 1186 / 1810 / 2142 us). A persistent variant (one CTA per SM walking row pairs with the
-// next pair's chunks in a second register buffer) was slower at every width (705-1516 us at 1-16).
+// columns (the per-width measurements are in the design record; the persistent variant they rejected
+// is in RESEARCH_NOTES.md, "LM-head tall mapping").
 constexpr int kTallThreads     = 256;
 constexpr int kTallWarps       = kTallThreads / 32;
 constexpr int kTallRowsPerWarp = 2;
@@ -454,9 +454,8 @@ constexpr int kTallMaxShared   = 101376;
 constexpr int kTallMinRows     = 32768;
 // The BF16 heads keep the tall mapping for 8..16 columns (tensor-core heads take 1..16).
 constexpr int kTallMaxColumnsBf16 = 16;
-// From these widths the tall mapping is faster (RTX 5090, [248320, 2560], 2026-10-08): BF16 840 vs
-// 1043 us at 8 columns and 869 vs 1500 at 9; q8_g32_fp16 841 vs 1209 at 9 but slower up to 8
-// (799 vs 762), where the narrow mapping stays near the DRAM floor.
+// From these widths the tall mapping is faster; the measured crossovers are in the design record
+// (qwen3_8-flash-next-design.md §8.4).
 constexpr int kTallMinColumnsBf16 = 8;
 constexpr int kTallMinColumnsQ8   = 9;
 
@@ -587,7 +586,7 @@ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& cod
 }
 
 // BF16 vocabulary heads at 1..16 columns: the tensor-core mapping, one route for every width, at the
-// DRAM floor (701-708 us for [248320, 2560] at 1..16 columns, 2026-10-08).
+// DRAM floor (qwen3_8-flash-next-design.md §8.4 holds the measured floor).
 bool mma_route(int rows, int columns, bool supported, detail::ProjectionRoute route) {
     if (route == detail::ProjectionRoute::Mma) {
         require(supported, "the tensor-core mapping does not serve this problem");

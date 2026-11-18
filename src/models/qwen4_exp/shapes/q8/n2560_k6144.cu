@@ -8,15 +8,16 @@
 namespace infernix::ops::detail {
 
 // Qwen3.8-Flash-Next GDN and QSA output projections: the SIMT route up to 8 columns (the register-streamed
-// route measured 16-29 % slower, M1 sweep), the MMA tiles beyond.
+// route measured slower there), the MMA tiles beyond (the sweep's measured winners are in RESEARCH_NOTES.md,
+// "Q8 MMA tile choices").
 Q8Launch select_q8_n2560_k6144(std::int32_t tokens) {
     if (tokens <= 4) return launch_q8_a16_simt_r8_t4;
     if (tokens <= 8) return launch_q8_a16_simt_r8_t8;
     if (tokens <= 64) return launch_q8_a16_mma_r32_t64;
     if (tokens <= 96) return launch_q8_a16_mma_r32_t96;
-    // Beyond 96 columns (prefill chunks): the MMA tile sweep of 2026-10-05 (fn/rigs/layer/q8tiles2.bat,
-    // RTX 5090). Every MMA tile accumulates each output over K in the same order, so their bits are
-    // identical (checked at every swept point); only speed differs.
+    // Beyond 96 columns (prefill chunks): the swept MMA tiles (RESEARCH_NOTES.md, "Q8 MMA tile
+    // choices"). Every MMA tile accumulates each output over K in the same order, so their bits are
+    // identical; only speed differs.
     if (tokens <= 256) return launch_q8_a16_mma_r32_t64;
     return launch_q8_a16_mma_r64_t128;
 }
@@ -53,15 +54,14 @@ Q8Launch select_q8_n2560_k6144_fast(std::int32_t tokens) {
     if (tokens <= 50) return launch_q8_a16_sliced_r16_t32_w4_s2;
     if (tokens <= 64) return fast_grouped;
     if (tokens <= 128) return fast_mma;
-    // Beyond 128 columns NInfer's table measured 1.0-1.45 times the exact routes (2026-10-15 sweep,
-    // RTX 5090), so the exact routes serve them.
+    // Beyond 128 columns NInfer's table measured slower than the exact routes at every width
+    // (the sweep ratios are in RESEARCH_NOTES.md, "Q8 MMA tile choices"), so the exact routes serve them.
     return select_q8_n2560_k6144(tokens);
 }
 
-// A16ColumnInvariant (the MTP attention output): the 8-K-warp sliced-K contraction at every T
-// (2026-10-24, RTX PRO 6000: 12.5 against 47.1 us at T = 1 for the MMA tiles' single K chain over 40
-// CTAs (the width route 14.3); 520 against 274 us for the width route at T = 2048, where only the
-// MTP's prompt pass runs it).
+// A16ColumnInvariant (the MTP attention output): the 8-K-warp sliced-K contraction at every T,
+// which measured faster than the MMA tiles' single K chain at every width it runs (the per-width
+// numbers are in RESEARCH_NOTES.md, "Q8 MMA tile choices").
 Q8Launch select_q8_n2560_k6144_invariant(std::int32_t tokens) {
     return select_q8_sliced_k_invariant<6144, 8>(tokens);
 }

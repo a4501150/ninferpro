@@ -301,8 +301,8 @@ struct DFlash2Io {
                 words = 0;
 };
 
-// Sampled MTP drafts (sampled-mtp-drafts) draw from the draft head's four most probable tokens:
-// measured against 8 and 16 at T 1.0 / top-p 0.95 / top-k 20 (design §3.1).
+// Sampled MTP drafts (sampled-mtp-drafts) draw from the draft head's four most probable tokens,
+// the rank count the sampler trials kept (model-quality.md §6.7, `sampled-mtp-drafts`).
 inline constexpr std::int32_t kSampledDraftRanks = 4;
 
 // Every fixed device allocation of a Program and the layouts in it (design §9.7). One function

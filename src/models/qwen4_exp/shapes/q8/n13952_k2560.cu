@@ -3,8 +3,9 @@
 
 namespace infernix::ops::detail {
 namespace {
-// Qwen3.8-Flash-Next MTP attention group: the register-streamed route up to 8 columns (4-28 % faster than
-// SIMT), the MMA tiles beyond (M1 sweep). K1: 2 row(s) per warp, x staged in shared memory per pass.
+// Qwen3.8-Flash-Next MTP attention group: the register-streamed route up to 8 columns, the MMA tiles beyond
+// (the sweep's measured winners are in RESEARCH_NOTES.md, "Q8 MMA tile choices"). K1: 2 row(s) per warp, x
+// staged in shared memory per pass.
 template <int MaxCols, int ColsPerPass>
 using Stream = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8StreamX::Shared, 2>;
 } // namespace

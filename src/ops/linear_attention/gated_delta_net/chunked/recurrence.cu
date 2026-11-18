@@ -122,8 +122,8 @@ __device__ __forceinline__ void mma_f16_f16acc_zero(unsigned& d0, unsigned& d1, 
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
 }
 
-// The k16 products an FP16 partial sum spans before its FP32 carry (measured 2026-10-16 against
-// one: 1.205x the exact route's op time at the 27B's shapes for both, and the more accurate state).
+// The k16 products an FP16 partial sum spans before its FP32 carry. Two spans the same op time as
+// one and gives the more accurate state (model-quality.md §6.7, `gdn-f16-accumulate`).
 inline constexpr int kFp16Carry = 2;
 
 // One k16 step of an FP16 partial sum; every kFp16Carry steps the partial (row g's columns

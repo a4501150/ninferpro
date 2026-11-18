@@ -46,9 +46,8 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
     plan.d3_schedule = SparseMoeSmallTD3Schedule::Paths3;
     // Rows is only a grid split: (kHidden / Rows, tokens). Rows2 runs twice the blocks, so it has
     // twice the parallelism to cover memory latency while the grid is small, and it re-reads the
-    // same per-expert activations in every block - +63 % L1 traffic, L2 flat (lts__t_bytes
-    // x1.004); dram__* is not exposed on this part. Those counters are from Q6 at T=17; the kernel
-    // is codec-parametric, so the mechanism is assumed to carry to Q5, not measured there.
+    // same per-expert activations in every block, which the profiled counters quantified (the
+    // counters and their run are in RESEARCH_NOTES.md, "Sparse MoE small-T row split").
     //
     // Below the crossover the parallelism wins; above it only the cost is left. Each codec keeps
     // its own crossover, taken where Rows2 is weakest - every token sharing one set of eight

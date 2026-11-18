@@ -233,9 +233,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value();
         program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value();
         program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value();
-        // Fitted 2026-10-05 (RTX 5090 at PCIe 5.0 x8, INT8 KV; design §15.3): 1.67 s per layer-walk
-        // span, 0.16 s per further call, 22 us per token and 1.06 ns per attention pair, within 5 %
-        // from 4K to 128K. The span is one pass of the experts over the link: the Program rescales
+        // Fitted on the RTX 5090 at PCIe 5.0 x8, INT8 KV (the fit and its bounds are design §15.3).
+        // The span is one pass of the experts over the link: the Program rescales
         // it, and the restore rate, to the link it measures at startup.
         program_options.prefix_cost.chunk_seconds          = 0.1645;
         program_options.prefix_cost.chunk_tokens           = chunk;

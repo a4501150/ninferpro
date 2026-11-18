@@ -50,9 +50,9 @@ struct SettledCpuRates {
 
 // Right after the expert banks' load or the SSD tier's fill (tens of GiB of direct reads), or while
 // the OS clears memory another process freed, memory is slow for some seconds, and a low reading
-// keeps too many decode misses on the link for the whole session: upstream's Flash-Next Dense8 read
-// 9,377 experts/s right after its tier's fill and 18,942 5 s later (decode -26 %, 2026-10-27); its
-// Qwen3.5-122B read 4,923 against 9,515-12,805 settled (decode -24 to -40 %, 2026-10-30). So the
+// keeps too many decode misses on the link for the whole session — upstream measured tier
+// readings far below their settled rates on two models (the readings and their decode costs are
+// MoE offload design §5.5). So the
 // rates are read again kRateSettle after the first reading, and again while a reading beats the best
 // experts/s by more than kRateSettleGain, at most kRateSettleReadings readings; the best of each rate
 // stands. `read` takes one reading (nullopt without expert records in RAM); `pause` waits between

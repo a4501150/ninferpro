@@ -8,13 +8,8 @@ using Geometry = Q8N2560K12800;
 
 // The DFlash2 feature projection's sliced-K schedules: 160 CTAs of one 16-row tile stream the 35 MB
 // weight, so each double-buffers its stages (48- and 64-column tiles with 8 K warps exceed the 99 KB
-// shared-memory budget, so 4 K warps serve the wider tiles). RTX PRO 6000 sweep of 2026-11-03, cold,
-// graph-timed, min/median of 60 (production serving concurrently): at 8 columns 24.3 us against the
-// runtime-shape SIMT route's 46.8, at 16 26.4 against 129, at 48 48.9 against 129, at 64 63.5
-// against 124.9, at 96 86.0 against 133 (single stage: the double buffer stops paying once the
-// kernel loops token blocks), at 128 110.4; the r32_t64 MMA tile takes 256 columns (137 against the
-// generic r32_t128's 139 at 256), r32_t96 384 (163.6 against 169.7) and r64_t128 beyond (176.1/286.7/
-// 569.3 at 512/1024/2048 against 190.5/376.4/720.9).
+// shared-memory budget, so 4 K warps serve the wider tiles), which the cold graph-timed sweep
+// measured ahead of the runtime-shape routes at every width (the per-width numbers are in RESEARCH_NOTES.md, "Q8 MMA tile choices").
 template <int Columns, int KWarps, int Stages = 2>
 using Sliced = Q8A16SlicedKMmaSchedule<Columns, KWarps, Stages, KWarps == 8 ? 2 : 3, Q8ScaleAccess::Shared,
                                        Cache::ca, Cache::cg, Q8ActivationStage::ActiveOnly>;

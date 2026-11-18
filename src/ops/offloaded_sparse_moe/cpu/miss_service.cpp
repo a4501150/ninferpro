@@ -123,8 +123,8 @@ void CpuMissService::wake() const noexcept {
 
 void CpuMissService::idle_wait() noexcept {
 #if defined(_WIN32)
-    // A wait's timeout and sleep_for both round up to the 15.6 ms timer tick; the high-resolution
-    // timer measured 0.51 ms for a 50 us request (2026-10-09, Windows 11, i9-13900K).
+    // A wait's timeout and sleep_for both round up to the OS timer tick; the high-resolution timer
+    // measured far closer to the request (MoE offload design §5.4).
     if (wake_event_ != nullptr && idle_timer_ != nullptr) {
         LARGE_INTEGER due{};
         due.QuadPart = -500; // 50 us, relative, in 100 ns units

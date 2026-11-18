@@ -5,7 +5,8 @@
 namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next MTP embedding and hidden projections: the register-streamed route up to 8 columns but 4
-// (SIMT there), the MMA tiles beyond (M1 sweep). K1: 2 row(s) per warp, x staged in shared memory per pass.
+// (SIMT there), the MMA tiles beyond (the sweep's measured winners are in RESEARCH_NOTES.md, "Q8 MMA tile
+// choices"). K1: 2 row(s) per warp, x staged in shared memory per pass.
 template <int MaxCols, int ColsPerPass>
 using Stream = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8StreamX::Shared, 2>;
 } // namespace
@@ -20,9 +21,8 @@ Q8Launch select_q8_n2560_k2560(std::int32_t tokens) {
 }
 
 // A16ColumnInvariant (the MTP embedding and hidden projections): the 8-K-warp sliced-K contraction at
-// every T (2026-10-24, RTX PRO 6000: 8.2 against 20.3 us at T = 1 for the MMA tiles' single K chain
-// over 40 CTAs (the width route 8.0); 236 against 154 us for the width route at T = 2048, where only
-// the MTP's prompt pass runs it).
+// every T, which measured faster than the MMA tiles' single K chain at every width it runs (the
+// per-width numbers are in RESEARCH_NOTES.md, "Q8 MMA tile choices").
 Q8Launch select_q8_n2560_k2560_invariant(std::int32_t tokens) {
     return select_q8_sliced_k_invariant<2560, 8>(tokens);
 }

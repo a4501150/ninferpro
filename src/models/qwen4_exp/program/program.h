@@ -487,12 +487,11 @@ struct ProgramOptions {
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
     // 0 derives it from the measured link and CPU rates, design §10.5).
-    // Defaults measured fastest on the i9-13900K (design §18.1): 16 jobs pay in
-    // calls with many misses (C = 4 fill +7 %, cold MTP +3 %) and are neutral elsewhere; 32 is no faster.
+    // Defaults measured fastest on the i9-13900K (design §10.5): 16 jobs pay in calls with many
+    // misses and are neutral elsewhere; 32 is no faster.
     std::uint32_t cpu_expert_workers = 6;
     // The workers for a GGUF import's banks (the ggml CPU route, compute-bound where the NVFP4
-    // route is DRAM-bound): on the i9-13900K, tg512 decoded 100.5 tok/s without CPU service, 98.4
-    // with 6 workers, 103.7 with 16 and 103.6 with 20 (2026-10-11; 16 workers with divisor 3: 101.1).
+    // route is DRAM-bound): the per-count tg512 measurements are design §10.5.
     std::uint32_t cpu_ggml_expert_workers = 16;
     std::uint32_t cpu_expert_jobs    = 16;
     std::int32_t cpu_pcie_divisor    = 0;

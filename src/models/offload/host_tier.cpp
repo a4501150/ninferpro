@@ -115,7 +115,7 @@ bool HostTier::eligible(const Slot& s, Victims kind) const {
 
 // Residents leave RAM least-used first. Shadows leave most-used first: a shadow saves a demotion only when its expert
 // leaves VRAM, which takes the least-used experts first, so dropping the least-used experts' shadows (as residents)
-// made nearly every VRAM victim a demotion (upstream Dense8 struct: 24,318 -> 2,057 demotions a request, 2026-10-29).
+// made nearly every VRAM victim a demotion (the measured demotion counts are MoE offload design §4.3).
 double HostTier::victim_value(std::uint32_t key, Victims kind) const {
     return kind == Victims::kShadow ? -lfu_.value(key) : lfu_.value(key);
 }

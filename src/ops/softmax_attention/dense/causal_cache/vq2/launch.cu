@@ -37,13 +37,13 @@ KVCacheVqStaging allocate_vq_staging(Allocator& allocator, int width, int kv_hea
 // on the codes under the INT8 rule's key minimums (plan.partition). Rows of 9-256 columns take
 // 16-column CTAs up to kVqWideTileMaxKeys visible keys (one expansion of each tile for sixteen
 // columns) and 8-column CTAs beyond, where the sixteen-warp CTA's single residency per SM costs
-// more than the second expansion (W = 16 at 128K keys: 421 against 359 us).
+// more than the second expansion (RESEARCH_NOTES.md, "VQ2 grouped-kernel key tiles").
 inline constexpr std::uint32_t kVqWideTileMaxKeys = 32768;
 // Keys per tile of the grouped kernel. A 64-key tile halves the number of tiles and their barriers,
-// which is worth 7-11 % on vq2 where a block already has the SM to itself (the sixteen-column CTA,
-// measured at 2-8K keys: W=16 takes 1.71x INT8 against 1.89x at 32 keys, B=1). It is not worth it
-// anywhere else: an eight-column block loses its second CTA per SM to the extra shared memory and
-// slows by 13-44 %, and single-token decode would lose it too. So 64 keys need Tokens > 8, and must
+// worth 7-11 % on vq2 where a block already has the SM to itself, and worth it nowhere else: an
+// eight-column block loses its second CTA per SM to the extra shared memory, and single-token
+// decode would lose it too (the measured variant costs are in RESEARCH_NOTES.md, "VQ2
+// grouped-kernel key tiles"). So 64 keys need Tokens > 8, and must
 // fit one block: k4v2's 130-byte K rows never do at that width, so it keeps 32 everywhere.
 template <class Geometry, int Tokens, KVCacheVqKeyCodec Codec>
 inline constexpr int kVqGroupedKeyRows =

@@ -5,7 +5,8 @@
 namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next shared expert gate/up: the register-streamed route up to 48 columns but 4 (SIMT there),
-// the MMA tiles beyond (M1 sweep). K1: 2 row(s) per warp, x staged in shared memory per pass.
+// the MMA tiles beyond (the sweep's measured winners are in RESEARCH_NOTES.md, "Q8 MMA tile choices").
+// K1: 2 row(s) per warp, x staged in shared memory per pass.
 template <int MaxCols, int ColsPerPass>
 using Stream = Q8A16StreamSchedule<2560, 2, 1, 4, MaxCols, ColsPerPass, Q8StreamX::Shared, 2>;
 } // namespace
@@ -17,16 +18,16 @@ Q8Launch select_q8_n1280_k2560(std::int32_t tokens) {
     if (tokens <= 48) return launch_q8_a16_stream_linear<Stream<16, 8>>;
     if (tokens <= 64) return launch_q8_a16_mma_r32_t64;
     if (tokens <= 96) return launch_q8_a16_mma_r32_t96;
-    // Beyond 96 columns (prefill chunks): the MMA tile sweep of 2026-10-05 (fn/rigs/layer/q8tiles2.bat,
-    // RTX 5090). Every MMA tile accumulates each output over K in the same order, so their bits are
-    // identical (checked at every swept point); only speed differs.
+    // Beyond 96 columns (prefill chunks): the swept MMA tiles (RESEARCH_NOTES.md, "Q8 MMA tile
+    // choices"). Every MMA tile accumulates each output over K in the same order, so their bits are
+    // identical; only speed differs.
     if (tokens <= 512) return launch_q8_a16_mma_r32_t64;
     return launch_q8_a16_mma_r64_t128;
 }
 
-// A16ColumnInvariant (the MTP shared expert gate/up): the 8-K-warp sliced-K contraction at every T
-// (2026-10-24, RTX PRO 6000: 5.2 against 20.2 us at T = 1 for the MMA tiles' single K chain over 20
-// CTAs (the width route 5.9); it runs at draft widths only).
+// A16ColumnInvariant (the MTP shared expert gate/up): the 8-K-warp sliced-K contraction at every T,
+// which measured faster than the MMA tiles' single K chain at the draft widths it runs (the numbers
+// are in RESEARCH_NOTES.md, "Q8 MMA tile choices").
 Q8Launch select_q8_n1280_k2560_invariant(std::int32_t tokens) {
     return select_q8_sliced_k_invariant<2560, 8>(tokens);
 }

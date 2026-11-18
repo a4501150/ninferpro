@@ -251,8 +251,8 @@ std::int32_t ProgramImpl::choose_batch_dflash_length(std::span<const std::uint32
     // interval a plain round (the plain EMA's sample -- without it the plain round time goes
     // stale and the drafting rounds' fixed overhead is priced into the columns it does not
     // belong to). While plain wins, that often would give away a round costing twice a plain
-    // one every 2 * kProbeInterval rounds (measured about 4 % of the size's tokens at six rows,
-    // 2026-10-21), so once the size is fitted the probe thins to every kProbeLossFactor'th cycle.
+    // one every 2 * kProbeInterval rounds (design §11.5 holds the measured cost), so once the size
+    // is fitted the probe thins to every kProbeLossFactor'th cycle.
     // Until then it probes every cycle, so a size's fit forms within a few hundred rounds instead
     // of thousands. The probes alternate one and two drafts: the columns fit needs their spread.
     const std::uint64_t round = ++batch_policy_rounds_;
@@ -393,7 +393,7 @@ void ProgramImpl::mtp_draft(std::span<const std::uint32_t> lanes, std::int32_t s
     // draft step runs only while every earlier draft cleared it: the device applies the host's
     // cut (the same binary64 comparison) and skips the steps whose drafts it would discard. A
     // skipped step leaves its draft and confidence words stale, beyond the cut that reads them.
-    // (Design §11.2: 34 % of the steps of mixed-topic MTP 4 rounds, decode +2.2 %.)
+    // (The measured share of skipped steps and the decode gain are design §11.2.)
     if (!sampled && batch == 1 && steps > 1 && std::isfinite(draft_min_logprob_)) {
         replay_gated(mtp_gated_graphs_[static_cast<std::size_t>(steps - 1)], steps, draft_step,
                      [&](std::int32_t j, cudaGraphConditionalHandle next) {

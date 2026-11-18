@@ -103,8 +103,8 @@ public:
     static constexpr std::uint32_t kProbePeriod = 16;
     static constexpr std::uint32_t kProbeRounds = 2;
     // Without measured or learned round times a round of K drafts costs 1 + kModelDraftCost * K.
-    // The cost is the model's (2026-10-18, INT8 KV, from fixed-length runs: about 0.06 on the
-    // NVFP4 27B, 0.19 on the 35B-A3B), so the learned fit replaces it once determined.
+    // The cost is the model's (the per-model values, from fixed-length runs, are in model-quality.md
+    // §6.7's `adaptive-mtp` entry), so the learned fit replaces it once determined.
     static constexpr double kModelDraftCost = 0.2;
     // The learned fit: per observed cycle decay, the rounds and length spread it needs, the gap
     // filter, and the largest cost it reports.

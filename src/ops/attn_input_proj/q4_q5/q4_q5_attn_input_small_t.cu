@@ -104,13 +104,11 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
     case 10:
     case 11:
     case 12:
-        // K-split for the Q4 parent across the whole parent-split range. Complete-op measurement
-        // (both parents launched, all four outputs, one graph, one probe run per column count):
-        // 73.0-77.6 us at T=9..12 against 100.1-105.7 us for the row-split SIMT that R0 used there,
-        // and 107.8-108.3 us for the grouped form the resolver switches to at T=13. The resolver
-        // boundary at 13 is right for the grouped-vs-row-split question, but it hid this: the split
-        // form with a K-split Q4 parent is 24-29% faster than both. T=2..6 keep the SIMT tile,
-        // where a 16-wide K-split tile would waste more MMA work than it saves.
+        // K-split for the Q4 parent across the whole parent-split range: the complete-op
+        // measurement that put it here, against the row-split SIMT the resolver used and the
+        // grouped form it switches to at T=13, is in RESEARCH_NOTES.md, "K-split Q4 parent of the
+        // attention input projections" (24-29 % faster than both at T=9..12). T=2..6 keep the SIMT
+        // tile, where a 16-wide K-split tile would waste more MMA work than it saves.
         launch_q4_sliced_band(x, weight, q, key, stream);
         return;
     case 2:

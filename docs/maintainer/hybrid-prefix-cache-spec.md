@@ -508,7 +508,9 @@ restore_seconds = (host_path_bytes + host_image_bytes + host_tail_bytes) / measu
 ```
 
 `prefill_seconds` is the existing calibrated machine model (`context_cost.cpp`: linear tokens
-plus `B·S + S(S+1)/2` attention pairs, keyed by `prefill_signature`). Pick the minimum. Ties
+plus `B·S + S(S+1)/2` attention pairs, keyed by `prefill_signature`; the compiled RTX 5090
+preset's transfer rows are unified from the measured 2026-08-24 transfer corpus, and a fresh
+machine-only transfer calibration replaces them without loading a model). Pick the minimum. Ties
 favour fewer transferred bytes. This is O(1) and deterministic, and the cost model only ranks
 feasible choices.
 

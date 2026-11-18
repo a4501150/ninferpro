@@ -22,17 +22,9 @@
 // compute_plane runs the same K loop over a decoded plane instead: each stage's codes, sub-scales
 // and scale words are a CodeStage image that decode_stage wrote once per call (ggml_linear's dense
 // projections), copied by cp.async one stage ahead with no decode in the loop. The experts' tiles
-// decode in the loop: a group-wise plane measured 2 % faster at 16,384 tokens and no faster end to
-// end, where the layer walk's MoE calls are 4,096-8,192 tokens (2026-10-12).
-//
-// Measured on the RTX 5090 (2026-10-11, the IQ3_S model's dense shapes at 512 columns): tiles of
-// 32 x 128 columns re-read each column's limbs per 32 rows and were bound by L2 throughput (66 %
-// of peak); folding the sub-scales into two byte planes of the weights (6 MMAs per weight instead
-// of 3 plus IMADs) was no faster, nor at 4096 columns with Q6_K planes at one CTA per SM (2026-10-13:
-// prefill pp32768 4,090 against 4,093 tok/s; Q6_K projections -11 % to +1 %, the experts' calls
-// mixed). At 4096 columns (2026-10-12) double-buffering the codes so the
-// next stage decodes beside this stage's MMAs (one barrier fewer per stage) was 3-5 % slower for
-// Q6_K, Q5_K and Q4_K than this decode-then-MMA order.
+// decode in the loop: a group-wise plane measured no faster end to end at the layer walk's MoE call
+// widths (the tile-form sweeps are in RESEARCH_NOTES.md, "GGUF dense projections"). The CTA shape,
+// the decode-then-MMA stage order and the sub-scale handling were all chosen by those sweeps.
 
 #include "core/ggml_format.h"
 #include "ops/ggml/ggml_dp4a.cuh"
@@ -872,7 +864,8 @@ __device__ __forceinline__ void compute_plane(PlaneShared& sm, RowOf row_of, con
 // The rows' raw bytes arrive by cp.async in one batch (each row from its 16-byte aligned start, in
 // sm.b, which the K loop fills only later), then every stage decodes from shared memory (tile_chunk):
 // one global latency per tile instead of one per stage. (Decoding each stage from global memory
-// was 12 % of the IQ4_NL down tiles' stall samples, 2026-10-14.)
+// was a measured share of the IQ4_NL down tiles' stall samples; RESEARCH_NOTES.md, "GGUF dense
+// projections".)
 template <QType F, int Stages, int Threads = kThreads, class Stage, class RowOf>
 __device__ __forceinline__ Accum decode_resident(ResidentShared<Stages, Stage>& sm, RowOf row_of) {
     constexpr int kBlockElems = static_cast<int>(ggml_block_elems(F));

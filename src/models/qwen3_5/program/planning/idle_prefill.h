@@ -15,9 +15,10 @@ namespace infernix::models::qwen3_5::detail {
 
 // Idle widths startup plans, widest first. Each is taken as a prefill step takes the chunk
 // (clamped to the context and rounded down to whole prompt-attention waves); startup keeps the
-// widest whose plan fits memory (runtime/engine/model_instance.cpp). On the RTX 5090 a 4096-token
-// step lifts prefill 2-7 % on the dense NVFP4 27B and 19-21 % on the 35B MoE over 1024 (NInfer
-// 5bcef9e2c, int8 KV), while a decode round waiting behind one step would stall about 3.4x longer.
+// widest whose plan fits memory (runtime/engine/model_instance.cpp). A 4096-token step lifts
+// prefill on both families' artifacts over 1024 while a decode round waiting behind one step
+// stalls several times longer (the per-family measurements are in model-quality.md §6.7's
+// `idle-wide-prefill` entry).
 inline constexpr std::array<std::uint32_t, 3> kIdlePrefillRequestedWidths{4096U, 2048U, 1024U};
 
 // The candidate idle widths, widest first, from `step_widths` (the requested widths as a prefill

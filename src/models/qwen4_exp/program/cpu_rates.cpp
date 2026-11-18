@@ -40,10 +40,8 @@ constexpr int kRepeats    = 3;   // batches per width, on distinct records
 constexpr int kLoadCopies = 150; // records the link copies during a batch (~15 ms at 27.5 GB/s)
 constexpr int kNarrowColumns = ops::offloaded_moe::kMaxCpuColumns; // the split's widest CPU job
 // Other processes' share of the CPU under which an attempt stands, the pause between attempts and
-// the time to keep trying. An idle desktop measured 2-7 %. On an i9-13900K (32 logical CPUs) the
-// 6-worker team reads 2 / 6 / 11 / 13 / 35 / 46 % low with 4 / 8 / 12 / 16 / 24 / 32 busy processes
-// (12.5-100 %), and the decode divisor (C t switching at 1.35) holds to about 18 % low: below 25 % an
-// attempt is at most ~6 % low, clear of both.
+// the time to keep trying: the busy-host readings that set the bound, and how far low readings move
+// the decode divisor, are MoE offload design §5.5.
 constexpr double kQuietShare = 0.25;
 constexpr auto kRetryPause   = std::chrono::milliseconds(500);
 constexpr auto kRetryBudget  = std::chrono::seconds(20);

@@ -486,8 +486,8 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
     for (int i = 0; i < kPerLane; ++i) { key[i] = lane + 32 * i < experts ? route_key(raw[i]) : 0U; }
     // The lane's earliest choice: the largest key, the lowest index among equal ones. A depth-4
     // tree over the 16 candidates (the 16-step compare chain it replaced took most of the fused
-    // route kernel's cycles at decode widths; upstream 2026-10-29: the selections 7,400 -> 3,500
-    // cycles of that kernel).
+    // route kernel's cycles at decode widths; RESEARCH_NOTES.md, "Offloaded MoE layer: removed
+    // expert-kernel forms").
     unsigned best_key = 0;
     int best_i        = 0;
     const auto lane_best = [&] {
@@ -711,8 +711,9 @@ __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries
 // --------------------------------------------------------------------------------------- experts
 //
 // The W4A4 narrow kernels compute one column of a job at a time (a job of n columns makes n passes
-// over its staged weights): at op level (frames, cold L2, uniform routing) they beat an eight-column
-// form 1.26-2.3x at every width from one to 64 columns per expert, which was removed 2026-10-11.
+// over its staged weights): at op level (frames, cold L2, uniform routing) they beat the removed
+// eight-column form at every width from one to 64 columns per expert (design §8.5; RESEARCH_NOTES.md,
+// "Offloaded MoE layer: removed expert-kernel forms").
 //
 // Half2 unit products. A unit's code byte 32q + 4i + j holds rows i (low nibble) and i + 8 (high nibble) at k = 4q + j.
 // cvt.rn.f16x2.e2m1x2 turns it into the two E2M1 values as a half2 (low nibble in .x), so lane
@@ -1038,8 +1039,8 @@ __device__ __forceinline__ int dp4a_su(int a, std::uint32_t b, int c) {
 // once per CTA, a gate/up CTA takes one row group, and the weights stream into registers a batch
 // ahead (a16_row_sums), so loads stay in flight while the CTA computes. The int64 sums are the
 // same exact sums. A job of n columns computes them one at a time against the weights its lanes hold
-// in registers: at op level (frames, cold L2) that beat four-column passes at every width measured,
-// 1-3 columns per expert and 6-48 columns per call (RTX PRO 6000, 2026-10-21).
+// in registers: at op level (frames, cold L2) that beat four-column passes at every width measured
+// (RESEARCH_NOTES.md, "Offloaded MoE layer: removed expert-kernel forms").
 static_assert(sizeof(A16Act) * moe::kGateUpBlocks == moe::wide::kA16XRowBytes);
 
 constexpr int kEncodeActsThreads = moe::kGateUpBlocks; // one 16-element block per thread
@@ -1178,10 +1179,9 @@ __device__ __forceinline__ void a16_row_sums(const UnitRows (&w)[kA16WarpSteps],
 }
 
 // Three CTAs per SM (80 registers, no spills): with a row pair's four quads per lane (one scale and one
-// int64 product per unit) the passes took 33 / 109 / 191 us at T = 1 / 6 / 12 (decode route, frames, cold
-// L2, RTX PRO 6000, 2026-10-24), against 33 / 113 / 194 at two and 37 / 121 / 210 with a quad per lane.
-// A persistent variant (two CTAs per SM double-buffering each item's weights through shared memory)
-// was slower at T = 12 (234 us).
+// int64 product per unit), which the CTA-shape sweep measured fastest (its per-variant numbers are in
+// RESEARCH_NOTES.md, "Offloaded MoE layer: removed expert-kernel forms"; the routed form's own
+// per-layer times are design §8.5).
 constexpr int kA16RowsMinCtas = 3;
 
 struct GateUpRowShared16 {
@@ -1434,21 +1434,18 @@ void launch_expert_pass_a16_rows(const MoeDispatch& dispatch, const MoeExpertSou
 }
 
 // The dp4a rows kernels' call width. Calls of at most this many columns stay on them: the
-// tensor-core kernels' down pass measured 300-380 us/round slower at every decode and verification
-// width on the real model (T1 kernel table, RTX PRO 6000, production stopped) and their whole-op
-// time 0.9-12 % slower through T = 48 at the op bench (cold L2, frames, interleaved A/B, min of
-// 2x2 runs), the two level to T = 128. Wider calls (prefill chunks) run the tensor-core kernels
-// for their narrow jobs: level at 112-128 and 0.9-8 % faster from T = 160 on (T = 256 -7.9 %,
-// T = 1024 -5.8 %, min-of-mins; the mixed narrow/wide widths 56-192 wobble a few percent run to
-// run, so the boundary sits below the first width where the tensor-core kernels win outside
-// that wobble). The boundary table is in the commit message.
+// tensor-core kernels' down pass measured slower at every decode and verification width on the
+// real model and their whole-op time slower through T = 48 at the op bench, the two level to
+// T = 128. Wider calls (prefill chunks) run the tensor-core kernels for their narrow jobs, which
+// measure faster from T = 160 on; the boundary sits below the first width where they win outside
+// the mixed narrow/wide widths' run-to-run wobble (design §8.5 holds the measured numbers).
 constexpr int kA16RowsMaxColumns = 128;
 
 // Calls of at most this many columns release the down pass per job (wait_job_h, the gate/up
 // pass's per-element counts) instead of by the grid-wide PDL wait. Through this width the earlier
-// per-job start measured faster (T1, RTX PRO 6000, 2026-11-04: 1x1 -0.7 %, 1x4 -1.7 %, 6x1
-// -1.0 %, 1x8 -1.0 %); at 12 columns the two measured level, and at 18 the grid-wide wait won by
-// 0.8 % — the down pass's earlier compute contends with the still-running gate/up CTAs for DRAM.
+// per-job start measured faster; at 12 columns the two measured level, and at 18 the grid-wide
+// wait won — the down pass's earlier compute contends with the still-running gate/up CTAs for
+// DRAM (design §8.5 holds the measured numbers).
 constexpr int kA16PerJobWaitColumns = 8;
 static_assert(kA16RowsMaxColumns >= kRouteDispatchColumns,
               "the in-place route plan's fused kernel encodes the dp4a x at its whole width");
@@ -1732,10 +1729,9 @@ __device__ __forceinline__ void publish_x_columns(const MoeCpuChannel& channel, 
 // makes the dispatch visible, its first kThreads threads plan as cpu_plan_kernel does (the same
 // results) and the rest exit, so the plan, and the host's start, follow the dispatch with no kernel
 // boundary. The warps that route no column publish x for the CPU while the others route (a call of
-// 32 columns: every thread, after the routing), so the copy, ~4,300 cycles after the plan's
-// decision before, overlaps the routing and the request goes out that much sooner (upstream
-// 2026-10-29); the plan's system fence orders these stores too (every thread passed the barriers
-// before it).
+// 32 columns: every thread, after the routing), so the copy, thousands of cycles after the plan's
+// decision before, overlaps the routing and the request goes out that much sooner (design §8.4);
+// the plan's system fence orders these stores too (every thread passed the barriers before it).
 __global__ void __launch_bounds__(kDispatchThreads)
     route_dispatch_plan_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
                                std::int32_t* __restrict__ ids, float* __restrict__ weights,

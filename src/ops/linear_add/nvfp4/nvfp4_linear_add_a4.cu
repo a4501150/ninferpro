@@ -28,10 +28,9 @@ using M128N128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 // This projection selects its own route, so the layout the quantizer writes below must be derived
 // from the same predicate; the two are read together at the call site for that reason. Past 512
-// tokens the TMA route is faster than the resident 128x128 tile (RTX 5090, cold weights): 513 tokens
-// take 144.7 instead of 187.7 us at K=17408 and 62.0 instead of 70.9 us at K=6144, 640-1000 tokens
-// 17-26 % less; at 512 and below the MMA tiles stay faster (114.0 against 133.7 us at K=17408).
-// Both routes give the same bits (27B top-32 logprobs over 640-token chunks are byte-identical).
+// tokens the TMA route is faster than the resident 128x128 tile, and at 512 and below the MMA tiles
+// stay faster (the measured crossover is in linear-tuning.md). Both routes give the same bits (27B
+// top-32 logprobs over 640-token chunks are byte-identical).
 constexpr bool uses_tma(std::int32_t tokens) { return tokens > 512; }
 
 template <class Geometry, class Schedule>

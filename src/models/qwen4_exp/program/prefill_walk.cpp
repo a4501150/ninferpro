@@ -489,11 +489,10 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         apply_vram_target(false);
     }
     // A walk promotes no experts (its routes still count toward the cache's scores). Between spans
-    // the stream lease holds most frames, so promotions would churn through the rest (~12,000
-    // records, ~1.2 s of link per 64K span) and the next span would wait for them. After the
-    // prompt they would fill the returned frames with the prompt's experts while the answer's own
-    // staged misses land there anyway: 16 per layer and chunk measured slower than none for every
-    // answer length (128K + 512 tokens: 23.16 -> 21.10 s; design §13.7).
+    // the stream lease holds most frames, so promotions would churn through the rest and the next
+    // span would wait for them. After the prompt they would fill the returned frames with the
+    // prompt's experts while the answer's own staged misses land there anyway: per-chunk
+    // promotions measured slower than none for every answer length (design §13.7).
     return prefill_progress(lane, index, begin, width, tokens, last, 0, start);
 }
 

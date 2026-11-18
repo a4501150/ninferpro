@@ -189,7 +189,7 @@ asset is the calibrated expert order (Apache 2.0, recorded in its file).
 | QSA selection that scales with context (multi-CTA scoring, histogram top-k) | Strata `cce52db` | vs one CTA per column: decode +4.9 / +10.6 / +34.6 % at 4K / 8K / 32K; 32K at 89 % of 4K (RTX 5090, 2026-10-05) | §14: `qsa_score_kernel`, `qsa_score_wide_kernel` (32+ columns) |
 | Warm start from a saved LFRU state, plus a built-in calibrated order when none is saved | NInfer `kFlashNextExpertPriority` (f8a774f73) | first request vs empty cache: decode 147 -> 162.6 tok/s (code prompt), prefill 52 -> 66 tok/s (RTX 5090, 2026-10-17) | §9: `expert_state`, `calibrated_order.cpp` |
 | Residual-A4 fast path for W4A16 wide experts (recipe C) | strata-nvfp4 | three terms are 35-43 % faster than the exact limb route at 4K-32K chunks; two terms left ~0.8 % row error and half the FP8-KV decode excess (RTX PRO 6000, 2026-11-02) | §13: `WideA16::kA4Residual`, three residual terms |
-| Fused HC up projection + collapse (bit-exact Q8 MMA epilogue) | strata-nvfp4 | same output hash at 13 widths; 540 vs 580 µs per 4,096-column mixer call (RTX 5090, 2026-10-14) | §13: `hyper_connection_up_collapse.cu` |
+| Fused HC up projection + collapse (bit-exact Q8 MMA epilogue) | strata-nvfp4 | same output hash at 13 widths; 540 vs 580 µs per 4,096-column mixer call (RTX 5090, 2026-10-14); above 96 columns only — below, the separate linear and collapse measured as fast or faster (+0.5-2 %, RTX 5090) | §13: `hyper_connection_up_collapse.cu` |
 | v4 HC read scheduling for mixer calls of 2+ columns | strata-nvfp4 `fused_gr.cu` | mixer 15.9 -> 13.1 µs at T 5, decode MTP +0.9 % (RTX 5090, 2026-10-16) | §8: `hc_down_partials_v4`, `hc_up_collapse_v4` |
 | Prefill chunk 16,384 | kido5217 #76 | pp32768 9,639 -> 11,211 tok/s from chunk 4,096; the exact route is chunk-invariant (RTX 5090, 2026-10-15) | §13: `kPrefillChunk` |
 | Halve a chunk whose wide workspace could never be lent | GitHub #5 | a 65,536-token chunk wanted 27 GiB and failed `cudaMalloc` after admission | §13: `fit_wide_work_to_free` |
@@ -708,7 +708,9 @@ QSA attention and KV appends, §17 the expert numerics.
 Host threads are not pinned. On Windows the process is exempted from EcoQoS power throttling once,
 when an Engine is constructed (`core/power_throttling`): the exemption is the whole gain
 (+69-162 % on tg8k workloads, i9-13900K, 2026-10-07), a P-core affinity set adds nothing and pinning
-each thread costs 3-4 %. No placement code is kept.
+each thread costs 3-4 %. No placement code is kept. The first measurement of the effect (i9-13900K +
+RTX 5090, Qwen3.8-Flash-Next): a hidden run decoded 37.6 tok/s at 8K context throttled and 98.7
+exempt (2.6x), and serving at two and four concurrent requests gained 69-81 %.
 
 GPU streams of a round: the compute stream (captured into the round's graph), `ForwardExperts::
 shared_stream` (the shared expert, forked at the layer's MoE input and joined before the combine),
@@ -749,7 +751,14 @@ fused prepare, attention and the output gate; §14):
 
 1. The attention mixer `hc_down_partials` + `hc_up_collapse` (`hyper_connection_mix`): two kernels,
    every intermediate FP32, weights loaded before the PDL wait. At two or more columns the same
-   arithmetic runs Strata v4's read scheduling (token groups sized to the call). The fused route
+   arithmetic runs Strata v4's read scheduling (token groups sized to the call), which measured, on
+   the RTX 5090 with the Q8 mixer (2026-10-16), -7.6 % per call at T 2 to -17.8 % at T 5 (+2.2 % at
+   T 1, which keeps the older pair); Flash-Next Dense8 MTP 4 decode +0.9 %, plain decode +0.6 %.
+   Sizing the token groups to the call measured -4 % (T 2) to -12 % (T 12) per call (RTX PRO 6000,
+   Q8), and forming m once per call (since 2026-10-24, K1a v4's four stream CTAs a cluster whose
+   stream 0 sums the row sums through distributed shared memory; K1b v4 copies m and decodes its
+   weight chunks once) measured T 4 / 8 / 12 / 16 at 10.6 / 14.3 / 19.0 / 23.2 -> 10.1 / 13.1 /
+   17.1 / 20.2 us per call (BF16 weights: T 2-3 +0.6-0.8 us, T >= 4 -0.3 to -3.9 us). The fused route
    serves up to 28 columns (16 when the norm weight is not 16-byte aligned); wider calls run the
    composed steps.
 2. The GDN input projection `gdn_input_proj` — the Q8 [16384, 2560] form writes q/k/v and z to
@@ -763,6 +772,11 @@ fused prepare, attention and the output gate; §14):
    (`hyper_connection_inject_mix`); at wider rounds one inject kernel runs before the mix pair.
 6. The MoE: the shared expert on its own stream from the layer's input; the router projection; the
    fused route/dispatch/plan kernel; the expert passes; the CPU wait; `moe_combine_inject` (§8.4-8.6).
+   A side-stream call encodes the routed experts' activations beside the router and the route — the
+   encoding followed the route on the call's critical path at ~3 us a layer — and measured, upstream
+   2026-10-29, IQ3_S 16K decode 265.5 -> 267.7 tok/s with Dense8 flat; the fork and join alone cost
+   Dense8 MTP decode 1.4 %, which is why a call without one (W4A4, or one the in-place plan's fused
+   kernel encodes) forks nothing.
 
 Per layer the chain is about 25 kernels — 1,139 per 6 x 1 round (measured, RTX PRO 6000, 2026-10-22).
 Every launch in a captured graph is a programmatic dependent (`pdl::launch_consumer`): a kernel loads
@@ -814,7 +828,22 @@ SHAPE=S METRICS=1` publishes this table for any shape.
 
 The router projection (`projection_fp32`, the [513, 2560] BF16 router row plus the shared-expert
 gate row) loads its weight rows into registers before staging x, and is a PDL consumer so its DRAM
-trip overlaps the mixer's tail.
+trip overlaps the mixer's tail. Its wide-call kernels, measured on the RTX PRO 6000 (2026-10-24):
+the routed 16 x 16 tiles (two CTAs per SM, to 512 columns) take 8 us from 21 to 64 columns (the
+narrow mappings 10-18 us) and 33 us at 512, the 32 x 32 tiles (one CTA per SM, beyond) 195-209 /
+743-778 us at 4,096 / 16,384 columns (55-58 TFLOP/s; FHFMA.BF16 peaks at ~110); the earlier 4 x 8
+tile with widened operands took 360 / 1358 us there (~30 TFLOP/s). In a round's graph the row
+mapping loads a row's whole K before its dependency wait, which the wide kernel's two staged slices
+do not match, so the wide kernel starts at 21 columns: T1 rounds of 18 columns took 0.6 % longer on
+it, 20 and 21 tied, 22-48 ran 0.4-2.0 % faster. The row mapping (each warp one row, one CTA per
+four rows and eight columns) took 27 us for a 12-column DFlash2 verification round's 513-row router
+in 34 CTAs (2026-10-21). The vocabulary head ([248320, 2560]) takes the tall mapping for the BF16
+head from 8 columns and the q8_g32_fp16 head from 9 (RTX 5090, 2026-10-08: BF16 840 vs 1043 us at 8
+columns and 869 vs 1500 at 9; q8_g32_fp16 841 vs 1209 at 9 but slower up to 8, 799 vs 762, where
+the narrow mapping stays near the DRAM floor); the narrow mapping took 1.04 ms at 8 columns and 1.5
+ms at 9-16 against a 0.71 ms DRAM floor, and the tall passes cut a q8_g32_fp16 head's 18 / 24 / 32
+columns from 1871 / 2107 / 2801 to 1186 / 1810 / 2142 us (2026-10-24). The head's tensor-core
+mapping at 1-16 columns runs at its DRAM floor, 701-708 us (2026-10-08).
 
 Calls of at most 32 columns and 1024 routed entries route, dispatch and plan in one 1024-thread CTA
 (`route_dispatch_plan_kernel`), launched as a programmatic dependent of the projection:
@@ -828,7 +857,10 @@ Calls of at most 32 columns and 1024 routed entries route, dispatch and plan in 
    distinct expert of the call becomes one job with its entries grouped.
 3. **CPU plan.** After a barrier of the whole CTA, its first 256 threads run the plan body of
    `cpu_plan_kernel` (§8.6) on a named barrier, so the host request follows the dispatch with no
-   kernel boundary. `moe_experts` then skips its own plan.
+   kernel boundary. `moe_experts` then skips its own plan. The warps that route no column publish x
+   for the CPU while the others route (a call of 32 columns: every thread, after the routing), so
+   the copy overlaps the routing and the request goes out ~4,300 cycles sooner than the plan's
+   decision before (upstream, 2026-10-29).
 
 Wider calls run `route_kernel` (a warp per column) and the separate count/scan/scatter kernels. A
 call that stages nothing and reads every record where it lies (a fully resident placement of an NVFP4
@@ -846,8 +878,8 @@ CPU or fetch channel — that machinery costs 0.37 ms of a 6 x 1 round in which 
 ### 8.5 Expert kernels
 
 The narrow route serves a job of at most 8 columns one column at a time, one pass over the job's
-weights per column. It beat an eight-column form at op level at every width from 1 to 64 columns
-per expert (RTX 5090, 2026-10-11; the eight-column form was removed).
+weights per column. It beat the removed eight-column form at op level (frames, cold L2, uniform
+routing) 1.26-2.3x at every width from 1 to 64 columns per expert (RTX 5090, 2026-10-11).
 
 **W4A4** (`gate_up_kernel` / `down_kernel`): a gate/up CTA owns two row groups of one expert (one
 A4 block of h) and stages its 46 KB slice into shared memory (two CTAs per SM); a down CTA owns four
@@ -880,7 +912,10 @@ h unread, so the round fails instead of the GPU hanging. Wider calls run the ten
 kernels (`narrow_a16_mma.cuh`) for their narrow jobs (§17.3): per 16-element block one m16n8k32
 pair over A = [8 c | c] gives the exact
 int32 P_b for up to eight columns at once, 0.9-8 % faster than the dp4a kernels for the whole op
-from T = 160 on and level to T = 128 (op bench, cold L2, interleaved A/B, 2026-11-04).
+from T = 160 on (T = 256 -7.9 %, T = 1024 -5.8 %, min-of-mins) and level to T = 128 (op bench,
+cold L2, frames, interleaved A/B; the dp4a whole-op time ran 0.9-12 % slower through T = 48 and the
+two level at 112-128; the mixed narrow/wide widths 56-192 wobble a few percent run to run, so the
+boundary sits below the first width the tensor-core kernels win outside that wobble).
 
 **Wide route** (a call of more than 8 columns, per-expert column count above 8): a block-scaled
 tensor-core grouped GEMM (`mma.kind::mxf4nvf4.block_scale`) with the same canonical A4 inputs; the
@@ -893,7 +928,11 @@ the narrow route at every width.
 `.cv` loads of tier slots, the first misses in job order landing in reserved frames — is MoE
 §6.1, the fork and overlap streams §8.1's. `stage_kernel` here runs 16 CTAs of 16 KiB chunks in
 one compact read window: pinned host memory read by many CTAs at scattered offsets, as the expert
-kernels would, runs at under half the copy rate (RTX 5090). `--expert-tail-skip` (§18) is an
+kernels would, runs at under half the copy rate (RTX 5090). The slot count: without the SSD tier 80
+slots ran MTP 4 + n-gram 7 on the IQ3_S import at 204.0 tok/s against 190.3 with 64 (+7.2 %, three
+runs, 2026-10-16); with the tier the larger staging and its ring took RAM and frames from the
+cache — the FP8 import with n-gram 7 ran 48.6-49.8 against 51.2 with 64 (SSD reads 59.0 against
+35.2 GiB) — so it keeps 64. `--expert-tail-skip` (§18) is an
 approximate fast path that skips the smallest-rank routed experts of a generation round and
 zeroes their outputs.
 
@@ -1040,6 +1079,14 @@ compute stream, `on_quiescent` frees every retired frame and drains the deferred
 `rounds_in_flight = 1`), so slack frames are 0. A failed round's requests fail through
 `runtime::RecoverableExecutionError` and the prefix cache is cleared (§15).
 
+Landing frames, measured per artifact (2026-10-17): with every expert in RAM, when a returned run
+lets them, the frames stay free and decode's misses land in them (NVFP4 Dense8, one pool: MTP 4 at
+4K + 512 decoded 154.8 tok/s against 137.5 with the refill, plain equal to the refill-free route);
+when another pool has none to spare (a GGUF import's record sizes), landing reserves nothing and
+the loans' victims reload instead (IQ3_S: MTP 185.4 against 162.2, plain 129.0 against 115.7). The
+SSD tier reloads only victims with a RAM copy and still lands (FP8: 44.0-44.2 tok/s against
+39.6-43.5 without).
+
 ### 9.4 Frame leases
 
 The lease mechanism is MoE §4.5. Users today: the prefill expert stream's ring and staging
@@ -1048,7 +1095,10 @@ refuses and the wide prefill workspace falls back to a temporary allocation.
 
 KV pages are not frames. The KV pool is a separate VMM arena (§14); when it must grow, the
 sizing law's current allowance (`frame_target`, §9.7) is spent first, and only the rest is
-taken from the pools by unmapping top chunks at a round boundary.
+taken from the pools by unmapping top chunks at a round boundary. Between calls a lease can go
+back only when the pool's capacity leaves room for the growth it funds: a return that cannot grow
+the pool just makes the prompt's next walk span lend again, and a full `--max-context` return once
+gave back 4,221 frames for nothing (2026-10-16).
 
 ### 9.5 The RAM tier
 
@@ -1061,8 +1111,12 @@ expert RAM at full / 32 GiB / 8 GiB: tg512 109.6 / 86.3 / 46.3 tok/s; code decod
 / 18.6, MTP 128.1 / 54.1 / 24.4; long-prompt prefill 977 / 542 / 407 tok/s; mean SSD read
 0.6-0.8 ms in decode. Greedy ids identical in every configuration (6/6 checks). Walk-span
 stream slots: with 640 about a quarter of an FP8 artifact's SSD-only experts were left to
-demand reads in a 32K prefill; 1,280 streams them all (32K prefill 2,850 → 3,945 tok/s, and
-the decode after it no slower, 2026-10-16). A host whose heartbeat word stops advancing for
+demand reads in a 32K prefill (7,680 of 10,156 streamed); 1,280 streams them all (32K prefill
+2,850-2,867 → 3,945-3,986 tok/s, and the decode after it no slower, 2026-10-16); a fixed pool
+measured -8 % fill-and-decode (fewer RAM residents), while lent per span it costs decode nothing.
+Unpinned records stream through four pinned bounce parts per caller, bounded at 64-256 parts: at
+x8, 8K-token prefill, 25.4 GiB of 63.3 unpinned ran at 2,350 tok/s with 160 and 2,673 with 256;
+18.4 of 42.8 GiB unpinned (24.4 pinned) at 1,144 with 160 and 1,082 with 256 (RTX 5090). A host whose heartbeat word stops advancing for
 10 s ends a wait (`kHeartbeatTimeoutNs`; raised from 1 s on 2026-10-16: under RAM pressure
 1 s failed healthy FP8 requests in 8 of 34 SSD-tier runs at ~2 GiB available) and writes
 `kErrorHostSilent` / `kErrorFetchSilent`; no trap.
@@ -1071,7 +1125,10 @@ the decode after it no slower, 2026-10-16). A host whose heartbeat word stops ad
 
 The placement forms, the runtime switch and its validation, the grow/shrink walks, the GET
 report and the export are MoE §4.8; the mechanism/policy split itself is
-[AGENTS.md](../../AGENTS.md)'s ("Mechanism and policy"). This family's grow walk refills 512
+[AGENTS.md](../../AGENTS.md)'s ("Mechanism and policy"). A placement drifts from its named counts
+between switches (empty frames, RAM shadows, SSD-only experts): measured after a 22k-token prompt
+from a 50/50 VRAM/RAM placement, 9,557 of 12,288 frames held and 3,383 experts were SSD-only
+(2026-10-22); when the engine idles, the placement returns to its named counts. This family's grow walk refills 512
 keys per maintenance tick, and its boot warm start seeds VRAM only from RAM (the pre-filled
 copies are released and refilled with the next keys of the order). The client owns the tier
 shares; client policy lives in `~/src/super-quant/scripts/infernix_placement.py` (`make
@@ -1230,15 +1287,31 @@ MoE §5.6, with the step evidence. This family's settings:
 - A GGUF import's one-column calls (plain decode, no speculation) take their divisor from
   the context instead: d = 1 below 1,536 tokens, d = 2 from there, written each round into
   a device io word the captured graphs read. Measured 2026-10-16 (Q2 IQ3_S artifact, same
-  host, tok/s, d = 1 / d = 2): 512 + 256: 151.5 / 139-141; 4K + 512: 99.5 / 114.4. With
+  host, tok/s, d = 1 / d = 2): 512 + 256: 151.5 / 139-141; 1K + 256: 152.4 / 143.8; 2K + 256:
+  124.9 / 129.9; 4K + 512: 99.5 / 114.4; 32K + 256: 119.5 / 126.3. The rule itself: 151.4 at
+  512 + 256, 115.2 at 4K + 512, and 114.4 at 1K + 1,024 (d = 1 105.5, d = 2 121.0 — a long
+  output from a short prompt would gain from d = 2 before the switch). A divisor following the
+  expert hit rate over eight-token windows trailed the better fixed divisor at every length
+  (its windows swing around any threshold: 47 switches in a 4K run). With
   MTP or n-gram drafts every call keeps the derived d: d = 1 in MTP's one-column calls
   measured 216.2 → 212.9 tok/s (2026-10-13, IQ3_S).
 - Workers: 6 for NVFP4 banks, 16 for GGUF banks (compute-bound where the NVFP4 route is
   DRAM-bound; tg512, i9-13900K host, 2026-10-11: no CPU service 100.5 tok/s, 6 workers
-  98.4, 16 workers 103.7, 20 workers 103.6). More than 6 NVFP4 workers lose end to end: CPU
+  98.4, 16 workers 103.7, 20 workers 103.6; 16 workers with divisor 3 read 101.1). More than 6 NVFP4 workers lose end to end: CPU
   and PCIe share DRAM, and spinning threads only add contention (tg512, 2026-10: 6 / 12 /
   16 / 24 workers 62.25 / 62.01 / 61.51 / 58.89 ± 1.61 tok/s).
 - Job cap 16 per call (C = 4 fill +7 %, cold MTP +3 %, 32 no faster).
+- **Link shares** (`pcie_share`, `wide_link_share`): the decode share is this machine's x16
+  value, `kDecodeLinkShare256` = 85, set on weak evidence (2026-11-04, 9950X3D2, RTX PRO 6000
+  over Gen5 x16, recipe C NVFP4 W4A16 records, DFlash2 auto, vram=50 %,ram=50 %): a sweep of two
+  rotated boots per value decoded a 30k-context prompt at 196 (51/256), 217 (67/256, upstream's)
+  and 231 tok/s (85/256), one request per boot, six lanes and short prompts flat; the divisor
+  rule derives d = 2 (128/256) here, against 1/3 on upstream's x8 link. The final T3 (two boots
+  per build, full KV) did not confirm it — 85 gave 230/210 against 67's 215/248, inside that
+  cell's boot-to-boot spread, no row regressed beyond it — so re-derive it with a lower-noise
+  measure before relying on the value. The wide share is upstream's (i9-13900K, RTX 5090 over
+  Gen5 x8): 51/256 from eight columns added struct +2.5 %, conv +0.7 % on W4A16 and +4.3 %, and
+  after 16K +1.7 % against the divisor rule on W4A4 (2026-11-02); not re-derived on this machine.
 
 ### 10.6 The prefill CPU split
 
@@ -1416,7 +1489,8 @@ round verifies only its confident drafts: those before the first whose head prob
 `--spec-min-p` (default 0.5 with `auto`, 0 with a fixed length). Measured (RTX 5090, 2026-10-07, C =
 1, AIME prompts sampled, MTP 4 with the proposal head): no cut 139.5 tok/s and 76.1 % accepted;
 cut 0.5 **145.6** tok/s and 82.1 %; cut 0.7 142.6 tok/s and 86.3 %. A confirmation alternated 138.8
-and 147.2 tok/s (+6.1 %); greedy output with the cut is byte-identical to without.
+and 147.2 tok/s (+6.1 %, acceptance 75.6 → 81.8 %, repeatable to the decimal); greedy output with
+the cut is byte-identical to without.
 
 **One-row DFlash2 rounds** choose after the proposal, from the drafts' selector probabilities: the
 K maximizing (1 + Σ products of the drafts' calibrated acceptances) / (1 + 0.1 + 0.31 K) plain
@@ -1642,7 +1716,10 @@ from 3,255 to 5,331 tok/s (RTX 5090, 2026-10-05).
 Reads go through a direct-mapped host cache of 2^20 rows (~170 MB pageable, alive with the
 Program), then to one unbuffered 4 KiB read per distinct block: a call's misses are sorted by
 (block, index), so a block serves every row it holds, however often each appears. Windows issues
-overlapped reads, Linux kernel AIO; other POSIX systems read serially.
+overlapped reads, Linux kernel AIO; other POSIX systems read serially. Linux reuses one kernel AIO
+context per concurrent caller: creating and destroying a context per call (io_setup, io_destroy)
+measured ~36 ms on Linux 6.18 (WSL2) against ~0.12 ms for a 4 KiB read, and an n-gram decode round
+makes a few calls behind the GPU (a large n-gram call reads on eight threads).
 
 A call with few distinct blocks reads through one rolling ring of 64 blocks (256 KiB, fixed). A call
 with 512 or more distinct blocks — a prefill chunk — splits them over 8 threads of a 16-block ring
@@ -1688,7 +1765,11 @@ gate word before the rows, so a round uploads it with the io prefix.
   Gating every replayed round lost 1.2% on warm tg512 plain (110.26 → 108.98 tok/s, sd 0.06); the
   probe keeps warm rounds staged before the launch.
 - A round that runs eagerly (first use, graph capture, mixed) reads its rows before the launch.
-- **Prefill** reads each chunk's rows before the launch and uploads them with the io. The layer walk
+- **Prefill** reads each chunk's rows before the launch and uploads them with the io; a call wide
+  enough to stream instead reads its rows behind the gate once it is enqueued (`run_rows_behind`),
+  which upstream measured faster at both prefill widths it ran on FP4-Local from a volume (RTX
+  5090, 2026-10-30, three interleaved runs): pp16413 6,829 → 6,999 tok/s, pp4096 2,727 → 2,802.
+  The layer walk
   (§13) reads the next span's chunks' rows into the walk slots while the current span computes
   (`walk_prefetch_rows`, validated by an FNV-1a key over the token window); a prefetched chunk
   skips its reads.
@@ -1774,7 +1855,7 @@ While another lane decodes, a wide call is split to `kPrefillChunkBesideDecode` 
 A chunk-major prompt of 4,096-token calls re-streams nearly every non-resident expert for every call: ~384 records per layer × 2.76 MB × 48 layers ≈ 51 GB, ~1.8 s at 27.6 GB/s (x8 link), against ~1.0 s of compute. A span of up to `kWalkMaxTokens` = 65,536 tokens streams them once and is compute-bound.
 
 - **Order.** Decoder layer l runs over every chunk of the span, then layer l+1 (`prefill_walk.cpp`). The span keeps the prompt's call grid: chunk c at layer l reads exactly what call c reads at layer l (its own residual columns, and the layer's state after chunks 0..c−1), so every output bit equals the chunk-major prefill's. Only expert placement differs, and the MoE's arithmetic is placement-invariant (§17).
-- **MoE groups.** `layer_mixer` runs per chunk (everything before the MoE); `layer_moe` runs once over a group of consecutive chunks, up to `kWalkMoeColumns` = 32,768 columns (16,384 before 2026-10-19) and what the arena holds. Every MoE step acts column by column, so grouping changes no bit; the expert calls see 2-8× the columns (IQ3_S expert tiles run 33-50 % more effective TOPS at 16,384 columns than at 4,096).
+- **MoE groups.** `layer_mixer` runs per chunk (everything before the MoE); `layer_moe` runs once over a group of consecutive chunks, up to `kWalkMoeColumns` = 32,768 columns (16,384 before 2026-10-19) and what the arena holds. Every MoE step acts column by column, so grouping changes no bit; the expert calls see 2-8× the columns (IQ3_S expert tiles run 33-50 % more effective TOPS at 16,384 columns than at 4,096, and at 32,768 a further 7-14 % — `infernix_offloaded_moe_ggml_test --bench`; IQ3_S prefill measured +1.4 % at 32K tokens and +2.5 % at 64K end to end).
 - **One-pass calls.** A walk MoE call whose layer has every non-resident expert in the ring and every record in RAM (`ExpertStream::complete`) stages nothing and runs as one pass over its jobs (`staging_slots` 0) instead of double-buffered passes of half the slots. An expert a decode round evicted meanwhile is read in place from its host record — the same bytes.
 - **Steps.** Each `advance_prefill` after the first enqueues ⌈48 / chunks⌉ layers of every chunk (about one call's work), synchronizes, and returns zero processed tokens as a service unit. Each step opens a fresh SSD-tier round (`tier_step`): a fetch request outside an open round fails at once (`require_tier_round`). The last step returns the span's tokens and runs the call-end work once.
 - **Memory.** The span's residual stream (BF16 [S·H, tokens]; 20 KB per token, 1.3 GB at 64K), every chunk's staged io image and an MoE group's input live in the walk area of the stream lease, lent with the ring (§9). Without enough lendable frames the prompt runs chunk-major.
@@ -1816,7 +1897,7 @@ With the link paid once per span, a span is bound by its kernels. The prefill-wi
 - **Router projection.** Calls of at least 64 columns use a tiled kernel (512-thread CTAs, K walked in 256-element slices): 370 µs against 755 µs per 4,096-token call, bit-identical by construction (each output's summation order is the narrow mapping's).
 - **q8 MMA tiles.** The Flash-Next shapes select wider tiles above 96 columns (r64_t128 at 4,096 columns, −14 to −30 % per shape; every tile's output bit-identical to `r32_t128`): +4.8 % at pp131072, 0.0 % at pp16384 (RTX 5090, 2026-10-05).
 - **`split_rows`.** Where every boundary, row count and pointer is 8-element aligned (all of Qwen4Exp's splits), a thread copies 16 bytes; the copy is exact.
-- **GGUF imports (IQ3_S and the official FP8 checkpoint).** Calls of 32 or more columns decode each weight segment once into a plane (64 MiB of workspace) and run tensor-core tiles over it; with the `ggml-bf16-prefill` fast path (`LinearRoutes::GgmlBf16Wide`) wide calls run BF16 tiles over the same planes instead — each code converts exactly to BF16, each product is exact, only the sums round. The GGUF expert banks take the same tiles in calls of 14,336 or more columns (`WideA16::kGgmlBf16`, `kGgmlBf16MinColumns`; 32 experts' planes, 225 MiB). Measured (RTX 5090, IQ3_S, INT8 KV, 2026-10-19, three rotated rounds): dense tiles +27.4 % at pp32768 and +36.4 % at pp65536; with the expert tiles too, +40.8 % / +56.0 % (225.2 → 144.4 µs per token at 64K); below 14K columns the expert route is no faster (its planes are a fixed per-expert cost) and keeps the exact tiles. Time to first token on the server workload: 128K prompts 29.2-29.5 → 19.71-19.89 s, 250K 58.79-58.86 → 39.21-39.40 s.
+- **GGUF imports (IQ3_S and the official FP8 checkpoint).** Calls of 32 or more columns decode each weight segment once into a plane (64 MiB of workspace) and run tensor-core tiles over it; with the `ggml-bf16-prefill` fast path (`LinearRoutes::GgmlBf16Wide`) wide calls run BF16 tiles over the same planes instead — each code converts exactly to BF16, each product is exact, only the sums round. The GGUF expert banks take the same tiles in calls of 14,336 or more columns (`WideA16::kGgmlBf16`, `kGgmlBf16MinColumns`; 32 experts' planes, 225 MiB). Measured (RTX 5090, IQ3_S, INT8 KV, 2026-10-19, three rotated rounds): dense tiles +27.4 % at pp32768 and +36.4 % at pp65536; with the expert tiles too, +40.8 % / +56.0 % (225.2 → 144.4 µs per token at 64K); below 14K columns the expert route is no faster (its planes are a fixed per-expert cost) and keeps the exact tiles. The per-width crossover on IQ3_S banks (RTX 5090): 8,192 columns 0 to +7 %, 12,288 columns −10 to +3 %, 14,336 columns 7-9 % faster, 32,768 columns 15-18 % faster. Time to first token on the server workload: 128K prompts 29.2-29.5 → 19.71-19.89 s, 250K 58.79-58.86 → 39.21-39.40 s.
 - **Qualification.** The BF16 routes are fast paths under the numerical acceptance policy: the dense route against an FP64 oracle on every GGUF format, width and layout; the expert route against the exact one; the model-level prefill gate passes on INT8, FP8, NVFP4, K8V4, VQ2 and K4V2 KV and fails on BF16 KV, where the exact route is the reference ([model-quality.md](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)). The exact items are bit-identical (`fast_path_gate identical`). The prefill's arithmetic can move greedy ties, so a fast-path build can differ from the exact route's text (§17).
 
 ### 13.6 PLE rows
@@ -1887,13 +1968,18 @@ profile and one 64-token page group for all of them
 
 - Calls of at most 8 columns split each column's attended tokens into 64-token tiles, 33 splits at
   this geometry, the same for every width. A column's bits then do not depend on the other columns
-  of its call, which preemption and prefix-cache resumes rely on; `test_qsa.cpp` checks it.
+  of its call, which preemption and prefix-cache resumes rely on; `test_qsa.cpp` checks it. Against
+  one wave per call this costs ~2 µs at W = 5 and ~10 µs at W = 8 per call, under 0.2 % of a round
+  (W = 1-2 measured equal).
 - Wider calls split to one wave of the decode kernel's CTAs, `clamp(SMs / (columns x kv_heads), 1,
   48)`, at least 4 once split; the SM count is queried at runtime. This is 42-73 % faster at 43-85
   columns than the earlier 340-CTA / 33-split rule (op bench, `int8`, 2026-10-06), and the calls it
   would run
   unsplit take the Tensor Core prompt route instead.
-- The prompt route (`qsa_prompt.h`, one CTA per (column, KV head)) scores with FP32-accumulated
+- The prompt route (`qsa_prompt.h`, one CTA per (column, KV head)) takes one stage where two CTAs
+  fit an SM and the call fills a wave — the second CTA's warps hide each tile's gather better than
+  a second stage does (26-41 % faster at 86-512 columns); narrower calls, and storages whose stages
+  and value tile keep one CTA per SM, keep two stages. It scores with FP32-accumulated
   m16n8k16 products and multiplies FP16 probabilities by FP16 values; it serves every storage at
   head_dim 256 and at most 16 query heads per KV head. Within its class a column's result does not
   depend on the call's width.
@@ -2160,7 +2246,9 @@ from the tails.
 arguments). Boundary exact taps (Explicit, Structural, coalescing, branch) always split; the
 generation opener and Automatic taps split only when the split adds at most `split_budget` = 0.1 s
 of fixed call cost and the tap's call is CPU-served (≤ 8 columns, ~35 ms), else become flexible at
-the next inner call boundary. The layer walk's span cost is charged to every plan (§13); a cut
+the next inner call boundary. Keeping the splits before GPU-staged calls measured strictly worse on
+the Flash-Next agentic replay: 84.6 % → 82.9 % of prompt tokens served from cache and +14 % average
+TTFT (2026-10-11, three seeds). The layer walk's span cost is charged to every plan (§13); a cut
 costs a span only where it leaves a narrower call between walk-eligible ones. Three family points:
 
 - **Branch tap.** An exact boundary tap where the prompt leaves its cached path, planned when

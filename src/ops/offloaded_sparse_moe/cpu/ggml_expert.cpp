@@ -100,8 +100,7 @@ inline __m256i iq4nl_codes(const std::uint8_t* qs) {
 }
 
 // The IQ grid entries are read by scalar loads, not vpgather (microcoded and slow on hybrid CPUs'
-// efficiency cores): scalar loads measured 0.9 % faster end to end than vpgather (RTX 5090, IQ3_S
-// artifact, MTP 4 + n-gram 7 at 4K: 202.0 against 200.2 tok/s, 2026-10-16).
+// efficiency cores): the scalar loads measured faster end to end (MoE offload design §5.2).
 template <QType F>
 INFERNIX_TARGET("avx2")
 inline Decoded decode(const std::uint8_t* row, int s) {

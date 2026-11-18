@@ -96,9 +96,8 @@ inline constexpr int kHTermsRowBytes = kResidualTerms * kHRowStride;
 // (ggml_tile.cuh CodeStage images: kGgmlCodeStageBytes per 64 rows x 64 elements), its gate and up
 // rows (2 kIntermediate x kHidden) then its down rows (kHidden x kIntermediate), kGgmlBf16Experts
 // jobs at a time. Calls of fewer than kGgmlBf16MinColumns columns carve no planes and keep the exact
-// tiles: below it the BF16 route measured no faster, its planes a per-expert cost (RTX 5090, IQ3_S banks:
-// 8,192 columns 0 to +7 %, 12,288 columns -10 to +3 %, 14,336 columns 7-9 % faster, 32,768 columns
-// 15-18 % faster; the walk's MoE groups reach it from 14,336-token prompts).
+// tiles: below it the BF16 route measured no faster, its planes a per-expert cost (the per-width
+// measurements are design §13.3; the walk's MoE groups reach it from 14,336-token prompts).
 inline constexpr int kGgmlBf16Experts         = 32;
 inline constexpr int kGgmlBf16MinColumns      = 14336;
 inline constexpr std::size_t kGgmlCodeStageBytes = 6144;

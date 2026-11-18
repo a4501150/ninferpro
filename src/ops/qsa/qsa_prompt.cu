@@ -1066,9 +1066,9 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
                                                                      static_cast<bf16*>(out.data));
     } else {
         // One stage where two CTAs fit an SM and the call fills a wave: the second CTA's warps hide
-        // each tile's gather better than a second stage does (26-41 % faster at 86-512
-        // columns). Narrower calls, and storages whose stages and value tile keep one CTA per SM, keep
-        // two stages.
+        // each tile's gather better than a second stage does, which the wide prompt calls measured
+        // (design §14.2). Narrower calls, and storages whose stages and value tile keep one CTA per
+        // SM, keep two stages.
         constexpr bool two_ctas = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
         if (two_ctas && columns * g.kv_heads >= multiprocessors()) {
             run.template operator()<1, false>();

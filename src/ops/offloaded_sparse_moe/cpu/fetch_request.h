@@ -39,8 +39,9 @@ inline constexpr std::uint64_t kRowsWaitTimeoutNs = 2000000000ULL;
 // A wait gives up when the host's heartbeat has not changed for this long (GPU time). A host thread
 // that died is reported at once through its own failure (CpuMissService::failure, the tier agent's);
 // this bound only ends a wait on a host that stopped without one. It is long enough for the OS to
-// stall a live thread: under RAM pressure (Windows trimming and compressing working sets) 1 s failed
-// FP8 requests on a healthy service (2026-10-16: 8 of 34 SSD-tier runs at ~2 GiB available).
+// stall a live thread: under RAM pressure (Windows trimming and compressing working sets) a
+// one-second wait failed FP8 requests on a healthy service (the measured incident is in MoE
+// offload design §5.4).
 inline constexpr std::uint64_t kHeartbeatTimeoutNs = 10000000000ULL;
 
 struct alignas(64) FetchRequest {

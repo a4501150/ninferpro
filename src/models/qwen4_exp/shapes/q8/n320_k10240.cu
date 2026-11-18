@@ -4,9 +4,9 @@
 
 namespace infernix::ops::detail {
 namespace {
-// Qwen3.8-Flash-Next final mixer down: the register-streamed route at 1-3 and 9-64 columns (2-7x faster than
-// the MMA tile there), the few-row SIMT route at 4-8 (M1 sweep). K1: 2 row(s) per warp, 8 warps splitting each
-// row's K, x read through L1.
+// Qwen3.8-Flash-Next final mixer down: the register-streamed route at 1-3 and 9-64 columns, the few-row SIMT
+// route at 4-8 (the sweep's measured winners are in RESEARCH_NOTES.md, "Q8 MMA tile choices"). K1: 2 row(s)
+// per warp, 8 warps splitting each row's K, x read through L1.
 template <int MaxCols, int ColsPerPass>
 using Stream = Q8A16StreamSchedule<10240, 2, 8, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
 } // namespace
@@ -20,8 +20,8 @@ Q8Launch select_q8_n320_k10240(std::int32_t tokens) {
     return launch_q8_a16_mma_r32_t128;
 }
 
-// A16ColumnInvariant: the 16-K-warp sliced-K contraction at every T (the MMA tiles' single K chain took
-// 104 us at T = 1).
+// A16ColumnInvariant: the 16-K-warp sliced-K contraction at every T, far faster at T = 1 than the
+// MMA tiles' single K chain (the measured times are in RESEARCH_NOTES.md, "Q8 MMA tile choices").
 Q8Launch select_q8_n320_k10240_invariant(std::int32_t tokens) {
     return select_q8_sliced_k_invariant<10240, 16>(tokens);
 }

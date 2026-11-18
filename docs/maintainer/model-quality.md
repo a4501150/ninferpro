@@ -866,7 +866,9 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
 2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
-probable tokens under its sampler and verified by sparse rejection sampling against that proposal,
+probable tokens under its sampler and verified by sparse rejection sampling against that proposal
+(four ranks measured against 8 and 16 under the same sampler, T 1.0 / top-p 0.95 / top-k 20, and
+kept),
 and its rounds verify every draft (no `--spec-min-p` cut). The output distribution stays the
 sampler's, but a seeded request's text changes, so it cannot be the exact route; greedy requests
 keep the argmax drafts. Its gate is therefore the distribution, not 6.4/6.5
@@ -892,7 +894,9 @@ not explained by acceptance alone and was not attributed further. Recipe A and r
 registered by the rule for a path that changes no logit (6.1), with these as the nearest timings.
 
 **`gdn-f16-accumulate`: FP16-accumulate chunked GDN (qualified on the 27B, 2026-10-17).** See
-`ops::GdnChunkArithmetic::Fp16Accumulate`. Op: 1.20x at the 27B's shapes, and closer to the FP64
+`ops::GdnChunkArithmetic::Fp16Accumulate`. Op: 1.20x at the 27B's shapes (the k16 carry width 2
+measured 1.205x the exact route's op time, the same as width 1, 2026-10-16, so 2 is kept as the
+more accurate state), and closer to the FP64
 oracle than the exact route (output relative RMS 2.08e-3 against 3.60e-3, state 8.6e-4 against
 2.6e-3). Prefill (INT8 KV, default route against default + the path, ABBA): 27B pp4096 12,956 ->
 12,986 and pp16384 11,965 -> 11,994 tok/s (+0.24 %, both runs of each arm ahead); Flash-Next
@@ -1465,7 +1469,9 @@ and recomputes the previous output) or admission (whole extents held without `pr
 - **Speed** (2026-10-15, RTX 5090, official Qwen3.8-27B NVFP4, INT8 KV, `infernix_bench`, one
   24,576-token prompt alone): 10,547.6 → 11,533.4 tok/s (+9.3 %). The upstream measurement (NInfer
   5bcef9e2c): 35B-A3B 1.41 → 1.26 s, 27B NVFP4 3.28 → 3.06 s, with the decode stall behind a
-  13.8k-token prompt unchanged. The wide first step (2026-10-16, same machine and artifact,
+  13.8k-token prompt unchanged. On the RTX 5090 a 4096-token step lifts prefill 2-7 % on the
+  dense NVFP4 27B and 19-21 % on the 35B MoE over 1024 (int8 KV), while a decode round waiting
+  behind one step would stall about 3.4x longer. The wide first step (2026-10-16, same machine and artifact,
   `infernix_bench` ABBA, two runs per arm, spread under 0.6 %): pp1024 11,744 → 14,013 tok/s
   (+19.3 %), pp2048 +11.5 %, pp3072 +5.2 %, pp4096 +0.5 %, pp8192 +1.8 %. Its steps are the
   idle-width steps the evidence below already gated.

@@ -81,8 +81,8 @@ public:
     // decode or verification round, the round's forked MoE calls copy their first staged misses
     // into them instead of staging slots, and the round's settle adopts them as resident.
     static constexpr std::uint32_t kLandingSlots = 16;
-    // LFRU counts halve every this many ticks (layer calls, ~170 plain rounds; moe-offload-design.md §4.3): on
-    // greedy decode traces of 14 mixed requests, 9-12 % fewer misses than never halving. A pool
+    // LFRU counts halve every this many ticks (layer calls, ~170 plain rounds; moe-offload-design.md
+    // §4.3 holds the trace measurements behind halving). A pool
     // ticks once per call of its layers, so its period is this share of its layers.
     static constexpr std::uint32_t kLfruHalvingPeriod = 8192;
 

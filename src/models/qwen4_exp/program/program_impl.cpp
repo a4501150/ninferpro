@@ -245,10 +245,9 @@ DeviceLayout ProgramImpl::plan_device(const ProgramOptions& o, const Config& con
     d.frame_bytes   = c.expert_frame_bytes != 0 ? c.expert_frame_bytes : d.record_stride;
     // Without the SSD tier, a verification call's misses (up to top_k per column) stage in one
     // pass, so it keeps the fork route (ops::moe_experts): eight columns (seven drafts) route up
-    // to 80 experts, and 80 slots ran MTP 4 + n-gram 7 on the IQ3_S import at 204.0 tok/s
-    // against 190.3 with 64 (+7.2 %, 3 runs, 2026-10-16). With the tier the larger staging and
-    // its ring took RAM and frames from the cache: the FP8 import with n-gram 7 ran 48.6-49.8
-    // against 51.2 with 64 (SSD reads 59.0 against 35.2 GiB), so it keeps 64.
+    // to 80 experts, and the larger slot count measured faster without the tier; with the tier the
+    // larger staging and its ring took RAM and frames from the cache, so it keeps 64 (the
+    // per-count measurements are design §8.5).
     d.staging_slots = o.expert_ram_bytes != 0
                           ? kStagingSlots
                           : std::clamp(static_cast<std::int32_t>(c.moe.top_k) * d.max_width, kStagingSlots,

@@ -94,6 +94,16 @@ policy does not prove that a particular accelerator route ran, so roofline evide
 and measure the implementation that production dispatch actually selects. These are completion
 requirements for the large-extent region, not a mandatory position in the development order.
 
+Three more linear-family route choices, measured: the FP8 column-invariant route's narrow tile
+(`Fp8A16TmaT16R64`, eight warps of 8 rows, twice the CTAs of the 32-column tile) runs within 0-2 us
+of the A16 route's GEMV at T = 1 on recipe C's shapes (2026-10-23 sweep, RTX PRO 6000); the BF16
+general fallback's skinny chunked route exists because a 12-column DFlash2 verification round's
+~640-row BF16 attention projection took 217 us in the unchunked `bf16_general_gemm` (RTX PRO 6000,
+2026-10-21); and the NVFP4 A4 linear-add projection takes its TMA route past 512 tokens (RTX 5090,
+cold weights: 513 tokens 144.7 instead of 187.7 us at K = 17408 and 62.0 instead of 70.9 at
+K = 6144, 640-1000 tokens 17-26 % less; at 512 and below the resident MMA tiles stay faster,
+114.0 against 133.7 us at K = 17408).
+
 ## 4. Report format
 
 This section applies when a retained absolute-performance report is requested; routine changes do
@@ -170,4 +180,7 @@ of the V0 tile sweep (within 2 % at each measured T).
 Measured with that sweep (RTX 5090, cold-L2 CUDA graphs, median of 7): `[13952,2560]` 303.6 ->
 45.5 us at T = 9, 5,473 -> 347 us at T = 1,024, 21,491 -> 1,229 us at T = 4,096 (17.5x), 85,492 ->
 4,836 us at T = 16,384; `[96,2560]` 222-443 us -> 6.8-36 us from T = 9 to 8,192 (the fallback's
-32x32 tiles leave most SMs idle at N = 96).
+32x32 tiles leave most SMs idle at N = 96). The QSA index projection's BF16 tiles
+(`Bf16IndexMma`, `[640,2560]`, from 9 columns) measured 4-7x faster than the runtime-shape GEMM
+(`bench/ops/bf16_flash_next_sweep.cu --shape qsaidx`, RTX PRO 6000, 2026-10-25: 8 against 33-74 us
+at 32-65 columns, 18 against 84 at 1,024, 178 against 926 at 16,384).

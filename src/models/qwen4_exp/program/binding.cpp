@@ -584,8 +584,8 @@ bool ProgramImpl::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
     // #24). Between calls they can go back: the prompt's next streamed call lends again from
     // the smaller cache, or stages its experts (the same bytes either way, design §13.3).
     // Only when the pool's capacity leaves room for the growth: a return that cannot grow the pool
-    // only makes the prompt's next walk span lend again (a full --max-context returned 4,221
-    // frames for nothing, 2026-10-16).
+    // only makes the prompt's next walk span lend again (the measured no-growth return is design
+    // §9.4).
     const bool room = pool_->capacity_pages() - pool_->backed_pages() >=
                       target - std::min(target, pool_->available_pages());
     if (pool_->available_pages() < target && room && leases_returnable()) {

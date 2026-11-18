@@ -54,9 +54,8 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
 }
 
 // Calls up to this many tokens (decode and verification rounds) run the skinny kernel in chunks of
-// kSkinnyMaxTokens; the chunks after the first read the weight from L2. In a 12-column DFlash2
-// verification round of Qwen3.8-Flash-Next, an attention layer's BF16 projection of about 640 rows
-// took 217 us in bf16_general_gemm (RTX PRO 6000, 2026-10-21).
+// kSkinnyMaxTokens; the chunks after the first read the weight from L2, which the unchunked general
+// GEMM's cost at verification-round widths made necessary (linear-tuning.md holds the measurement).
 constexpr std::int32_t kSkinnyChunkedMaxTokens = 64;
 
 // Decode-sized calls stream each weight row once when the rows can be read in 16-byte chunks.

@@ -23,9 +23,9 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
         pdl::Dependency::Programmatic);
 }
 
-// Up to 64 columns the sliced-K schedules stream the weight faster than the MMA schedules: on the
-// RTX 5090 they beat the 64-column MMA schedule by 17-21 % at 42-48 columns, 13-16 % at 49-56 and
-// 4-8 % at 57-64. Above 48 columns two K warps with a double-buffered stage beat four.
+// Up to 64 columns the sliced-K schedules stream the weight faster than the MMA schedules; above
+// 48 columns two K warps with a double-buffered stage beat four (the measured per-width margins
+// are in RESEARCH_NOTES.md, "FP8 LM head schedules at 42-64 columns").
 constexpr int kSlicedKTokens = 64;
 
 void launch_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {

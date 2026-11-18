@@ -1063,9 +1063,8 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
 // within one tap separation: what the image saves a
 // repeat is the re-fill from the path's deepest published frontier (the opener's realization, or
 // the tail tap of a one-call span) up to n, while the image is a fixed cost beside the decode
-// rounds that follow — measured on the artifact, capturing at every transition cost a concurrent
-// six-request decode ~4 % tok/s and filled the Host tier, for repeats a tail call of at most the
-// separation re-fills anyway. A span whose opener demoted to its last inner boundary (the
+// rounds that follow — capturing at every transition measured far dearer than the tail call it
+// saves (design §15.4). A span whose opener demoted to its last inner boundary (the
 // multi-call re-fill loss, up to chunk - 1 tokens) is past the separation and still captures.
 void ProgramImpl::prefix_prompt_end_capture(Lane& lane, std::uint32_t index) {
     if (!options_.free_cache_resume) { return; }

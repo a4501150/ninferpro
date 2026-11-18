@@ -29,8 +29,9 @@ struct ReadOnlyFile::Impl {
 
 #if defined(__linux__)
     // Kernel AIO contexts of finished read_direct_blocks calls, reused by later calls: creating and
-    // destroying one per call (io_setup, io_destroy) measured ~36 ms on Linux 6.18 (WSL2) against
-    // ~0.12 ms for a 4 KiB read, and an n-gram decode round makes a few calls behind the GPU. One
+    // destroying a context per call measured hundreds of times a 4 KiB read's cost, and an n-gram
+    // decode round makes a few calls behind the GPU (the measured costs are qwen3_8-flash-next
+    // design §12.3). One
     // context per concurrent caller (a large n-gram call reads on eight threads).
     struct AioContext {
         aio_context_t id = 0;

@@ -319,16 +319,13 @@ private:
     // The SSD tier's smallest RAM (design §9.8: 1,024 slots, 2.6 GiB).
     static constexpr std::uint32_t kMinTierSlots = 1024;
     // RAM slots a layer walk's span borrows for its stream reads (at most 1/8 of the SSD tier's): with
-    // reads kReadAhead layers ahead, each layer streams up to 1,280 / 4 = 320 SSD-only experts. 640
-    // left about a quarter of the FP8 artifact's SSD-only experts to the tier's demand reads in a 32K
-    // prefill (7,680 of 10,156 streamed); 1,280 streams them all: 32K prefill 2,850-2,867 -> 3,945-3,986
-    // tok/s, and the decode after it no slower (2026-10-16). A fixed pool measured -8 % F-A decode
-    // (fewer RAM residents); lent per span it costs decode nothing.
+    // reads kReadAhead layers ahead, each layer streams up to 1,280 / 4 = 320 SSD-only experts. The
+    // count that streams a 32K prefill's SSD-only experts whole — lent per span, so it costs decode
+    // nothing — and the smaller counts' costs are measured in design §9.5.
     static constexpr std::uint32_t kStreamReadSlots = 1280;
     // Unpinned records a layer may stream through the bounce, per part: the layer's unpinned share
-    // of its experts, within these bounds (the bounce comes out of the pinned share). RTX 5090 at
-    // x8, 8K-token prefill: 25.4 GiB of 63.3 unpinned ran at 2,350 tok/s with 160 and 2,673 with 256;
-    // 18.4 of 42.8 GiB unpinned (24.4 pinned) at 1,144 with 160 and 1,082 with 256.
+    // of its experts, within these bounds (the bounce comes out of the pinned share; the measured
+    // tok/s at each bound are design §9.5).
     static constexpr std::uint32_t kStreamBounceMin = 64, kStreamBounceMax = 256;
     // Promotions follow the tokens a round advances (the longest row's), not rounds: a verification
     // round that advances four tokens promotes what four decode rounds would, so a speculative
@@ -623,8 +620,8 @@ public:
     // until use promotes into them; the swapper's promotions keep their RAM copies (shadows) while
     // the VRAM victims it does not demote (past a boundary's allowance) leave RAM for the artifact.
     // VRAM then holds fewer experts than its frames, RAM fewer distinct ones than its slots, and
-    // the SSD more than the placement named (50/50 VRAM/RAM after a 22k-token prompt: 9557 of
-    // 12288 frames held, 3383 SSD-only experts; 2026-10-22). True when a frame is empty with no
+    // the SSD more than the placement named (the measured after-state of a long prompt is design
+    // §9.6). True when a frame is empty with no
     // lease out, or the tier holds a shadow or a free slot.
     [[nodiscard]] bool placement_drifted() const;
 
@@ -1065,9 +1062,8 @@ private:
     // rounds are fitted separately: an EMA of the plain rounds (a_p) and a regression of the
     // drafting rounds against their extra columns (batch * (width - 1)), gap-filtered like
     // round_cost_. A single line through both would hide the fixed overhead in the intercept and
-    // understate the slope -- measured on RTX PRO 6000 at six rows it priced a draft at 0.47 plain
-    // rounds when wide rounds cost about twice that, so the policy drafted where it lost (2026-10-21,
-    // this fork).
+    // understate the slope -- a single line priced drafts far under their cost and the policy
+    // drafted where it lost (design §11.5).
     struct BatchCostFit {
         RoundCostFit draft;     // drafting rounds: columns > 0
         double plain_n = 0.0;  // plain rounds: EMA count
@@ -1078,11 +1074,9 @@ private:
     std::int32_t last_round_extra_ = -1; // its extra verify columns; -1: not a sample (set by the round)
 
     // The round cost fits describe the expert placement they were measured under: a plain round
-    // timed with half the experts on the SSD (24 ms at six rows) priced drafts at a twentieth of
-    // the 11 ms all-VRAM round after a switch back, and the plain EMA, sampled only by the probes
-    // while drafting wins, would take ~800 rounds to correct (T3, 2026-10-22: C6 444 -> 351
-    // tok/s). A placement switch, and the resident refill that completes a grow, start them again
-    // from the priors.
+    // timed under one placement can price drafts from another wildly wrong, and the plain EMA
+    // corrects only slowly (the measured failure is design §11.5). A placement switch, and the
+    // resident refill that completes a grow, start them again from the priors.
     void reset_round_costs(const char* why);
 
     // The plain round time a_p, the drafting round's fixed overhead `fixed` (seconds) and marginal
@@ -1298,13 +1292,12 @@ private:
 
     // The share of a decode call's misses the PCIe stage keeps, misses / d, from C t (C experts per
     // second on the CPU, t seconds per record on the link): d = floor(1.65 + C t). The balance point
-    // of the two parts is d = 1 + C t; the measured fastest divisors (2026-10-09, x8) put the
-    // switches between them: C t = 1.5-1.7 at 6 workers (d = 3; d = 2 loses 9 % MTP), 1.0 at 3 and
-    // 0.7-0.8 at 2 (d = 2; d = 3 loses 4-12 %), so d steps from 2 to 3 at C t = 1.35, midway, and
-    // the startup measurement's noise (± 7 %) stays clear of it; x16 gives 2. A whole divisor, as a
-    // fractional share flips calls' splits at floor(M share) between startups (3 workers: 100.8
-    // against 107.5 tok/s). A positive cpu_pcie_divisor fixes d (one_column_divisor below
-    // overrides d in a GGUF import's one-column calls).
+    // of the two parts is d = 1 + C t; the measured fastest divisors put the switches between
+    // them, so d steps from 2 to 3 at C t = 1.35, midway, where the startup measurement's noise
+    // stays clear of it (the step evidence is MoE offload design §5.6). A whole divisor, as a
+    // fractional share flips calls' splits at floor(M share) between startups. A positive
+    // cpu_pcie_divisor fixes d (one_column_divisor below overrides d in a GGUF import's one-column
+    // calls).
     // The CPU expert team's workers: a GGUF import's banks take their own count (ProgramOptions).
     [[nodiscard]] std::uint32_t cpu_workers() const noexcept {
         return c_.exact_experts ? options_.cpu_ggml_expert_workers : options_.cpu_expert_workers;
@@ -1318,16 +1311,9 @@ private:
     // Fixed family constants, not measured rates — a MEASURED fractional share flipped calls' splits
     // at floor(M * share) between startups (3 workers: 100.8 against 107.5 tok/s, 2026-10-09), which
     // is why the divisor rule above steps at a measured boundary instead. The decode share is set
-    // for this machine (2026-11-04, 9950X3D2, RTX PRO 6000 over Gen5 x16, recipe C NVFP4 W4A16
-    // records, DFlash2 auto, vram=50%,ram=50%) on weak evidence: a sweep of two rotated boots per
-    // value decoded a 30k-context prompt at 196 (51/256), 217 (67/256, upstream's) and 231 tok/s
-    // (85/256), one request per boot, with six lanes and short prompts flat; the divisor rule
-    // derives d = 2 (128/256) here, against 1/3 on upstream's x8 link. The final T3 (two boots per
-    // build, full KV) did not confirm it: 85 gave 230/210 against 67's 215/248, inside that cell's
-    // boot-to-boot spread, and no row regressed beyond it. Re-derive it with a lower-noise measure
-    // before relying on the value. The wide share is still upstream's (i9-13900K, RTX 5090 over
-    // Gen5 x8): 51/256 from eight columns added struct +2.5 %, conv +0.7 % on W4A16 and +4.3 %,
-    // after 16K +1.7 % against the divisor rule on W4A4 (2026-11-02); not re-derived on this
+    // for this machine on weak evidence, its final T3 inside boot-to-boot spread, and re-derivation
+    // with a lower-noise measure is still owed (design §10.5 records the sweep and the caveat). The
+    // wide share is still upstream's (design §10.5 holds its derivation); not re-derived on this
     // machine. A positive cpu_pcie_divisor leaves every width on the divisor rule; banks other than
     // NVFP4 keep the rule everywhere.
     [[nodiscard]] int pcie_share() const noexcept;
@@ -1343,18 +1329,13 @@ private:
     // Without speculation, a GGUF import's one-column calls (plain decode) take the round's divisor
     // by context (plain_divisor; 1 until the first round sets it). 0 (pcie_divisor) for other banks,
     // with speculation and when cpu_pcie_divisor fixes d: MTP keeps d everywhere, as d = 1 in its
-    // rounds' one-column calls lost 216.2 -> 212.9 tok/s (2026-10-13, IQ3_S, 16 workers, derived d = 2).
+    // rounds' one-column calls measured slower (design §10.5).
     [[nodiscard]] int one_column_divisor() const noexcept;
 
     // Plain decode's one-column divisor: every host-memory miss on the link (d = 1) below
     // kPlainDivisorContext context tokens, half of them on the CPU (d = 2) from there; each round
-    // writes it into the device io word its graph reads. Measured 2026-10-16 (Q2 IQ3_S artifact, RTX
-    // 5090 on PCIe 5.0 x8, plain decode, tok/s at d = 1 / d = 2; prompt + output tokens): 512 + 256
-    // 151.5 / 139-141, 1K + 256 152.4 / 143.8, 2K + 256 124.9 / 129.9, 4K + 512 99.5 / 114.4, 32K +
-    // 256 119.5 / 126.3. This rule: 151.4 at 512 + 256, 115.2 at 4K + 512, and 114.4 at 1K + 1,024
-    // (d = 1 105.5, d = 2 121.0: a long output from a short prompt would gain from d = 2 before the
-    // switch). A divisor following the hit rate over eight-token windows trailed the better fixed
-    // divisor at every length (its windows swing around any threshold: 47 switches in a 4K run).
+    // writes it into the device io word its graph reads. The d = 1 / d = 2 measurements behind the
+    // boundary, and the hit-rate-following divisor they rejected, are design §10.5.
     static constexpr std::int32_t kPlainDivisorContext = 1536;
     [[nodiscard]] static std::int32_t plain_divisor(std::int32_t position) noexcept {
         return position >= kPlainDivisorContext ? 2 : 1;
@@ -1561,9 +1542,8 @@ private:
     std::uint64_t walk_prefetched_chunks_ = 0, prefetched_at_lease_ = 0; // chunks whose rows were prefetched
     static constexpr std::uint32_t kWalkMaxTokens = 65536;
     // A walk's MoE calls take up to this many columns (several chunks'): at 16,384 tokens the
-    // experts run 33-50 % more effective TOPS than at 4,096, and at 32,768 a further 7-14 %
-    // (infernix_offloaded_moe_ggml_test --bench; IQ3_S prefill +1.4 % at 32K tokens and +2.5 % at
-    // 64K end to end, design §13.5).
+    // experts run more effective TOPS than at 4,096 columns, and more again at 32,768; the
+    // measured shares and the end-to-end gains are design §13.2.
     static constexpr std::int32_t kWalkMoeColumns = 32768;
 
     [[nodiscard]] std::size_t walk_bytes(std::uint32_t tokens, std::size_t chunks) const noexcept;
@@ -1590,10 +1570,10 @@ private:
     // CPU's predicted time and the link's time for the experts left to it.
     // The model charges the link a record's copy per kept expert, but the stream copies most of a
     // layer's experts ahead, so the GPU side finishes far sooner than modelled and full rates overload
-    // the CPU (traced 2026-10-10: the GPU waited ~the whole CPU time). Planning at kSplitRateShare of
-    // the measured rates was fastest on a 13900K at 6 and at 3 workers (Dense8, pp256-1024; 6 workers
-    // -4 to -6 % against the fitted rates, 3 workers -11 to -19 % against the measured ones). A line
-    // fitted to measured layer times starved the CPU instead (the kept experts' cost is not linear).
+    // the CPU — a trace measured the GPU waiting ~the whole CPU time. Planning at kSplitRateShare of
+    // the measured rates was fastest at every worker count measured (design §10.6 holds the sweep). A
+    // line fitted to measured layer times starved the CPU instead (the kept experts' cost is not
+    // linear).
     static constexpr double kSplitRateShare = 0.3;
     class SplitPolicy final : public execution::CpuSplitPolicy {
     public:
@@ -1710,15 +1690,13 @@ private:
     static constexpr double kWidthCost            = 0.38;
     static constexpr std::uint64_t kProbeInterval = 8;
     // DFlash2's calibrated length (--draft-tokens auto): a verified draft's column and a proposal in
-    // plain one-row rounds. Measured on the 5090 with the NVFP4 Dense8 import, greedy code, INT8 KV
-    // (2026-10-20): fixed lengths 2-7 took 14.2-27.7 ms rounds against 8.4 ms plain ones, about 2.6 ms
-    // a draft and 0.6-1 ms of proposal. The online fit (width_cost) chose shorter lengths and was
-    // 6 % slower, so the priors stand.
+    // plain one-row rounds. The priors stand on their own measurement; the online fit chose shorter
+    // lengths and was slower (design §11.4).
     static constexpr double kDFlashDraftCost    = 0.31;
     static constexpr double kDFlashProposalCost = 0.1;
     // How much a batched round's drafting must beat its plain alternative by before it is chosen:
-    // the fit decides on tens of noisy rounds and thin decisions lose (RTX PRO 6000, six rows,
-    // 2026-10-21: the pre-margin fit drafted at a score 5 % above plain and measured 8 % below it).
+    // the fit decides on tens of noisy rounds and thin decisions lose — the pre-margin fit drafted
+    // above its score and measured below it (design §11.5).
     static constexpr double kBatchDraftMargin = 0.05;
     // The online draft cost (width_cost): sample decay (about 50 rounds), the rounds and the share of
     // K's variance (of the mean square) it needs, its ceiling, and the cycle that counts as a gap.
@@ -1735,8 +1713,7 @@ private:
     static constexpr double kCostMax       = 2.0;
     static constexpr double kCostGapRatio  = 3.0;
     // Two-row rounds: at most 2 drafts per row, each costing kPairWidthCost plain two-row rounds
-    // (C = 2 decode on the 5090, AIME prompts sampled: K = 1 and 2 rounds took 1.44 and 1.95 plain
-    // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 11.5).
+    // (the measured per-K costs are design §11.5).
     static constexpr std::int32_t kPairMaxDrafts = 2;
     // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the
     // same bits whatever the call boundaries (request invariance's resume grid).
@@ -1744,8 +1721,7 @@ private:
     static constexpr double kPairWidthCost       = 0.47;
     // A one-row round verifies its drafts up to the first whose draft-head probability is below
     // ProgramOptions::draft_min_p, held as its log (-inf at 0: every draft). The 0.5 default is
-    // Strata's --spec-min-p rule (C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
-    // acceptance 75.6 -> 81.8 %, repeatable to the decimal; 0.7 gave 142.6; design 11.4).
+    // Strata's --spec-min-p rule, measured best on the 5090's AIME sweeps (design §11.4).
     double draft_min_logprob_ = 0.0;
     // Prompt seeding (seed_prompt_experts): the LFRU count an expert gains when every token of the
     // prompt routed to it. Mixed-topic Dense8 decode, credit only: 64 -0.9 %, 256 -1.8 % time, and

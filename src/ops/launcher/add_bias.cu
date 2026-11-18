@@ -16,9 +16,9 @@ void add_bias_launch(const Tensor& bias, Tensor& x, cudaStream_t stream) {
     const std::int64_t rows = n / x.ne[0];
     const auto addresses =
         reinterpret_cast<std::uintptr_t>(bias.data) | reinterpret_cast<std::uintptr_t>(x.data);
-    // One 16-byte pack per thread over the whole tensor (RTX 5090, 2026-10-16, against the earlier
-    // per-row packs and the large-domain BF16x2 stream: [4304,4096] 19.3 -> 15.1 us, [4304,65536]
-    // 722.9 -> 649.2 us, [2048,16384] -13 %, [3456,65536] -2.6 %; launch-bound shapes unchanged).
+    // One 16-byte pack per thread over the whole tensor, which measured faster than the earlier
+    // per-row packs and the large-domain BF16x2 stream at every measured shape (RESEARCH_NOTES.md,
+    // "Add-bias launcher packs").
     if ((x.ne[0] % 8) == 0 && (addresses & (alignof(Bf16x8Pack) - 1)) == 0 &&
         n / 8 <= std::numeric_limits<std::uint32_t>::max()) {
         const auto total = static_cast<std::uint32_t>(n / 8);

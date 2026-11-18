@@ -33,8 +33,8 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 // No single-term A8 route: the checkpoint is weight-only, served with BF16 activations. The
 // fp8-a8-pair fast path carries them as two E4M3 terms from T = 1025.
 bool uses_a8(std::int32_t, std::int32_t) { return false; }
-// The pair route's admission (2026-10-15 sweep, RTX 5090): 1.08-2.43 times the exact route up to
-// T=1024, 0.69-1.00 beyond.
+// The pair route's admission sweep, faster beyond T=1024 and slower below, is in RESEARCH_NOTES.md,
+// "Flash-Next FP8 pair-route admission".
 constexpr std::int32_t kPairMinTokens = 1025;
 
 // A16ColumnInvariant: the tensor-core tiles at every T. Each accumulates an output as one FP32 chain

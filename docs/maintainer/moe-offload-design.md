@@ -223,7 +223,9 @@ gate can refuse a victim, which stops that layer's admissions for the round.
 eviction victims, so exactly the placed set stays resident. The cache starts from the saved
 state of the previous run (`--expert-state`, identity-checked against the artifact; counts
 capped so a stale expert yields to new uses), else from a shipped calibrated order for the
-architecture's shape, else spread across the layers. The seed fills a share of the frames,
+architecture's shape, else spread across the layers. A cold start from the calibrated order
+measured, on Qwen3.8-Flash-Next (2026-10-16), the first request's decode +9 % on code, +15 % on a
+math problem and +56 % with the SSD tier, against an empty cache. The seed fills a share of the frames,
 leaving the rest free for the fill phase's landings. A static profile alone loses badly on a
 differing workload, which is why the ranking is saved per session.
 
@@ -288,7 +290,8 @@ host slots, read in place from the artifact. An agent thread owns the unbuffered
 dividing every `v` by the same power of two once the clock is 256 half-lives past the base — so
 ranking by `v` equals ranking by the current score; victims come from indexed min-heaps (each
 eligible slot once; a resident's entry re-ranked lazily at the top, a shadow's at each use). The
-log2 form (`v = log2 s + t/h`, two transcendentals a use) and lazy heaps that grew an entry a
+log2 form (`v = log2 s + t/h`, two transcendentals a use, which upstream measured at ~100 µs of a
+decode round's host time on its struct fixture, 2026-10-29) and lazy heaps that grew an entry a
 use are gone. The clock advances by decode tokens, accepted verification
 tokens and `min(columns, 16)` per prefill chunk; the half-life is a family constant. A demand
 landing is admitted when it outranks the lowest resident; a prefetch landing at a margin
@@ -452,7 +455,10 @@ per job, at most 4,096 columns per CPU-served call. The caps a family sets below
 
 ### 5.2 Kernels
 
-Four ISA variants, chosen by CPUID at first use: scalar, AVX2, AVX-VNNI, AVX-512 VNNI. Each
+Four ISA variants, chosen by CPUID at first use: scalar, AVX2, AVX-VNNI, AVX-512 VNNI. The IQ
+grid entries are read by scalar loads, not vpgather (microcoded and slow on hybrid CPUs'
+efficiency cores): the scalar loads measured 0.9 % faster end to end (RTX 5090 host, IQ3_S
+artifact, MTP 4 + n-gram 7 at 4K: 202.0 against 200.2 tok/s, 2026-10-16). Each
 kernel is a template on the column count: a record's codes are decoded once and reused for
 all columns. Software prefetch runs a configurable distance ahead along the unit stream (a
 host probe sweeps it; the default is a starting point, the tuned value a family constant).
@@ -502,9 +508,14 @@ status word for a record it could not read, and publishes the answered sequence.
 them. The device's wait lasts while the service's heartbeat word keeps changing — the service
 thread beats on every poll, worker 0 after each completed item, so a multi-second tier read
 stays alive while a hung worker stops the beat; after 10 s of silence the call writes
-`kErrorHostSilent` (a wait without an error word or heartbeat traps after 2 s). After 20 ms
+`kErrorHostSilent` (a wait without an error word or heartbeat traps after 2 s). The 10 s bound
+leaves room for the OS to stall a live thread: under RAM pressure (Windows trimming and
+compressing working sets) a 1 s wait failed FP8 requests on a healthy service (2026-10-16: 8 of
+34 SSD-tier runs at ~2 GiB available). After 20 ms
 without a request the service idles in short waits; `wake()` ends one when a round that may
-hand it requests is enqueued. A stopped service fails every later call. The fetch channel
+hand it requests is enqueued. On Windows a wait's timeout and `sleep_for` both round up to the
+15.6 ms timer tick; the high-resolution waitable timer measured 0.51 ms for a 50 µs request
+(2026-10-09, Windows 11, i9-13900K), which is why the idle wait uses it. A stopped service fails every later call. The fetch channel
 (§4.7) carries the same discipline for SSD-only experts, with one elected poller CTA per call.
 
 ### 5.5 Startup rate probes
@@ -523,12 +534,16 @@ later only if the second beat the first's experts/s by more than 10 %, at most t
 best of each rate standing — memory is slow for some seconds after the banks' load or the
 tier's fill, or after another process frees tens of GiB, and upstream measured a tier reading
 9,377 experts/s right after its fill and 18,942 5 s later (decode −26 % for the session on
-the low reading). Both layouts measure after the experts' warm start: the service starts on
-the reference rates and its channels take the measured divisor or share afterwards. The
-measured link rescales the
-family's bandwidth-dependent constants (the promotion interval, the split's width limit,
-restore rates); until records exist in RAM the family's reference rates stand. A fixed rate
-is injectable in tests.
+the low reading; Flash-Next Dense8, 2026-10-27), and its Qwen3.5-122B read 4,923 against
+9,515-12,805 settled (decode −24 to −40 %, 2026-10-30). The quiet-share bound under which an
+attempt stands: an idle desktop measured 2-7 %, and on an i9-13900K (32 logical CPUs) the
+6-worker team read 2 / 6 / 11 / 13 / 35 / 46 % low with 4 / 8 / 12 / 16 / 24 / 32 busy processes
+(12.5-100 %); the decode divisor (C·t switching at 1.35) holds to about 18 % low, and below 25 %
+an attempt is at most ~6 % low, clear of both. Both layouts measure after the experts' warm
+start: the service starts on the reference rates and its channels take the measured divisor or
+share afterwards. The measured link rescales the family's bandwidth-dependent constants (the
+promotion interval, the split's width limit, restore rates); until records exist in RAM the
+family's reference rates stand. A fixed rate is injectable in tests.
 
 ### 5.6 The decode miss divisor
 
@@ -536,8 +551,9 @@ A call's host-memory misses are shared between the CPU and the PCIe stage: `miss
 on the stage, the CPU serves the rest up to its cap. `d = floor(1.65 + C·t)`, with `C` the
 measured one-column expert rate and `t` a record's link time; the step from 2 to 3 lands at
 `C·t = 1.35`, midway between the measured fastest divisors (Qwen3.8-Flash-Next, i9-13900K
-host, Gen5 x8, 2026-10-09: at 6 workers `C·t = 1.5-1.7`, d = 3 best; at 3 and 2 workers
-`C·t ≈ 1.0` and 0.7-0.8, d = 2 best), so the ±7 % startup noise stays clear of the switch. A
+host, Gen5 x8, 2026-10-09: at 6 workers `C·t = 1.5-1.7`, d = 3 best (d = 2 lost 9 % MTP); at 3
+and 2 workers `C·t ≈ 1.0` and 0.7-0.8, d = 2 best (d = 3 lost 4-12 %), so the ±7 % startup noise
+stays clear of the switch. A
 positive fixed divisor overrides the derivation, and one-column calls can take their own
 divisor — a device word the captured graphs read, which a Program rewrites between rounds.
 
@@ -546,8 +562,12 @@ NVFP4 banks take a fixed **share form** instead of the divisor rule: W4A16 banks
 at least eight columns — a CPU expert's cost past its first column is its compute, which the
 one-column rate the rules take hides, so wide verification rounds give the CPU more. The
 shares are fixed family constants, not measured rates; they are upstream's, derived on its
-host (i9-13900K, RTX 5090 over Gen5 x8, DFlash2 auto), and need re-deriving on this machine
-(9950X3D2, Gen5 x16) at T3 in a RAM/SSD placement.
+host (i9-13900K, RTX 5090 over Gen5 x8, DFlash2 auto): 51/256 from eight columns added struct
++2.5 %, conv +0.7 % on W4A16 and +4.3 %, and after 16K +1.7 % against the divisor rule on W4A4
+(2026-11-02), and a measured fractional share flipped calls' splits at floor(M·share) between
+startups (3 workers: 100.8 against 107.5 tok/s). They need re-deriving on this machine
+(9950X3D2, Gen5 x16) at T3 in a RAM/SSD placement; Qwen3.8-Flash-Next's own re-derivation and
+its caveat are its design §10.5.
 
 **Rejected:** a MEASURED fractional share `1/(1+C·t)` (floor flips between startups);
 `round(1 + C·t)` (the switch lands inside the startup noise); a divisor following the expert

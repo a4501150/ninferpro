@@ -95,8 +95,8 @@ void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePl
         // (hybrid_program.cpp), whatever the other lanes do. Under idle-wide-prefill it takes the
         // idle width instead when no other lane is generating, the prompt has no media, and the free
         // KV pages alone hold the whole wide extent (so a request that could start with one chunk is
-        // never paused or failed for the width): RTX 5090, 27B NVFP4, INT8 KV, C = 1, 2026-10-16:
-        // pp1024 +19.3 %, pp2048 +11.5 %, pp3072 +5.2 %, pp4096 +0.5 %, pp8192 +1.8 % (ABBA).
+        // never paused or failed for the width); its measured per-width gains are in model-quality.md
+        // §6.7's `idle-wide-prefill` entry (ABBA).
         std::uint32_t step = prefill_chunk;
         const std::uint32_t prompt = base.summary().prompt_tokens;
         if (idle_prefill_width > prefill_chunk && !request.prefill->vision_plan &&

@@ -41,10 +41,9 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
             ? Cache::cg
             : Cache::ca;
     // Flash-Next's attention output projection at its eight-column block (2560 rows: 160 CTAs, one a
-    // row tile) double-buffers its weight stages: on the RTX PRO 6000 the cold op's min-of-360
-    // drops 11.8-12.0 -> 10.2 us with the median pinned at the timer's 12.3 us quantum (2026-11-03;
-    // upstream measured 11.6-12.7 -> 11.0 on an RTX 5090 and found 16 K warps or four slower, and
-    // the MLP down projection no faster with either change). The tile serves one lane's block of at
+    // row tile) double-buffers its weight stages, which the cold op's timer measured faster on both
+    // cards (RESEARCH_NOTES.md, "Q8 MMA tile choices"; upstream found wider K-warp counts and the
+    // MLP down projection unchanged). The tile serves one lane's block of at
     // most eight columns; a multi-lane call's wider tiles keep one stage.
     constexpr int Stages = Rows == 2560 && InputRows == 4096 && TileColumns == 8 ? 2 : 1;
     using Geometry    = Q8LinearGeometry<Rows, InputRows>;

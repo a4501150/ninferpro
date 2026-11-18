@@ -417,12 +417,10 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
 
 // Strata v4's hyper-connection read scheduling (strata-nvfp4 src/kernels/cuda/fused_gr.cu,
 // gr_down_v4_kernel and gr_up_v4_kernel) for calls of two or more columns. Every product and sum
-// below is the one K1a/K1b compute, in the same order, so the outputs are bit-identical. RTX 5090,
-// Q8 mixer, 2026-10-16: per call -7.6 % (T 2) to -17.8 % (T 5), +2.2 % at T 1 (which keeps
-// K1a/K1b); Flash-Next Dense8 MTP 4 decode +0.9 %, plain decode +0.6 %. Two rows per warp in K1a
-// (v4's other change) spilled 120-160 bytes of stack and was slower (-0 to +20 % per call); with
-// the pass width a template argument and 4 warps per CTA it did not spill but was slower still
-// (RTX PRO 6000, T 6: 17.9 us against 12.7): the kernel is latency bound, not shared-memory bound.
+// below is the one K1a/K1b compute, in the same order, so the outputs are bit-identical; the
+// per-width and end-to-end measurements that adopted it are design §8.3. The kernel is latency
+// bound, not shared-memory bound, so K1a keeps 8 warps of one row each (the two-rows-per-warp and
+// 4-warp variants it rejected are in RESEARCH_NOTES.md, "Hyper-connection mix pair").
 //
 // K1a/K1b already had v4's weights-first loads (every weight chunk in registers before the PDL
 // wait), the residual read through __ldg, its lane-chunk K mapping (k = 8 lane + 256 m) and, in
@@ -439,15 +437,14 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
 //     gather) = 448, and each m read feeds 8 rows instead of 4; m is staged in two planes; partials,
 //     inv and R are read through __ldg. The collapse runs after the token loop, one thread per
 //     (token, feature), from the row sums in shared memory, with K1b's own expressions in its order.
-//     The token groups are sized to the call (6 columns run 4 + 2, not 4 + 4 with two repeated):
-//     RTX PRO 6000, Q8, per call -4 % (T 2) to -12 % (T 12).
-//   Since 2026-10-24 the v4 pair forms m once per call: K1a v4's four stream CTAs of a row block are a
+//     The token groups are sized to the call (6 columns run 4 + 2, not 4 + 4 with two repeated),
+//     which measured faster at every width (design §8.3).
+//   The v4 pair forms m once per call: K1a v4's four stream CTAs of a row block are a
 //     cluster, and stream 0's CTA sums their row sums from distributed shared memory in K1b's order
 //     and writes m and the injects. Every K1b CTA had formed all of m itself (S x down_rows x T
 //     partials through L2 and down_rows x T sigmoids per CTA); K1b v4 now copies m. K1b v4 also
-//     decodes its weight chunks once, not once per token group. RTX PRO 6000, Q8, per call T 2-3
-//     unchanged, T 4 / 8 / 12 / 16 10.6 / 14.3 / 19.0 / 23.2 -> 10.1 / 13.1 / 17.1 / 20.2 us (BF16
-//     weights: T 2-3 +0.6-0.8 us, T >= 4 -0.3 to -3.9 us).
+//     decodes its weight chunks once, not once per token group (the measured per-width gains are
+//     design §8.3).
 // Not adopted: v4's deferred RMS scale (Strata multiplies unscaled partials by inv in up, another
 // rounding) and its collapse (it rounds each sigmoid(u) Rn product before the stream sum, where
 // K1b's chain may fuse each product into the sum).

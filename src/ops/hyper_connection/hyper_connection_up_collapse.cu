@@ -103,7 +103,8 @@ bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_
 
 bool hc_up_collapse_preferred(const Weight& up, std::int32_t hidden, std::int32_t streams,
                               std::int32_t columns) noexcept {
-    // Up to 96 columns the separate linear and collapse measured as fast or faster (+0.5-2 %).
+    // Up to 96 columns the separate linear and collapse measured as fast or faster (design §3.1
+    // holds the boundary measurement).
     return columns > 96 && hc_up_collapse_supported(up, hidden, streams);
 }
 
@@ -114,8 +115,8 @@ void hc_up_collapse(const Tensor& m, const Weight& up, const Tensor& normalized,
         normalized.ne[0] != up.n || x.ne[1] != T) {
         throw std::invalid_argument("hyper_connection: fused up + collapse shapes disagree");
     }
-    // Tiles by width from the sweep of 2026-10-14 (whole mixer, 8 Q8 layers, RTX 5090); every tile
-    // gives the same bits.
+    // Tiles by width from the measured sweep; every tile gives the same bits (RESEARCH_NOTES.md,
+    // "Q8 MMA tile choices").
     if (T <= 128) return launch<q8_instances::MmaR32T64>(m, up, normalized, x, stream);
     return launch<q8_instances::MmaR64T128>(m, up, normalized, x, stream);
 }

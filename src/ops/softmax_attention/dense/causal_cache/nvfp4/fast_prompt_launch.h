@@ -17,12 +17,10 @@
 namespace infernix::ops::detail {
 
 // Whether an NVFP4 prompt-route launch runs the fast kernel: over 768 visible keys. Forced at
-// every visible count (3 passes, H24 and H16 geometries, 256-3584 columns over 0-8192 keys) the
-// fast kernel is equal to the tiled kernel at 512-768 visible keys, up to 1.6x faster from 1024
-// on and up to 3.4x at 8192, and up to 1.6x slower for 256-512-column launches over an empty
-// context (the tiled kernel's launch is cheaper there). Picking the fast kernel above 768 keys is
-// within 0.03 % of the per-shape best in both geometries; the 2048 threshold of 2026-09, from a
-// kernel without the one-decode V arena, costs 2.3-2.7 % overall and 56-64 % in its worst cell.
+// every visible count the sweep measured, picking the fast kernel above 768 keys is within a
+// fraction of a percent of the per-shape best in both geometries (the sweep, and the cost of the
+// older 2048 threshold it replaced, are in RESEARCH_NOTES.md, "NVFP4 fast-prompt threshold
+// re-tuned to 768 visible keys").
 inline bool nvfp4_fast_prompt_applies(std::uint32_t max_visible_keys) {
     return max_visible_keys > 768;
 }

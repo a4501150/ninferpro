@@ -36,18 +36,17 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence, runtime::T
     const bool last          = begin + width == static_cast<std::int32_t>(lane.prefill_end);
     // A call the CPU serves (an opener tail, a tiny suffix) promotes at the decode rate (design
     // §13.7). Wider prefill calls promote nothing: the answer's staged misses land in free
-    // frames and pick its experts, while the prompt's would displace them (16 per layer per
-    // call measured slower than none in every regime: serve C = 4 fill -4.3 %, warm -5.6 %;
-    // design §13.7). Their routes still count toward the cache's scores.
+    // frames and pick its experts, while the prompt's would displace them (per-call promotions
+    // measured slower than none in every regime; design §13.7). Their routes still count toward
+    // the cache's scores.
     const std::size_t promotions =
         width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
     // Host phases of a chunk for nsys attribution (the GPU side is in the CUDA trace).
     const nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                         static_cast<std::uint64_t>(width));
     // A call wide enough to stream reads its n-gram rows behind the gate once it is enqueued
-    // (run_rows_behind); the others, and a call the stream turns down, read them first.
-    // Upstream measured this on FP4-Local from a volume (RTX 5090, 2026-10-30, three interleaved
-    // runs): pp16413 6,829 -> 6,999 tok/s, pp4096 2,727 -> 2,802.
+    // (run_rows_behind); the others, and a call the stream turns down, read them first. Upstream
+    // measured this faster end to end at both prefill widths it ran (design §12.4).
     const bool rows_behind = static_cast<bool>(expert_stream_) && width >= kStreamMinColumns;
     {
         const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
@@ -406,7 +405,8 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
     //   (choose_pair_draft_length), so no row is padded to the other's; its at most 2 x 3 = 6
     //   columns stay on the column-invariant dense routes, so greedy output equals C = 1, and
     //   below the 7-column fork and CPU-job limits; the shared length couples the rows, and a
-    //   pair round's output differed from the rows alone in 1-4 of 96 segments (2026-10-14);
+    //   pair round's output differed from the rows alone in a small share of segments
+    //   (design §11.5);
     // - DFlash2 rows of any size, with the fast path: one shared length for the round
     //   (choose_batch_dflash_length). The drafter proposes every row's block in one pass, so
     //   the proposal does not grow with the round, and the policy reads the size's measured

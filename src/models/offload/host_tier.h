@@ -21,8 +21,8 @@ namespace infernix::models::offload::expert_cache {
 // v_k = sum over uses of w * 2^((t_use - base) / h), so a use is one multiply-add by the clock's
 // growth 2^((t - base) / h) and ranking by v equals ranking by the current score; v only increases,
 // except that a rebase divides every v by the same power of two (exactly) once the clock is kRebase
-// half-lives past the base. The log2 form this replaced took two transcendentals a use (upstream
-// measured ~100 us of a decode round's host time on its struct fixture, 2026-10-29).
+// half-lives past the base. The log2 form this replaced took two transcendentals a use (its measured
+// host-time cost is in MoE offload design §4.3).
 class DecayedLfu {
 public:
     DecayedLfu(std::uint32_t num_keys, double half_life);

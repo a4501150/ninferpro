@@ -12,9 +12,9 @@ Bf16Launch select_bf16_n640_k2560_invariant(std::int32_t tokens) {
     if (tokens <= 8) return launch_bf16_sliced_k_mma<Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 8, 8, 64, 2>, 2560>>;
     return launch_bf16_sliced_k_mma<Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 32, 8, 64, 2>, 2560>>;
 }
-// LinearRoutes::Bf16IndexMma: the BF16 tensor-core tiles from 9 columns, 4-7x faster than the
-// runtime-shape GEMM (bench/ops/bf16_flash_next_sweep.cu --shape qsaidx, RTX PRO 6000, 2026-10-25:
-// 8 against 33-74 us at 32-65 columns, 18 against 84 at 1,024, 178 against 926 at 16,384).
+// LinearRoutes::Bf16IndexMma: the BF16 tensor-core tiles from 9 columns, several times faster than
+// the runtime-shape GEMM at every measured width (the sweep's per-width numbers are in
+// linear-tuning.md §6).
 Bf16Launch select_bf16_n640_k2560_index_mma(std::int32_t tokens) {
     if (tokens <= 8) return select_bf16_general_launch(tokens);
     if (tokens <= 128) return launch_bf16_sliced_k_mma<Bf16A16SlicedR32T16W4>; // sliced_r32t16w4

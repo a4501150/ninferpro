@@ -884,10 +884,10 @@ constexpr int kSmallCallColumns = 8;
 //   bound (33 at budget 2048, ratio 4), whatever the width. A column's bits then do not depend on how
 //   many columns share the call, so concurrent sequences decode as they do alone (the preemption and
 //   prefix-cache resumes rely on it; test_qsa checks it). Against one wave per call (the rule below)
-//   this costs ~2 us at W = 5 and ~10 us at W = 8 per call, under 0.2 % of a round; W = 1-2 are equal.
+//   this costs little per call (the measured per-width costs are design §14.2); W = 1-2 are equal.
 // - Wider calls: one wave of the decode kernel's CTAs (one 512-thread CTA per SM), at most 48 and at
-//   least 4 once split. A call that fills half the SMs unsplit takes the prompt route. Against the
-//   earlier 340-CTA / 33-split rule: 42-73 % faster at 43-85 columns (design §14.2).
+//   least 4 once split. A call that fills half the SMs unsplit takes the prompt route. This is
+//   faster than the earlier 340-CTA / 33-split rule at the wide counts (design §14.2).
 int attention_splits(int columns, const QsaGeometry& g) {
     const int attended = g.budget + g.ratio - 1;
     if (columns <= kSmallCallColumns) { return (attended + kTokenTile - 1) / kTokenTile; }

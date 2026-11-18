@@ -194,6 +194,11 @@ the committed prefix of that recorded physical block. The projection/convolution
 remains in the model's finite execution choices. [ReplaySSM](replayssm-gdn.md) defines the record
 and commit semantics, including their numerical boundary.
 
+The Q8 decode input projection runs four blocks per SM so each thread fits 64 registers (from 80),
+issuing the same instructions in the same order and so producing the same bits; every four-block
+run measured ahead of the wider-occupancy form end to end on Qwen3.6-35B-A3B plain decode,
+397.4 -> 398.6 tok/s (giveen/ninfer-ext 310d3bf18; RTX 5090, ABAB x2).
+
 ### Sparse MoE
 
 For token h, with E routed experts and K selected experts:

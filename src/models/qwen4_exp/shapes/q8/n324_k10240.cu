@@ -4,9 +4,9 @@
 
 namespace infernix::ops::detail {
 namespace {
-// Qwen3.8-Flash-Next hyper-connection down + inject: the register-streamed route at 1-3 and 9-64 columns (2-7x
-// faster than the MMA tile there), the few-row SIMT route at 4-8 (M1 sweep). K1: 2 row(s) per warp, 8 warps
-// splitting each row's K, x read through L1.
+// Qwen3.8-Flash-Next hyper-connection down + inject: the register-streamed route at 1-3 and 9-64 columns, the
+// few-row SIMT route at 4-8 (the sweep's measured winners are in RESEARCH_NOTES.md, "Q8 MMA tile choices").
+// K1: 2 row(s) per warp, 8 warps splitting each row's K, x read through L1.
 template <int MaxCols, int ColsPerPass>
 using Stream = Q8A16StreamSchedule<10240, 2, 8, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
 } // namespace
@@ -18,14 +18,10 @@ Q8Launch select_q8_n324_k10240(std::int32_t tokens) {
     if (tokens <= 64) return launch_q8_a16_stream_linear<Stream<16, 8>>;
     if (tokens <= 96) return launch_q8_a16_mma_r32_t96;
     // Beyond 96 columns (prefill chunks): every MMA tile accumulates each output over K in the same
-    // order, so their bits are identical (checked at every swept point); only speed differs. Up to
-    // 2048 columns the single K chain holds every tile at 96-125 us (the tile sweep of 2026-10-05,
-    // fn/rigs/layer/q8tiles2.bat, RTX 5090). Beyond it a tile runs one CTA per SM, so its time steps
-    // up by 50-100 us wherever its CTA count passes a multiple of the RTX PRO 6000's 188 SMs; each
-    // range takes a tile not just past a step (2026-10-24, RTX PRO 6000: the fastest of four tiles in
-    // every 128-column step from 2048 to 16384 and on both sides of each boundary, 1.01 times the
-    // fastest at worst; the 48 x 64 tile alone took 1.19 times as long in total and 1.35 at worst,
-    // 664 against 590 us at T = 16384).
+    // order, so their bits are identical; only speed differs. Up to 2048 columns the single K chain
+    // holds every tile near its floor; beyond it a tile runs one CTA per SM, so its time steps up
+    // wherever its CTA count passes a multiple of the device's SMs, and each range takes a tile not
+    // just past a step (the sweep's per-tile numbers are in RESEARCH_NOTES.md, "Q8 MMA tile choices").
     if (tokens <= 1024) return launch_q8_a16_mma_r32_t64;
     if (tokens <= 2048) return launch_q8_a16_mma_r48_t64;
     if (tokens <= 3968) return launch_q8_a16_mma_r64_t128;  // 6 x 31 CTAs

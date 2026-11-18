@@ -7,7 +7,7 @@
 // pass of up to kColumns columns and adds their exact terms into one int128 per column; the
 // group's partial sums are added exactly (order cannot matter) and its first lane rounds. (Every
 // rows CTA encoding a decode call's column into shared memory instead of encode_kernel measured
-// 4 % slower end to end: 98.0 -> 94.0 tok/s.)
+// slower end to end; RESEARCH_NOTES.md, "GGUF dense projections".)
 //
 // Calls of kMmaMinColumns..kMmaMaxColumns columns (MTP verification) run mma_rows_kernel on tensor
 // cores; calls of kTileMinColumns or more (prefill) first decode each segment's weights once into
@@ -55,8 +55,8 @@ constexpr std::size_t kPlaneBytes = 64ULL << 20;
 // Up to kMax segments of one format in one narrow launch; CTAs [first[i], first[i + 1]) take segment
 // i's rows into out[i] (n[i] rows per column). A verification launch may hold two formats
 // (mma_rows_mixed_kernel): format[i] picks F0 or F1, row_bytes[i] its rows. One launch per call
-// instead of one per segment (GDN q/k/v/z at one column 33.4 -> 23.0 us; RTX 5090, IQ3_S, MTP 4 +
-// n-gram 7 at 4K 196.1 -> 202.4 tok/s with mixed launches, two rounds, 2026-10-16).
+// instead of one per segment (measured faster at every narrow width; RESEARCH_NOTES.md,
+// "GGUF dense projections").
 struct RowsGroup {
     static constexpr int kMax = 4;
     const std::uint8_t* data[kMax] = {};
@@ -136,8 +136,8 @@ __device__ int encode_column(const std::uint16_t* __restrict__ v, int k, const s
     return e;
 }
 
-// encode_column with 16-byte loads, for every column it can read (end to end 0.7 % faster, two
-// rounds, 2026-10-16). Thread i takes the column's 8-element chunks i, i + Threads, ... (chunk c holds
+// encode_column with 16-byte loads, for every column it can read (measured faster end to end;
+// RESEARCH_NOTES.md, "GGUF dense projections"). Thread i takes the column's 8-element chunks i, i + Threads, ... (chunk c holds
 // groups 2c and 2c + 1, read from the permuted source in one load: needs perm_block % 8 == 0 and a
 // 16-byte aligned column), keeps the first kKeep of them in registers from the exponent's pass to the
 // limbs' pass, and adds a slice's sum over its four chunks' lanes. Writes the same words as
@@ -297,9 +297,8 @@ __global__ void __launch_bounds__(kThreads)
 
 // Narrow calls of kMmaMinColumns..kMmaMaxColumns columns (MTP verification rounds) on tensor cores
 // (ops/ggml/ggml_mma_rows.cuh): one CTA per 16 rows, its warps taking K's blocks in turn; the outputs
-// are the same integers as rows_kernel's. (Measured at 5 columns, 2026-10-12: four warps taking
-// whole blocks beat eight, and eight or sixteen taking 2- or 4-slice parts of a block, at every dense
-// shape, the 1,280- and 2,560-row ones included.)
+// are the same integers as rows_kernel's. (Four warps taking whole blocks measured fastest at
+// every dense shape; the warp-count sweep is in RESEARCH_NOTES.md, "GGUF dense projections".)
 constexpr int kMmaRows       = 16;
 constexpr int kMmaWarps      = 4;
 constexpr int kMmaMinColumns = 3;
@@ -309,8 +308,8 @@ static_assert(kMmaWarps > 1, "the mma rows' warps reduce through shared memory")
 using MmaPartial = unsigned long long[kMmaWarps - 1][4][2][32];
 
 // The mma rows' weight paths: 2-byte loads from the rows (kPlain: the mixed-format launch), or the
-// rows' units staged through shared memory by cp.async (kStaged: single-format launches; MTP 4 +
-// n-gram 7 at 4K 202.4 -> 206.7 tok/s, two rounds, 2026-10-16).
+// rows' units staged through shared memory by cp.async (kStaged: single-format launches; measured
+// faster end to end — RESEARCH_NOTES.md, "GGUF dense projections").
 enum : int { kPlain = 0, kStaged = 1 };
 
 // One CTA of the mma rows: segment `seg` (rows row_bytes apart) of its launch.
@@ -373,8 +372,8 @@ __global__ void __launch_bounds__(kMmaWarps * 32, 4)
 }
 
 // A verification call's segments of two formats in one launch, each CTA running its segment's format
-// (RowsGroup::format 0: F0, 1: F1): end to end 1.0 % faster than a launch per format (two rounds,
-// 2026-10-16).
+// (RowsGroup::format 0: F0, 1: F1): measured faster end to end than a launch per format
+// (RESEARCH_NOTES.md, "GGUF dense projections").
 template <QType F0, QType F1, bool OutF32>
 __global__ void __launch_bounds__(kMmaWarps * 32, 4)
     mma_rows_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
@@ -400,10 +399,9 @@ __global__ void __launch_bounds__(kMmaWarps * 32, 4)
 // mma_rows::unit_sums over each, mma_rows_kernel's arithmetic; the tile's warps add their int128
 // partials through shared memory (exact, in any order). A call's segments of two tiled formats share
 // one launch (tiled_mma_mixed_kernel). One-column Q6_K and IQ4_XS calls of one format run rows_kernel
-// with tiled addressing instead (tiled_rows_route); every route returns the same integers. Against
-// the row-major routes (2026-10-16, RTX 5090, the IQ3_S import's dense calls weighted per token):
-// -12 / -23 / -26 / -27 / -32 % at 1 / 2 / 4 / 5 / 8 columns; end to end MTP 4 + n-gram 7 at 4K
-// 221.7-222.6 against 214.0-214.5 tok/s, plain decode 99.6-99.7 against 99.5-99.6.
+// with tiled addressing instead (tiled_rows_route); every route returns the same integers. The
+// tiled routes are faster than the row-major ones at every narrow width and end to end
+// (RESEARCH_NOTES.md, "GGUF dense projections").
 template <QType F>
 inline constexpr bool kTiledFormat = ggml_tiles16_supported(F);
 template <QType F>
@@ -412,8 +410,8 @@ constexpr int kTiledMaxThreads = 256;
 
 // A 16-byte cp.async with an L2 evict-first policy: the dense weights (about 1.3 GB a token) are
 // read once per call and never reused from L2, so their stream should not push out what other
-// kernels reuse (MTP 4 + n-gram 7 at 4K +0.5 %, both runs ahead, 2026-10-16; the head's evict-first
-// loads +0.3 %, design §8.3).
+// kernels reuse (measured slightly faster end to end; RESEARCH_NOTES.md, "GGUF dense projections".
+// The head's evict-first loads are design §8.3).
 __device__ __forceinline__ void cp_async16_evict_first(void* shared, const void* global, std::uint64_t policy) {
     const auto s = static_cast<unsigned>(__cvta_generic_to_shared(shared));
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(s), "l"(global), "l"(policy));
@@ -577,15 +575,13 @@ __global__ void __launch_bounds__(ggml::tile::kThreads)
 }
 
 // Wide calls: one CTA per tile of ggml::tile::kTileRows rows x kTileColumns encoded columns, its
-// stages the images of the segment's decoded plane (rows still give the scales' accumulator choice).
-// Measured at 4096 columns against tiles that decode their raw rows in the loop (2026-10-12): 15-34 %
-// faster (Q6_K attn_qkv 3,912 -> 2,839 us). Tiles of Q6_K and IQ4_NL fit two CTAs per SM (128
-// registers): Q6_K 3-6 % and IQ4_NL 14 % faster than one; Q4_K and Q5_K (min-term accumulators)
-// spill and run 60-70 % slower, IQ4_XS 9 % slower.
-// The other formats' tiles have 512 threads (16 warps of 16 x 16 outputs, one CTA per SM within 128
-// registers; ggml_tile.cuh), measured at 4096 columns against 256 (2026-10-14): Q5_K -2.4 %, Q4_K
-// -3.6 %, IQ4_XS -4.1 % time; Q6_K +9-12 % and IQ4_NL +3 %, which keep 256 at two CTAs per SM.
-// (Q2_0 and the IQ2/IQ3 formats, which no dense projection of the IQ3_S import uses, unmeasured.)
+// stages the images of the segment's decoded plane (rows still give the scales' accumulator choice),
+// measured faster at 4096 columns than tiles that decode their raw rows in the loop. Tiles of Q6_K
+// and IQ4_NL fit two CTAs per SM (128 registers); Q4_K and Q5_K (min-term accumulators) would spill
+// there. The other formats' tiles have 512 threads (16 warps of 16 x 16 outputs, one CTA per SM
+// within 128 registers; ggml_tile.cuh); Q6_K and IQ4_NL keep 256 at two CTAs per SM. The tile
+// sweeps are in RESEARCH_NOTES.md, "GGUF dense projections". (Q2_0 and the IQ2/IQ3 formats, which
+// no dense projection of the IQ3_S import uses, unmeasured.)
 template <QType F>
 inline constexpr int kPlaneTileThreads = F == QType::GGML_Q6_K || F == QType::GGML_IQ4_NL ? 256 : 512;
 template <QType F>
@@ -677,12 +673,9 @@ void launch_tile_format(const GgmlSegment& s, int k, const Columns& in, int colu
 // rows' blocks and the device's residency at the shape's shared memory: the first of kTiledShapes
 // whose CTAs all fit in one wave (cudaOccupancyMaxActiveBlocksPerMultiprocessor x SMs) and whose
 // split either keeps the call within kTiledWarpBudget warps or leaves each warp kTiledMinBlocks
-// blocks; a call no shape fits in one wave (the head) takes 4 warps, unsplit. Measured 2026-10-16
-// (RTX 5090, 170 SMs; the IQ3_S import's dense calls at 1-8 columns, every shape): a second wave of
-// even two CTAs costs a call 25-30 % (GDN q/k/v/z, 1,024 tiles: 4 warps split 2, 512 CTAs against
-// 510 resident, 28.8 us at one column; unsplit, 21.9); within one wave more warps help small calls
-// (128 tiles: split 8, 7.6 us; split 2, 10.0), while split 4 over 2.5 blocks a warp loses to split 2
-// (384 tiles: 13.3 against 13.0 us).
+// blocks; a call no shape fits in one wave (the head) takes 4 warps, unsplit. A second wave of even
+// two CTAs costs a call dearly, and within one wave more warps help small calls (the shape sweep is
+// in RESEARCH_NOTES.md, "GGUF dense projections").
 struct TiledShape {
     int warps  = 4;
     int split  = 1;
@@ -757,10 +750,8 @@ TiledShape tiled_shape(Kernel kernel, int tiles, int blocks, int slot_bytes, con
 
 // The rows route (rows_kernel with tiled addressing) takes a single-format tiled group of Q6_K or
 // IQ4_XS at one column and every tiled call wider than kMmaMaxColumns; the MMA route takes the rest
-// and every two-format call of 1-8 columns (one launch). Measured at one column (2026-10-16): the GDN
-// output projection (Q6_K) 13.0 us against 15.5 by MMA, the head 295.5 against 297.5; a 6,144-row
-// Q4_K matrix 11.1 by MMA against 13.3 by rows; GDN q/k/v/z 22.1 in one MMA launch against 26.0 in
-// a rows launch per format.
+// and every two-format call of 1-8 columns (one launch). The per-shape measurements behind these
+// boundaries are in RESEARCH_NOTES.md, "GGUF dense projections".
 bool tiled_rows_route(QType format, int columns) {
     return columns > kMmaMaxColumns || (columns == 1 && (format == QType::GGML_Q6_K || format == QType::GGML_IQ4_XS));
 }
