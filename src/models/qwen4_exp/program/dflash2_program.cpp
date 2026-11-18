@@ -227,4 +227,23 @@ void ProgramImpl::dflash2_walk_context(Lane& lane, std::uint32_t index) {
     lane.dflash_frontier = lane.state_tokens;
 }
 
+Tensor ProgramImpl::dflash_feature_columns(std::int32_t column, std::int32_t n) const {
+    return Tensor(static_cast<std::byte*>(dflash_features_.p) +
+                      2ULL * static_cast<std::size_t>(dflash_feature_rows()) * static_cast<std::size_t>(column),
+                  DType::BF16, {dflash_feature_rows(), n});
+}
+
+std::pair<std::int32_t, std::int32_t> ProgramImpl::dflash_call_region(std::int32_t cols) const noexcept {
+    if (walk_.active) { return {0, std::min(cols, plan_.dflash_round_columns)}; }
+    return {plan_.dflash_round_columns, std::min(cols, dim(plan_.dflash2_config->window))};
+}
+
+std::int32_t ProgramImpl::dflash2_auto_length(Lane& lane, std::int32_t most) {
+    std::int32_t best = calibrated_draft_length(
+        lane.dflash_calibration, std::span<const float>(dflash_confidence_[0].data(), static_cast<std::size_t>(most)),
+        most, kDFlashDraftCost, kDFlashProposalCost);
+    if (++lane.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, most); }
+    return best;
+}
+
 } // namespace infernix::models::qwen4_exp::detail

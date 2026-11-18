@@ -200,4 +200,63 @@ void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
     }
 }
 
+void ProgramImpl::measure_link() {
+    double rate = options_.link_bytes_per_second;
+    const void* source = parameters_.layers.front().moe.bank->planes.records;
+    if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
+    if (rate <= 0.0 && source != nullptr && staging_.p != nullptr && plan_.staging > 0) {
+        rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 3);
+    }
+    if (rate <= 0.0) { return; } // no frames to probe with: keep the reference rate
+    link_bytes_per_second_ = rate;
+    options_.prefix_cost.h2d_bytes_per_second = rate;
+    options_.prefix_span_seconds *= kReferenceLinkBytesPerSecond / rate;
+    if (prefix_) { prefix_->index().set_cost(options_.prefix_cost); }
+    char text[256];
+    std::snprintf(text, sizeof(text),
+                  "host-to-device link: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to "
+                  "%d columns",
+                  rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (set)" : " measured",
+                  static_cast<unsigned long long>(promotion_interval()),
+                  options_.prefill_cpu_split ? split_columns() : 0);
+    diagnostic(text, DiagnosticLevel::Debug);
+    std::snprintf(text, sizeof(text), "PCIe link to the GPU: %.1f GB/s%s", rate / 1e9,
+                  options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured");
+    diagnostic(text);
+}
+
+int ProgramImpl::pcie_divisor() const noexcept {
+    if (options_.cpu_pcie_divisor > 0) { return options_.cpu_pcie_divisor; }
+    const double record_seconds =
+        static_cast<double>(parameters_.layers.front().moe.bank->planes.record_stride) / link_bytes_per_second_;
+    return std::max(1, static_cast<int>(std::floor(1.65 + cpu_expert_rate() * record_seconds)));
+}
+
+int ProgramImpl::pcie_share() const noexcept {
+    if (options_.cpu_pcie_divisor > 0) { return 0; }
+    const auto& bank = *parameters_.layers.front().moe.bank;
+    return bank.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
+                   bank.planes.gate_up_format == QType::NVFP4_MUL
+               ? kDecodeLinkShare256
+               : 0;
+}
+
+std::pair<std::int32_t, std::int32_t> ProgramImpl::wide_link_share() const {
+    if (options_.cpu_pcie_divisor > 0 ||
+        parameters_.layers.front().moe.bank->planes.gate_up_format != QType::NVFP4_MUL) {
+        return {0, 0};
+    }
+    return {kWideLinkShare256, ops::offloaded_moe::kMaxColumns};
+}
+
+int ProgramImpl::one_column_divisor() const noexcept {
+    const bool speculative = mtp_k_ > 0 || options_.ngram_draft_tokens > 0;
+    return c_.ggml_weights && !speculative && options_.cpu_pcie_divisor == 0 ? 1 : 0;
+}
+
+std::int32_t ProgramImpl::split_columns() const noexcept {
+    const double scaled = options_.cpu_split_columns * kReferenceLinkBytesPerSecond / link_bytes_per_second_;
+    return static_cast<std::int32_t>(std::min<double>(scaled, ops::offloaded_moe::kMaxCpuCallColumns));
+}
+
 } // namespace infernix::models::qwen4_exp::detail

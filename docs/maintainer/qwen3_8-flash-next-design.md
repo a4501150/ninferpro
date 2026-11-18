@@ -665,7 +665,7 @@ itself, a shared offload tier, and a shared Qwen frontend.
 | Component | Owner | Location |
 |---|---|---|
 | Mathematics, config, binding, block order, MTP/DFlash2 alignment, tuned shapes | Model | `src/models/qwen4_exp/` (`config.*`, `load.*`, `instance.*`, `model.h`; `execution/` forward and parameters; `shapes/`) |
-| Program: mutable state, placement, residency, tiers, CUDA graphs, prefix cache, n-gram volume, vision window, scoring, draft-length policy, fast paths | Program (allocated at startup) | `src/models/qwen4_exp/program/` (`program_impl.h`, `prefix/`, `ngram_volume.*`, `vision_window.*`, `score.cpp`, `dflash2_program.cpp`, `draft_length.h`, `fast_paths.*`, `prefill_walk.cpp`, `rope_positions.*`, `constraint.cpp`) |
+| Program: mutable state, placement, residency, tiers, CUDA graphs, prefix cache, n-gram volume, vision window, scoring, draft-length policy, fast paths | Program (allocated at startup) | `src/models/qwen4_exp/program/` (`program_impl.h` declares the Program, `internal.h` its layouts and plans; topic files `program_impl.cpp`, `binding.cpp`, `decode.cpp`, `verify.cpp`, `mtp.cpp`, `exec.cpp`, `placement.cpp`, `reports.cpp`, `kv_pool.cpp`, `cpu_rates.*`; `prefix/`, `ngram_volume.*`, `vision_window.*`, `score.cpp`, `dflash2_program.cpp`, `draft_length.h`, `fast_paths.*`, `prefill_walk.cpp`, `rope_positions.*`, `constraint.cpp`) |
 | Expert residency machinery shared by the flash families: LFRU policy, VRAM frames and tables, placement, SSD records, RAM/SSD tier controllers, warm-start state, calibrated order, route trace, VRAM monitor | Offload tier (composed by each Program; no base class, no virtual interface; [MoE offload design](moe-offload-design.md) §1) | `src/models/offload/` (`expert_cache.*`, `expert_residency.*`, `expert_placement.*`, `expert_store.*`, `host_tier.*`, `host_expert_tier.*`, `expert_state.*`, `calibrated_order.*`, `route_trace.*`, `vram_monitor.*`, `geometry.h`) |
 | Frontend shared by the Qwen families: tokenizer, chat template, processor, prompt layout, tool grammar, reasoning loop, media cache, vision tower and weight stream, n-gram proposer, prefix block keys | Shared Qwen frontend | `src/models/qwen_common/` (`frontend/`, `execution/`, `program/`, `load/`) |
 | Routed-expert MoE: routing, residency classification, narrow and wide GPU kernels, CPU engine, placement-invariant contract (output = MoE(x) independent of residency) | Op family `offloaded_sparse_moe` | `include/infernix/ops/offloaded_sparse_moe.h`; `src/ops/offloaded_sparse_moe/` (`cuda/moe_layer.cu`, `cuda/narrow_expert.cu`, `cuda/wide_expert.cu`, `cpu/` the expert team and miss service) |
@@ -1281,7 +1281,9 @@ them). Chain verification only: `--draft-tree-nodes` is refused
 (`src/models/qwen4_exp/instance.cpp`), so a round verifies one linear sequence per row.
 
 Code: the round, the drafters and the policies are in
-[src/models/qwen4_exp/program/program_impl.h](../../src/models/qwen4_exp/program/program_impl.h),
+[decode.cpp](../../src/models/qwen4_exp/program/decode.cpp),
+[verify.cpp](../../src/models/qwen4_exp/program/verify.cpp),
+[mtp.cpp](../../src/models/qwen4_exp/program/mtp.cpp),
 [draft_length.h](../../src/models/qwen4_exp/program/draft_length.h) and
 [dflash2_program.cpp](../../src/models/qwen4_exp/program/dflash2_program.cpp); the DFlash2 Op
 sequence is [execution/dflash2.cpp](../../src/models/qwen4_exp/execution/dflash2.cpp). DFlash2

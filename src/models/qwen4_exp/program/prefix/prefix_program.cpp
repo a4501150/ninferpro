@@ -1207,4 +1207,11 @@ std::array<std::span<const cudaEvent_t>, 2> ProgramImpl::prefix_waits(const Lane
             prefix_->capture_events(lane.prefix.capture)};
 }
 
+PrefixSelection ProgramImpl::prefix_root(const qwen_common::PreparedPromptData& prompt, const BasePlanImpl& base) {
+    PrefixSelection root;
+    root.need = binding_pages(base, static_cast<std::uint32_t>(prompt.token_ids.size()));
+    root.plan = plan_prefill(prompt, 0, {}, base.reuse);
+    return root;
+}
+
 } // namespace infernix::models::qwen4_exp::detail

@@ -239,4 +239,11 @@ const execution::VisionInput* ProgramImpl::stage_mtp_vision(Lane& lane, std::uin
     return mtp_vision_inputs_.data();
 }
 
+double ProgramImpl::vision_seconds_of(const Lane& lane) {
+    if (lane.vision_timer) {
+        if (const auto ms = lane.vision_timer->try_elapsed_ms()) { return *ms * 1e-3; }
+    }
+    return lane.vision_seconds;
+}
+
 } // namespace infernix::models::qwen4_exp::detail

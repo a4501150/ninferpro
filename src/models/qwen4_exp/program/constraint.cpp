@@ -220,4 +220,59 @@ PromptReadout ProgramImpl::read_prompt_frontier(const Lane& lane) {
     return readout;
 }
 
+std::size_t ProgramImpl::grammar_mask_bytes(std::int32_t token_domain, std::int32_t lanes,
+                                            std::int32_t width) noexcept {
+    return 4ULL * ((static_cast<std::size_t>(token_domain) + 31) / 32) * static_cast<std::size_t>(width) *
+           static_cast<std::size_t>(lanes);
+}
+
+ops::SamplingMask ProgramImpl::grammar_mask(std::size_t row, std::span<const TokenId> drafts) {
+    grammar_dead_[row] = 0;
+    if (grammar_ == nullptr || !grammar_->constrained(row)) { return {}; }
+    if (drafts.size() + 1 > static_cast<std::size_t>(max_width_)) {
+        throw std::logic_error("Qwen4Exp: a constrained row verifies more positions than its mask holds");
+    }
+    const std::size_t words  = (static_cast<std::size_t>(token_domain_) + 31) / 32;
+    const std::size_t offset = row * static_cast<std::size_t>(max_width_) * words;
+    std::span<std::uint32_t> host(static_cast<std::uint32_t*>(grammar_host_.data()) + offset,
+                                  (drafts.size() + 1) * words);
+    grammar_dead_[row] = grammar_->fill(row, drafts, host);
+    auto* device_words = static_cast<std::uint32_t*>(grammar_masks_.p) + offset;
+    // Read through the host mapping: a copy-engine copy would wait behind expert promotions.
+    upload_pinned(device_words, host.data(), host.size_bytes(), device_.stream);
+    grammar_->uploaded(row, host.size_bytes());
+    return {device_words, static_cast<std::int32_t>(words)};
+}
+
+void ProgramImpl::reasoning_ban(std::size_t row, ops::SamplingConfig& config) const noexcept {
+    const runtime::ReasoningBan ban = grammar_ != nullptr ? grammar_->reasoning_ban(row)
+                                                          : runtime::ReasoningBan{};
+    config.reasoning_close   = ban.close;
+    config.reasoning_ends[0] = ban.ends[0];
+    config.reasoning_ends[1] = ban.ends[1];
+}
+
+void ProgramImpl::mark_row_failures(PendingBatch& pending, std::span<const std::int32_t> counts) noexcept {
+    const auto rows = ContractAccess::rows(pending);
+    for (std::size_t row = 0; row < rows.size(); ++row) {
+        const auto count = counts.empty() ? 1 : counts[row];
+        const std::uint64_t reached = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1U;
+        std::int32_t* const nonfinite = nonfinite_flag(ContractAccess::lane(rows[row]));
+        ContractAccess::set_row_failure(pending, row,
+                                        std::exchange(*nonfinite, 0) != 0
+                                            ? runtime::PendingRowFailure::NonFiniteLogits
+                                            : (grammar_dead_[row] & reached) != 0
+                                                  ? runtime::PendingRowFailure::ConstraintDeadEnd
+                                                  : runtime::PendingRowFailure::None);
+    }
+}
+
+std::size_t ProgramImpl::constraint_bytes(std::int32_t lanes, std::int32_t width) noexcept {
+    const auto sets    = static_cast<std::size_t>(lanes) * kMaximumConstraintSets;
+    const auto columns = static_cast<std::size_t>(lanes) * static_cast<std::size_t>(width);
+    return 4ULL * (sets * ops::kTokenConstraintChoices + sets +
+                   columns * (1 + ops::kTokenConstraintRecord + ops::kTokenObserveTokens +
+                              ops::kTokenObserveRecord));
+}
+
 } // namespace infernix::models::qwen4_exp::detail

@@ -4,7 +4,7 @@
 // (docs/maintainer/moe-offload-design.md §5.5): the rates set the decode miss split for the whole
 // session, and memory is slow for some seconds after the banks' load or the SSD tier's fill, or
 // after another process frees tens of GiB, so the readings repeat until they settle. Used by
-// qwen4_exp's Program (program_impl.h measure_cpu_rate_settled); host only.
+// qwen4_exp's Program (cpu_rates.cpp measure_cpu_rate_settled); host only.
 
 #include <algorithm>
 #include <chrono>

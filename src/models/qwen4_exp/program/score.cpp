@@ -148,4 +148,9 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
     return output;
 }
 
+Tensor ProgramImpl::score_residuals(std::int32_t begin, std::int32_t columns) const {
+    return Tensor(static_cast<std::byte*>(score_residuals_.p) + 2ULL * width_ * static_cast<std::size_t>(begin),
+                  DType::BF16, {width_, columns});
+}
+
 } // namespace infernix::models::qwen4_exp::detail

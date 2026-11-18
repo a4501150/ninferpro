@@ -184,7 +184,7 @@ void test_placement_fits_shape() {
 }
 
 
-// The resident warm fill's window walk (program_impl.h warm_frames; design §9.6): the tier's
+// The resident warm fill's window walk (placement.cpp warm_start_frames; design §9.6): the tier's
 // slots hold a window of the fill order, the frames seed it, the shadows free, and the next
 // window reads the following keys from the artifact. The cursor rule is the regression: it
 // starts past prefill_tier's fill and advances by what each prefill really landed. A fixed span
