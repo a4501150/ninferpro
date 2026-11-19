@@ -1,12 +1,14 @@
 # infernix-monitor
 
-A live status page for a running `infernix-serve`: GPU, CPU, RAM and disk readings, decode and
-prefill speed, the expert placement, finished requests, and the server log. The page is adapted
-from [Basalt](https://github.com/jesdga95/basalt)'s status page (MIT, see
-[LICENSE.basalt](LICENSE.basalt)).
+A live status page for `infernix-serve`: GPU, CPU, RAM and disk readings, decode and prefill
+speed, the expert placement, finished requests, and the server log. From the page you can also
+switch the expert placement between VRAM, RAM and SSD, and, with `--control`, start and stop the
+server. The page is adapted from [Basalt](https://github.com/jesdga95/basalt)'s status page (MIT,
+see [LICENSE.basalt](LICENSE.basalt)).
 
-The monitor is a separate process that only reads from the engine, so it can be started, stopped
-or restarted at any time without touching the server. It reads:
+The monitor is a separate process and a client of the engine's public endpoints; the engine has
+no code for it. It can be started, stopped or restarted at any time without touching the server.
+It reads:
 
 | Source | Shown as |
 |---|---|
@@ -40,10 +42,39 @@ Then open `http://127.0.0.1:8090`. The options:
 | `--api-key KEY` | none | the server's `--api-key`, sent as a bearer token |
 | `--request-log FILE` | none | the server's `--request-log-jsonl` file |
 | `--log-file FILE` | none | the server's console log or `--log-file` |
+| `--control CMD` | none | the command behind Start and Stop ([Start and Stop](#start-and-stop)); without it the page has neither |
 | `--host ADDR` | `127.0.0.1` | address the page is served on |
 | `--port N` | `8090` | port the page is served on |
 
 The page has no authentication of its own; it binds to loopback unless `--host` says otherwise.
+Requests that change the server must come from the page itself: a JSON body, an `Origin` (when
+sent) equal to the page's, and a `Host` that is an IP address, `localhost` or this machine's name,
+so another web site open in the same browser cannot switch the placement or stop the server.
+
+## Expert placement
+
+`Change` in the Experts panel opens two sliders: the VRAM and RAM shares of the routed experts,
+whole percents, the rest on SSD. They follow the server's placement until moved. While the server
+runs, a move previews the shares with the engine's dry run (counts per tier, expert bytes, VRAM
+left free, whether it fits) and Apply switches to them through `POST /admin/expert-placement`;
+100 % VRAM is the engine's resident placement (`vram=all`). The engine places exactly what the
+shares say; choosing them, such as leaving room for a game, stays with you.
+
+## Start and Stop
+
+`--control CMD` names an executable the monitor runs, one action at a time, as
+
+- `CMD start [EXPERTS]`: start the server and exit 0 once it answers; `EXPERTS` is an `--experts`
+  spec (`vram=80%,ram=20%,ssd=0%`), passed when the placement editor is open, and the server's
+  configured placement applies without it;
+- `CMD stop`: stop the server and exit 0 once it is gone.
+
+Its stdout and stderr go to the Logs pane, and its last line is the outcome shown in the top bar.
+It runs in a process group of its own with no other open file of the monitor's (the server it
+starts must not hold the page's port); a start is killed after 420 s and a stop after 120 s.
+Start is offered while the server does not answer, Stop while it does. The command owns how the
+server is launched (binary, artifact, flags, log); super-quant's `scripts/infernix_control.sh`,
+which `make monitor` passes, runs its `serve_infernix.sh` and `stop_infernix.sh`.
 
 ## Endpoints
 
@@ -51,6 +82,11 @@ The page has no authentication of its own; it binds to loopback unless `--host` 
   binary at build time.
 - `GET /api/state`: one JSON object with the latest readings and 60-sample histories.
 - `GET /api/logs?after=N`: log lines after sequence number `N`, and the last sequence number.
+- `POST /api/placement` with `{"vram": V, "ram": R, "dry_run": bool}` (whole percents): passed on
+  to `POST /admin/expert-placement`; the engine's status and body come back.
+- `POST /api/control` with `{"action": "start", "vram": V, "ram": R}` (without `vram`, the
+  configured placement) or `{"action": "stop"}`: queues the action (202 with the control state;
+  409 while another action runs).
 
 ## Differences from Basalt's page
 

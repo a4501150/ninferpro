@@ -30,6 +30,14 @@ async function get(path) {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
+// a change to the server; the error carries the monitor's or the engine's message
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  let j = {};
+  try { j = await r.json(); } catch (e) { /* no body */ }
+  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
 
 /* ---- series and charts ---- */
 // the last HIST samples, padded at the start with null (no line) so the newest sample sits at the right edge
@@ -216,8 +224,104 @@ function drawMain(live, eng, reqs, sources) {
   html($("#pane"), cur === "req" ? requestsPane(reqs, sources) : enginePane(live, eng));
 }
 
+/* ---- placement: VRAM and RAM shares of the experts, the rest on SSD ---- */
+// The editor opens from the Experts header. Its sliders follow the server's placement until moved.
+// While the server runs, a move previews the shares (dry run) and Apply switches them; while it
+// is stopped, Start starts with them (with the editor closed, with the configured placement).
+const P = { open: false, dirty: false, applied: 0, seq: 0, timer: 0, err: false };
+const plV = $("#pl-vram"), plR = $("#pl-ram");
+const shares = () => ({ vram: +plV.value, ram: +plR.value });
+function setShares(vram, ram) {
+  plV.value = vram; plR.max = 100 - vram; plR.value = Math.min(ram, 100 - vram);
+  const s = shares();
+  text($("#pl-vram-v"), `${s.vram}%`); text($("#pl-ram-v"), `${s.ram}%`); text($("#pl-ssd-v"), `${100 - s.vram - s.ram}%`);
+}
+function note(msg, err) { P.err = !!err; text($("#pl-note"), msg); $("#pl-note").classList.toggle("err", P.err); }
+const placementLive = () => M && M.engine && M.engine.reachable && M.placement && M.placement.supported;
+function preview() {
+  clearTimeout(P.timer);
+  if (!placementLive()) { note(M && M.control && M.control.enabled ? "Start uses these shares." : ""); return; }
+  const seq = ++P.seq;
+  P.timer = setTimeout(async () => {
+    try {
+      const r = await post("api/placement", { ...shares(), dry_run: true });
+      if (seq !== P.seq) return;
+      const c = r.placement || {}, d = r.predicted || {};
+      const problem = !d.fits ? "does not fit in VRAM" : !d.ram_fits ? "more RAM than is available" : "";
+      note(`${fmt(c.vram)} · ${fmt(c.ram)} · ${fmt(c.ssd)} experts; VRAM ${gib(d.vram_expert_bytes)} GiB, ${gib(d.vram_free_after)} free after; RAM ${gib(d.ram_expert_bytes)} GiB${problem ? ` — ${problem}` : ""}`, !!problem);
+    } catch (e) { if (seq === P.seq) note(e.message, true); }
+  }, 250);
+}
+function moved() { P.dirty = true; setShares(+plV.value, +plR.value); preview(); drawPlace(); }
+plV.addEventListener("input", moved);
+plR.addEventListener("input", moved);
+$("#pl-all").addEventListener("click", () => { setShares(100, 0); moved(); });
+// back to following the server; a preview still in flight is dropped
+function resetEditor() { P.dirty = false; P.seq++; note(""); }
+$("#pl-reset").addEventListener("click", () => { resetEditor(); draw(); });
+$("#pl-toggle").addEventListener("click", () => {
+  P.open = !P.open;
+  if (!P.open && !P.applied) resetEditor();
+  draw();
+});
+$("#pl-apply").addEventListener("click", async () => {
+  $("#pl-apply").disabled = true;
+  try {
+    await post("api/placement", shares());
+    P.applied = Date.now(); note("Switching…");
+  } catch (e) { note(e.message, true); }
+  drawPlace();
+});
+function drawPlace() {
+  const pl = M && M.placement, ctl = (M && M.control) || {}, live = placementLive();
+  const offline = !(M && M.engine && M.engine.reachable), usable = live || (ctl.enabled && offline);
+  $("#pl-toggle").hidden = !usable;
+  text($("#pl-toggle"), P.open ? "Close" : "Change");
+  $("#place").hidden = !(usable && P.open);
+  // an applied switch keeps the sliders until the engine reports it done
+  if (P.applied && live && !pl.switching && Date.now() - P.applied > 2500) {
+    P.applied = 0; P.dirty = false;
+    const ls = pl.last_switch || {};
+    note(ls.ok === false ? ls.message || "The switch failed." : "", ls.ok === false);
+  }
+  if (!P.dirty && live) {
+    const m = pl.mechanism, t = m.total_experts;
+    setShares(Math.max(1, Math.round(m.vram.experts / t * 100)), Math.round(m.ram.experts / t * 100));
+  }
+  if (!P.dirty && !live && !P.err) note(ctl.enabled && offline ? "Start uses these shares." : "");
+  $("#pl-apply").hidden = !live;
+  $("#pl-apply").disabled = !P.dirty || !!P.applied || !!(pl && pl.switching);
+  $("#pl-reset").hidden = !live;
+  $("#pl-reset").disabled = !P.dirty;
+}
+
+/* ---- Start and Stop ---- */
+function drawControl() {
+  const ctl = (M && M.control) || {};
+  $("#ctl").hidden = !ctl.enabled;
+  if (!ctl.enabled) return;
+  const up = !!(M.engine && M.engine.reachable), busy = !!ctl.busy || (M.live || {}).state === "starting";
+  $("#ctl-start").disabled = busy || up;
+  $("#ctl-stop").disabled = busy || !up;
+  const last = ctl.last, msg = $("#ctl-msg");
+  const show = last && (!last.ok || Date.now() / 1000 - last.time < 60);
+  text(msg, busy ? "" : show ? `${last.action}: ${last.message || (last.ok ? "done" : "failed")}` : "");
+  msg.title = show ? last.message || "" : "";
+  msg.classList.toggle("err", !!(show && !last.ok));
+}
+async function control(body) {
+  try { M.control = await post("api/control", body); }
+  catch (e) { M.control = { ...M.control, last: { action: body.action, ok: false, message: e.message, time: Date.now() / 1000 } }; }
+  draw();
+}
+$("#ctl-start").addEventListener("click", () => control(P.open ? { action: "start", ...shares() } : { action: "start" }));
+$("#ctl-stop").addEventListener("click", () => {
+  if (confirm("Stop the server? Requests in flight are cut off.")) control({ action: "stop" });
+});
+
 /* ---- the whole page ---- */
-const STATE = { offline: "Offline", loading: "Loading", idle: "Idle", reading: "Reading", generating: "Generating" };
+const STATE = { offline: "Offline", starting: "Starting", loading: "Loading", stopping: "Stopping", idle: "Idle",
+  reading: "Reading", generating: "Generating" };
 function draw() {
   if (!M) return;
   const live = M.live || {}, eng = M.engine || {}, hist = M.history || {}, reqs = M.requests || [];
@@ -227,6 +331,8 @@ function draw() {
   drawSide(M.hardware || {}, M.hardware_static || {}, hist, M.placement, eng);
   drawHero(live, hist, reqs, M.best || {}, eng);
   drawMain(live, eng, reqs, M.sources || {});
+  drawPlace();
+  drawControl();
 }
 
 /* ---- logs ---- */
@@ -258,7 +364,7 @@ async function pollState() {
   try {
     M = await get("api/state"); draw();
   } catch (e) {
-    M = null; setState("offline", "Monitor offline");
+    M = null; setState("offline", "Monitor offline"); $("#ctl").hidden = true;
   }
   setTimeout(pollState, 1000);
 }
@@ -274,4 +380,5 @@ async function pollLog() {
 }
 
 $("#host").textContent = location.host;
+setShares(100, 0);
 pollState(); pollLog();

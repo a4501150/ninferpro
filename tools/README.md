@@ -21,7 +21,7 @@ Python tools are independent of CMake; there is no `INFERNIX_BUILD_TOOLS` option
 | Decide whether an artifact's fast paths (or a change to the exact route's numerics) meet the numerical acceptance policy, or that two builds' exact routes are bit-identical | `python -m tools.quality.fast_path_gate prefill\|decode\|compare-prefill\|identical ...`; [policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
-| Watch a running server live: GPU and host readings, decode/prefill speed, expert placement, finished requests, the log | C++ target `infernix-monitor` (built with the apps); [`monitor/`](monitor/README.md) |
+| Watch a running server live: GPU and host readings, decode/prefill speed, expert placement, finished requests, the log; switch its expert placement; start and stop it | C++ target `infernix-monitor` (built with the apps); [`monitor/`](monitor/README.md) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 | Check that no CUDA kernel's per-thread stack or local memory (register spills, local arrays) grew past the recorded allow-list; record a reviewed change | `python tools/cuda_stack/check_cuda_stack.py check\|update BINARY`; [`cuda_stack/`](cuda_stack/check_cuda_stack.py); CTest `infernix_cuda_stack_check` |
 | Profile a family's decode: per-kernel round time, round time against context, where a decode step's time goes | `make t1 PROFILE=1`, `make t1 SWEEP=1`, `make t2-bench PROFILE=1`; [`tiers/`](tiers/); [contract](../docs/maintainer/round-bench.md) |

@@ -4,6 +4,7 @@
 // and /admin/expert-placement, and reads new lines from the request log and the console log.
 // The page reads the result through state_json() and logs_json().
 
+#include "control.h"
 #include "file_tail.h"
 #include "prometheus.h"
 #include "records.h"
@@ -28,6 +29,14 @@ struct MonitorOptions {
     std::string api_key;
     std::filesystem::path request_log; // empty: no request table
     std::filesystem::path log_file;    // empty: no Logs pane
+    std::filesystem::path control;     // the control command; empty: no Start or Stop
+};
+
+// The engine's answer to a request the monitor passes on: its HTTP status (502 when the engine
+// did not answer) and body.
+struct EngineReply {
+    int status = 502;
+    std::string body;
 };
 
 // Counter totals the page turns into rates; every field is a monotonic engine counter.
@@ -54,6 +63,12 @@ public:
     std::string state_json() const;
     std::string logs_json(std::uint64_t after) const;
 
+    // POST /admin/expert-placement with whole-percent shares (control.h: placement_body).
+    EngineReply switch_placement(int vram_percent, int ram_percent, bool dry_run);
+    // nullptr without --control.
+    Controller* controller() noexcept { return controller_.get(); }
+    void add_log(LogLevel level, std::string message);
+
 private:
     struct Gpu {
         std::deque<std::optional<double>> util, power, temp;
@@ -74,14 +89,15 @@ private:
     void read_request_log();
     void read_console_log();
     void add_request(const FinishedRequest& request);
-    std::string build_state() const;
+    nlohmann::json build_state() const;
 
     MonitorOptions options_;
     SystemSampler sampler_;
     std::unique_ptr<EngineClient> engine_;
     std::unique_ptr<FileTail> request_tail_, log_tail_;
+    std::unique_ptr<Controller> controller_;
 
-    // Written by tick() only; read under mutex_ through the cached strings.
+    // Written by tick() only; read under mutex_ through state_ and logs_.
     std::vector<GpuReading> gpus_;
     HostReading host_;
     std::map<unsigned, Gpu> gpu_history_;
@@ -97,7 +113,7 @@ private:
     double last_log_time_ = 0.0;
 
     mutable std::mutex mutex_;
-    std::string state_;
+    nlohmann::json state_; // the last tick's readings; state_json() adds the control state
     std::deque<LogEntry> logs_;
     std::uint64_t log_seq_ = 0;
 };

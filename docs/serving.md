@@ -1736,7 +1736,8 @@ expert-cache series read the placement report, which waits for the worker's curr
 initiate device work. Detailed per-request records remain available through the JSONL log.
 Monitoring tools with engine-specific metric names need an engine adapter; `infernix-monitor`
 ([tools/monitor](../tools/monitor/README.md)) is a live status page built on this endpoint, the
-placement report and the two logs.
+placement report and the two logs; it also switches the placement through
+`POST /admin/expert-placement`.
 
 ## Structured request log
 

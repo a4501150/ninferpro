@@ -14,6 +14,11 @@ namespace {
 constexpr std::uint64_t kRequestBacklogBytes = 16ull << 20; // records carry their token ids
 constexpr std::uint64_t kLogBacklogBytes     = 256ull << 10;
 constexpr double kPlacementRetrySeconds      = 30.0;
+// A switch is validated before it returns (it moves nothing until the next round boundary); a
+// dry run only computes.
+constexpr int kPlacementPostSeconds = 30;
+constexpr int kPlacementDryRunSeconds = 5;
+constexpr double kStartSettleSeconds = 5.0;
 // A finished request counts toward the session bests only past these sizes, so a two-token
 // reply does not set the decode record.
 constexpr std::uint64_t kBestDecodeTokens  = 32;
@@ -104,9 +109,43 @@ Monitor::Monitor(MonitorOptions options)
         request_tail_ = std::make_unique<FileTail>(options_.request_log, kRequestBacklogBytes);
     }
     if (!options_.log_file.empty()) { log_tail_ = std::make_unique<FileTail>(options_.log_file, kLogBacklogBytes); }
+    if (!options_.control.empty()) {
+        controller_ = std::make_unique<Controller>(options_.control, [this](const std::string& line, bool error) {
+            add_log(error ? LogLevel::Error : LogLevel::Info, line);
+        });
+    }
 }
 
-Monitor::~Monitor() = default;
+// The controller's thread writes to the log, so it stops before the log goes.
+Monitor::~Monitor() { controller_.reset(); }
+
+void Monitor::add_log(LogLevel level, std::string message) {
+    const std::lock_guard lock(mutex_);
+    logs_.push_back(LogEntry{++log_seq_, unix_seconds(), level, std::move(message)});
+    while (logs_.size() > kLogLines) { logs_.pop_front(); }
+}
+
+EngineReply Monitor::switch_placement(int vram_percent, int ram_percent, bool dry_run) {
+    const auto body = placement_body(vram_percent, ram_percent);
+    if (!body) {
+        return EngineReply{400, Json{{"error", kSharesError}}.dump()};
+    }
+    // Its own client: the sampler thread owns engine_.
+    httplib::Client client(options_.engine_url);
+    client.set_connection_timeout(1, 0);
+    client.set_read_timeout(dry_run ? kPlacementDryRunSeconds : kPlacementPostSeconds, 0);
+    if (!options_.api_key.empty()) { client.set_bearer_token_auth(options_.api_key); }
+    const auto result = client.Post(dry_run ? "/admin/expert-placement?dry_run=1" : "/admin/expert-placement",
+                                    body->dump(), "application/json");
+    if (!result) {
+        return EngineReply{502, Json{{"error", "the engine did not answer: " + httplib::to_string(result.error())}}.dump()};
+    }
+    if (!dry_run) {
+        add_log(result->status == 200 ? LogLevel::Info : LogLevel::Warn,
+                "monitor: placement " + body->dump() + " -> HTTP " + std::to_string(result->status) + " " + result->body);
+    }
+    return EngineReply{result->status, result->body};
+}
 
 void Monitor::tick() {
     const double now = steady_seconds();
@@ -121,7 +160,7 @@ void Monitor::tick() {
     poll_engine(now);
     read_request_log();
     read_console_log();
-    std::string state = build_state();
+    Json state = build_state();
     const std::lock_guard lock(mutex_);
     state_ = std::move(state);
 }
@@ -160,11 +199,15 @@ void Monitor::poll_engine(double now) {
     if (now >= next_placement_poll_) {
         const auto placement = engine_->get("/admin/expert-placement");
         const Json parsed    = placement ? Json::parse(*placement, nullptr, false) : Json();
-        if (parsed.is_object() && parsed.value("supported", false)) {
-            placement_ = *placement;
-        } else {
-            placement_.clear();
-            next_placement_poll_ = now + kPlacementRetrySeconds;
+        // Without an answer in time (a switch building its RAM tier holds the report) the last
+        // report stays and the next tick asks again.
+        if (parsed.is_object()) {
+            if (parsed.value("supported", false)) {
+                placement_ = *placement;
+            } else {
+                placement_.clear();
+                next_placement_poll_ = now + kPlacementRetrySeconds;
+            }
         }
     }
 }
@@ -217,7 +260,7 @@ void Monitor::read_console_log() {
     while (logs_.size() > kLogLines) { logs_.pop_front(); }
 }
 
-std::string Monitor::build_state() const {
+Json Monitor::build_state() const {
     Json state;
     const StaticInfo& info = sampler_.static_info();
 
@@ -335,12 +378,29 @@ std::string Monitor::build_state() const {
     state["sources"] = {
         {"request_log", options_.request_log.empty() ? Json(nullptr) : Json(options_.request_log.string())},
         {"log_file", options_.log_file.empty() ? Json(nullptr) : Json(options_.log_file.string())}};
-    return state.dump();
+    return state;
 }
 
 std::string Monitor::state_json() const {
+    // The control state is read now, not at the last tick: a tick can take seconds while the server
+    // loads, and a state from before an action would show the page that action undone.
+    const Json control = controller_ ? controller_->state()
+                                     : Json{{"enabled", false}, {"busy", nullptr}, {"last", nullptr}};
     const std::lock_guard lock(mutex_);
-    return state_.empty() ? std::string("{}") : state_;
+    if (state_.is_null()) { return "{}"; }
+    Json state         = state_;
+    state["control"]   = control;
+    const bool up      = state["engine"]["reachable"].get<bool>();
+    const Json& last   = control["last"];
+    // A start returns once the server answers; until a tick sees it, it is still starting.
+    const bool started = last.is_object() && last["action"] == "start" && last["ok"] == true &&
+                         unix_seconds() - last["time"].get<double>() < kStartSettleSeconds;
+    if (control["busy"].is_string()) {
+        state["live"]["state"] = control["busy"] == "stop" ? "stopping" : up ? "loading" : "starting";
+    } else if (!up && started) {
+        state["live"]["state"] = "starting";
+    }
+    return state.dump();
 }
 
 std::string Monitor::logs_json(std::uint64_t after) const {

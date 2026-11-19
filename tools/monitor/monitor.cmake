@@ -25,6 +25,7 @@ add_library(infernix_monitor_core STATIC
   "${INFERNIX_MONITOR_DIR}/file_tail.cpp"
   "${INFERNIX_MONITOR_DIR}/records.cpp"
   "${INFERNIX_MONITOR_DIR}/system_sampler.cpp"
+  "${INFERNIX_MONITOR_DIR}/control.cpp"
   "${INFERNIX_MONITOR_DIR}/monitor.cpp")
 target_compile_features(infernix_monitor_core PUBLIC cxx_std_20)
 # nvml.h only: NVML itself is loaded at run time.

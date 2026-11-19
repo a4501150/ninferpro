@@ -1,16 +1,20 @@
 // infernix-monitor's readers: the Prometheus text the engine serves, the request-log records,
-// the console log lines, and following a file through appends, a partial line and replacement.
+// the console log lines, and following a file through appends, a partial line and replacement;
+// and its controls: the control command runner, the placement shares and the POST guard.
 
+#include "control.h"
 #include "file_tail.h"
 #include "prometheus.h"
 #include "records.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <fcntl.h>
 #include <unistd.h>
 
 using namespace infernix::monitor;
@@ -142,6 +146,63 @@ void test_file_tail() {
     check(missing.read_lines().empty(), "a missing file reads nothing");
 }
 
+void test_run_command() {
+    std::vector<std::string> lines;
+    const LineSink collect = [&](const std::string& line, bool) { lines.push_back(line); };
+    CommandResult r = run_command({"/bin/sh", "-c", "echo one; echo two >&2; printf 'three\\r\\nfour'; exit 3"},
+                                  std::chrono::seconds(10), collect);
+    check(r.exit_code == 3 && !r.timed_out, "the command's exit status");
+    check(lines == std::vector<std::string>{"one", "two", "three", "four"},
+          "stdout and stderr lines, CR removed, the unterminated last line kept");
+    check(r.last_line == "four", "the last line");
+
+    // The monitor's own descriptors (its listening socket) must not reach the server a start launches.
+    const int fd = ::dup2(::open("/dev/null", O_RDONLY), 57);
+    lines.clear();
+    r = run_command({"/bin/sh", "-c", "test -e /proc/$$/fd/57 && echo open || echo closed"}, std::chrono::seconds(10),
+                    collect);
+    ::close(fd);
+    check(r.exit_code == 0 && lines == std::vector<std::string>{"closed"}, "no inherited descriptor");
+
+    const auto begin = std::chrono::steady_clock::now();
+    r = run_command({"/bin/sh", "-c", "echo waiting; sleep 30"}, std::chrono::seconds(1), collect);
+    const auto took = std::chrono::steady_clock::now() - begin;
+    check(r.timed_out && r.exit_code == 128 + 9 && took < std::chrono::seconds(5),
+          "past the timeout the command and its children are killed");
+
+    const auto detached = std::chrono::steady_clock::now();
+    r = run_command({"/bin/sh", "-c", "(sleep 4 &); echo left"}, std::chrono::seconds(10), collect);
+    check(r.exit_code == 0 && !r.timed_out && std::chrono::steady_clock::now() - detached < std::chrono::seconds(3),
+          "a program the command leaves holding the output does not hold the result");
+
+    r = run_command({"/nonexistent/command"}, std::chrono::seconds(10), collect);
+    check(r.exit_code == 127, "a command that cannot run exits 127");
+}
+
+void test_placement_shares() {
+    check(placement_body(100, 0) == nlohmann::json{{"vram", "all"}}, "100 % VRAM is vram=all");
+    check(placement_body(60, 25) == nlohmann::json{{"vram", "60%"}, {"ram", "25%"}, {"ssd", "15%"}},
+          "the shares add up to 100 %");
+    check(!placement_body(0, 50) && !placement_body(60, 41) && !placement_body(101, 0) && !placement_body(50, -1),
+          "VRAM below 1 %, a sum past 100 % or a negative share is refused");
+    check(experts_spec(100, 0) == std::string() && experts_spec(40, 60) == "vram=40%,ram=60%,ssd=0%",
+          "the start spec: empty for the engine's default");
+}
+
+void test_page_request() {
+    const std::vector<std::string> names{"box", "box.local"};
+    const char* json = "application/json";
+    check(page_request_allowed("127.0.0.1:8090", "", json, names), "loopback, no Origin");
+    check(page_request_allowed("localhost:8090", "http://localhost:8090", json, names), "the page's own Origin");
+    check(page_request_allowed("[::1]:8090", "http://[::1]:8090", "application/json; charset=utf-8", names), "IPv6");
+    check(page_request_allowed("Box:8090", "", json, names), "the machine's name");
+    check(!page_request_allowed("127.0.0.1:8090", "http://evil.example", json, names), "another site's Origin");
+    check(!page_request_allowed("evil.example:8090", "http://evil.example:8090", json, names),
+          "a DNS name rebound to this address");
+    check(!page_request_allowed("127.0.0.1:8090", "", "text/plain", names), "a form or text POST");
+    check(!page_request_allowed("", "", json, names), "no Host");
+}
+
 } // namespace
 
 int main() {
@@ -149,6 +210,9 @@ int main() {
     test_request_log();
     test_log_lines();
     test_file_tail();
+    test_run_command();
+    test_placement_shares();
+    test_page_request();
     if (failures != 0) {
         std::cerr << failures << " checks failed\n";
         return EXIT_FAILURE;

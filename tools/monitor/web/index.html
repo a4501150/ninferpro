@@ -17,6 +17,11 @@
   <span class="model" id="model"></span>
   <span class="grow"></span>
   <span class="state" id="state" data-s="offline">Connecting</span>
+  <span class="ctl" id="ctl" hidden>
+    <span class="ctl-msg" id="ctl-msg"></span>
+    <button type="button" class="btn" id="ctl-start">Start</button>
+    <button type="button" class="btn" id="ctl-stop">Stop</button>
+  </span>
   <span class="where" id="host"></span>
 </header>
 
@@ -29,8 +34,19 @@
       <div class="sb-body" id="sys"></div>
     </div>
     <div class="sb-exp">
-      <div class="sb-h">Experts<span id="exp-note">Placement</span></div>
+      <div class="sb-h">Experts<button type="button" class="sb-link" id="pl-toggle" hidden>Change</button></div>
       <div class="sb-body" id="experts"></div>
+      <div class="sb-place" id="place" hidden>
+        <div class="pl-row"><label for="pl-vram">VRAM</label><input type="range" id="pl-vram" min="1" max="100" value="100"><b id="pl-vram-v"></b></div>
+        <div class="pl-row"><label for="pl-ram">RAM</label><input type="range" id="pl-ram" min="0" max="0" value="0"><b id="pl-ram-v"></b></div>
+        <div class="pl-row"><span>SSD</span><span class="pl-rest">the rest</span><b id="pl-ssd-v"></b></div>
+        <div class="pl-note" id="pl-note"></div>
+        <div class="pl-act">
+          <button type="button" class="btn" id="pl-all">All VRAM</button>
+          <button type="button" class="btn" id="pl-reset">Reset</button>
+          <button type="button" class="btn pri" id="pl-apply">Apply</button>
+        </div>
+      </div>
     </div>
   </aside>
 

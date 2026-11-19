@@ -47,6 +47,14 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .state[data-s="generating"], .state[data-s="reading"] { color: var(--accent); }
 .state[data-s="offline"] { color: var(--err); }
 .where { font: 400 13px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; }
+.state[data-s="starting"], .state[data-s="stopping"], .state[data-s="loading"] { color: var(--warn); }
+.ctl { display: flex; align-items: center; gap: 8px; }
+.ctl-msg { font: 400 12px/1 var(--font-mono); color: var(--fg-3); max-width: 360px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctl-msg.err { color: var(--err); }
+.btn { padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--fg-2); font-size: 12.5px; line-height: 1.4; white-space: nowrap; }
+.btn:hover:not(:disabled) { color: var(--fg); border-color: var(--basalt-500); }
+.btn:disabled { opacity: .4; cursor: default; }
+.btn.pri:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 
 
 /* Page: the hardware sidebar at full height, Speed across the top, the requests and the logs below */
@@ -98,6 +106,16 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .sb-exp .sb-body.flat { display: flex; padding: 16px 0 0; }
 .sb-none.flat { padding: 0; }
 .sb-foot.warn { color: var(--warn); }
+.sb-link { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); }
+.sb-link:hover { color: var(--accent); }
+.sb-place { display: flex; flex-direction: column; gap: 9px; padding: 0 20px 16px; }
+.pl-row { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 10px; font-size: 13px; color: var(--fg-3); }
+.pl-row b { font: 500 13.5px/1 var(--font-mono); color: var(--fg); text-align: right; font-variant-numeric: tabular-nums; }
+.pl-row input { width: 100%; margin: 0; accent-color: var(--accent); }
+.pl-rest { font: 400 11.5px/1 var(--font-mono); }
+.pl-note { font: 400 11.5px/1.5 var(--font-mono); color: var(--fg-3); min-height: 1.5em; }
+.pl-note.err { color: var(--err); }
+.pl-act { display: flex; gap: 8px; justify-content: flex-end; }
 .sb-foot.err { color: var(--err); }
 .pane table + table { border-top: 1px solid var(--line); }
 .sb-stack { display: flex; height: 8px; border-radius: 4px; overflow: hidden; gap: 2px; background: var(--raised); }

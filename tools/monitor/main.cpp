@@ -1,6 +1,7 @@
-// infernix-monitor: a live status page for a running infernix-serve. It only reads the engine
-// (/metrics, /admin/expert-placement, the request log and the console log), so it can start,
-// stop and restart independently of the server.
+// infernix-monitor: a live status page for infernix-serve. It reads the engine (/metrics,
+// /admin/expert-placement, the request log and the console log), switches its expert placement,
+// and with --control starts and stops it; it can itself start, stop and restart independently of
+// the server.
 
 #include "monitor.h"
 #include "monitor_web.h"
@@ -14,11 +15,13 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 namespace {
 
 using infernix::monitor::Monitor;
 using infernix::monitor::MonitorOptions;
+using Json = nlohmann::json;
 
 struct Options {
     MonitorOptions monitor;
@@ -34,6 +37,9 @@ void usage(std::ostream& out) {
            "                       the session bests\n"
            "  --log-file FILE      the engine's console log or --log-file: the Logs pane; a\n"
            "                       symlink is followed to each new target\n"
+           "  --control CMD        the command that starts and stops the server\n"
+           "                       (tools/monitor/README.md); without it the page has no Start\n"
+           "                       or Stop\n"
            "  --host ADDR          address to serve the page on (default 127.0.0.1)\n"
            "  --port N             port to serve the page on (default 8090)\n";
 }
@@ -60,6 +66,12 @@ Options parse(int argc, char** argv) {
             options.monitor.request_log = value();
         } else if (arg == "--log-file") {
             options.monitor.log_file = value();
+        } else if (arg == "--control") {
+            options.monitor.control = value();
+            if (access(options.monitor.control.c_str(), X_OK) != 0) {
+                std::cerr << "--control " << options.monitor.control << " is not an executable file\n";
+                std::exit(2);
+            }
         } else if (arg == "--host") {
             options.host = value();
         } else if (arg == "--port") {
@@ -87,6 +99,23 @@ httplib::Server* g_server = nullptr;
 
 void on_signal(int) {
     if (g_server != nullptr) { g_server->stop(); }
+}
+
+void reply_raw(httplib::Response& res, int status, const std::string& body) {
+    res.status = status;
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(body, "application/json");
+}
+
+void reply(httplib::Response& res, int status, const Json& body) { reply_raw(res, status, body.dump()); }
+
+// The page's shares: whole percents of the experts, the rest on SSD.
+bool read_shares(const Json& body, int& vram, int& ram) {
+    if (!body.contains("vram") || !body["vram"].is_number_integer()) { return false; }
+    if (body.contains("ram") && !body["ram"].is_number_integer()) { return false; }
+    vram = body["vram"].get<int>();
+    ram  = body.value("ram", 0);
+    return true;
 }
 
 } // namespace
@@ -121,6 +150,75 @@ int main(int argc, char** argv) {
     server.Get("/api/state", [&](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-store");
         res.set_content(monitor.state_json(), "application/json");
+    });
+    // What a POST's Host may name besides IP literals and localhost.
+    std::vector<std::string> names;
+    if (char name[256] = {}; gethostname(name, sizeof(name) - 1) == 0 && name[0] != '\0') {
+        names.push_back(name);
+        names.push_back(std::string(name) + ".local");
+    }
+    if (options.host != "0.0.0.0" && options.host != "::") { names.push_back(options.host); }
+    // Every POST changes the server: refuse what did not come from this page, and malformed JSON.
+    const auto post = [&](const char* path, auto handler) {
+        server.Post(path, [&, handler](const httplib::Request& req, httplib::Response& res) {
+            if (!infernix::monitor::page_request_allowed(req.get_header_value("Host"), req.get_header_value("Origin"),
+                                                         req.get_header_value("Content-Type"), names)) {
+                reply(res, 403, {{"error", "only this page may change the server"}});
+                return;
+            }
+            const Json body = Json::parse(req.body, nullptr, false);
+            if (!body.is_object()) {
+                reply(res, 400, {{"error", "the body must be a JSON object"}});
+                return;
+            }
+            try {
+                handler(body, res);
+            } catch (const Json::type_error& e) {
+                reply(res, 400, {{"error", std::string("a field has the wrong type: ") + e.what()}});
+            }
+        });
+    };
+    // {"vram": V, "ram": R, "dry_run": bool}: passed on to POST /admin/expert-placement.
+    post("/api/placement", [&](const Json& body, httplib::Response& res) {
+        int vram = 0, ram = 0;
+        if (!read_shares(body, vram, ram)) {
+            reply(res, 400, {{"error", "vram (a whole percent) is required"}});
+            return;
+        }
+        const auto result = monitor.switch_placement(vram, ram, body.value("dry_run", false));
+        reply_raw(res, result.status, result.body);
+    });
+    // {"action": "start", "vram": V, "ram": R} (the placement to start with; without vram the
+    // engine's default) or {"action": "stop"}.
+    post("/api/control", [&](const Json& body, httplib::Response& res) {
+        auto* controller = monitor.controller();
+        if (controller == nullptr) {
+            reply(res, 404, {{"error", "the monitor runs without --control"}});
+            return;
+        }
+        const std::string action = body.value("action", "");
+        if (action != "start" && action != "stop") {
+            reply(res, 400, {{"error", "action must be start or stop"}});
+            return;
+        }
+        std::optional<std::string> error;
+        if (action == "stop") {
+            error = controller->stop();
+        } else {
+            int vram = 100, ram = 0;
+            std::optional<std::string> spec;
+            if (!body.contains("vram") || read_shares(body, vram, ram)) { spec = infernix::monitor::experts_spec(vram, ram); }
+            if (!spec) {
+                reply(res, 400, {{"error", infernix::monitor::kSharesError}});
+                return;
+            }
+            error = controller->start(*spec);
+        }
+        if (error) {
+            reply(res, 409, {{"error", *error}});
+            return;
+        }
+        reply(res, 202, controller->state());
     });
     server.Get("/api/logs", [&](const httplib::Request& req, httplib::Response& res) {
         std::uint64_t after = 0;
