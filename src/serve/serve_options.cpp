@@ -3,6 +3,7 @@
 #include "product/config/config_file.h"
 #include "product/logits_options.h"
 #include "product/speculative_options.h"
+#include "runtime/engine/experts_spec.h"
 
 #include <algorithm>
 #include <array>
@@ -1006,7 +1007,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (text == "auto") {
                 options.experts.clear();
             } else {
-                options.experts = text; // the Engine checks its grammar before loading
+                static_cast<void>(runtime::parse_experts_spec(text)); // grammar checked up front
+                options.experts = text;
             }
         } else if (arg == "--expert-placement") {
             options.expert_placement = std::filesystem::path(std::string(require_value("--expert-placement")));

@@ -22,7 +22,6 @@ struct FamilyOptionRules {
     // An explicit KV capacity.
     void (*validate_explicit_kv_capacity)(const EngineOptions&) = nullptr;
     void (*validate_logits_dtype)(const EngineOptions&)         = nullptr;
-    void (*validate_experts)(const EngineOptions&)              = nullptr;
     void (*validate_expert_tail_skip)(const EngineOptions&)     = nullptr;
     // --draft-tokens auto.
     void (*validate_draft_backend)(const EngineOptions&) = nullptr;

@@ -2,6 +2,7 @@ add_library(infernix_runtime_support STATIC
   engine/context_cache/context_cost.cpp
   engine/context_cache/context_cost_defaults.cpp
   engine/engine_options.cpp
+  engine/experts_spec.cpp
   engine/kv_capacity.cpp
   engine/public_types.cpp
   prefix_cache/block_hash.cpp

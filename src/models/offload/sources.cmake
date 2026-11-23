@@ -14,6 +14,6 @@ add_library(infernix_offload STATIC
   "${CMAKE_CURRENT_LIST_DIR}/route_trace.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/vram_monitor.cpp")
 infernix_internal_includes(infernix_offload)
-target_link_libraries(infernix_offload PUBLIC infernix_artifact infernix_ops)
+target_link_libraries(infernix_offload PUBLIC infernix_artifact infernix_ops infernix_runtime_support)
 target_link_libraries(infernix_model_loading PUBLIC infernix_offload)
 target_link_libraries(infernix_model_runtime PUBLIC infernix_offload)

@@ -1,5 +1,7 @@
 #include "runtime/engine/engine_options.h"
 
+#include "runtime/engine/experts_spec.h"
+
 #include <algorithm>
 #include <stdexcept>
 #include <system_error>
@@ -74,8 +76,9 @@ void validate_engine_options(const EngineOptions& options, const FamilyOptionRul
             "16-bit activations (the quality reference) run the exact route: disable fast paths");
     }
     if (family.validate_logits_dtype != nullptr) { family.validate_logits_dtype(options); }
-    if (!options.experts_spec.empty() && family.validate_experts != nullptr) {
-        family.validate_experts(options);
+    // Every model refuses a malformed --experts, whether or not it has an expert cache.
+    if (!options.experts_spec.empty()) {
+        static_cast<void>(parse_experts_spec(options.experts_spec));
     }
 }
 

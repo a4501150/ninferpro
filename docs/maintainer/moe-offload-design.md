@@ -30,7 +30,8 @@ One tier, owned by no family. What it is:
 |---|---|
 | Bank geometry (`ExpertBankGeometry`: banks, experts per bank, top-k) | `src/models/offload/geometry.h` |
 | VRAM frame pools, device tables, route log, landing, frame leases (`ExpertResidency`; `expert_cache::LfruPolicy`, `FramePool`, `CacheController`) | `src/models/offload/expert_residency.*`, `expert_cache.*` |
-| Placement spec, placement file, runtime switch request (`ExpertPlacementSpec`, `ExpertsSpec`) | `src/models/offload/expert_placement.*` |
+| Placement spec, placement file, runtime switch request (`ExpertPlacementSpec`) | `src/models/offload/expert_placement.*` |
+| The `--experts` grammar and its tier counts (`ExpertsSpec`), checked for every model | `src/runtime/engine/experts_spec.*` |
 | In-place expert records and the expert stripe (`ExpertStore`, `ExpertStripe`) | `src/models/offload/expert_store.*` |
 | RAM level: decayed-LFU ranking, pinned slots, pins, landings (`HostTier`); the read agent, tickets, stream slots (`HostExpertTier`) | `src/models/offload/host_tier.*`, `host_expert_tier.*` |
 | Saved cache state (a family may ship a calibrated order that seeds it, e.g. `src/models/qwen4_exp/calibrated_order.*`) | `src/models/offload/expert_state.*` |

@@ -1,7 +1,5 @@
 #include "models/qwen4_exp/options.h"
 
-#include "models/offload/expert_placement.h"
-
 #include <stdexcept>
 
 namespace infernix::models::qwen4_exp {
@@ -64,10 +62,6 @@ void resolve_cache(ContextCacheOptions& cache, const EngineOptions& options, std
     cache.hybrid.tool_call_hold = std::chrono::milliseconds{0};
 }
 
-void validate_experts(const EngineOptions& options) {
-    static_cast<void>(models::offload::parse_experts_spec(options.experts_spec));
-}
-
 std::uint32_t tap_ladder_chunk(std::uint32_t prefill_chunk) noexcept {
     return prefill_chunk < 4096U ? prefill_chunk : 4096U;
 }
@@ -77,7 +71,6 @@ const runtime::FamilyOptionRules& option_rules() {
         .prefill_chunk               = kPrefillChunk,
         .prefill_chunk_beside_decode = kPrefillChunkBesideDecode,
         .draft_tokens_auto           = kDraftTokensAuto,
-        .validate_experts            = validate_experts,
         .validate_draft_backend      = validate_draft_backend,
         .validate_draft_min_p        = validate_draft_min_p,
         .resolve_cache               = resolve_cache,

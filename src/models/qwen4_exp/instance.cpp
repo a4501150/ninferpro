@@ -20,6 +20,7 @@
 #include "models/registry.h"
 #include "runtime/engine/engine_backend_for.h"
 #include "runtime/engine/engine_options.h"
+#include "runtime/engine/experts_spec.h"
 
 #include <algorithm>
 #include <array>
@@ -334,9 +335,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     } else if (!options.experts_spec.empty()) {
         // The exclusive three-tier spec: shares or counts by usage rank. vram=all (or 100%) is
         // the resident placement; the probe below holds it or fails the start.
-        const models::offload::ExpertsSpec experts = models::offload::parse_experts_spec(options.experts_spec);
-        const auto [vram_count, ram_count] =
-            models::offload::experts_spec_counts(experts, placement_keys);
+        const runtime::ExpertsSpec experts = runtime::parse_experts_spec(options.experts_spec);
+        const auto [vram_count, ram_count] = runtime::experts_spec_counts(experts, placement_keys);
         if (vram_count >= placement_keys) {
             all_in_vram = true;
             placement_origin = options.experts_spec;
@@ -781,8 +781,8 @@ Qwen4ExpInstance::preview_expert_placement(const std::string& experts_spec,
     if (!now.supported || now.total_experts == 0) {
         throw std::invalid_argument("this model runs without the expert cache");
     }
-    const models::offload::ExpertsSpec spec = models::offload::parse_experts_spec(experts_spec);
-    const auto [vram, ram] = models::offload::experts_spec_counts(spec, now.total_experts);
+    const runtime::ExpertsSpec spec  = runtime::parse_experts_spec(experts_spec);
+    const auto [vram, ram]           = runtime::experts_spec_counts(spec, now.total_experts);
     const std::uint64_t frames_bytes = vram * now.frame_bytes;
     const std::uint64_t available    = now.vram_free + now.pool_bytes;
     return {.total_experts     = now.total_experts,

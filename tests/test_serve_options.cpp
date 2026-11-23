@@ -789,10 +789,14 @@ int main() {
                           parse({"infernix-serve", "model.ninfer", "--experts", "auto"}).experts.empty() &&
                           parse({"infernix-serve", "model.ninfer"}).experts.empty(),
                       "--experts must parse the spec and auto");
-    // The grammar is the Engine's (test_hybrid_cache_defaults): the option passes the text through.
-    failures +=
-        check(parse({"infernix-serve", "model.ninfer", "--experts", "disk=1"}).experts == "disk=1",
-              "--experts must pass its spec to the Engine");
+    for (const auto* bad :
+         {"vram", "ram=50%", "vram=0", "vram=all,ram=5", "vram=50,ram=25%", "disk=1"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--experts", bad});
+        } catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, ("--experts must reject " + std::string(bad)).c_str());
+    }
     { // --expert-swap: on by default, off freezes, anything else is refused.
         bool rejected = false;
         try {

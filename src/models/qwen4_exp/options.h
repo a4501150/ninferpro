@@ -30,9 +30,6 @@ constexpr std::uint32_t kDraftTokensAuto = 7U;
 // (design §16.5).
 constexpr bool kVisionOffloadAuto = true;
 
-// --experts: the spec's grammar, refused before the artifact is opened.
-void validate_experts(const EngineOptions& options);
-
 // --draft-tokens auto drafts with --spec mtp or dflash2 here.
 void validate_draft_backend(const EngineOptions& options);
 

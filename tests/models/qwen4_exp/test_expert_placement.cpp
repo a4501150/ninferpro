@@ -6,6 +6,7 @@
 #include "models/offload/expert_placement.h"
 #include "models/offload/expert_cache.h"
 #include "models/offload/host_tier.h"
+#include "runtime/engine/experts_spec.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -18,6 +19,9 @@
 
 using namespace infernix;
 using namespace infernix::models::offload;
+using infernix::runtime::experts_spec_counts;
+using infernix::runtime::ExpertsSpec;
+using infernix::runtime::parse_experts_spec;
 
 namespace {
 
