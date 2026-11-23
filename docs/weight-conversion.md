@@ -378,7 +378,8 @@ so it satisfies the same interface a recipe already expects from `sources["..."]
 `use_gguf_source.py`:
 
 ```python
-from tools.convert.sources.gguf import HFAliasSource, standard_dense_name_map
+from tools.convert.qwen3_5_gguf import standard_dense_name_map
+from tools.convert.sources.gguf import HFAliasSource
 
 
 def configure(model, recipe, sources):
@@ -411,7 +412,8 @@ normal multi-component conversion, though each component needs its own wiring:
   transformer layer appended after the base model's real layers (layer 64 for a
   64-layer model), reusing the same attention/MLP/norm tensor roles
   `standard_dense_name_map` already covers, plus four MTP-specific tensors.
-  `qwen35_mtp_name_map(gguf_layer_index, hf_prefix=...)` builds that map --
+  `qwen35_mtp_name_map(gguf_layer_index, hf_prefix=...)` in
+  `tools/convert/qwen3_5_gguf.py` builds that map --
   `hf_prefix="mtp."` when the MTP tensors are fused into the main checkpoint's
   state dict, or `hf_prefix=""` for a standalone MTP-only checkpoint whose
   tensors have no prefix. Pass it its own `--source mtp_quantized=mtp-*.gguf`
@@ -420,7 +422,8 @@ normal multi-component conversion, though each component needs its own wiring:
 - **Vision** is exported as a separate `mmproj-*.gguf` file (GGUF architecture
   `clip`, not the text model's `qwen35`/`qwen35moe`) covering the ViT tower and
   the projector MLP. `qwen35_vision_name_map(depth, hidden_size=..., patch_size=...,
-  temporal_patch_size=..., ...)` builds its name map from the checkpoint's own
+  temporal_patch_size=..., ...)` in `tools/convert/qwen_common.py` builds its name
+  map from the checkpoint's own
   `vision_config`. It also needs a `--source vision_quantized=mmproj-*.gguf`.
   One tensor needs more than a name/value transform: the patch-embed Conv3d
   kernel's temporal dimension is split across two separate GGUF tensors
@@ -459,8 +462,8 @@ than the GGUF's own quant level.
 name, shape and ggml type in your file, and extend the map for anything it doesn't
 cover -- mixture-of-experts routing/shared-expert tensors, MTP/nextn tensors, or
 (for Qwen3.5's hybrid linear-attention layers) the GDN tensors handled by
-`qwen35_linear_attention_name_map` and `reorder_linear_attention_v_heads` in the
-same module. Verify a full conversion's outputs (`tools.artifact.inspect`, then the
+`qwen35_linear_attention_name_map` and `reorder_linear_attention_v_heads` in
+`tools/convert/qwen3_5_gguf.py`. Verify a full conversion's outputs (`tools.artifact.inspect`, then the
 normal CLI/serving smoke test) before relying on it -- name-mapping mistakes for a
 component this map doesn't cover fail as a missing-tensor error, but a wrong
 element ordering for a component it does claim to cover would not.

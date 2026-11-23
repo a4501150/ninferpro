@@ -137,7 +137,7 @@ void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
     workspace_logical_peak_bytes = std::max(workspace_logical_peak_bytes, phase_bytes);
 }
 
-const GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t verify_drafts) const {
+const ops::GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t verify_drafts) const {
     if (!replay_records) { return nullptr; }
     if (verify_drafts == draft_window) { return &*replay_records; }
     for (const NarrowReplayView& view : narrow_replay_views) {

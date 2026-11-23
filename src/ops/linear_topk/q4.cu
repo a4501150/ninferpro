@@ -48,8 +48,8 @@ constexpr auto make_launchers(std::index_sequence<I...>) {
 }
 
 // Qwen3.8-27B's proposal head (5120) and Qwen3.8-Flash-Next's (2560).
-constexpr auto k27BLaunchers       = make_launchers<5120>(std::make_index_sequence<2>{});
-constexpr auto kFlashNextLaunchers = make_launchers<2560>(std::make_index_sequence<2>{});
+constexpr auto kH5120Launchers = make_launchers<5120>(std::make_index_sequence<2>{});
+constexpr auto kH2560Launchers = make_launchers<2560>(std::make_index_sequence<2>{});
 
 } // namespace
 
@@ -57,7 +57,7 @@ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
                            const Tensor& row_to_global_ids, const LinearTopKWorkspace& workspace,
                            cudaStream_t stream) {
     if (workspace.rows_per_producer == kLinearTopKDirectRows) {
-        const auto& launchers = hidden.ne[0] == 5120 ? k27BLaunchers : kFlashNextLaunchers;
+        const auto& launchers = hidden.ne[0] == 5120 ? kH5120Launchers : kH2560Launchers;
         launchers[(hidden.ne[1] - 1) / 8](hidden, head, row_to_global_ids, workspace, stream);
     } else {
         linear_topk_q4_m64_launch(hidden, head, row_to_global_ids, workspace, stream);

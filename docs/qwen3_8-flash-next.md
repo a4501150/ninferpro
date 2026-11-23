@@ -483,8 +483,8 @@ check it against the artifact; the stripe tool's `--tail-fraction F` (default 0.
 each record to the second drive:
 
 ```text
-python -m tools.flash_next.expert_stripe <artifact part 1> D:\stripes\<model>.stripe
-python -m tools.flash_next.expert_stripe <artifact part 1> D:\stripes\<model>.stripe --verify
+python -m tools.artifact.expert_stripe <artifact part 1> D:\stripes\<model>.stripe
+python -m tools.artifact.expert_stripe <artifact part 1> D:\stripes\<model>.stripe --verify
 infernix-serve <artifact part 1> --expert-stripe D:\stripes\<model>.stripe ...
 ```
 

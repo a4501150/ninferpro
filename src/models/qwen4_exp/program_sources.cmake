@@ -10,6 +10,7 @@ target_sources(infernix_model_loading PRIVATE
 )
 
 target_sources(infernix_model_runtime PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/calibrated_order.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/instance.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"

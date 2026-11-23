@@ -1,9 +1,12 @@
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
+#include "models/registry.h"
 #include "runtime/engine/engine_options.h"
 
 #include <chrono>
 #include <iostream>
+#include <string>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -14,7 +17,13 @@ int check(bool condition, const char* message) {
 }
 
 using infernix::EngineOptions;
-using infernix::runtime::normalize_engine_options;
+using infernix::models::Architecture;
+
+EngineOptions normalize_engine_options(EngineOptions options,
+                                       Architecture architecture = Architecture::Qwen3_5) {
+    return infernix::runtime::normalize_engine_options(
+        std::move(options), infernix::models::family_option_rules(architecture));
+}
 
 } // namespace
 
@@ -314,6 +323,31 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected == (variant == 1 || variant == 2 || variant == 3),
                           "--spec-min-p was misjudged for its model, backend or range");
+    }
+
+    // --experts: Qwen3.8-Flash-Next refuses a malformed spec before the artifact is opened.
+    for (const auto* bad :
+         {"vram", "ram=50%", "vram=0", "vram=all,ram=5", "vram=50,ram=25%", "disk=1"}) {
+        EngineOptions options;
+        options.artifact_path = "model.ninfer";
+        options.experts_spec  = bad;
+        bool rejected         = false;
+        try {
+            infernix::runtime::validate_engine_options(
+                options, infernix::models::family_option_rules(Architecture::Qwen4Exp));
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, (std::string("--experts must reject ") + bad).c_str());
+    }
+    {
+        EngineOptions options;
+        options.artifact_path = "model.ninfer";
+        options.experts_spec  = "vram=60%,ram=25%,ssd=15%";
+        bool accepted         = true;
+        try {
+            infernix::runtime::validate_engine_options(
+                options, infernix::models::family_option_rules(Architecture::Qwen4Exp));
+        } catch (const std::invalid_argument&) { accepted = false; }
+        failures += check(accepted, "--experts refused a valid spec");
     }
 
     if (failures == 0) { std::cout << "ok\n"; }

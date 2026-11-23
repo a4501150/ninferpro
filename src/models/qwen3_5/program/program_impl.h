@@ -2,7 +2,7 @@
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "infernix/ops/gdn_replay.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/speculative_tree.h"
@@ -178,7 +178,7 @@ struct SpeculativeRoundFamily {
 // ReplaySSM records viewed densely at a width narrower than the frame's, with the fold bound to
 // that view. Rounds verified at the narrower width record and fold only through it.
 struct NarrowReplayView {
-    GdnReplayRecords records;
+    ops::GdnReplayRecords records;
     ops::GdnReplayFoldPlan fold;
 };
 struct SequenceState {
@@ -471,7 +471,7 @@ public:
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
     std::unique_ptr<StateImageStore> state_store;
-    std::optional<GdnReplayRecords> replay_records;
+    std::optional<ops::GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     // One view per round-family width below draft_window: rounds of a narrower family verify at
     // their own width for every batch size and record/fold through the dense view of that width.
@@ -704,7 +704,8 @@ public:
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
     // ReplaySSM record view and fold plan for a speculative round verified at verify_drafts.
-    [[nodiscard]] const GdnReplayRecords* round_replay_records(std::uint32_t verify_drafts) const;
+    [[nodiscard]] const ops::GdnReplayRecords*
+    round_replay_records(std::uint32_t verify_drafts) const;
     [[nodiscard]] const ops::GdnReplayFoldPlan& round_replay_fold(std::uint32_t verify_drafts) const;
     // The narrowest family of `kind` that verifies at least `drafts` proposals per row.
     [[nodiscard]] SpeculativeRoundFamily& round_family(SpeculativeRoundKind kind,

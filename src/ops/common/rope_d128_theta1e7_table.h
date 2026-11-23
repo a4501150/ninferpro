@@ -1,8 +1,8 @@
 #pragma once
 
-// D128 full-head 1-D RoPE inverse frequencies for theta=1e7: the words of dflash_rope.cuh's device
-// table, for host code that passes a table (context_kv_materialize).
-#define INFERNIX_DFLASH_ROPE_1E7_INV_FREQUENCY                                                     \
+// D128 full-head 1-D RoPE inverse frequencies for theta=1e7: the words of rope_d128_theta1e7.cuh's
+// device table, for host code that passes a table (context_kv_materialize).
+#define INFERNIX_ROPE_D128_THETA1E7_INV_FREQUENCY                                                  \
     1.00000000000000000e+00, 7.77365030238775789e-01, 6.04296390238132863e-01,                     \
         4.69758881670649164e-01, 3.65174127254837722e-01, 2.83873596475875456e-01,                 \
         2.20673406908458991e-01, 1.71543789634287902e-01, 1.33352143216332403e-01,                 \

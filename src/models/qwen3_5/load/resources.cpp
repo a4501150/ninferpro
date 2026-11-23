@@ -17,7 +17,13 @@ qwen_common::FrontendResources bind_resources(artifact::Binder& binder, const Co
         out.preprocessor_config_json       = resource("vision", "preprocessor_config.json");
         out.video_preprocessor_config_json = resource("vision", "video_preprocessor_config.json");
     }
-    qwen_common::parse_resources(out, config);
+    qwen_common::parse_resources(
+        out,
+        {.vocab_size     = config.text.vocab_size,
+         .vision         = config.vision ? &*config.vision : nullptr,
+         .selector_top_k = config.draft && config.draft->dflash2
+                               ? std::optional<std::uint32_t>(config.draft->dflash2->selector_top_k)
+                               : std::nullopt});
     return out;
 }
 

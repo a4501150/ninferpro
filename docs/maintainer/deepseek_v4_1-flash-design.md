@@ -1044,7 +1044,7 @@ DeepSeek's reference code and DS4 are MIT-licensed; any code ported from them ke
 ### 8.2 The shared offload tier: what exists, what this family adds
 
 The shared tier exists today in `src/models/offload/` (geometry, residency, cache, placement,
-store, tiers, state, calibrated order, route trace, monitor) with its MoE ops in
+store, tiers, state, route trace, monitor) with its MoE ops in
 `src/ops/offloaded_sparse_moe/` — the [MoE offload design](moe-offload-design.md) §1 table names
 every file, and MoE §9 is the adding-a-family checklist this design follows. A family's Program
 constructs the tier's pieces directly, hands each its `ExpertBankGeometry` and record strides, and

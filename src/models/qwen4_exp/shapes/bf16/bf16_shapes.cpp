@@ -1,12 +1,13 @@
-// The Qwen4Exp (Qwen3.8-Flash-Next, recipe A) family's tuned BF16 linear shapes: one row per
-// shape file in this directory. The table's external linkage (bf16_shapes.h declares it extern;
-// the dispatch references it) forces the linker to extract this translation unit and, through
-// its rows, every shape file below.
-#include "ops/linear/bf16/bf16_shapes.h"
+// The Qwen4Exp (Qwen3.8-Flash-Next, recipe A) family's tuned BF16 linear shapes: one row per shape
+// file in this directory. src/models/shapes.cpp registers this table with the dispatch, which
+// forces the linker to extract this translation unit and, through its rows, every shape file below.
+#include "models/qwen4_exp/shapes/shapes.h"
 
-namespace infernix::ops::detail {
+namespace infernix::models::qwen4_exp {
 
-const Bf16ShapeEntry qwen4_exp_bf16_shapes[] = {
+using namespace ops::detail;
+
+const Bf16ShapeEntry bf16_shapes[] = {
     {48, 2560, select_bf16_n48_k2560},
     {96, 2560, select_bf16_n96_k2560, select_bf16_n96_k2560_invariant},
     {640, 2560, select_bf16_n640_k2560, select_bf16_n640_k2560_invariant,
@@ -25,7 +26,6 @@ const Bf16ShapeEntry qwen4_exp_bf16_shapes[] = {
     {2560, 640, select_bf16_n2560_k640},
     {2560, 4608, select_bf16_n2560_k4608},
 };
-const std::size_t qwen4_exp_bf16_shapes_count =
-    sizeof(qwen4_exp_bf16_shapes) / sizeof(qwen4_exp_bf16_shapes[0]);
+const std::size_t bf16_shapes_count = sizeof(bf16_shapes) / sizeof(bf16_shapes[0]);
 
-} // namespace infernix::ops::detail
+} // namespace infernix::models::qwen4_exp

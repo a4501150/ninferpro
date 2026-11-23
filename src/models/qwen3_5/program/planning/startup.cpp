@@ -11,6 +11,7 @@
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
+#include "models/qwen3_5/options.h"
 #include "core/device.h"
 #include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/candidate_selector.h"
@@ -289,9 +290,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     out.state_images = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
     if (plan.speculative_backend != SpeculativeBackend::None) {
-        out.replay_records = plan_gdn_replay_records(
+        out.replay_records = ops::plan_gdn_replay_records(
             builder,
-            GdnReplayRecordSpec{
+            ops::GdnReplayRecordSpec{
                 .layers          = dimension(config.linear_attention_layers),
                 .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                 .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
@@ -939,7 +940,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         parameters.model.config().text.full_attention_layers == 0) {
         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
     }
-    if (parameters.model.options() != models::load_options(options, Architecture::Qwen3_5)) {
+    if (parameters.model.options() != models::load_options(options, kVisionOffloadAuto)) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
     }
@@ -1315,7 +1316,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
-        .features             = models::load_options(options, Architecture::Qwen3_5),
+        .features             = models::load_options(options, kVisionOffloadAuto),
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
         .device               = options.device,

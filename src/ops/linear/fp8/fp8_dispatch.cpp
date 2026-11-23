@@ -6,15 +6,14 @@
 
 namespace infernix::ops::detail {
 namespace {
-// Scans each owning family's table in turn; the first (n, k) row wins.
+// Scans each registered table in turn; the first (n, k) row wins.
 const Fp8LinearShape* find_shape(std::int32_t n, std::int32_t k) {
-    for (std::size_t i = 0; i < qwen3_5_fp8_shapes_count; ++i) {
-        const Fp8LinearShape* shape = qwen3_5_fp8_shapes[i];
-        if (shape->n == n && shape->k == k) return shape;
-    }
-    for (std::size_t i = 0; i < qwen4_exp_fp8_shapes_count; ++i) {
-        const Fp8LinearShape* shape = qwen4_exp_fp8_shapes[i];
-        if (shape->n == n && shape->k == k) return shape;
+    for (std::size_t s = 0; s < fp8_linear_shape_set_count; ++s) {
+        const auto& set = fp8_linear_shape_sets[s];
+        for (std::size_t i = 0; i < *set.count; ++i) {
+            const Fp8LinearShape* shape = set.rows[i];
+            if (shape->n == n && shape->k == k) return shape;
+        }
     }
     return nullptr;
 }

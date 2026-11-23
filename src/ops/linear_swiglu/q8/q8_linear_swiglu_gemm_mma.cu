@@ -85,26 +85,26 @@ void q8_linear_swiglu_mma_r128_c80_launch(const Tensor& x, const Weight& w, Tens
     launch_route<Schedule>(x, w, out, stream);
 }
 
-void q8_dflash2_linear_swiglu_mma_r32_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                                      cudaStream_t stream) {
+void q8_linear_swiglu_mma_r32_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                              cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
-void q8_dflash2_linear_swiglu_mma_r64_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                                      cudaStream_t stream) {
+void q8_linear_swiglu_mma_r64_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                              cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
-void q8_dflash2_linear_swiglu_mma_r64_c80_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                                      cudaStream_t stream) {
+void q8_linear_swiglu_mma_r64_c80_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                              cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<64, 80, 128, 64, 8, 1, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
-void q8_dflash2_linear_swiglu_mma_r64_c96_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                                      cudaStream_t stream) {
+void q8_linear_swiglu_mma_r64_c96_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                              cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<64, 96, 128, 64, 8, 1, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }

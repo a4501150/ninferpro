@@ -56,7 +56,7 @@
 #include "core/device.h"
 #include "core/dram_probe.h"
 #include "core/dtype.h"
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "core/ggml_format.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
@@ -500,16 +500,18 @@ struct Harness {
         // Verification records (the Program's allocate_verification, at the largest width).
         if (max_width > 1) {
             LayoutBuilder records_builder;
-            const auto plan = plan_gdn_replay_records(records_builder, {.layers          = static_cast<std::int32_t>(c.gdn_layers),
-                                                                        .record_capacity = rows,
-                                                                        .width           = max_width,
-                                                                        .conv_channels   = static_cast<std::int32_t>(c.gdn.conv_channels()),
-                                                                        .qk_heads        = static_cast<std::int32_t>(c.gdn.key_heads),
-                                                                        .value_heads     = static_cast<std::int32_t>(c.gdn.value_heads),
-                                                                        .key_dim         = static_cast<std::int32_t>(c.gdn.key_head_dim),
-                                                                        .value_dim       = static_cast<std::int32_t>(c.gdn.value_head_dim)});
+            const auto plan = ops::plan_gdn_replay_records(
+                records_builder, {.layers          = static_cast<std::int32_t>(c.gdn_layers),
+                                  .record_capacity = rows,
+                                  .width           = max_width,
+                                  .conv_channels = static_cast<std::int32_t>(c.gdn.conv_channels()),
+                                  .qk_heads      = static_cast<std::int32_t>(c.gdn.key_heads),
+                                  .value_heads   = static_cast<std::int32_t>(c.gdn.value_heads),
+                                  .key_dim       = static_cast<std::int32_t>(c.gdn.key_head_dim),
+                                  .value_dim = static_cast<std::int32_t>(c.gdn.value_head_dim)});
             records_backing = DeviceBuffer(records_builder.finish(256));
-            records         = GdnReplayRecords(DeviceSpan{records_backing.p, records_backing.bytes}, plan);
+            records =
+                ops::GdnReplayRecords(DeviceSpan{records_backing.p, records_backing.bytes}, plan);
             ple_records     = DeviceBuffer(2ULL * width * max_width * rows);
             qsa_records     = DeviceBuffer(2ULL * di * max_width * rows * c.attention_layers);
         }
@@ -590,7 +592,7 @@ struct Harness {
     DeviceBuffer records_backing, ple_records, qsa_records;
     DeviceBuffer staging, landing, landed; // the miss staging and landing tables (--staging-slots)
     DeviceBuffer snapshot[3];
-    GdnReplayRecords records;
+    ops::GdnReplayRecords records;
     q4::prefix::KvWindowGeometry window_geometry;
     std::unique_ptr<LinearAttentionStatePool> gdn;
     std::unique_ptr<DeviceKVPagePool> pool;

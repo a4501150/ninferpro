@@ -666,7 +666,7 @@ itself, a shared offload tier, and a shared Qwen frontend.
 |---|---|---|
 | Mathematics, config, binding, block order, MTP/DFlash2 alignment, tuned shapes | Model | `src/models/qwen4_exp/` (`config.*`, `load.*`, `instance.*`, `model.h`; `execution/` forward and parameters; `shapes/`) |
 | Program: mutable state, placement, residency, tiers, CUDA graphs, prefix cache, n-gram volume, vision window, scoring, draft-length policy, fast paths | Program (allocated at startup) | `src/models/qwen4_exp/program/` (`program_impl.h` declares the Program, `internal.h` its layouts and plans; topic files `program_impl.cpp`, `binding.cpp`, `decode.cpp`, `verify.cpp`, `mtp.cpp`, `exec.cpp`, `placement.cpp`, `reports.cpp`, `kv_pool.cpp`, `cpu_rates.*`; `prefix/`, `ngram_volume.*`, `vision_window.*`, `score.cpp`, `dflash2_program.cpp`, `draft_length.h`, `fast_paths.*`, `prefill_walk.cpp`, `rope_positions.*`, `constraint.cpp`) |
-| Expert residency machinery shared by the flash families: LFRU policy, VRAM frames and tables, placement, SSD records, RAM/SSD tier controllers, warm-start state, calibrated order, route trace, VRAM monitor | Offload tier (composed by each Program; no base class, no virtual interface; [MoE offload design](moe-offload-design.md) §1) | `src/models/offload/` (`expert_cache.*`, `expert_residency.*`, `expert_placement.*`, `expert_store.*`, `host_tier.*`, `host_expert_tier.*`, `expert_state.*`, `calibrated_order.*`, `route_trace.*`, `vram_monitor.*`, `geometry.h`) |
+| Expert residency machinery shared by the flash families: LFRU policy, VRAM frames and tables, placement, SSD records, RAM/SSD tier controllers, warm-start state, route trace, VRAM monitor | Offload tier (composed by each Program; no base class, no virtual interface; [MoE offload design](moe-offload-design.md) §1) | `src/models/offload/` (`expert_cache.*`, `expert_residency.*`, `expert_placement.*`, `expert_store.*`, `host_tier.*`, `host_expert_tier.*`, `expert_state.*`, `route_trace.*`, `vram_monitor.*`, `geometry.h`) |
 | Frontend shared by the Qwen families: tokenizer, chat template, processor, prompt layout, tool grammar, reasoning loop, media cache, vision tower and weight stream, n-gram proposer, prefix block keys | Shared Qwen frontend | `src/models/qwen_common/` (`frontend/`, `execution/`, `program/`, `load/`) |
 | Routed-expert MoE: routing, residency classification, narrow and wide GPU kernels, CPU engine, placement-invariant contract (output = MoE(x) independent of residency) | Op family `offloaded_sparse_moe` | `include/infernix/ops/offloaded_sparse_moe.h`; `src/ops/offloaded_sparse_moe/` (`cuda/moe_layer.cu`, `cuda/narrow_expert.cu`, `cuda/wide_expert.cu`, `cpu/` the expert team and miss service) |
 | Canonical routed-expert arithmetic (A4 quantizer, E2M1/E4M3 integer decode, int64 block sums; one header for CPU and GPU) | Op common code | `src/ops/common/canonical_math.h` |
@@ -1064,7 +1064,8 @@ the prompt credit — is MoE §4.3. This family's constants:
   scaled by its share of layers). The mixed-trace halving evidence and the never-halving
   comparison are MoE §4.3's.
 - The saved state caps counts at 16, so a stale expert yields to new uses.
-- The seed is the shipped calibrated order (`calibrated_expert_order`, every artifact of
+- The seed is the shipped calibrated order (`calibrated_expert_order` in
+  `src/models/qwen4_exp/calibrated_order.*`, every artifact of
   this architecture's shape, 48 × 512; the program checks the shape) and fills half the
   frames (`kSeedShare`), leaving the rest free for the fill phase's landings. A static
   profile alone loses badly on a differing workload (+82 % misses on trace B), which is why

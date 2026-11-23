@@ -68,7 +68,7 @@ __global__ void speculative_sample_sparse_drafts_kernel(const std::int32_t* rows
         mass    = weight(0);
     }
     for (int j = 0; j < support; ++j) { q[j] = weight(j) / mass; }
-    const float u = sampling_uniform(cfg.seed, positions[t], kSamplePurposeDFlash2Proposal, draw);
+    const float u    = sampling_uniform(cfg.seed, positions[t], kSamplePurposeDraftProposal, draw);
     int pick      = support - 1;
     float cumulative = 0.0F;
     for (int j = 0; j < support; ++j) {

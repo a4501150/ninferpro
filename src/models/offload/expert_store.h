@@ -73,7 +73,7 @@ private:
     std::vector<std::vector<float>> multipliers_;
 };
 
-// An expert stripe file (tools/flash_next/expert_stripe.py): the tail of every routed expert record
+// An expert stripe file (tools/artifact/expert_stripe.py): the tail of every routed expert record
 // of one artifact, on another drive, so the SSD tier reads each record from two drives at once (the
 // head from the artifact, the tail from here) without a second copy of the experts.
 //

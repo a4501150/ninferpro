@@ -168,41 +168,50 @@ void test_resolution_and_atomic_upserts() {
         ("infernix-context-cost-test-" + std::to_string(test_process_id()));
     std::filesystem::create_directories(directory);
     const std::filesystem::path path = directory / "presets.json";
+    const std::array<infernix::runtime::ContextCompiledPrefill, 1> compiled_prefill{{
+        {"nvidia-geforce-rtx-5090-sm120", "measured-config-and-formats", prefill(41)},
+    }};
+    const infernix::runtime::ContextPrefillDefaults defaults{.fallback = prefill(17),
+                                                             .compiled = compiled_prefill};
     try {
         const infernix::runtime::ContextCostIdentity compiled_identity{
             .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
             .prefill_signature = "unmeasured-config-and-formats",
         };
-        const auto compiled = infernix::runtime::resolve_context_machine_cost(compiled_identity);
+        const auto compiled =
+            infernix::runtime::resolve_context_machine_cost(compiled_identity, defaults);
         expect(
             compiled.summary.transfer_source == infernix::ContextCostPresetSource::CompiledDefault &&
                 compiled.summary.prefill_source == infernix::ContextCostPresetSource::GenericDefault,
             "compiled transfer and prefill defaults did not resolve independently");
 
-        const auto measured = infernix::runtime::resolve_context_machine_cost({
-            .hardware_class    = compiled_identity.hardware_class,
-            .prefill_signature = "e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a",
-        });
+        const auto measured = infernix::runtime::resolve_context_machine_cost(
+            {
+                .hardware_class    = compiled_identity.hardware_class,
+                .prefill_signature = "measured-config-and-formats",
+            },
+            defaults);
         expect(measured.summary.prefill_source ==
                        infernix::ContextCostPresetSource::CompiledDefault &&
-                   measured.model.prefill.token_ns_q32 == 375'800'765'711'778,
+                   measured.model.prefill.chunk_ns == 41,
                "measured bindings did not select their compiled prefill cost");
 
         const infernix::runtime::ContextCostIdentity unknown{
             .hardware_class    = "unmeasured-machine",
             .prefill_signature = "unmeasured-config-and-formats",
         };
-        const auto generic = infernix::runtime::resolve_context_machine_cost(unknown);
-        expect(
-            generic.summary.transfer_source == infernix::ContextCostPresetSource::GenericDefault &&
-                generic.summary.prefill_source == infernix::ContextCostPresetSource::GenericDefault &&
-                generic.model.transfer[0].ns_per_byte_q32 > 0 &&
-                generic.model.prefill.token_ns_q32 > 0,
-            "unknown identity did not retain a numerical cost model");
+        const auto generic = infernix::runtime::resolve_context_machine_cost(unknown, defaults);
+        expect(generic.summary.transfer_source ==
+                       infernix::ContextCostPresetSource::GenericDefault &&
+                   generic.summary.prefill_source ==
+                       infernix::ContextCostPresetSource::GenericDefault &&
+                   generic.model.transfer[0].ns_per_byte_q32 > 0 &&
+                   generic.model.prefill == prefill(17),
+               "unknown identity did not retain a numerical cost model");
 
         infernix::runtime::upsert_context_transfer_cost_atomic(path, unknown.hardware_class,
                                                              transfer(77), R"({"run":1})");
-        auto resolved = infernix::runtime::resolve_context_machine_cost(unknown, path);
+        auto resolved = infernix::runtime::resolve_context_machine_cost(unknown, defaults, path);
         expect(resolved.model.transfer[0].batch_ns == 77 &&
                    resolved.summary.transfer_source == infernix::ContextCostPresetSource::External &&
                    resolved.summary.prefill_source ==
@@ -211,7 +220,7 @@ void test_resolution_and_atomic_upserts() {
 
         infernix::runtime::upsert_context_prefill_cost_atomic(path, unknown, prefill(91),
                                                             R"({"run":2})");
-        resolved = infernix::runtime::resolve_context_machine_cost(unknown, path);
+        resolved = infernix::runtime::resolve_context_machine_cost(unknown, defaults, path);
         expect(resolved.model.transfer[0].batch_ns == 77 && resolved.model.prefill.chunk_ns == 91 &&
                    resolved.summary.transfer_source == infernix::ContextCostPresetSource::External &&
                    resolved.summary.prefill_source == infernix::ContextCostPresetSource::External,
@@ -221,7 +230,8 @@ void test_resolution_and_atomic_upserts() {
             .hardware_class    = unknown.hardware_class,
             .prefill_signature = "other-config-and-formats",
         };
-        const auto layered_miss = infernix::runtime::resolve_context_machine_cost(other_model, path);
+        const auto layered_miss =
+            infernix::runtime::resolve_context_machine_cost(other_model, defaults, path);
         expect(layered_miss.summary.transfer_source == infernix::ContextCostPresetSource::External &&
                    layered_miss.summary.prefill_source ==
                        infernix::ContextCostPresetSource::GenericDefault,

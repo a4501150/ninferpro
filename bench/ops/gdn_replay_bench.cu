@@ -7,7 +7,7 @@
 #include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/gdn_replay.h"
 
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "infernix_bench_common.h"
@@ -331,16 +331,16 @@ public:
     [[nodiscard]] const ops::GdnReplayFoldPlan& fold_plan() const { return fold_plan_; }
 
 private:
-    static GdnReplayRecordLayout make_record_layout(const Profile& profile, std::int32_t width,
-                                                    LayoutBuilder& builder) {
-        return plan_gdn_replay_records(builder, {.layers          = profile.layers,
-                                                 .record_capacity = kRecordCapacity,
-                                                 .width           = width,
-                                                 .conv_channels   = profile.conv_channels,
-                                                 .qk_heads        = kQkHeads,
-                                                 .value_heads     = profile.value_heads,
-                                                 .key_dim         = kStateDim,
-                                                 .value_dim       = kStateDim});
+    static ops::GdnReplayRecordLayout make_record_layout(const Profile& profile, std::int32_t width,
+                                                         LayoutBuilder& builder) {
+        return ops::plan_gdn_replay_records(builder, {.layers          = profile.layers,
+                                                      .record_capacity = kRecordCapacity,
+                                                      .width           = width,
+                                                      .conv_channels   = profile.conv_channels,
+                                                      .qk_heads        = kQkHeads,
+                                                      .value_heads     = profile.value_heads,
+                                                      .key_dim         = kStateDim,
+                                                      .value_dim       = kStateDim});
     }
 
     static LinearAttentionStatePoolLayout make_state_layout(const Profile& profile,
@@ -371,11 +371,12 @@ private:
     Profile profile_;
     std::int32_t width_;
     LayoutBuilder record_builder_;
-    GdnReplayRecordLayout record_layout_ = make_record_layout(profile_, width_, record_builder_);
+    ops::GdnReplayRecordLayout record_layout_ =
+        make_record_layout(profile_, width_, record_builder_);
     LayoutBuilder state_builder_;
     LinearAttentionStatePoolLayout state_layout_ = make_state_layout(profile_, state_builder_);
     DeviceBuffer record_storage_;
-    GdnReplayRecords records_;
+    ops::GdnReplayRecords records_;
     DeviceBuffer state_storage_;
     LinearAttentionStatePool states_;
     std::unique_ptr<bench::SavedBuffer> initial_;

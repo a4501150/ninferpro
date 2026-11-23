@@ -121,7 +121,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                             })) {
                 continue;
             }
-            GdnReplayRecords narrowed = replay_records->narrowed(width);
+            ops::GdnReplayRecords narrowed = replay_records->narrowed(width);
             ops::GdnReplayFoldPlan fold(narrowed, state_images->linear().all_layers_view());
             narrow_replay_views.push_back(NarrowReplayView{narrowed, std::move(fold)});
         }

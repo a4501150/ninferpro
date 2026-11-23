@@ -3,7 +3,6 @@
 #include "infernix/types.h"
 #include "models/qwen_common/ngram.h"
 #include "models/qwen_common/frontend/output_session.h"
-#include "models/registry.h"
 #include "runtime/contract/request.h"
 
 #include <array>
@@ -17,12 +16,11 @@
 
 namespace infernix::models::qwen_common {
 
-[[nodiscard]] ModelSamplingDefaults default_sampling(Architecture architecture);
-
 struct FrontendOptions {
     std::filesystem::path chat_template_path;
     std::size_t grammar_cache_bytes        = 256ULL * 1024 * 1024;
-    Architecture architecture              = Architecture::Qwen3_5;
+    // The family's recommended sampling presets (a request's omitted fields take them).
+    ModelSamplingDefaults sampling;
     bool vision_enabled                    = true;
     std::uint32_t max_context              = 2'048;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;

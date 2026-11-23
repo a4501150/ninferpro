@@ -1,3 +1,4 @@
+#include "models/qwen3_5/options.h"
 #include "models/qwen3_5/instance.h"
 #include "runtime/engine/engine_options.h"
 
@@ -219,7 +220,8 @@ int run(const Options& options) {
     engine.use_cuda_graph            = options.use_cuda_graph;
     engine.max_concurrency           = options.batch_size;
 
-    engine = infernix::runtime::normalize_engine_options(std::move(engine));
+    engine = infernix::runtime::normalize_engine_options(std::move(engine),
+                                                         infernix::models::qwen3_5::option_rules());
     infernix::DeviceContext device(options.device);
     auto constructed = infernix::runtime::construct_model(engine, device);
     auto& frontend   = constructed.instance->frontend;

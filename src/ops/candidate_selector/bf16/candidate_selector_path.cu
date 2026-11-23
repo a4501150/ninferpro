@@ -52,7 +52,7 @@ __device__ int draw_rank(float edge, float temperature, unsigned long long seed,
     const float probability = weight / warp_sum(weight);
     if (lane < kCandidates) q[lane] = probability;
     float uniform =
-        lane == 0 ? sampling_uniform(seed, position, kSamplePurposeDFlash2Proposal, 0U) : 0.0F;
+        lane == 0 ? sampling_uniform(seed, position, kSamplePurposeDraftProposal, 0U) : 0.0F;
     uniform          = __shfl_sync(kFullWarpMask, uniform, 0);
     float cumulative = probability;
 #pragma unroll
@@ -226,7 +226,7 @@ __device__ __forceinline__ int draw_untaken(float edge, float law, unsigned take
     const float remaining = available ? law : 0.0F;
     const float mass      = warp_sum(remaining);
     float uniform =
-        lane == 0 ? sampling_uniform(seed, position, kSamplePurposeDFlash2Proposal, index) : 0.0F;
+        lane == 0 ? sampling_uniform(seed, position, kSamplePurposeDraftProposal, index) : 0.0F;
     uniform          = __shfl_sync(kFullWarpMask, uniform, 0);
     const float goal = uniform * mass;
     float cumulative = remaining;

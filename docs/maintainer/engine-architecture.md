@@ -142,6 +142,15 @@ A ModelInstance holds the Model, const Parameters, Frontend and Program. The Pla
 requirements of every layer and backend, resolves capacity against the Device headroom left after the
 weights are resident, and establishes the final layout.
 
+The public Engine reaches a family only through `src/models/registry.*`: the artifact probe picks
+the family, its `FamilyOptionRules` give the shared option checks their defaults and refusals, and
+its `construct_engine_backend` loads the instance and returns an `EngineBackend`
+(`src/runtime/engine/engine_backend.h`). Each family's `instance.cpp` instantiates
+`EngineBackendFor` (`engine_backend_for.h`) over its instance and the common `EngineCore` or
+`CausalScoreCore`; the prepared prompt it hands out is opaque to the Engine and consumed by the same
+backend. The Engine makes one virtual call per public API call; the worker, rounds and every
+per-token path run in the concrete core with no indirection.
+
 Weights, State/KV backing, block-table matrices, workspace and CUDA Graph resources are established
 before requests are accepted. At runtime only ownership, mappings, frontiers and replica placement
 change. Each Program exclusively owns its mutable state and Device allocations; on destruction, the
@@ -434,8 +443,9 @@ no cached prefix that external requests could hit.
 | Public Engine facade | `include/infernix/engine.h`, `src/runtime/engine/engine.cpp` |
 | Request lifecycle, scheduling and observation | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl` |
 | Shared artifact-free option checks, defaults and the hybrid-cache fingerprint | `src/runtime/engine/engine_options.*` |
-| Family instance construction and family option branches | `src/models/<family>/instance.*`, `options.*` (qwen3_5, qwen4_exp) |
-| Artifact architecture detection | `src/models/registry.cpp` |
+| The Engine's handle on a family (`EngineBackend`, `EngineBackendFor`) | `src/runtime/engine/engine_backend*.h` |
+| Family instance construction, Engine backend and option rules | `src/models/<family>/instance.*`, `options.*` (qwen3_5, qwen4_exp) |
+| Artifact architecture detection and the family entry points (the only shared code that names families) | `src/models/registry.*` |
 | Engine connection to the prefix cache | `src/runtime/engine/context_cache/` |
 | Model-agnostic prefix index, tap planner and cost model | `src/runtime/prefix_cache/` |
 | Public request, execution and resource contracts | `src/runtime/contract/` |
@@ -445,7 +455,7 @@ no cached prefix that external requests could hit.
 | Shared Qwen frontend, n-gram archive and vision pieces | `src/models/qwen_common/` |
 | Shared expert-offload tier (placement, store, host cache, host and SSD tiers, residency, route trace, VRAM monitor), parameterized by `ExpertBankGeometry` | `src/models/offload/` |
 | Model state layout | `src/models/<family>/state/` (qwen3_5); qwen4_exp keeps it in `program/` with the state image under `program/prefix/` |
-| Family-owned linear shape tuning, one extern table per family and format beside the Ops dispatch | `src/models/<family>/shapes/` |
+| Family-owned linear shape tuning, registered with the Ops dispatch's neutral per-format registries by `src/models/shapes.cpp` | `src/models/<family>/shapes/` |
 | Tensors, arenas, graphs, physical KV and raw transfers | `src/core/` |
 | Generic artifact framing and materialization | `src/artifact/` |
 | Closed compute and state-transition Ops | `src/ops/`, `include/infernix/ops/` |

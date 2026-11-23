@@ -4,7 +4,7 @@
 
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/weight.h"
@@ -101,7 +101,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const std::size_t conv_slot_elements   = static_cast<std::size_t>(profile.conv_channels) * 3;
     const std::size_t conv_slot_bytes      = conv_slot_elements * sizeof(std::uint16_t);
 
-    const GdnReplayRecordSpec record_spec{
+    const ops::GdnReplayRecordSpec record_spec{
         .layers          = profile.layers,
         .record_capacity = record_capacity,
         .width           = storage_width > width ? storage_width : width,
@@ -112,15 +112,15 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         .value_dim       = kStateDim,
     };
     LayoutBuilder record_builder;
-    const GdnReplayRecordLayout record_layout =
-        plan_gdn_replay_records(record_builder, record_spec);
+    const ops::GdnReplayRecordLayout record_layout =
+        ops::plan_gdn_replay_records(record_builder, record_spec);
     const std::size_t record_bytes = record_builder.finish(256);
     DeviceBuffer record_storage(record_bytes + 2 * kGuardBytes);
     record_storage.fill(0xa5);
     void* record_base = offset_pointer(record_storage.p, kGuardBytes);
     cuda_check(cudaMemset(record_base, 0xff, record_bytes), "initialize replay records");
-    const GdnReplayRecords storage_records({record_base, record_bytes}, record_layout);
-    const GdnReplayRecords records =
+    const ops::GdnReplayRecords storage_records({record_base, record_bytes}, record_layout);
+    const ops::GdnReplayRecords records =
         storage_width > width ? storage_records.narrowed(width) : storage_records;
 
     std::vector<std::uint16_t> conv_records(records.conv.numel(), 0xffffU);
@@ -288,7 +288,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const float kScale = 1.0F / std::sqrt(128.0F);
 
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
-        const GdnReplayRecordLayer layer_records = records.layer(layer, rows);
+        const ops::GdnReplayRecordLayer layer_records = records.layer(layer, rows);
         for (std::int32_t row = 0; row < rows; ++row) {
             const auto initial_recurrent =
                 initial_recurrent_values(recurrent_slot_elements, seed, layer, row);
@@ -570,18 +570,18 @@ int run_record_fold_rounds() {
     DeviceBuffer device_snapshot    = to_device(std::vector<std::int32_t>{kSnapshotBase});
 
     LayoutBuilder record_builder;
-    const GdnReplayRecordLayout record_layout =
-        plan_gdn_replay_records(record_builder, {.layers          = kProfile.layers,
-                                                 .record_capacity = 1,
-                                                 .width           = kWidth,
-                                                 .conv_channels   = kProfile.conv_channels,
-                                                 .qk_heads        = kQkHeads,
-                                                 .value_heads     = kProfile.value_heads,
-                                                 .key_dim         = kStateDim,
-                                                 .value_dim       = kStateDim});
+    const ops::GdnReplayRecordLayout record_layout =
+        ops::plan_gdn_replay_records(record_builder, {.layers          = kProfile.layers,
+                                                      .record_capacity = 1,
+                                                      .width           = kWidth,
+                                                      .conv_channels   = kProfile.conv_channels,
+                                                      .qk_heads        = kQkHeads,
+                                                      .value_heads     = kProfile.value_heads,
+                                                      .key_dim         = kStateDim,
+                                                      .value_dim       = kStateDim});
     DeviceBuffer record_storage(record_builder.finish(256));
     record_storage.fill(0xff);
-    GdnReplayRecords records({record_storage.p, record_storage.bytes}, record_layout);
+    ops::GdnReplayRecords records({record_storage.p, record_storage.bytes}, record_layout);
 
     LayoutBuilder state_builder;
     const LinearAttentionStatePoolLayout state_layout = plan_linear_attention_state_pool(
@@ -690,7 +690,7 @@ int run_record_fold_rounds() {
         device_beta.copy_from_host(beta_host.data(), device_beta.bytes);
 
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
-            GdnReplayRecordLayer layer_records = records.layer(layer, 1);
+            ops::GdnReplayRecordLayer layer_records = records.layer(layer, 1);
             Tensor conv_states = state_pool.layer_view(static_cast<std::uint32_t>(layer)).conv;
             ops::gdn_input_proj_conv_snapshot(
                 x, qk_parent.view(), vz_parent.view(), conv_weight, conv_states, valid,

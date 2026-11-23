@@ -338,7 +338,7 @@ void TextContext::compact_tree_kv(const Tensor& verify_positions, const Tensor& 
 }
 
 void TextContext::set_gdn_state_action(GdnStateAction action,
-                                       const GdnReplayRecords* replay_records) {
+                                       const ops::GdnReplayRecords* replay_records) {
     if ((action == GdnStateAction::RecordForReplay) != (replay_records != nullptr)) {
         throw std::invalid_argument("TextContext GDN state action has inconsistent records");
     }
@@ -1064,7 +1064,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             if (replay_records_ == nullptr) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            ops::GdnReplayRecordLayer records =
+                replay_records_->layer(gidx, active_sequence_batch_);
             if (active_sequence_batch_ == 1) { records = records.single_row_prefix(width); }
             gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
@@ -1119,7 +1120,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            ops::GdnReplayRecordLayer records =
+                replay_records_->layer(gidx, active_sequence_batch_);
             if (active_sequence_batch_ == 1) { records = records.single_row_prefix(width); }
             const float scale = static_cast<float>(
                 1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim)));

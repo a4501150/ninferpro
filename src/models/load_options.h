@@ -1,6 +1,5 @@
 #pragma once
 
-#include "models/registry.h"
 #include "infernix/types.h"
 
 #include <filesystem>
@@ -68,16 +67,14 @@ struct LoadOptions {
     return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
 }
 
-// --vision-offload auto: on for Qwen4Exp, whose expert cache lends the encode window's device
-// memory (design §16.5); off for Qwen3.5, which borrows it from an evictable weight ladder.
-[[nodiscard]] constexpr bool resolve_vision_offload(VisionOffload mode, Architecture architecture) noexcept {
-    return mode == VisionOffload::On || (mode == VisionOffload::Auto && architecture == Architecture::Qwen4Exp);
-}
-
-[[nodiscard]] inline LoadOptions load_options(const EngineOptions& options, Architecture architecture) {
-    return {.purpose                  = options.purpose,
-            .vision                   = options.enable_vision,
-            .vision_offload           = resolve_vision_offload(options.vision_offload, architecture),
+// vision_offload_auto: the family's --vision-offload auto.
+[[nodiscard]] inline LoadOptions load_options(const EngineOptions& options,
+                                              bool vision_offload_auto) {
+    return {.purpose = options.purpose,
+            .vision  = options.enable_vision,
+            .vision_offload =
+                options.vision_offload == VisionOffload::On ||
+                (options.vision_offload == VisionOffload::Auto && vision_offload_auto),
             .vision_max_merged_tokens = options.vision_max_merged_tokens,
             .speculative              = options.speculative.backend,
             .proposal_head            = options.speculative.proposal_head,

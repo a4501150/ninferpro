@@ -1,8 +1,6 @@
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "core/device.h"
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
 #include "ops/linear/fp_a16/a16_sliced_k_mma.cuh"
 #include "ops/linear/fp8/fp8_a16_mma.cuh"
 

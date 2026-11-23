@@ -33,7 +33,7 @@ One tier, owned by no family. What it is:
 | Placement spec, placement file, runtime switch request (`ExpertPlacementSpec`, `ExpertsSpec`) | `src/models/offload/expert_placement.*` |
 | In-place expert records and the expert stripe (`ExpertStore`, `ExpertStripe`) | `src/models/offload/expert_store.*` |
 | RAM level: decayed-LFU ranking, pinned slots, pins, landings (`HostTier`); the read agent, tickets, stream slots (`HostExpertTier`) | `src/models/offload/host_tier.*`, `host_expert_tier.*` |
-| Saved cache state and the shipped calibrated order | `src/models/offload/expert_state.*`, `calibrated_order.*` |
+| Saved cache state (a family may ship a calibrated order that seeds it, e.g. `src/models/qwen4_exp/calibrated_order.*`) | `src/models/offload/expert_state.*` |
 | Route trace for offline replay | `src/models/offload/route_trace.*` |
 | VRAM monitor | `src/models/offload/vram_monitor.*` |
 | Routed-expert MoE op: routing, dispatch, narrow and wide GPU kernels, staging, CPU engine, miss and fetch channels | `include/infernix/ops/offloaded_sparse_moe.h`; `src/ops/offloaded_sparse_moe/` (`cuda/`, `cpu/`) |

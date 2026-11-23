@@ -224,7 +224,7 @@ def test_mmproj_vision_tower_is_exact(tmp_path):
 def test_expert_bank_import_is_verbatim(tmp_path):
     """Each record is the expert's gate rows, up rows and down rows, as stored, padded to 4 KiB."""
 
-    from tools.convert.qwen4_exp_gguf import GgmlExpertBank, import_ggml_expert_bank
+    from tools.convert.sources.ggml_sources import GgmlExpertBank, import_ggml_expert_bank
     from tools.convert.methods import MethodInput, PrepareRequest
     from tools.artifact.schema import TensorSpec
 

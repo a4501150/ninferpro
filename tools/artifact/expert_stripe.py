@@ -1,8 +1,8 @@
 """Write or verify a Qwen3.8-Flash-Next expert stripe: the tail of every routed expert record, for
 a second drive.
 
-    python -m tools.flash_next.expert_stripe ARTIFACT D:/stripes/MODEL.stripe [--tail-fraction 0.5]
-    python -m tools.flash_next.expert_stripe ARTIFACT D:/stripes/MODEL.stripe --verify
+    python -m tools.artifact.expert_stripe ARTIFACT D:/stripes/MODEL.stripe [--tail-fraction 0.5]
+    python -m tools.artifact.expert_stripe ARTIFACT D:/stripes/MODEL.stripe --verify
 
 With `--expert-stripe` the SSD expert tier reads each record's head from the artifact and its tail
 from the stripe at the same time, so a record that misses RAM crosses two drives in parallel. The

@@ -56,7 +56,7 @@ void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store, 
         card.compact_tree_kv(frame.cache_positions, frame.kv_table_rows,
                              frame.state_destination_slots, frame.accepted_path,
                              frame.accepted_drafts);
-        const GdnReplayRecords& records = *frame.replay_records;
+        const ops::GdnReplayRecords& records = *frame.replay_records;
         const auto dense_columns        = [](const Tensor& plane) {
             return Tensor(plane.data, plane.dtype,
                           {plane.ne[0] * plane.ne[1], plane.ne[2], plane.ne[3]});

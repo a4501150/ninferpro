@@ -1,5 +1,5 @@
 #pragma once
-#include "ops/common/dflash_rope.cuh"
+#include "ops/common/rope_d128_theta1e7.cuh"
 #include "core/pdl.cuh"
 #include "ops/kernel/rope.cuh"
 #include "ops/rmsnorm_rope/d128.cuh"
@@ -29,7 +29,7 @@ __global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
     __shared__ __nv_bfloat162 weight_cache[kPairs];
     if (threadIdx.x < kPairs) {
         const int pair = threadIdx.x;
-        coefficients.template sincos<RopeKernelMode::DflashText1D>(
+        coefficients.template sincos<RopeKernelMode::FullHead1D>(
             positions, 0, token, pair, &sin_cache[pair], &cos_cache[pair]);
         weight_cache[pair] = weight[pair];
     }

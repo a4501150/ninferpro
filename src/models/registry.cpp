@@ -1,7 +1,9 @@
 #include "models/registry.h"
 
 #include "artifact/reader.h"
+#include "models/qwen3_5/options.h"
 #include "models/qwen4_exp/load.h"
+#include "models/qwen4_exp/options.h"
 
 #include <stdexcept>
 #include <string>
@@ -26,6 +28,17 @@ Architecture resolve_architecture(std::string_view architecture, std::string_vie
     }
     throw std::invalid_argument("unsupported architecture/config pair " +
                                 std::string(architecture) + "/" + std::string(model_type));
+}
+
+const runtime::FamilyOptionRules& family_option_rules(Architecture architecture) {
+    switch (architecture) {
+    case Architecture::Qwen3_5:
+    case Architecture::Qwen3_5Moe:
+        return qwen3_5::option_rules();
+    case Architecture::Qwen4Exp:
+        return qwen4_exp::option_rules();
+    }
+    throw std::invalid_argument("unknown model architecture");
 }
 
 std::string_view architecture_name(Architecture architecture) noexcept {

@@ -376,11 +376,12 @@ suite: a transfer run updates the hardware node's three directions, while a pref
 prefill-signature entry and preserves machine transfer plus other entries. The resulting file is parsed by
 the runtime's strict loader before publication.
 
-[`context_cost_defaults.cpp`](../src/runtime/engine/context_cache/context_cost_defaults.cpp) is the sole table of
-defaults compiled into the binary. JSON is not a build input: `--preset-out` produces a runtime
+[`context_cost_defaults.cpp`](../src/runtime/engine/context_cache/context_cost_defaults.cpp) holds the
+compiled machine transfer defaults, and each model family compiles its own prefill defaults (Qwen3.5:
+[`measurement.cpp`](../src/models/qwen3_5/measurement.cpp)). JSON is not a build input: `--preset-out` produces a runtime
 registry that can be selected immediately, without recompilation, through
 `EngineOptions.context_cost.preset_path` or `infernix-serve --context-cost-presets`. Resolution always
-starts with generic numerical coefficients,
+starts with generic transfer coefficients and the family's fallback prefill,
 then independently applies matching compiled transfer/prefill values, then independently applies
 matching external values. A malformed explicit file is an error; a missing hardware or prefill-signature
 entry retains the preceding numerical layer. After real-scenario acceptance, a maintainer may
@@ -1342,9 +1343,9 @@ cmake --build build --parallel --target \
 
 ./build/bench/infernix_residual_add_bench [--patches P] [--control]
 ./build/bench/infernix_sigmoid_mul_bench \
-  [--tokens T[,T...]] [--control | --candidate-block B]
+  [--tokens T[,T...]] [--control]
 ./build/bench/infernix_position_bench \
-  [--tokens T[,T...]] [--candidate-block B] [--cold-graph] [--warmup N] [--repeat N]
+  [--tokens T[,T...]] [--cold-graph] [--warmup N] [--repeat N]
 ./build/bench/infernix_gelu_bench [--mode tanh|exact --columns C] [--control]
 ./build/bench/infernix_add_bias_bench [--d D --columns C] [--control]
 ```

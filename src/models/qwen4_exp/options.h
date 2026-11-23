@@ -1,10 +1,11 @@
 #pragma once
 
-// The Qwen4Exp (Qwen3.8-Flash-Next) family's option defaults and refusals: the family's branches
-// of the shared runtime::validate_engine_options / runtime::normalize_engine_options
-// (src/runtime/engine/engine_options.cpp), which calls them at their original points.
+// The Qwen4Exp (Qwen3.8-Flash-Next) family's option defaults and refusals: its FamilyOptionRules,
+// which the shared runtime::validate_engine_options / runtime::normalize_engine_options
+// (src/runtime/engine/engine_options.cpp) call at fixed points.
 
 #include "infernix/types.h"
+#include "runtime/engine/engine_options.h"
 
 namespace infernix::models::qwen4_exp {
 
@@ -25,6 +26,13 @@ constexpr std::uint32_t kPrefillChunkBesideDecode = 1024U;
 // verifies 8 columns column-invariantly. Its DFlash2 drafter takes the same per-round policy.
 constexpr std::uint32_t kDraftTokensAuto = 7U;
 
+// --vision-offload auto: on; the expert cache lends the encode window's device memory
+// (design §16.5).
+constexpr bool kVisionOffloadAuto = true;
+
+// --experts: the spec's grammar, refused before the artifact is opened.
+void validate_experts(const EngineOptions& options);
+
 // --draft-tokens auto drafts with --spec mtp or dflash2 here.
 void validate_draft_backend(const EngineOptions& options);
 
@@ -42,5 +50,7 @@ void resolve_cache(ContextCacheOptions& cache, const EngineOptions& options, std
 // (free-cache-resume), so the ladder keeps the 4,096-token chunk's spacing whatever wider chunk it
 // prefills with.
 [[nodiscard]] std::uint32_t tap_ladder_chunk(std::uint32_t prefill_chunk) noexcept;
+
+[[nodiscard]] const runtime::FamilyOptionRules& option_rules();
 
 } // namespace infernix::models::qwen4_exp

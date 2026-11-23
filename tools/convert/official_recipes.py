@@ -458,7 +458,7 @@ def qwen3_8_flash_next_gsq_rco_iq3s(model, recipe, sources):
 
     from tools.artifact.layouts import GGML_TILES16_FORMATS
 
-    from .qwen4_exp_gguf import GgmlExpertBank, import_ggml_expert_bank
+    from .sources.ggml_sources import GgmlExpertBank, import_ggml_expert_bank
     from .methods import import_ggml_rows
 
     if model.config.get("architectures") != ["Qwen4ExpForCausalLM"] or model.config.get("gdn_a") != "direct":

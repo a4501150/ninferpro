@@ -8,9 +8,12 @@
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/runtime_types.h"
+#include "runtime/engine/engine_backend.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <memory>
+#include <optional>
+#include <string>
 
 namespace infernix {
 struct DeviceContext;
@@ -32,6 +35,10 @@ struct ModelInstance {
     ~ModelInstance();
     ModelInstance(const ModelInstance&)            = delete;
     ModelInstance& operator=(const ModelInstance&) = delete;
+
+    // The prefix cache file the Generation core saves at its orderly stop.
+    [[nodiscard]] std::string prefix_cache_save_notice(const EngineOptions& options) const;
+    [[nodiscard]] std::optional<PrefixCacheSave> prefix_cache_shutdown_save() const;
 };
 
 struct ConstructedModel {
@@ -41,5 +48,9 @@ struct ConstructedModel {
 };
 
 [[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device);
+
+// The family's Engine backend (models::construct_engine_backend).
+[[nodiscard]] ConstructedBackend construct_qwen3_5_backend(EngineOptions& options,
+                                                           DeviceContext& device);
 
 } // namespace infernix::runtime

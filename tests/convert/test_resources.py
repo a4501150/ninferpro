@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from tools.convert.resources import STD_QWEN_SPLIT_PATTERN, load_resources, token_domain
+from tools.convert.qwen_common import STD_QWEN_SPLIT_PATTERN, normalize_tokenizer
+from tools.convert.resources import load_resources, token_domain
 
 
 def _write_text_resources(tmp_path, tokenizer, config):
@@ -34,6 +35,7 @@ def test_final_resources_override_defaults_without_hash_pinning(tmp_path):
         tmp_path,
         vocab_size=4,
         overrides={"tokenizer.json": selected, "chat_template.jinja": template},
+        normalize=normalize_tokenizer,
     )
     assert count == 3 and special == (2,)
     assert set(references) == {"text"}
@@ -72,7 +74,7 @@ def test_missing_added_tokens_decoder_is_built_from_added_tokens(tmp_path):
         ],
     }
     _write_text_resources(tmp_path, tokenizer, {"bos_token": "a"})
-    references, payloads, count, special = load_resources(tmp_path, vocab_size=4)
+    references, payloads, count, special = load_resources(tmp_path, vocab_size=4, normalize=normalize_tokenizer)
     stored = json.loads(payloads[references["text"]["tokenizer_config.json"]])
     assert stored["added_tokens_decoder"] == {
         "2": {
@@ -108,7 +110,7 @@ def test_drifted_split_pattern_is_normalized_to_standard(tmp_path):
         },
     }
     _write_text_resources(tmp_path, tokenizer, {})
-    references, payloads, _, _ = load_resources(tmp_path, vocab_size=4)
+    references, payloads, _, _ = load_resources(tmp_path, vocab_size=4, normalize=normalize_tokenizer)
     stored = json.loads(payloads[references["text"]["tokenizer.json"]])
     assert (
         stored["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"]
@@ -145,7 +147,7 @@ def test_standard_tokenizer_assets_are_not_reserialized(tmp_path):
     (tmp_path / "tokenizer_config.json").write_bytes(cfg_bytes)
     (tmp_path / "chat_template.jinja").write_text("{{ messages }}")
     (tmp_path / "generation_config.json").write_text("{}")
-    references, payloads, _, _ = load_resources(tmp_path, vocab_size=4)
+    references, payloads, _, _ = load_resources(tmp_path, vocab_size=4, normalize=normalize_tokenizer)
     assert payloads[references["text"]["tokenizer.json"]] == tok_bytes
     assert payloads[references["text"]["tokenizer_config.json"]] == cfg_bytes
 
@@ -176,7 +178,7 @@ def test_defective_prefix_semantics_are_normalized(tmp_path):
         "tokenizer_class": "Qwen2Tokenizer",
     }
     _write_text_resources(tmp_path, tokenizer, config)
-    references, payloads, _, _ = load_resources(tmp_path, vocab_size=4)
+    references, payloads, _, _ = load_resources(tmp_path, vocab_size=4, normalize=normalize_tokenizer)
     stored = json.loads(payloads[references["text"]["tokenizer_config.json"]])
     # Every C++-required invariant now holds.
     assert stored["add_bos_token"] is False

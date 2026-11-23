@@ -5,10 +5,49 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <vector>
 
 namespace infernix::models::qwen3_5 {
+namespace {
+
+constexpr runtime::ContextPrefillCost kGroupwise27bPrefill{
+    .chunk_ns              = 40'813'570,
+    .token_ns_q32          = 1'012'273'154'411'951,
+    .attention_pair_ns_q32 = 30'497'396'515,
+    .vision_item_ns        = 5'986'585,
+    .vision_patch_ns_q32   = 23'710'212'854'694,
+};
+constexpr runtime::ContextPrefillCost kNvfp4Fp8Prefill{
+    .chunk_ns              = 14'672'989,
+    .token_ns_q32          = 375'800'765'711'778,
+    .attention_pair_ns_q32 = 8'200'474'657,
+    .vision_item_ns        = 5'860'255,
+    .vision_patch_ns_q32   = 23'832'529'381'413,
+};
+
+// Existing measurements apply to these Text bindings with Vision disabled/enabled. The signature
+// excludes trained values and the selected speculative backend; it describes the primary
+// reconstruction work priced by ContextPrefillCost.
+constexpr std::array<runtime::ContextCompiledPrefill, 4> kCompiledPrefill{{
+    {"nvidia-geforce-rtx-5090-sm120",
+     "200f57efee7b0fe1172dfd4a06b1e6e0b2dbc36dfcd6a242fea35338bb5ff0d2", kGroupwise27bPrefill},
+    {"nvidia-geforce-rtx-5090-sm120",
+     "badf2271162e72c8c51a91da02cbb4343d4b7574d037a014ca6862ff2862638b", kGroupwise27bPrefill},
+    {"nvidia-geforce-rtx-5090-sm120",
+     "e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a", kNvfp4Fp8Prefill},
+    {"nvidia-geforce-rtx-5090-sm120",
+     "953e22d9b9a6639c09f7389d49084b059dea07720bc0121dfd9c154002459915", kNvfp4Fp8Prefill},
+}};
+
+} // namespace
+
+runtime::ContextPrefillDefaults context_prefill_defaults() {
+    // The slower measured 27B configuration is the conservative estimate for an unmeasured
+    // configuration: it still receives continuous recomputation costs.
+    return {.fallback = kGroupwise27bPrefill, .compiled = kCompiledPrefill};
+}
 
 std::string prefill_signature(const Model& model) {
     using Json         = nlohmann::json;

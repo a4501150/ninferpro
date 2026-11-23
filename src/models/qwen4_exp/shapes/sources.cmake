@@ -1,8 +1,8 @@
 # Qwen4Exp (Qwen3.8-Flash-Next) linear shape tuning: the family owns its tuned (n, k)
 # instantiations (bf16 recipe A, fp8 recipe C, q8 recipe B); each dtype's <dtype>_shapes.cpp
-# lists the family's whole set in one table the ops dispatch scans; the table's external linkage
-# pulls every shape file it references out of the archive. The compile target stays infernix_ops
-# because the launch templates and RDC live there; no link-graph change.
+# lists the family's whole set in one table, which src/models/shapes.cpp registers with the ops
+# dispatch; that reference pulls every shape file the table lists out of the archive. The compile
+# target stays infernix_ops because the launch templates and RDC live there.
 target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/bf16/n10240_k320.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/n12800_k2560.cu"

@@ -1,6 +1,5 @@
 #include "serve/serve_options.h"
 
-#include "models/offload/expert_placement.h"
 #include "product/config/config_file.h"
 #include "product/logits_options.h"
 #include "product/speculative_options.h"
@@ -1007,8 +1006,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (text == "auto") {
                 options.experts.clear();
             } else {
-                static_cast<void>(models::offload::parse_experts_spec(text)); // grammar checked up front
-                options.experts = text;
+                options.experts = text; // the Engine checks its grammar before loading
             }
         } else if (arg == "--expert-placement") {
             options.expert_placement = std::filesystem::path(std::string(require_value("--expert-placement")));

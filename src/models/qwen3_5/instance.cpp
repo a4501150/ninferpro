@@ -1,4 +1,5 @@
 #include "models/qwen3_5/instance.h"
+#include "models/qwen3_5/sampling_defaults.h"
 #include "runtime/engine/engine_options.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "artifact/reader.h"
@@ -7,8 +8,10 @@
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/options.h"
 #include "models/qwen3_5/program/planning/fast_paths.h"
 #include "runtime/diagnostics.h"
+#include "runtime/engine/engine_backend_for.h"
 
 #include <algorithm>
 #include <system_error>
@@ -77,17 +80,16 @@ std::size_t current_free_device_bytes() {
 
 } // namespace
 
-
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
       frontend(models::qwen_common::make_frontend(
           model->resources(),
-          {.chat_template_path       = options.chat_template_path,
-           .grammar_cache_bytes      = options.grammar_cache_bytes,
-           .architecture             = model->config().text.architecture,
-           .vision_enabled           = options.enable_vision,
-           .max_context              = options.max_context,
+          {.chat_template_path  = options.chat_template_path,
+           .grammar_cache_bytes = options.grammar_cache_bytes,
+           .sampling       = models::qwen3_5::default_sampling(model->config().text.architecture),
+           .vision_enabled = options.enable_vision,
+           .max_context    = options.max_context,
            .media_cache_bytes        = options.media_cache_bytes,
            .media_live_bytes         = options.media_live_bytes,
            .media_preprocess_threads = options.media_preprocess_threads,
@@ -99,13 +101,14 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 ModelInstance::~ModelInstance() = default;
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
-    validate_engine_options(options, models::Architecture::Qwen3_5);
+    validate_engine_options(options, models::qwen3_5::option_rules());
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan = models::qwen3_5::plan_load(reader, models::load_options(options, models::Architecture::Qwen3_5));
+    auto plan = models::qwen3_5::plan_load(
+        reader, models::load_options(options, models::qwen3_5::kVisionOffloadAuto));
     plan.set_host_reserve(options.ram_headroom_bytes);
     binding.complete();
     auto model =
@@ -126,9 +129,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =
-                context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
-            .prefill_signature = signature},
-        options.context_cost.preset_path);
+             context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
+         .prefill_signature = signature},
+        models::qwen3_5::context_prefill_defaults(), options.context_cost.preset_path);
     const std::size_t base_headroom = options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes);
     std::size_t retry_headroom      = 0;
     std::uint32_t planned_prefill_chunk = 0, planned_idle_width = 0;
@@ -287,6 +290,42 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         }
     }
     return {std::move(instance), std::move(summary), std::move(metadata)};
+}
+
+std::string ModelInstance::prefix_cache_save_notice(const EngineOptions& options) const {
+    if (!options.context_cache.enabled || options.context_cache.hybrid.persistent_file.empty()) {
+        return {};
+    }
+    return "saving the prefix cache to " + options.context_cache.hybrid.persistent_file.string();
+}
+
+std::optional<PrefixCacheSave> ModelInstance::prefix_cache_shutdown_save() const {
+    const std::optional<models::qwen3_5::HybridCachePersistence> saved =
+        program->hybrid_shutdown_save();
+    if (!saved) { return std::nullopt; }
+    return PrefixCacheSave{.ok        = saved->ok,
+                           .message   = saved->message,
+                           .blocks    = saved->blocks,
+                           .snapshots = saved->snapshots,
+                           .bytes     = saved->bytes,
+                           .seconds   = saved->seconds};
+}
+
+ConstructedBackend construct_qwen3_5_backend(EngineOptions& options, DeviceContext& device) {
+    const bool tree_auto_requested = options.speculative.draft_tree_auto;
+    ConstructedModel constructed   = construct_model(options, device);
+    if (tree_auto_requested && !options.speculative.draft_tree_auto) {
+        publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Warning,
+            "automatic DFlash2 tree verification is unavailable for this artifact (its GDN "
+            "input projections are not single FP8 or NVFP4 parents); rounds verify chains");
+    }
+    StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+    ConstructedBackend out{.load           = std::move(constructed.load),
+                           .model_metadata = std::move(constructed.model_metadata)};
+    out.backend = make_engine_backend(std::move(constructed.instance), device, options);
+    finalize_phase.complete();
+    return out;
 }
 
 } // namespace infernix::runtime

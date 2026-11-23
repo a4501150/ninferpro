@@ -190,7 +190,7 @@ float oracle_uniform(std::uint64_t seed, std::int32_t position) {
     std::uint64_t key = seed;
     key = splitmix64(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position)) *
                             0xD1B54A32D192ED03ULL));
-    key = splitmix64(key ^ (static_cast<std::uint64_t>(ops::kSamplePurposeDFlash2Proposal) << 21));
+    key = splitmix64(key ^ (static_cast<std::uint64_t>(ops::kSamplePurposeDraftProposal) << 21));
     const std::uint32_t bits = static_cast<std::uint32_t>(key >> 40);
     return static_cast<float>(bits) * (1.0F / 16777216.0F);
 }

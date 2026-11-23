@@ -6,9 +6,12 @@ namespace infernix::ops::detail {
 
 Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) throw std::invalid_argument("q5 linear: T must be positive");
-    for (std::size_t i = 0; i < qwen3_5_q5_shapes_count; ++i) {
-        const Q5ShapeEntry& entry = qwen3_5_q5_shapes[i];
-        if (entry.n == n && entry.k == k) return entry.select(t);
+    for (std::size_t s = 0; s < q5_linear_shape_set_count; ++s) {
+        const auto& set = q5_linear_shape_sets[s];
+        for (std::size_t i = 0; i < *set.count; ++i) {
+            const Q5ShapeEntry& entry = set.rows[i];
+            if (entry.n == n && entry.k == k) return entry.select(t);
+        }
     }
     throw std::invalid_argument("q5 linear: unsupported shape");
 }

@@ -535,23 +535,6 @@ fi::OutputMarkerTokens output_marker_tokens(const fi::Tokenizer& tokenizer,
 
 } // namespace
 
-ModelSamplingDefaults default_sampling(Architecture architecture) {
-    ModelSamplingDefaults sampling;
-    sampling.thinking     = {.temperature      = 1.0F,
-                             .top_k            = 20,
-                             .top_p            = 0.95F,
-                             .min_p            = 0.0F,
-                             .presence_penalty = architecture == Architecture::Qwen3_5Moe ? 1.5F : 0.0F,
-                             .frequency_penalty = 0.0F};
-    sampling.non_thinking = {.temperature       = 0.7F,
-                             .top_k             = 20,
-                             .top_p             = 0.80F,
-                             .min_p             = 0.0F,
-                             .presence_penalty  = 1.5F,
-                             .frequency_penalty = 0.0F};
-    return sampling;
-}
-
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, FrontendOptions options)
@@ -600,7 +583,7 @@ public:
                 if (tokenizer->is_special_token(id)) { ngram_boundaries.push_back(id); }
             }
         }
-        sampling            = default_sampling(options.architecture);
+        sampling            = options.sampling;
         grammar_cache_bytes = options.grammar_cache_bytes;
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {

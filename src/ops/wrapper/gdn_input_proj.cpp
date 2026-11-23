@@ -280,7 +280,7 @@ void require_q8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
 }
 
 // Qwen3.8-Flash-Next's Q8_G32_FP16 [16384,2560] query/key/value/z parent.
-void require_q8_flash_next_parent(const Weight& weight, const char* operation) {
+void require_q8_n16384_k2560_parent(const Weight& weight, const char* operation) {
     if (weight.qtype != QType::Q8_G32_FP16 || weight.n != 16384 || weight.k != 2560 ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.ndim != 2 ||
         weight.padded_shape[1] != 2560 || weight.qhigh != nullptr ||
@@ -358,7 +358,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         require_matrix(qkv, kQkvRows, cols, "qkv");
         require_matrix(z, kZRows, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
-        require_q8_flash_next_parent(weight, "gdn_input_proj");
+        require_q8_n16384_k2560_parent(weight, "gdn_input_proj");
         detail::launch_q8_n16384_k2560_split(x, weight, qkv, z, routes, stream);
         return;
     }
@@ -1083,7 +1083,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot: unsupported route set");
     }
-    require_q8_flash_next_parent(query_key_value_z_weight, kOperation);
+    require_q8_n16384_k2560_parent(query_key_value_z_weight, kOperation);
     const std::int32_t batch = x.ne[2];
     if (x.ne[1] != 1 || batch <= 0 || batch > kMaxBatch) {
         throw std::invalid_argument(

@@ -1,10 +1,9 @@
 # The shared expert-offload tier (docs/maintainer/moe-offload-design.md), extracted from
 # Qwen4Exp: the expert placement and store, the host expert cache (LFRU policy,
-# frames, controller, saved state, calibrated order, RAM-level HostTier), the VRAM residency
+# frames, controller, saved state, RAM-level HostTier), the VRAM residency
 # controller, the SSD tier's HostExpertTier, the route trace and the VRAM monitor. Host-only
 # components each Program composes; Qwen4Exp's loading and runtime link it.
 add_library(infernix_offload STATIC
-  "${CMAKE_CURRENT_LIST_DIR}/calibrated_order.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_placement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_residency.cpp"

@@ -1,6 +1,5 @@
 #include "serve/http_server.h"
 
-#include "models/offload/expert_placement.h"
 
 #include "product/logging/logging.h"
 #include "serve/anthropic_messages.h"
@@ -683,33 +682,29 @@ void HttpServer::handle_expert_placement_post(const httplib::Request& req, httpl
             for (std::size_t i = 0; i < terms.size(); ++i) {
                 spec_text += (i == 0 ? "" : ",") + terms[i];
             }
-            const auto spec = infernix::models::offload::parse_experts_spec(spec_text);
-            const auto [vram_count, ram_count] =
-                infernix::models::offload::experts_spec_counts(spec, now.total_experts);
+            const infernix::ExpertPlacementPreview preview =
+                service_->preview_expert_placement(spec_text);
             if (dry_run) {
-                // The preview: the placement's own numbers, applied to nothing.
-                const std::uint64_t frames_bytes = vram_count * now.frame_bytes;
-                const std::uint64_t ram_bytes    = ram_count * now.expert_record_bytes;
-                const std::uint64_t free_after   = now.vram_free + now.pool_bytes > frames_bytes
-                                                       ? now.vram_free + now.pool_bytes - frames_bytes
-                                                       : 0;
-                res.set_content(
-                    nlohmann::json{{"dry_run", true},
-                                   {"applied", false},
-                                   {"total_experts", now.total_experts},
-                                   {"placement", {{"vram", vram_count}, {"ram", ram_count},
-                                                  {"ssd", now.total_experts - vram_count - ram_count}}},
-                                   {"predicted",
-                                    {{"vram_expert_bytes", frames_bytes},
-                                     {"vram_free_after", free_after},
-                                     {"ram_expert_bytes", ram_bytes},
-                                     {"ram_tier_slots", now.tier_slots},
-                                     {"fits", frames_bytes <= now.vram_free + now.pool_bytes},
-                                     {"ram_fits", ram_bytes <= now.host_available}}}}
-                        .dump(),
-                    "application/json");
+                res.set_content(nlohmann::json{{"dry_run", true},
+                                               {"applied", false},
+                                               {"total_experts", preview.total_experts},
+                                               {"placement",
+                                                {{"vram", preview.vram_experts},
+                                                 {"ram", preview.ram_experts},
+                                                 {"ssd", preview.ssd_experts}}},
+                                               {"predicted",
+                                                {{"vram_expert_bytes", preview.vram_expert_bytes},
+                                                 {"vram_free_after", preview.vram_free_after},
+                                                 {"ram_expert_bytes", preview.ram_expert_bytes},
+                                                 {"ram_tier_slots", preview.ram_tier_slots},
+                                                 {"fits", preview.fits},
+                                                 {"ram_fits", preview.ram_fits}}}}
+                                    .dump(),
+                                "application/json");
                 return;
             }
+            const std::uint64_t vram_count = preview.vram_experts;
+            const std::uint64_t ram_count  = preview.ram_experts;
             // vram=all maps to the resident default (the whole cache, no host expert bytes).
             request.vram_experts = vram_count >= now.total_experts ? now.frame_limit
                                                                    : static_cast<std::uint32_t>(vram_count);

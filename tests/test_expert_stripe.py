@@ -1,4 +1,4 @@
-"""Expert stripes (tools/flash_next/expert_stripe.py): the tails of every routed expert record,
+"""Expert stripes (tools/artifact/expert_stripe.py): the tails of every routed expert record,
 written for a second drive. Against the artifact's own bytes: the header the C++ reader parses
 (src/models/offload/expert_store.h), every tail, records that straddle part files, the split
 fraction rounded to 4 KiB, verification of a damaged stripe, and refusal of another artifact."""
@@ -13,7 +13,7 @@ import pytest
 from tools.artifact.layouts import fp8_expert_geometry
 from tools.artifact.schema import ArtifactError, TensorSpec
 from tools.artifact.writer import ArtifactWriter
-from tools.flash_next.expert_stripe import read_header, verify, write
+from tools.artifact.expert_stripe import read_header, verify, write
 
 SHAPE = (3, 256, 128)  # experts, hidden, intermediate
 FORMAT, LAYOUT = "fp8_e4m3fn_b128", "fp8_expert_b128_v1"

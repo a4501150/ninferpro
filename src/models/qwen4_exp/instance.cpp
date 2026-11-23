@@ -7,15 +7,18 @@
 #include "core/vram_budget.h"
 #include "models/load_options.h"
 #include "models/offload/expert_placement.h"
+#include "models/qwen4_exp/calibrated_order.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/memory_plan.h"
-#include "models/offload/calibrated_order.h"
+#include "models/qwen4_exp/options.h"
 #include "models/offload/expert_state.h"
 #include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/sampling_defaults.h"
 #include "models/offload/route_trace.h"
 #include "models/offload/vram_monitor.h"
 #include "models/registry.h"
+#include "runtime/engine/engine_backend_for.h"
 #include "runtime/engine/engine_options.h"
 
 #include <algorithm>
@@ -120,18 +123,19 @@ void validate(const EngineOptions& options) {
 
 } // namespace
 
-Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
+Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source,
+                                   const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
-      frontend(models::qwen_common::make_frontend(model->resources(),
-                                              {.chat_template_path      = options.chat_template_path,
-                                               .architecture            = models::Architecture::Qwen4Exp,
-                                               .vision_enabled          = options.enable_vision,
-                                               .max_context             = options.max_context,
-                                               .media_cache_bytes       = options.media_cache_bytes,
-                                               .media_live_bytes        = options.media_live_bytes,
-                                               .media_preprocess_threads = options.media_preprocess_threads,
-                                               .vision_max_merged_tokens = options.vision_max_merged_tokens,
-                                               .thinking_budget_message = options.thinking_budget_message})),
+      frontend(models::qwen_common::make_frontend(
+          model->resources(), {.chat_template_path       = options.chat_template_path,
+                               .sampling                 = models::qwen4_exp::default_sampling(),
+                               .vision_enabled           = options.enable_vision,
+                               .max_context              = options.max_context,
+                               .media_cache_bytes        = options.media_cache_bytes,
+                               .media_live_bytes         = options.media_live_bytes,
+                               .media_preprocess_threads = options.media_preprocess_threads,
+                               .vision_max_merged_tokens = options.vision_max_merged_tokens,
+                               .thinking_budget_message  = options.thinking_budget_message})),
       capacity(options.max_context) {}
 
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
@@ -145,7 +149,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("artifact is not Qwen4ExpForCausalLM");
     }
     inspect.complete();
-    auto plan = models::qwen4_exp::plan_load(reader, models::load_options(options, models::Architecture::Qwen4Exp));
+    auto plan = models::qwen4_exp::plan_load(
+        reader, models::load_options(options, models::qwen4_exp::kVisionOffloadAuto));
     // The RAM ledger (design §9.8): the experts take what the reserve and every other planned
     // allocation leave, before anything is pinned or read.
     models::qwen4_exp::HostMemoryDemand demand;
@@ -307,9 +312,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             }
         }
         if (counts.empty() && ranked.empty() && text_config.hidden_size == 2560 &&
-            placement_layers == models::offload::expert_cache::kCalibratedLayers &&
-            placement_experts == models::offload::expert_cache::kCalibratedExperts) {
-            const auto calibrated = models::offload::expert_cache::calibrated_expert_order();
+            placement_layers == models::qwen4_exp::kCalibratedLayers &&
+            placement_experts == models::qwen4_exp::kCalibratedExperts) {
+            const auto calibrated = models::qwen4_exp::calibrated_expert_order();
             counts = calibrated.counts;
             ranked = calibrated.ranked;
             return true;
@@ -467,7 +472,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
     const bool tier = ledger.placement == models::qwen4_exp::ExpertPlacement::Tier;
     if (tier) {
-        auto streamed           = models::load_options(options, models::Architecture::Qwen4Exp);
+        auto streamed = models::load_options(options, models::qwen4_exp::kVisionOffloadAuto);
         streamed.stream_experts = true;
         plan                    = models::qwen4_exp::plan_load(reader, streamed);
     }
@@ -768,6 +773,60 @@ bool Qwen4ExpInstance::export_expert_placement(const std::filesystem::path& path
         return false;
     }
     return program->export_expert_placement(path, error);
+}
+
+ExpertPlacementPreview
+Qwen4ExpInstance::preview_expert_placement(const std::string& experts_spec,
+                                           const ExpertPlacementReport& now) const {
+    if (!now.supported || now.total_experts == 0) {
+        throw std::invalid_argument("this model runs without the expert cache");
+    }
+    const models::offload::ExpertsSpec spec = models::offload::parse_experts_spec(experts_spec);
+    const auto [vram, ram] = models::offload::experts_spec_counts(spec, now.total_experts);
+    const std::uint64_t frames_bytes = vram * now.frame_bytes;
+    const std::uint64_t available    = now.vram_free + now.pool_bytes;
+    return {.total_experts     = now.total_experts,
+            .vram_experts      = vram,
+            .ram_experts       = ram,
+            .ssd_experts       = now.total_experts - vram - ram,
+            .vram_expert_bytes = frames_bytes,
+            .vram_free_after   = available > frames_bytes ? available - frames_bytes : 0,
+            .ram_expert_bytes  = ram * now.expert_record_bytes,
+            .ram_tier_slots    = now.tier_slots,
+            .fits              = frames_bytes <= available,
+            .ram_fits          = ram * now.expert_record_bytes <= now.host_available};
+}
+
+std::string Qwen4ExpInstance::prefix_cache_save_notice(const EngineOptions& options) const {
+    const HybridPrefixCacheOptions& hybrid = options.context_cache.hybrid;
+    if (!options.context_cache.enabled || hybrid.disk_directory.empty()) { return {}; }
+    return (options.context_cache.host_capacity_bytes.value_or(1U) == 0
+                ? "finishing the prefix cache's writes to its Disk tier in "
+                : "spilling the prefix cache to its Disk tier in ") +
+           hybrid.disk_directory.string();
+}
+
+std::optional<PrefixCacheSave> Qwen4ExpInstance::prefix_cache_shutdown_save() const {
+    const std::optional<models::qwen4_exp::PrefixCacheDiskSpill> spill =
+        program->prefix_shutdown_spill();
+    if (!spill) { return std::nullopt; }
+    return PrefixCacheSave{.ok        = spill->ok,
+                           .message   = spill->message,
+                           .blocks    = spill->blocks,
+                           .snapshots = spill->snapshots,
+                           .bytes     = spill->bytes,
+                           .seconds   = spill->seconds};
+}
+
+ConstructedBackend construct_qwen4_exp_backend(EngineOptions& options, DeviceContext& device) {
+    ConstructedQwen4Exp constructed = construct_qwen4_exp(options, device);
+    options                         = std::move(constructed.options);
+    StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+    ConstructedBackend out{.load           = std::move(constructed.load),
+                           .model_metadata = std::move(constructed.model_metadata)};
+    out.backend = make_engine_backend(std::move(constructed.instance), device, options);
+    finalize_phase.complete();
+    return out;
 }
 
 } // namespace infernix::runtime

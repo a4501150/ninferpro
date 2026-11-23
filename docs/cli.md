@@ -297,7 +297,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768`; larger media is downscaled during preprocessing | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--expert-state FILE\|off` | Qwen3.8-Flash-Next: the expert cache's saved state, seeded from at startup and rewritten at stop and every 10 minutes between requests; `off` starts with an empty cache and saves nothing (cold benchmarks). The full contract is [serving](serving.md#server-options)'s | `<artifact>.expert-state` |
-| `--expert-stripe FILE` | Qwen3.8-Flash-Next with the SSD expert tier: an expert stripe (`tools/flash_next/expert_stripe.py`) holding the tail of every expert record on a second drive, read beside each record's head from the artifact; the stripe must belong to the artifact, and it is unused when every expert fits in RAM ([guide](qwen3_8-flash-next.md#ssd-expert-tier)) | none |
+| `--expert-stripe FILE` | Qwen3.8-Flash-Next with the SSD expert tier: an expert stripe (`tools/artifact/expert_stripe.py`) holding the tail of every expert record on a second drive, read beside each record's head from the artifact; the stripe must belong to the artifact, and it is unused when every expert fits in RAM ([guide](qwen3_8-flash-next.md#ssd-expert-tier)) | none |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |

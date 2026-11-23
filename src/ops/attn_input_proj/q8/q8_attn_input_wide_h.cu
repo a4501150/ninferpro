@@ -86,10 +86,10 @@ void launch_mma(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Ten
 
 } // namespace
 
-void q8_dflash2_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q,
-                                          Tensor& k, Tensor& v, cudaStream_t stream) {
+void q8_attn_input_wide_h_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                         Tensor& k, Tensor& v, cudaStream_t stream) {
     if (x.ne[1] < 1 || x.ne[1] > kLastSmallTokens) {
-        throw std::invalid_argument("Q8 DFlash2 attention input small-T: unsupported T");
+        throw std::invalid_argument("Q8 wide-H attention input small-T: unsupported T");
     }
     switch (x.ne[0]) {
     case 5120:
@@ -97,36 +97,36 @@ void q8_dflash2_attn_input_small_t_launch(const Tensor& x, const Weight& weight,
     case 2560:
         return small_t<2560>(x, weight, q, k, v, stream);
     }
-    throw std::invalid_argument("Q8 DFlash2 attention input small-T: unsupported H");
+    throw std::invalid_argument("Q8 wide-H attention input small-T: unsupported H");
 }
 
-void q8_dflash2_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,
-                                              Tensor& k, Tensor& v, cudaStream_t stream) {
+void q8_attn_input_wide_h_mma_r32_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                             Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<32, 64, 64, 32, 16, 2, 3>;
     launch_mma<Schedule>(x, weight, q, k, v, stream);
 }
 
-void q8_dflash2_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
-                                               Tensor& k, Tensor& v, cudaStream_t stream) {
+void q8_attn_input_wide_h_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                              Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
     launch_mma<Schedule>(x, weight, q, k, v, stream);
 }
 
-void q8_dflash2_attn_input_mma_r16_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
-                                                   Tensor& k, Tensor& v, cudaStream_t stream) {
+void q8_attn_input_wide_h_mma_r16_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
+                                                  Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<16, 64, 128, 16, 16, 1, 1>;
     // This route owns only the partial 49..63-column tile.
     launch_mma<Schedule>(x, w, q, k, v, stream);
 }
 
-void q8_dflash2_attn_input_mma_r32_c32_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
-                                                   Tensor& k, Tensor& v, cudaStream_t stream) {
+void q8_attn_input_wide_h_mma_r32_c32_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
+                                                  Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<32, 32, 128, 16, 16, 1, 1>;
     launch_mma<Schedule>(x, w, q, k, v, stream);
 }
 
-void q8_dflash2_attn_input_mma_r32_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
-                                                   Tensor& k, Tensor& v, cudaStream_t stream) {
+void q8_attn_input_wide_h_mma_r32_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
+                                                  Tensor& k, Tensor& v, cudaStream_t stream) {
     // Three-block launch bounds reduce register usage and keep all 384 decode CTAs in one wave.
     using Schedule = Q8A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>;
     launch_mma<Schedule>(x, w, q, k, v, stream);

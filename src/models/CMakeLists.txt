@@ -3,7 +3,7 @@ add_library(infernix_model_loading STATIC registry.cpp)
 infernix_internal_includes(infernix_model_loading)
 target_link_libraries(infernix_model_loading PUBLIC infernix_artifact infernix_text infernix_ops)
 
-add_library(infernix_model_runtime STATIC)
+add_library(infernix_model_runtime STATIC registry_engine.cpp)
 infernix_internal_includes(infernix_model_runtime)
 target_link_libraries(infernix_model_runtime
   PUBLIC infernix_model_loading infernix_ops infernix_runtime_support
@@ -14,9 +14,11 @@ target_include_directories(infernix_model_runtime SYSTEM PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
 
 # The families' tuned linear shapes compile into infernix_ops (the launch templates and RDC
-# live there); each family owns and lists its own shape files.
+# live there); each family owns and lists its own shape files, and shapes.cpp registers every
+# family's tables with the linear dispatch.
 include(qwen3_5/shapes/sources.cmake)
 include(qwen4_exp/shapes/sources.cmake)
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes.cpp")
 
 include(qwen3_5/loading_sources.cmake)
 include(qwen3_5/execution_sources.cmake)

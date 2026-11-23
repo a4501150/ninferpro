@@ -2,7 +2,7 @@
 #include "infernix/ops/context_kv_materialize.h"
 
 #include "core/layout.h"
-#include "ops/common/dflash_rope_table.h"
+#include "ops/common/rope_d128_theta1e7_table.h"
 #include "ops/context_kv_materialize/launch.h"
 
 #include <algorithm>
@@ -170,7 +170,7 @@ void context_kv_materialize(
         key_scratch = allocate_key_scratch(workspace, columns);
     // theta^(-2j/128): the stored words of the 1e7 table, else prepare_rope's (so these keys rotate
     // exactly as a prepared rmsnorm_rope rotates the query block's).
-    static constexpr std::array<double, 64> k1e7{INFERNIX_DFLASH_ROPE_1E7_INV_FREQUENCY};
+    static constexpr std::array<double, 64> k1e7{INFERNIX_ROPE_D128_THETA1E7_INV_FREQUENCY};
     std::array<double, 64> inv_frequency = k1e7;
     if (rope_theta != 1.0e7F) {
         for (int pair = 0; pair < 64; ++pair) {

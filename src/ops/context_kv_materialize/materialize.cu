@@ -37,7 +37,7 @@ struct DeviceLayers {
     double inv_frequency[64];
 };
 
-// dflash_rope_sincos's range reduction over the call's frequencies.
+// rope_d128_theta1e7_sincos's range reduction over the call's frequencies.
 __device__ __forceinline__ void rope_sincos(const DeviceLayers& layers, const int* positions,
                                             int token, int pair, float* sine, float* cosine) {
     constexpr double kInvTwoPi = 1.59154943091895336e-01;

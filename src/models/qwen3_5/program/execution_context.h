@@ -33,7 +33,7 @@ struct ExecutionCore {
     const execution::Parameters& parameters;
     WorkspaceArena& work;
     qwen3_5::StateImageDevicePool& state_images;
-    const GdnReplayRecords* replay_records;
+    const ops::GdnReplayRecords* replay_records;
     qwen3_5::RoundState& io;
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
@@ -140,7 +140,7 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
-    const GdnReplayRecords* replay_records = nullptr;
+    const ops::GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
     // Tree verification: each row's device-built tree (I32 [words,B]) and its ancestor masks

@@ -119,6 +119,11 @@ public:
     [[nodiscard]] bool request_expert_placement(const ExpertPlacementSwitch& request, std::string* error = nullptr);
     // Writes the current placement and ranking to `path`, loadable by --expert-placement.
     [[nodiscard]] bool export_expert_placement(const std::filesystem::path& path, std::string* error = nullptr);
+    // What a counts switch to `experts_spec` (--experts' grammar) would take; applies nothing.
+    // Throws std::invalid_argument for a malformed spec, one the placement cannot take, or a
+    // model without an expert cache.
+    [[nodiscard]] ExpertPlacementPreview
+    preview_expert_placement(const std::string& experts_spec) const;
 
     // Begins the orderly stop without waiting for it: new work is refused, and queued and active
     // generation requests end with an Unavailable error within one unit of work. A Generation

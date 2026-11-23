@@ -23,9 +23,10 @@ from tools.artifact.codecs.nvfp4_expert import encode_nvfp4_expert_bank
 from tools.artifact.layouts import expert_bank_geometry, fp8_expert_geometry
 from tools.flash_next.ngram import NgramConfig, head_tables, layer_multipliers
 
+from .config_values import _f32, _fixed, _positive
 from .methods import PrepareRequest, PreparedMethod
 from .model import Model, Parameter
-from .qwen3_5 import _Builder, _f32, _fixed, _positive, _rope_source, vision_config
+from .qwen_common import _Builder, _rope_source, normalize_tokenizer, vision_config
 from .resources import load_resources
 from .sources.logical import LogicalSource
 from .sources.modelopt import (
@@ -673,6 +674,7 @@ def build_model(
         vocab_size=config["vocab_size"],
         vision_config=records["vision"]["config"] if "vision" in selected else None,
         overrides=resource_overrides,
+        normalize=normalize_tokenizer,
     )
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
@@ -714,12 +716,13 @@ def build_dflash2_companion(base: SafetensorsSource, draft: SafetensorsSource) -
     proposal head, so the companion declares its Uses of those target parameters. Its config
     records the target identity the loader checks (``target_config``)."""
 
-    from .qwen3_5 import draft_config
+    from .qwen_common import draft_config
 
     target = text_config(base.config, mtp=False)
     config = draft_config(draft.config, target, "dflash2")
     config["target_config"] = {key: target[key] for key in DFLASH2_TARGET_FIELDS}
-    _, _, count, special = load_resources(base.root, vocab_size=target["vocab_size"])
+    _, _, count, special = load_resources(base.root, vocab_size=target["vocab_size"],
+                                          normalize=normalize_tokenizer)
     if config["dflash_config"]["selector_top_k"] > count:
         raise ValueError("DFlash2 selector_top_k exceeds public token domain")
     model = Model(

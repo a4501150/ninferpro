@@ -344,10 +344,12 @@ FrontendResources bind_resources(artifact::Binder& binder, const Config& config)
     }
     // The shared frontend validates the token domain against the embedding rows and, with vision,
     // the preprocessors against the tower.
-    qwen3_5::Config domain;
-    domain.text.vocab_size = config.text.vocab_size;
-    domain.vision          = config.vision;
-    qwen_common::parse_resources(out, domain);
+    qwen_common::parse_resources(
+        out, {.vocab_size     = config.text.vocab_size,
+              .vision         = config.vision ? &*config.vision : nullptr,
+              .selector_top_k = config.dflash2
+                                    ? std::optional<std::uint32_t>(config.dflash2->selector_top_k)
+                                    : std::nullopt});
     return out;
 }
 

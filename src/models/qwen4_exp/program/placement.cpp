@@ -54,7 +54,7 @@ void ProgramImpl::warm_start_experts() {
             source = SeedSource::Saved;
         } else if (has_calibrated_order()) {
             diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
-            load.state = offload::expert_cache::calibrated_expert_order();
+            load.state = qwen4_exp::calibrated_expert_order();
             source     = SeedSource::Calibrated;
         }
     }
@@ -130,8 +130,8 @@ void ProgramImpl::warm_start_experts() {
 }
 
 bool ProgramImpl::has_calibrated_order() const noexcept {
-    return c_.hidden_size == 2560 && c_.num_hidden_layers == offload::expert_cache::kCalibratedLayers &&
-           c_.moe.experts == offload::expert_cache::kCalibratedExperts && c_.moe.top_k == 10 &&
+    return c_.hidden_size == 2560 && c_.num_hidden_layers == qwen4_exp::kCalibratedLayers &&
+           c_.moe.experts == qwen4_exp::kCalibratedExperts && c_.moe.top_k == 10 &&
            c_.moe.intermediate == 640 && c_.moe.shared_intermediate == 640;
 }
 

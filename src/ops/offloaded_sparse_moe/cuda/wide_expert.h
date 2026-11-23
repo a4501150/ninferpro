@@ -27,7 +27,7 @@
 #include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "ops/common/canonical_math.h"
-#include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
+#include "ops/offloaded_sparse_moe/expert_layout.h"
 
 #include <cuda_runtime.h>
 

@@ -1,11 +1,12 @@
 #pragma once
 
-// The Qwen3.5 family's option defaults and refusals: the family's branches of the shared
+// The Qwen3.5 family's option defaults and refusals: its FamilyOptionRules, which the shared
 // runtime::validate_engine_options / runtime::normalize_engine_options
-// (src/runtime/engine/engine_options.cpp), which calls them at their original points. The
-// messages name the families because the flags are shared vocabulary across them.
+// (src/runtime/engine/engine_options.cpp) call at fixed points. The messages name the families
+// because the flags are shared vocabulary across them.
 
 #include "infernix/types.h"
+#include "runtime/engine/engine_options.h"
 
 namespace infernix::models::qwen3_5 {
 
@@ -16,6 +17,10 @@ constexpr std::uint32_t kPrefillChunk = 1024U;
 // An automatic draft length chooses up to the model's most drafts unless given a ceiling: the
 // Qwen3.5 planner captures 5 columns.
 constexpr std::uint32_t kDraftTokensAuto = 5U;
+
+// --vision-offload auto: off; the family borrows the encode window's device memory from an
+// evictable weight ladder.
+constexpr bool kVisionOffloadAuto = false;
 
 // --vram-headroom-mib is what automatic KV capacity leaves; an explicit capacity has none
 // (Qwen3.8-Flash-Next's is what its expert cache leaves, with any KV capacity).
@@ -28,6 +33,12 @@ void validate_expert_tail_skip(const EngineOptions& options);
 // --draft-tokens auto drafts with --spec mtp only here.
 void validate_draft_backend(const EngineOptions& options);
 
+// The head's logits are BF16.
+void validate_logits_dtype(const EngineOptions& options);
+
+// The prefix cache Disk tier belongs to Qwen3.8-Flash-Next.
+void validate_disk_tier(const EngineOptions& options);
+
 // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; this family
 // refuses it rather than ignoring a tuning value.
 void validate_draft_min_p(const EngineOptions& options);
@@ -39,5 +50,7 @@ void validate_draft_min_p(const EngineOptions& options);
 // prefixes), and the default tool-call hold.
 void resolve_cache(ContextCacheOptions& cache, const EngineOptions& options, std::uint32_t concurrency,
                     bool host_tier);
+
+[[nodiscard]] const runtime::FamilyOptionRules& option_rules();
 
 } // namespace infernix::models::qwen3_5

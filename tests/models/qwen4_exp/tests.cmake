@@ -1,5 +1,6 @@
 infernix_add_test(infernix_qwen4_exp_expert_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_cache.cpp"
+          "${PROJECT_SOURCE_DIR}/src/models/qwen4_exp/calibrated_order.cpp"
   LIBRARIES infernix_offload
   NEEDS_SOURCE_DIR)
 

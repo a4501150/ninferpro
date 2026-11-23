@@ -35,7 +35,7 @@ namespace infernix::ops {
  * A row with configs[b].temperature<=0 selects the lowest candidate rank attaining max(edge) and
  * writes its exact one-hot distribution. A positive-temperature row writes the FP32 softmax of
  * edge/temperature, then draws a candidate with counter key
- * (configs[b].seed,base_positions[b]+i,kSamplePurposeDFlash2Proposal). The selected global id is
+ * (configs[b].seed,base_positions[b]+i,kSamplePurposeDraftProposal). The selected global id is
  * written to drafts[i,b] and becomes the next predecessor. The Op ignores all other
  * SamplingConfig fields and never updates token_counts.
  *
@@ -70,7 +70,7 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
  * values along v's path and the expectation is taken over the child's draw given v's earlier
  * children (the best untaken rank for greedy rows, which score with the temperature-1 law). The
  * winner's next child is drawn without replacement from q_v restricted to its untaken ranks with
- * counter key (seed, base+i-1, kSamplePurposeDFlash2Proposal, ((v+1) << 5) | j) for sibling j;
+ * counter key (seed, base+i-1, kSamplePurposeDraftProposal, ((v+1) << 5) | j) for sibling j;
  * greedy rows take the best untaken rank. A child never exceeds depth K and a row never exceeds
  * shape.paths leaves. Since a child's priority is fixed before it is drawn, the tree's shape never
  * depends on a column's own token, which keeps recursive rejection sampling exact.

@@ -203,7 +203,7 @@ void speculative_accept_sparse_drafts(
  *   the support is the ranks before the first with w[j] < min_p * w[0] (min_p>0), cut after the
  *   shortest prefix whose weight reaches top_p * sum_{j<m} w[j] (top_p<1), and at least rank 0;
  *   q[j] = w[j] / sum_{support} w. The draft is the first rank whose cumulative q exceeds
- *   u = sampling_uniform(seed, positions[t], kSamplePurposeDFlash2Proposal, draw), the last support
+ *   u = sampling_uniform(seed, positions[t], kSamplePurposeDraftProposal, draw), the last support
  *   rank if none does: a caller drawing several drafts at one position (chained steps at a clamped
  *   position) gives each its own `draw`. Penalties, masks and token_counts are not read: q is only
  *   the distribution the draft was drawn from, and the acceptance Op applies the sampler to the

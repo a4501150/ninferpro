@@ -71,17 +71,31 @@ struct ResolvedContextMachineCost {
     ContextCostSummary summary;
 };
 
+struct ContextCompiledPrefill {
+    std::string_view hardware_class;
+    std::string_view prefill_signature;
+    ContextPrefillCost cost;
+};
+
+// A model family's accepted prefill costs, compiled into the binary: the estimate for an
+// unmeasured configuration and the measured cost of each hardware class and prefill signature.
+struct ContextPrefillDefaults {
+    ContextPrefillCost fallback;
+    std::span<const ContextCompiledPrefill> compiled;
+};
+
 [[nodiscard]] std::string context_cost_hardware_class(std::string_view gpu_name, int major,
                                                       int minor);
-[[nodiscard]] ContextMachineCostModel generic_context_machine_cost_model();
 
 [[nodiscard]] std::vector<ContextCostMachinePreset>
 parse_context_cost_presets(std::string_view json, std::string_view source_name);
 
-// Transfer and prefill are resolved independently. Generic numerical defaults always exist;
-// compiled hardware/model values and then matching external values override them.
+// Transfer and prefill are resolved independently. Generic transfer and the family's fallback
+// prefill always exist; compiled hardware/model values and then matching external values override
+// them.
 [[nodiscard]] ResolvedContextMachineCost
 resolve_context_machine_cost(const ContextCostIdentity& identity,
+                             const ContextPrefillDefaults& prefill_defaults,
                              const std::filesystem::path& external_preset_path = {});
 
 // Calibration updates one independently measurable component and preserves every other component.

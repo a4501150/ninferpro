@@ -21,8 +21,7 @@
 namespace infernix::runtime {
 
 const std::array<ContextTransferCost, 3>& generic_context_transfer_cost();
-const ContextPrefillCost& generic_context_prefill_cost();
-const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
+const std::vector<ContextCostMachinePreset>& compiled_context_transfer_defaults();
 
 namespace {
 
@@ -318,11 +317,6 @@ std::string context_cost_hardware_class(std::string_view gpu_name, int major, in
     return slug + "-sm" + std::to_string(major) + std::to_string(minor);
 }
 
-ContextMachineCostModel generic_context_machine_cost_model() {
-    return ContextMachineCostModel{.transfer = generic_context_transfer_cost(),
-                                   .prefill  = generic_context_prefill_cost()};
-}
-
 std::vector<ContextCostMachinePreset> parse_context_cost_presets(std::string_view json,
                                                                  std::string_view source_name) {
     const Json document = parse_document(json, source_name);
@@ -391,26 +385,31 @@ std::vector<ContextCostMachinePreset> parse_context_cost_presets(std::string_vie
 
 ResolvedContextMachineCost
 resolve_context_machine_cost(const ContextCostIdentity& identity,
+                             const ContextPrefillDefaults& prefill_defaults,
                              const std::filesystem::path& external_preset_path) {
     if (identity.hardware_class.empty() || identity.prefill_signature.empty()) {
         throw std::invalid_argument("context-cost identity contains an empty component");
     }
 
+    validate_prefill(prefill_defaults.fallback, "compiled context-cost prefill fallback");
     ContextMachineCostModel model{.transfer = generic_context_transfer_cost(),
-                                  .prefill  = generic_context_prefill_cost()};
+                                  .prefill  = prefill_defaults.fallback};
     ContextCostPresetSource transfer_source = ContextCostPresetSource::GenericDefault;
     ContextCostPresetSource prefill_source  = ContextCostPresetSource::GenericDefault;
 
-    const auto& compiled = compiled_context_cost_defaults();
+    const auto& compiled = compiled_context_transfer_defaults();
     validate_presets(compiled, "compiled context-cost defaults");
     if (const ContextCostMachinePreset* machine = find_machine(compiled, identity.hardware_class)) {
         if (machine->transfer) {
             model.transfer  = *machine->transfer;
             transfer_source = ContextCostPresetSource::CompiledDefault;
         }
-        if (const ContextPrefillPreset* prefill =
-                find_prefill(*machine, identity.prefill_signature)) {
-            model.prefill  = prefill->cost;
+    }
+    for (const ContextCompiledPrefill& preset : prefill_defaults.compiled) {
+        validate_prefill(preset.cost, "compiled context-cost prefill");
+        if (preset.hardware_class == identity.hardware_class &&
+            preset.prefill_signature == identity.prefill_signature) {
+            model.prefill  = preset.cost;
             prefill_source = ContextCostPresetSource::CompiledDefault;
         }
     }

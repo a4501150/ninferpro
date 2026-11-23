@@ -3,7 +3,7 @@
 
 #include "core/cyclic_kv_cache.h"
 #include "core/dtype.h"
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/tensor.h"
 #include "models/qwen3_5/state/decoder_state.h"
@@ -99,7 +99,7 @@ struct DFlashPersistentLayout {
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
-    std::optional<GdnReplayRecordLayout> replay_records;
+    std::optional<ops::GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_5::RoundStateLayout round;
     TensorLayout prefill_hidden;

@@ -5,7 +5,7 @@
 // top and never names a frame above it.
 
 #include "test_temp_path.h"
-#include "models/offload/calibrated_order.h"
+#include "models/qwen4_exp/calibrated_order.h"
 #include "models/offload/expert_cache.h"
 #include "models/offload/expert_state.h"
 
@@ -27,6 +27,9 @@
 #endif
 
 using namespace infernix::models::offload::expert_cache;
+using infernix::models::qwen4_exp::calibrated_expert_order;
+using infernix::models::qwen4_exp::kCalibratedExperts;
+using infernix::models::qwen4_exp::kCalibratedLayers;
 
 namespace {
 

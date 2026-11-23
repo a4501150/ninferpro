@@ -6,9 +6,12 @@ namespace infernix::ops::detail {
 
 Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) throw std::invalid_argument("q4 linear: T must be positive");
-    for (std::size_t i = 0; i < qwen3_5_q4_shapes_count; ++i) {
-        const Q4ShapeEntry& entry = qwen3_5_q4_shapes[i];
-        if (entry.n == n && entry.k == k) return entry.select(t);
+    for (std::size_t s = 0; s < q4_linear_shape_set_count; ++s) {
+        const auto& set = q4_linear_shape_sets[s];
+        for (std::size_t i = 0; i < *set.count; ++i) {
+            const Q4ShapeEntry& entry = set.rows[i];
+            if (entry.n == n && entry.k == k) return entry.select(t);
+        }
     }
     throw std::invalid_argument("q4 linear: unsupported shape");
 }

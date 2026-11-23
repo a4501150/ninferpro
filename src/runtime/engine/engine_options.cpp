@@ -1,15 +1,12 @@
 #include "runtime/engine/engine_options.h"
 
-#include "models/qwen3_5/options.h"
-#include "models/qwen4_exp/options.h"
-
 #include <algorithm>
 #include <stdexcept>
 #include <system_error>
 
 namespace infernix::runtime {
 
-void validate_engine_options(const EngineOptions& options, models::Architecture architecture) {
+void validate_engine_options(const EngineOptions& options, const FamilyOptionRules& family) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
@@ -26,10 +23,8 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         if (options.kv_capacity.explicit_tokens == 0) {
             throw std::invalid_argument("Engine explicit kv_capacity must be nonzero");
         }
-        // Qwen3.5's headroom is what automatic KV capacity leaves; an explicit capacity has none
-        // (Qwen3.8-Flash-Next's is what its expert cache leaves, with any KV capacity).
-        if (architecture != models::Architecture::Qwen4Exp) {
-            models::qwen3_5::validate_headroom(options);
+        if (family.validate_explicit_kv_capacity != nullptr) {
+            family.validate_explicit_kv_capacity(options);
         }
         break;
     case KvCapacityMode::Automatic:
@@ -78,14 +73,9 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument(
             "16-bit activations (the quality reference) run the exact route: disable fast paths");
     }
-    // Qwen3.5's head runs through ops::linear, whose output is BF16 for every head format, and its
-    // round buffers and CUDA Graphs are planned for BF16 logits; no FP32 head route exists for it
-    // (Qwen3.8-Flash-Next computes its head's FP32 sums natively). As upstream refuses a head
-    // format that cannot produce FP32 logits, the family refuses the dtype.
-    if (architecture != models::Architecture::Qwen4Exp && options.logits_dtype != LogitsDtype::BF16) {
-        throw std::invalid_argument(
-            "Qwen3.5/3.6/3.8 head logits are BF16; pass --logits-dtype bf16 (FP32 logits are "
-            "Qwen3.8-Flash-Next's)");
+    if (family.validate_logits_dtype != nullptr) { family.validate_logits_dtype(options); }
+    if (!options.experts_spec.empty() && family.validate_experts != nullptr) {
+        family.validate_experts(options);
     }
 }
 
@@ -103,8 +93,8 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";kv=" + std::to_string(static_cast<int>(options.kv_cache));
     out += ";speculative=" + std::to_string(static_cast<int>(options.speculative.backend));
     out += ";yarn=" + std::to_string(options.rope_yarn_factor);
-    // Qwen3.5's exact-route prefill bits follow the chunk grid, so a state prefilled at another
-    // chunk would not be the one this engine computes.
+    // A family's exact-route prefill bits may follow the chunk grid, so a state prefilled at
+    // another chunk would not be the one this engine computes.
     out += ";chunk=" + std::to_string(options.prefill_chunk);
     out += ";host_state=" +
            std::to_string(static_cast<int>(options.context_cache.hybrid.host_state_precision));
@@ -117,7 +107,7 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     return out;
 }
 
-EngineOptions normalize_engine_options(EngineOptions options, models::Architecture architecture) {
+EngineOptions normalize_engine_options(EngineOptions options, const FamilyOptionRules& family) {
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -150,48 +140,35 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
                                     "archive capacity");
     }
     const std::uint32_t concurrency = options.max_concurrency;
-    const bool qwen4_exp             = architecture == models::Architecture::Qwen4Exp;
 
     // The model's default prefill chunk (each family's tuning notes live with its constant).
-    if (options.prefill_chunk == 0) {
-        options.prefill_chunk = qwen4_exp ? models::qwen4_exp::kPrefillChunk
-                                           : models::qwen3_5::kPrefillChunk;
-    }
+    if (options.prefill_chunk == 0) { options.prefill_chunk = family.prefill_chunk; }
     if (options.prefill_chunk_beside_decode == 0) {
-        options.prefill_chunk_beside_decode =
-            qwen4_exp ? models::qwen4_exp::kPrefillChunkBesideDecode : options.prefill_chunk;
+        options.prefill_chunk_beside_decode = family.prefill_chunk_beside_decode != 0
+                                                  ? family.prefill_chunk_beside_decode
+                                                  : options.prefill_chunk;
     }
-    if (!qwen4_exp) { models::qwen3_5::validate_expert_tail_skip(options); }
+    if (family.validate_expert_tail_skip != nullptr) { family.validate_expert_tail_skip(options); }
     // An approximation whose output depends on the cache state: never on the exact route.
     if (options.expert_tail_skip != 0 && !options.fast_paths) {
         throw std::invalid_argument("--expert-tail-skip is approximate; the exact route (--disable-fast-paths) refuses it");
     }
     if (options.speculative.draft_tokens_auto) {
-        if (qwen4_exp) {
-            models::qwen4_exp::validate_draft_backend(options);
-        } else {
-            models::qwen3_5::validate_draft_backend(options);
-        }
+        if (family.validate_draft_backend != nullptr) { family.validate_draft_backend(options); }
         if (options.speculative.draft_tokens == 0) {
-            options.speculative.draft_tokens =
-                qwen4_exp ? models::qwen4_exp::kDraftTokensAuto : models::qwen3_5::kDraftTokensAuto;
+            options.speculative.draft_tokens = family.draft_tokens_auto;
         }
     } else if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                          FastPath::AdaptiveMtp) != options.fast_path_candidates.end()) {
         throw std::invalid_argument("--fast-path adaptive-mtp is the policy of --draft-tokens auto; "
                                     "a fixed --draft-tokens N drafts N");
     }
-    // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; another
-    // model refuses it rather than ignoring a tuning value.
+    // A family without the draft-confidence gate refuses it rather than ignoring a tuning value.
     if (const auto& p = options.speculative.draft_min_p) {
         if (!(*p >= 0.0F && *p <= 1.0F)) {
             throw std::invalid_argument("speculative draft_min_p (--spec-min-p) must be in [0,1]");
         }
-        if (qwen4_exp) {
-            models::qwen4_exp::validate_draft_min_p(options);
-        } else {
-            models::qwen3_5::validate_draft_min_p(options);
-        }
+        if (family.validate_draft_min_p != nullptr) { family.validate_draft_min_p(options); }
     }
     if (cache.enabled) {
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
@@ -210,28 +187,23 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             throw std::invalid_argument("the prefix cache Disk tier (--prefix-cache-disk) needs cuFile, which has no "
                                         "Windows build");
 #endif
-            if (!qwen4_exp) {
-                throw std::invalid_argument(
-                    "the prefix cache Disk tier (--prefix-cache-disk) applies to Qwen3.8-Flash-Next only");
-            }
+            if (family.validate_disk_tier != nullptr) { family.validate_disk_tier(options); }
         } else if (hybrid.disk_capacity_bytes.value_or(0U) != 0U) {
             throw std::invalid_argument("--prefix-cache-disk-gib needs --prefix-cache-disk");
         } else {
             hybrid.disk_capacity_bytes = 0U;
         }
         // The family's own tier rules and defaults.
-        if (qwen4_exp) {
-            models::qwen4_exp::resolve_cache(cache, options, concurrency, host_tier);
-        } else {
-            models::qwen3_5::resolve_cache(cache, options, concurrency, host_tier);
+        if (family.resolve_cache != nullptr) {
+            family.resolve_cache(cache, options, concurrency, host_tier);
         }
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
         // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below
         // the chunk: coarser ladders only waste snapshots on taps that share one boundary.
         const std::uint32_t chunk = std::max<std::uint32_t>(
-            qwen4_exp ? models::qwen4_exp::tap_ladder_chunk(options.prefill_chunk)
-                      : options.prefill_chunk,
+            family.tap_ladder_chunk != nullptr ? family.tap_ladder_chunk(options.prefill_chunk)
+                                               : options.prefill_chunk,
             64U);
         hybrid.tap_ladder_tokens =
             hybrid.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * chunk));

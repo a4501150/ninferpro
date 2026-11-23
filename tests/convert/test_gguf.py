@@ -9,15 +9,14 @@ import torch
 
 gguf = pytest.importorskip("gguf")
 
-from tools.convert.sources.gguf import (
-    GGUFSource,
-    HFAliasSource,
+from tools.convert.qwen3_5_gguf import (
     qwen35_linear_attention_name_map,
     qwen35_mtp_name_map,
-    qwen35_vision_name_map,
     reorder_linear_attention_v_heads,
     standard_dense_name_map,
 )
+from tools.convert.qwen_common import qwen35_vision_name_map
+from tools.convert.sources.gguf import GGUFSource, HFAliasSource
 
 
 def _write_gguf(path, tensors: dict[str, np.ndarray]) -> None:

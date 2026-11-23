@@ -1851,7 +1851,8 @@ int sample_sparse_drafts_case() {
             for (int s = 0; s < S; ++s) {
                 ok = ok && got_candidates[t * S + s] == ids[s] && std::abs(got_q[t * S + s] - want_q[s]) <= 2e-6;
             }
-            const double u = draft_uniform(configs[t].seed, positions[t], ops::kSamplePurposeDFlash2Proposal, kDraw);
+            const double u    = draft_uniform(configs[t].seed, positions[t],
+                                              ops::kSamplePurposeDraftProposal, kDraw);
             int pick = support - 1;
             double cumulative = 0, nearest = 1;
             for (int j = 0; j < support; ++j) {

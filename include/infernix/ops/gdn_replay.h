@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 
 #include <cuda_runtime.h>

@@ -76,10 +76,6 @@ infernix_add_test(infernix_state_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_state_store.cpp"
   LIBRARIES infernix_core)
 
-infernix_add_test(infernix_gdn_replay_records_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_gdn_replay_records.cpp"
-  LIBRARIES infernix_core)
-
 set_tests_properties(
   infernix_device_test
   infernix_decode_graph_test

@@ -4,7 +4,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "core/weight.h"
@@ -114,7 +114,7 @@ public:
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
-    void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+    void set_gdn_state_action(GdnStateAction action, const ops::GdnReplayRecords* replay_records);
     // Verification-tree binding for batched verification: attention uses each row's ancestor
     // masks (I32 [W,B]) and GDN convolves over and replays each row's tree (I32 [words,B]).
     // nullptr restores the chain.
@@ -291,7 +291,7 @@ private:
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
-    const GdnReplayRecords* replay_records_   = nullptr;
+    const ops::GdnReplayRecords* replay_records_ = nullptr;
     const Tensor* verification_tree_          = nullptr;
     const Tensor* tree_ancestor_masks_        = nullptr;
     std::int64_t prefill_split_frontier_      = -1;

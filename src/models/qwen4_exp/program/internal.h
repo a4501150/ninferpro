@@ -18,7 +18,7 @@
 #include "core/vmm_arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/link_probe.h"
 #include "core/linear_attention_state.h"
@@ -39,7 +39,7 @@
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/offload/expert_residency.h"
 #include "models/offload/host_expert_tier.h"
-#include "models/offload/calibrated_order.h"
+#include "models/qwen4_exp/calibrated_order.h"
 #include "models/offload/expert_state.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/call_plan.h"
@@ -318,7 +318,7 @@ struct DeviceLayout {
     LinearAttentionStatePoolLayout gdn;
     DeviceKVPagePoolLayout pool;
     KVExecutionTableLayout tables;
-    GdnReplayRecordLayout records;
+    ops::GdnReplayRecordLayout records;
     IoLayout io;
     SpecLayout spec;
     MtpIo mtp_io;

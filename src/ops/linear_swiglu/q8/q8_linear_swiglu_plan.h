@@ -22,12 +22,12 @@ enum class Q8LinearSwiGluScheduleId {
     MmaR64C128,
     MmaR128C64,
     MmaR128C80,
-    DFlash2SmallT,
-    DFlash2MmaR32C64K128,
-    DFlash2MmaR64C64K128,
-    DFlash2MmaR64C80K128,
-    DFlash2MmaR64C96K128,
-    DFlash2MmaR64C128,
+    WideHSmallT,
+    WideHMmaR32C64K128,
+    WideHMmaR64C64K128,
+    WideHMmaR64C80K128,
+    WideHMmaR64C96K128,
+    WideHMmaR64C128,
     StreamPair, // Qwen3.8-Flash-Next shared expert, T <= 16
 };
 

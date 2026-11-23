@@ -173,6 +173,11 @@ public:
         return engine_->export_expert_placement(path, error);
     }
 
+    [[nodiscard]] infernix::ExpertPlacementPreview
+    preview_expert_placement(const std::string& experts_spec) const {
+        return engine_->preview_expert_placement(experts_spec);
+    }
+
     [[nodiscard]] infernix::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }

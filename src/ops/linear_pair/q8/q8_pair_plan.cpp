@@ -264,7 +264,7 @@ void require_pair_weights(const Weight& first_weight, const Weight& second_weigh
     }
 }
 
-void require_dflash_row_views(const Weight& first_weight, const Weight& second_weight) {
+void require_n6144_k2048_row_views(const Weight& first_weight, const Weight& second_weight) {
     constexpr std::int32_t kParentRows     = 6144;
     constexpr std::int32_t kHidden         = 2048;
     constexpr std::int32_t kFirstRow       = 4096;
@@ -520,7 +520,7 @@ void q8_pair_execute_plan(Q8PairPlan plan, const Tensor& x, const Weight& first_
     }
 
     require_pair_weights(first_weight, second_weight, x.ne[0]);
-    if (problem.k == 2048) { require_dflash_row_views(first_weight, second_weight); }
+    if (problem.k == 2048) { require_n6144_k2048_row_views(first_weight, second_weight); }
     require_pair_operands(x, first_weight, second_weight, first_out, second_out,
                           uses_mma(plan.schedule));
 

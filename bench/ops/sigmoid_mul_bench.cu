@@ -1,6 +1,5 @@
 #include "infernix/ops/sigmoid_mul.h"
 #include "infernix_bench_common.h"
-#include "ops/launcher/sigmoid_gate_mul.h"
 
 #include <cuda_runtime.h>
 
@@ -49,7 +48,7 @@ std::vector<int> parse_tokens(const char* raw) {
     return tokens;
 }
 
-void run(int tokens, int heads, bool control, int candidate_block) {
+void run(int tokens, int heads, bool control) {
     const int d         = 256 * heads;
     const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(tokens);
     DeviceBuffer gate   = make_bf16(n, 101U);
@@ -70,23 +69,18 @@ void run(int tokens, int heads, bool control, int candidate_block) {
                     maxGrid, std::max<std::int64_t>(1, (packs + block - 1) / block)));
                 sigmoid_mul_payload_control<<<grid, block, 0, stream>>>(
                     static_cast<const uint4*>(gate.p), static_cast<uint4*>(x.p), packs);
-            } else if (candidate_block != 0) {
-                ops::detail::sigmoid_gate_mul_bf16x8_launch(tgate, tx, candidate_block, stream);
             } else {
                 ops::sigmoid_mul(tgate, tx, stream);
             }
         },
         static_cast<double>(n) * 6.0);
 
-    const int block = candidate_block == 0 ? 256 : candidate_block;
+    constexpr int block = 256;
     const std::size_t grid =
         std::min<std::size_t>(4096, std::max<std::size_t>(1, (n / 8 + block - 1) / block));
     char tag[128];
     std::snprintf(tag, sizeof(tag), "sigmoid_mul [256,%d,%-2d] route=%s-b%d-g%zu", heads, tokens,
-                  control                ? "control"
-                  : candidate_block == 0 ? "bf16x8"
-                                         : "candidate",
-                  block, grid);
+                  control ? "control" : "bf16x8", block, grid);
     print_result(tag, result);
 }
 
@@ -100,9 +94,8 @@ int main(int argc, char** argv) {
     }
 
     std::vector<int> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    bool control        = false;
-    int candidate_block = 0;
-    int heads           = 16;
+    bool control = false;
+    int heads    = 16;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
             tokens = parse_tokens(argv[++i]);
@@ -114,26 +107,12 @@ int main(int argc, char** argv) {
             }
         } else if (!std::strcmp(argv[i], "--control")) {
             control = true;
-        } else if (!std::strcmp(argv[i], "--candidate-block") && i + 1 < argc) {
-            candidate_block = std::atoi(argv[++i]);
-            if (candidate_block <= 0 || candidate_block > 256 || candidate_block % 32 != 0) {
-                std::fprintf(stderr,
-                             "candidate block must be a positive multiple of 32 no larger than "
-                             "256\n");
-                return 2;
-            }
         } else {
-            std::fprintf(stderr,
-                         "usage: %s [--heads 16|24] [--tokens T[,T...]] [--control] "
-                         "[--candidate-block B]\n",
+            std::fprintf(stderr, "usage: %s [--heads 16|24] [--tokens T[,T...]] [--control]\n",
                          argv[0]);
             return 2;
         }
     }
-    if (control && candidate_block != 0) {
-        std::fprintf(stderr, "--control and --candidate-block are mutually exclusive\n");
-        return 2;
-    }
-    for (const int value : tokens) { run(value, heads, control, candidate_block); }
+    for (const int value : tokens) { run(value, heads, control); }
     return 0;
 }

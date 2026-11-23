@@ -1,9 +1,11 @@
 #pragma once
 
-#include "models/qwen3_5/config.h"
 #include "models/qwen_common/frontend/tokenizer.h"
+#include "models/qwen_common/vision_config.h"
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 namespace infernix::models::qwen_common {
@@ -21,6 +23,14 @@ struct FrontendResources {
     std::uint32_t public_token_count = 0;
 };
 
-void parse_resources(FrontendResources& resources, const qwen3_5::Config& config);
+// The model geometry a family checks its frontend resources against: the embedding rows, the
+// bound Vision tower and a bound DFlash2 drafter's selector width.
+struct FrontendDomain {
+    std::uint32_t vocab_size   = 0;
+    const VisionConfig* vision = nullptr;
+    std::optional<std::uint32_t> selector_top_k;
+};
+
+void parse_resources(FrontendResources& resources, const FrontendDomain& domain);
 
 } // namespace infernix::models::qwen_common

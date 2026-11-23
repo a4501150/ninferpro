@@ -37,6 +37,7 @@ from tools.artifact.codecs.row_split import decode_row_split_codes
 from tools.artifact.layouts import ggml_expert_geometry, ggml_rows_geometry, ggml_tiles16_geometry
 from tools.artifact.reader import Artifact
 from tools.convert import qwen4_exp_gguf
+from tools.convert.sources.ggml_sources import GgmlExpertBank
 from tools.convert.sources.gguf_raw import GgufStore
 from tools.convert.sources.safetensors import SafetensorsSource
 from tools.flash_next.verify_artifact import _WORD, _binding_values, _bits, verify_ngram
@@ -48,7 +49,7 @@ def _parts(binding: dict) -> list[dict]:
     return binding["parts"] if "parts" in binding else [{"object": binding["object"]}]
 
 
-def verify_bank(artifact: Artifact, binding: dict, bank: qwen4_exp_gguf.GgmlExpertBank) -> int:
+def verify_bank(artifact: Artifact, binding: dict, bank: GgmlExpertBank) -> int:
     obj = artifact.object(binding["object"])
     g = ggml_expert_geometry(obj.layout, obj.format, obj.shape)
     if (g.gate_up_format, g.down_format) != (bank.gate_up_format, bank.down_format):
@@ -148,7 +149,7 @@ def main() -> int:
                 component = name.split("/", 1)[0]
                 report["requantized"][component] = report["requantized"].get(component, 0) + 1
                 continue
-            if isinstance(parameter.source, qwen4_exp_gguf.GgmlExpertBank):
+            if isinstance(parameter.source, GgmlExpertBank):
                 report["expert_mismatches"] += verify_bank(artifact, binding, parameter.source)
                 report["experts"] += parameter.shape[0]
                 print(f"{name}: {parameter.shape[0]} experts verified ({time.time() - start:.0f}s)", flush=True)

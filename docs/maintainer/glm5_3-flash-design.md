@@ -881,7 +881,7 @@ of a 990 PRO 2 TB's rated 1,200 TBW.
 **How the volumes meet the shared SSD tier.** The tier today reads the artifact in place through
 `ExpertStore`'s file segments (one per record, two when a record straddles the container's part
 files, plus an optional head/tail **expert stripe** that puts every record's tail on a second drive —
-`src/models/offload/expert_store.h`, `tools/flash_next/expert_stripe.py`, MoE §3 and §4.7). The
+`src/models/offload/expert_store.h`, `tools/artifact/expert_stripe.py`, MoE §3 and §4.7). The
 volumes generalize the stripe: N drives instead of two, 12 equal units instead of a head/tail split.
 What the tier gains for this family, and nothing else changes (§8.2): `ExpertStore`'s segment count
 per record rises from 3 to 12 (a static array; the units are 4 KiB-aligned and adjacent-unit
@@ -984,7 +984,7 @@ The offload machinery is no longer inside a family: it lives in `src/models/offl
 by each family's Program — `expert_cache.*` (LFRU, `FramePool`, `CacheController`),
 `expert_residency.*`, `expert_placement.*`, `expert_store.*` (records as file segments, the expert
 stripe), `host_tier.*` / `host_expert_tier.*` (the RAM tier, its read agent and tickets),
-`expert_state.*`, `calibrated_order.*`, `route_trace.*`, `vram_monitor.*`, and `geometry.h`
+`expert_state.*`, `route_trace.*`, `vram_monitor.*`, and `geometry.h`
 (`ExpertBankGeometry`: banks, experts per bank, top-k). The composition contract — no base class, no
 virtual model interface, the tier an execution resource of the MoE op, the Program driving
 `before_round` / `after_round` / `tier_step` at its own round boundaries — is MoE §1 and §2;
@@ -1014,7 +1014,7 @@ switch, the sizing laws and the CPU expert engine's team and protocol are taken 
 |---|---|
 | New dense Linear format **`exl3`** | E3A16 (§9.5) for K ∈ {3, 4, 5, 6}: decode route (T ≤ 8, CUDA-core integer) and prompt route (int8 tensor cores), bit-identical to each other; transposed application for the absorbed MLA query (§13.1); variants in `linear_swiglu` (with the SwiGLU clamp) and `projection_fp32` (FP32 logits for the head); registered in the artifact format and layout registries (`src/artifact/formats.*`, `layouts.*`) |
 | `offloaded_sparse_moe` | The **`exl3_mul1`** bank beside `nvfp4_mul` and the ggml/FP8 banks (E3A16 on the GPU narrow and wide routes and in the CPU engine; geometry from the bank's H, I, K). The **`noaux_tc` routing** variant (§2.2: FP32 sigmoid, `e_score_correction_bias` in selection only, weights the unbiased scores normalized, × 2.5; ties by lower id). The shared expert **ungated** (the gate row is absent, as GLM stores none). The SwiGLU clamp limit (10) as a semantic input on every MLP class. Frame side entries and landed-unit masks (§8.2) |
-| `kimi_delta_attention` | Unchanged mathematics — the existing Op (`src/ops/linear_attention/kimi_delta_attention/`, recurrent and chunked routes, qualified against an FP64 oracle, lower bound in [−5, 0]) gets its first consumer. New companions: `kda_input_prep` (conv + SiLU on q, k, v with state update, L2 norm, gate and β from the projection outputs), `kda_replay_record` / fold for speculative commit, mirroring the GDN replay records (`src/core/gdn_replay_records.*`) |
+| `kimi_delta_attention` | Unchanged mathematics — the existing Op (`src/ops/linear_attention/kimi_delta_attention/`, recurrent and chunked routes, qualified against an FP64 oracle, lower bound in [−5, 0]) gets its first consumer. New companions: `kda_input_prep` (conv + SiLU on q, k, v with state update, L2 norm, gate and β from the projection outputs), `kda_replay_record` / fold for speculative commit, mirroring the GDN replay records (`include/infernix/ops/gdn_replay_records.h`, `src/ops/linear_attention/gated_delta_net/replay_records.cpp`) |
 | New `mhc` | §15: the mixer (norm, 24 projections, gates, Sinkhorn, collapse) and the residual update, both fused with neighbours |
 | New `dsa_indexer` | §13.3: key preparation (LayerNorm), gated pooling with APE, scoring, top-512 selection with tail; shares the exact radix select with `qsa` (`src/ops/qsa/qsa_select.cu`), which moves to `src/ops/common/` to serve both Ops |
 | New `mla_sparse_attention` | §13.2: latent append (paged), absorbed decode over selected tokens, prompt kernels |
@@ -1783,7 +1783,7 @@ rescoring of the top candidates, is option O4 (§25.3).
 - **Speculative verification:** `kda_replay_record` writes, per verify column and layer, the inputs
   a fold needs (k, v, the 128-channel log α, β: ≈ 49 KB per layer and column), and the commit folds
   the accepted prefix from the pre-round state, as the GDN replay records do
-  (`src/core/gdn_replay_records.*`). Bit-exact against the committing form.
+  (`include/infernix/ops/gdn_replay_records.h`, `src/ops/linear_attention/gated_delta_net/replay_records.cpp`). Bit-exact against the committing form.
 - **Prefix snapshots:** 136 MiB of state plus 5 MB of conv state, 141 MB per snapshot (§18).
 
 ---

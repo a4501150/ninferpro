@@ -1,11 +1,11 @@
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 
 #include <array>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
-namespace infernix {
+namespace infernix::ops {
 namespace {
 
 constexpr std::size_t kRecordAlignment        = 256;
@@ -137,9 +137,10 @@ GdnReplayRecords GdnReplayRecords::narrowed(std::int32_t width) const {
     result.spec       = spec;
     result.spec.width = width;
     result.conv       = Tensor(conv.data, DType::BF16, {spec.conv_channels, width, outer});
-    result.key   = Tensor(key.data, DType::BF16, {spec.key_dim, spec.qk_heads, width, outer});
-    result.value = Tensor(value.data, DType::BF16, {spec.value_dim, spec.value_heads, width, outer});
-    result.gate  = Tensor(gate.data, DType::FP32, {2, spec.value_heads, width, outer});
+    result.key        = Tensor(key.data, DType::BF16, {spec.key_dim, spec.qk_heads, width, outer});
+    result.value =
+        Tensor(value.data, DType::BF16, {spec.value_dim, spec.value_heads, width, outer});
+    result.gate = Tensor(gate.data, DType::FP32, {2, spec.value_heads, width, outer});
     return result;
 }
 
@@ -174,4 +175,4 @@ GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int3
     };
 }
 
-} // namespace infernix
+} // namespace infernix::ops

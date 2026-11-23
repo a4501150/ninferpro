@@ -8,9 +8,12 @@ namespace {
 const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
     if (!valid_linear_policy(policy) || column_invariant(policy))
         throw std::invalid_argument("nvfp4 linear: unsupported policy");
-    for (std::size_t i = 0; i < qwen3_5_nvfp4_shapes_count; ++i) {
-        const Nvfp4LinearShape* shape = qwen3_5_nvfp4_shapes[i];
-        if (shape->n == n && shape->k == k) return *shape;
+    for (std::size_t s = 0; s < nvfp4_linear_shape_set_count; ++s) {
+        const auto& set = nvfp4_linear_shape_sets[s];
+        for (std::size_t i = 0; i < *set.count; ++i) {
+            const Nvfp4LinearShape* shape = set.rows[i];
+            if (shape->n == n && shape->k == k) return *shape;
+        }
     }
     throw std::invalid_argument("nvfp4 linear: unsupported shape");
 }

@@ -21,7 +21,7 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_attn_input_gemm_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_attn_input_gemm_simt.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_attn_input_gemm_splitk.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/q8/q8_dflash2_attn_input.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q8/q8_attn_input_wide_h.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_attn_input_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/attn_input_proj.cpp"
 )

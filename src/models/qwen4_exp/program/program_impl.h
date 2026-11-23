@@ -409,7 +409,7 @@ private:
     // Where the warm start's ranking and counts came from.
     enum class SeedSource { None, Saved, Calibrated };
 
-    // The calibrated order (offload/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
+    // The calibrated order (qwen4_exp/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
     // applies to every model of that shape (NInfer's guard), whatever the artifact's formats.
     [[nodiscard]] bool has_calibrated_order() const noexcept;
 
@@ -1813,7 +1813,7 @@ private:
     DeviceBuffer records_backing_, ple_records_, qsa_records_, spec_device_;
     PinnedHostBuffer spec_host_{1};
     SpecLayout spec_layout_;
-    GdnReplayRecords records_;
+    ops::GdnReplayRecords records_;
     std::vector<std::optional<ops::GdnReplayFoldPlan>> folds_;
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> drafts_;
     // The n-gram gate of verification rounds (design §12.4): the pinned ready word, its last

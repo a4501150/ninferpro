@@ -14,7 +14,6 @@
 #include "infernix/ops/qsa.h"
 #include "core/paged_kv_cache.h"
 #include "ops/host_parallel.h"
-#include "ops/kernel/paged_kv_address.cuh"
 #include "ops/op_tester.h"
 #include "ops/qsa/qsa_select.h"
 
@@ -35,8 +34,6 @@ using infernix::DeviceBuffer;
 using infernix::DType;
 using infernix::kPagedKVPageSize;
 using infernix::Tensor;
-using infernix::ops::kPagedKVPageMask;
-using infernix::ops::kPagedKVPageShift;
 using infernix::ops::QsaBatch;
 using infernix::ops::QsaGeometry;
 using infernix::test::cuda_check;
@@ -71,9 +68,9 @@ __device__ __forceinline__ float warp_sum(float v) {
 
 __device__ __forceinline__ std::int64_t pooled_offset(const std::int32_t* table, int position,
                                                       int slot_width, int lane) {
-    const int page = table[position >> kPagedKVPageShift];
+    const int page = table[position / kPagedKVPageSize];
     return static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * page +
-           static_cast<std::int64_t>(slot_width) * (position & kPagedKVPageMask) + lane;
+           static_cast<std::int64_t>(slot_width) * (position % kPagedKVPageSize) + lane;
 }
 
 __device__ __forceinline__ std::uint32_t sortable(float x) {

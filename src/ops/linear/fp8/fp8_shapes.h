@@ -1,5 +1,6 @@
 #pragma once
 #include "ops/linear/fp8/fp8_launch.h"
+#include "ops/linear/common/shape_set.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/common/row_parts.h"
 
@@ -23,19 +24,12 @@ struct Fp8LinearShape {
                       cudaStream_t) = nullptr;
 };
 
-// Family shape tables: the model families own their tuned shapes (src/models/<family>/shapes/),
-// and each family's table lists its whole set in one visible place. The tables have external
-// linkage — the dispatch declares them extern, which forces the linker to extract the table
-// translation unit and, through its rows, every shape file it references from the archive.
-
-// The Qwen3.5 family's tuned shapes (src/models/qwen3_5/shapes/fp8/fp8_shapes.cpp).
-extern const Fp8LinearShape* const qwen3_5_fp8_shapes[];
-extern const std::size_t qwen3_5_fp8_shapes_count;
-
-// The Qwen4Exp (Qwen3.8-Flash-Next) family's tuned shapes
-// (src/models/qwen4_exp/shapes/fp8/fp8_shapes.cpp).
-extern const Fp8LinearShape* const qwen4_exp_fp8_shapes[];
-extern const std::size_t qwen4_exp_fp8_shapes_count;
+// The tuned shape tables, owned by the model families (src/models/<family>/shapes/) and listed
+// by src/models/shapes.cpp. The dispatch references this registry, which forces the linker to
+// extract the registry's translation unit and, through it, every table and shape file it
+// references from the archive.
+extern const LinearShapeSet<const Fp8LinearShape*> fp8_linear_shape_sets[];
+extern const std::size_t fp8_linear_shape_set_count;
 
 extern const Fp8LinearShape kFp8N14336K5120;
 extern const Fp8LinearShape kFp8N16384K5120;

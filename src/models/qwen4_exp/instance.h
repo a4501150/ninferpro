@@ -9,9 +9,12 @@
 #include "models/qwen4_exp/program/program.h"
 #include "infernix/types.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/engine_backend.h"
 
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <string>
 
 namespace infernix {
 struct DeviceContext;
@@ -39,6 +42,14 @@ struct Qwen4ExpInstance {
     [[nodiscard]] ExpertPlacementReport expert_placement_status() const;
     [[nodiscard]] bool request_expert_placement(const ExpertPlacementSwitch& request, std::string* error = nullptr);
     [[nodiscard]] bool export_expert_placement(const std::filesystem::path& path, std::string* error = nullptr);
+    // A counts switch's dry run over the live placement `now` (Engine::preview_expert_placement).
+    [[nodiscard]] ExpertPlacementPreview
+    preview_expert_placement(const std::string& experts_spec,
+                             const ExpertPlacementReport& now) const;
+
+    // The Disk tier the Generation core spills the prefix cache to at its orderly stop.
+    [[nodiscard]] std::string prefix_cache_save_notice(const EngineOptions& options) const;
+    [[nodiscard]] std::optional<PrefixCacheSave> prefix_cache_shutdown_save() const;
 
 private:
     [[nodiscard]] const models::qwen4_exp::TextConfig& text_config_() const;
@@ -52,5 +63,10 @@ struct ConstructedQwen4Exp {
 };
 
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device);
+
+// The family's Engine backend (models::construct_engine_backend); options take the family's
+// resolved values.
+[[nodiscard]] ConstructedBackend construct_qwen4_exp_backend(EngineOptions& options,
+                                                             DeviceContext& device);
 
 } // namespace infernix::runtime

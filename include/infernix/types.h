@@ -578,9 +578,9 @@ struct EngineOptions {
     // before the first request (warm start), written at stop and every 10 minutes between requests.
     // Empty: no warm start (the cache starts empty and nothing is saved).
     std::filesystem::path expert_state_path;
-    // Qwen3.8-Flash-Next's expert stripe (tools/flash_next/expert_stripe.py): the tail of every routed
-    // expert record on a second drive, read beside each record's head in the artifact when the SSD
-    // expert tier serves the experts. Empty: whole records from the artifact.
+    // Qwen3.8-Flash-Next's expert stripe (tools/artifact/expert_stripe.py): the tail of every
+    // routed expert record on a second drive, read beside each record's head in the artifact when
+    // the SSD expert tier serves the experts. Empty: whole records from the artifact.
     std::filesystem::path expert_stripe_path;
     // Qwen3.8-Flash-Next: writes the internal per-round route trace (route_trace.h) to this file,
     // truncating it at startup. Empty (default): no trace is written and the run is numerically
@@ -1305,6 +1305,21 @@ struct ExpertPlacementReport {
     // (the warm start's seed loads count as neither).
     std::uint64_t swap_promotion_bytes = 0;
     std::uint64_t swap_demotion_bytes  = 0;
+};
+
+// A dry run of a counts switch: an --experts spec's tiers over the live placement and what
+// applying it would take, computed from the placement's own numbers and applied to nothing.
+struct ExpertPlacementPreview {
+    std::uint32_t total_experts     = 0;
+    std::uint64_t vram_experts      = 0;
+    std::uint64_t ram_experts       = 0;
+    std::uint64_t ssd_experts       = 0;
+    std::uint64_t vram_expert_bytes = 0;     // the VRAM frames the spec's VRAM tier needs
+    std::uint64_t vram_free_after   = 0;     // free VRAM once those frames replace the current pool
+    std::uint64_t ram_expert_bytes  = 0;     // the records the spec's RAM tier holds
+    std::uint32_t ram_tier_slots    = 0;     // the live placement's RAM tier slots
+    bool fits                       = false; // the frames fit the free VRAM and the current pool
+    bool ram_fits                   = false; // the records fit the host's available RAM
 };
 
 struct MediaCacheSummary {

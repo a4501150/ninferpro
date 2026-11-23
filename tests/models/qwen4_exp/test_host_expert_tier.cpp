@@ -449,7 +449,7 @@ void write_stripe(const std::filesystem::path& path, const infernix::artifact::A
     if (!f) { throw std::runtime_error("cannot write the stripe test file"); }
 }
 
-// An expert stripe (tools/flash_next/expert_stripe.py): each record's tail is read from the stripe
+// An expert stripe (tools/artifact/expert_stripe.py): each record's tail is read from the stripe
 // file, its head from the artifact (the straddling record's head is its file-A part), and the record
 // lands whole; a stripe of another artifact, of other strides, cut short or without its magic is refused.
 void test_stripe(const ExpertStore& base) {

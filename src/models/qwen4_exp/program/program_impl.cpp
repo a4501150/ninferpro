@@ -140,14 +140,15 @@ DeviceLayout ProgramImpl::plan_device(const ProgramOptions& o, const Config& con
     // Verification (W > 1): GDN replay records, PLE and QSA records, the round's I32 arrays.
     if (W > 1) {
         LayoutBuilder records_builder;
-        d.records       = plan_gdn_replay_records(records_builder, {.layers          = dim(c.gdn_layers),
-                                                                    .record_capacity = lanes,
-                                                                    .width           = W,
-                                                                    .conv_channels   = dim(c.gdn.conv_channels()),
-                                                                    .qk_heads        = dim(c.gdn.key_heads),
-                                                                    .value_heads     = dim(c.gdn.value_heads),
-                                                                    .key_dim         = dim(c.gdn.key_head_dim),
-                                                                    .value_dim       = dim(c.gdn.value_head_dim)});
+        d.records       = ops::plan_gdn_replay_records(records_builder,
+                                                       {.layers          = dim(c.gdn_layers),
+                                                        .record_capacity = lanes,
+                                                        .width           = W,
+                                                        .conv_channels   = dim(c.gdn.conv_channels()),
+                                                        .qk_heads        = dim(c.gdn.key_heads),
+                                                        .value_heads     = dim(c.gdn.value_heads),
+                                                        .key_dim         = dim(c.gdn.key_head_dim),
+                                                        .value_dim       = dim(c.gdn.value_head_dim)});
         d.records_bytes = records_builder.finish(256);
         d.ple_records   = 2ULL * width * W * lanes;
         d.qsa_records   = 2ULL * di * W * lanes * c.attention_layers;

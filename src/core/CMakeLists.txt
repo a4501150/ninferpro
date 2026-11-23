@@ -25,7 +25,6 @@ add_library(infernix_core STATIC
   link_probe.cu
   power_throttling.cpp
   vram_budget.cpp
-  gdn_replay_records.cpp
   cyclic_kv_cache.cpp
   host_context_arena.cpp
   host_kv_arena.cpp

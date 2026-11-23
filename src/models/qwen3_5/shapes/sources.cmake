@@ -1,9 +1,9 @@
 # Qwen3.5 family linear shape tuning: the family owns its tuned (n, k) instantiations — the
 # 5120-K Qwen3.8-27B set, the 2048-K Qwen3.5-B set (and its DFlash2 companion drafter), and the
 # vision tower both families share (Qwen3.5's tower). Each dtype's <dtype>_shapes.cpp lists the
-# family's whole set in one table the ops dispatch scans; the table's external linkage pulls
-# every shape file it references out of the archive. The compile target stays infernix_ops
-# because the launch templates and RDC live there; no link-graph change.
+# family's whole set in one table, which src/models/shapes.cpp registers with the ops dispatch;
+# that reference pulls every shape file the table lists out of the archive. The compile target
+# stays infernix_ops because the launch templates and RDC live there.
 target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/bf16/n1152_k1152.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/n1152_k1536.cu"

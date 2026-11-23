@@ -22,7 +22,7 @@ constexpr int kLargeBlockResidentCtasPerSm = 6;
 template <RopeKernelMode Mode>
 inline constexpr bool kTextMode =
     Mode == RopeKernelMode::Text1D || Mode == RopeKernelMode::TextMrope ||
-    Mode == RopeKernelMode::DflashText1D;
+    Mode == RopeKernelMode::FullHead1D;
 
 // Prepared (YaRN) coefficients carry their own inverse frequencies, so the fixed instances
 // accept them at any theta; native coefficients are only instantiated for the model's theta.
@@ -72,17 +72,17 @@ void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, DeviceExecution
 }
 
 template <int HeadsPerBlock, int QHeads, int KHeads, class Coefficients = NativeRopeCoefficients>
-void launch_dflash_split(const Tensor& positions, Tensor* q, Tensor* k, cudaStream_t stream,
-                         const Coefficients& coefficients = {}) {
+void launch_full_head_split(const Tensor& positions, Tensor* q, Tensor* k, cudaStream_t stream,
+                            const Coefficients& coefficients = {}) {
     constexpr int kGroups = (QHeads + KHeads + HeadsPerBlock - 1) / HeadsPerBlock;
     constexpr int kBlock  = HeadsPerBlock <= 2 ? 64 : HeadsPerBlock * 32;
     const int tokens      = positions.ne[0];
-    rope_fixed_split_kernel<RopeKernelMode::DflashText1D, QHeads, KHeads, HeadsPerBlock,
-                            Coefficients><<<tokens * kGroups, kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data),
-        q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
-        k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), tokens, token_stride(q),
-        token_stride(k), coefficients);
+    rope_fixed_split_kernel<RopeKernelMode::FullHead1D, QHeads, KHeads, HeadsPerBlock, Coefficients>
+        <<<tokens * kGroups, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(positions.data),
+            q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
+            k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), tokens, token_stride(q),
+            token_stride(k), coefficients);
 }
 
 template <class Coefficients = NativeRopeCoefficients>
@@ -96,12 +96,12 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
         k.ne[1] == 8) {
         const int tokens = positions.ne[0];
         if (tokens <= 16) {
-            launch_dflash_split<5, 32, 8>(positions, &q, &k, stream, coefficients);
+            launch_full_head_split<5, 32, 8>(positions, &q, &k, stream, coefficients);
         } else if (tokens <= 400) {
-            launch_dflash_split<8, 32, 8>(positions, &q, &k, stream, coefficients);
+            launch_full_head_split<8, 32, 8>(positions, &q, &k, stream, coefficients);
         } else {
-            launch_fixed_block<RopeKernelMode::DflashText1D, 32, 8>(positions, &q, &k, 160,
-                                                                    stream, coefficients);
+            launch_fixed_block<RopeKernelMode::FullHead1D, 32, 8>(positions, &q, &k, 160, stream,
+                                                                  coefficients);
         }
         return true;
     }
@@ -169,13 +169,13 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
     const bool text_theta = kPrepared<Coefficients> || theta == 1.0e7F;
     if (axes == 1 && x.ne[0] == 128 && rotary_dim == 128 && text_theta) {
         if (x.ne[1] == 32) {
-            launch_fixed_single<RopeKernelMode::DflashText1D, 32>(positions, x, execution,
-                                                                  coefficients);
+            launch_fixed_single<RopeKernelMode::FullHead1D, 32>(positions, x, execution,
+                                                                coefficients);
             return true;
         }
         if (x.ne[1] == 8) {
-            launch_fixed_single<RopeKernelMode::DflashText1D, 8>(positions, x, execution,
-                                                                 coefficients);
+            launch_fixed_single<RopeKernelMode::FullHead1D, 8>(positions, x, execution,
+                                                               coefficients);
             return true;
         }
     }

@@ -6,7 +6,8 @@ namespace infernix::models::qwen4_exp::detail {
 
 void ProgramImpl::allocate_verification(std::int32_t lanes, std::uint64_t& allocated) {
     allocate(records_backing_, plan_.records_bytes, allocated);
-    records_ = GdnReplayRecords(DeviceSpan{records_backing_.p, records_backing_.bytes}, plan_.records);
+    records_ = ops::GdnReplayRecords(DeviceSpan{records_backing_.p, records_backing_.bytes},
+                                     plan_.records);
     allocate(ple_records_, plan_.ple_records, allocated);
     allocate(qsa_records_, plan_.qsa_records, allocated);
     folds_.resize(static_cast<std::size_t>(max_width_) + 1);

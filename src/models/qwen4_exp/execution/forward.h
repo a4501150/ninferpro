@@ -7,7 +7,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
@@ -124,7 +124,7 @@ struct ForwardExperts {
 // an accepted prefix needs instead; K/V and pooled keys are written as usual, since positions past
 // the accepted prefix are rewritten before any later query reads them.
 struct ForwardVerify {
-    GdnReplayRecords gdn; // narrowed to the call's width; physical record row b = sequence b
+    ops::GdnReplayRecords gdn; // narrowed to the call's width; physical record row b = sequence b
     Tensor ple_inputs;    // BF16 [S*H, W, B]: the PLE convolution inputs
     Tensor qsa_keys;      // BF16 [Di, W, B, attention layers]: the raw index keys
 };

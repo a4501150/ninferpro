@@ -4,14 +4,11 @@
 #include "core/nvtx.h"
 #include "core/power_throttling.h"
 #include "core/startup.h"
-#include "runtime/contract/sampling.h"
+#include "models/registry.h"
 #include "runtime/contract/request.h"
-#include "runtime/engine/causal_score_core.h"
-#include "runtime/engine/engine_core.h"
+#include "runtime/contract/sampling.h"
 #include "runtime/diagnostics.h"
-#include "runtime/engine/context_cache/hybrid_resource_manager.h"
-#include "models/qwen3_5/instance.h"
-#include "models/qwen4_exp/instance.h"
+#include "runtime/engine/engine_backend.h"
 #include "runtime/engine/engine_options.h"
 
 #include <algorithm>
@@ -21,9 +18,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <utility>
-#include <variant>
 
 namespace infernix {
 namespace {
@@ -134,15 +129,14 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 
 class PreparedPrompt::Impl {
 public:
-    Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         models::qwen_common::PreparedPrompt prepared)
-        : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
-          value(std::move(prepared)) {}
+    Impl(runtime::BackendPrepared prepared, SamplingMode mode)
+        : summary(std::move(prepared.summary)), prepare(std::move(prepared.preparation)),
+          sampling_mode(mode), value(std::move(prepared.prompt)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    models::qwen_common::PreparedPrompt value;
+    std::unique_ptr<runtime::BackendPrompt> value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -228,77 +222,37 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
-    using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
-    // Qwen3.8-Flash-Next: the common cores over its own Program.
-    using Qwen4ExpCore        = runtime::EngineCore<runtime::Qwen4ExpInstance>;
-    using Qwen4ExpScoringCore = runtime::CausalScoreCore<runtime::Qwen4ExpInstance>;
-    using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
-                              std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Qwen4ExpScoringCore>>;
-    template <class CoreState>
-    static constexpr bool kScoring = std::is_same_v<CoreState, std::unique_ptr<ScoringCore>> ||
-                                     std::is_same_v<CoreState, std::unique_ptr<Qwen4ExpScoringCore>>;
-
     explicit Impl(EngineOptions engine_options)
-        : options(normalize(std::move(engine_options))),
-          device(initialize_device(options)) {
+        : options(normalize(std::move(engine_options))), device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        if (architecture == models::Architecture::Qwen4Exp) {
-            auto constructed  = runtime::construct_qwen4_exp(options, device);
-            options           = std::move(constructed.options);
-            qwen4             = std::move(constructed.instance);
-            load              = std::move(constructed.load);
-            model_metadata    = std::move(constructed.model_metadata);
-            load.cuda_sync_mode = device.sync_mode();
-            sampling_defaults = qwen4->frontend.sampling_defaults();
-            StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
-            if (options.purpose == EnginePurpose::CausalScoring) {
-                core = std::make_unique<Qwen4ExpScoringCore>(*qwen4, device);
-            } else {
-                core = std::make_unique<Qwen4ExpCore>(*qwen4, device, options);
-            }
-            finalize_phase.complete();
-            return;
-        }
-        const bool tree_auto_requested = options.speculative.draft_tree_auto;
-        auto constructed               = runtime::construct_model(options, device);
-        active                         = std::move(constructed.instance);
-        load                           = std::move(constructed.load);
-        model_metadata                 = std::move(constructed.model_metadata);
-        load.cuda_sync_mode            = device.sync_mode();
-        if (tree_auto_requested && !options.speculative.draft_tree_auto) {
-            runtime::publish_diagnostic(
-                options.diagnostic_observer, DiagnosticLevel::Warning,
-                "automatic DFlash2 tree verification is unavailable for this artifact (its GDN "
-                "input projections are not single FP8 or NVFP4 parents); rounds verify chains");
-        }
-        sampling_defaults = active->frontend.sampling_defaults();
-        StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
-        if (options.purpose == EnginePurpose::CausalScoring) {
-            core = std::make_unique<ScoringCore>(*active, device);
-        } else {
-            core = std::make_unique<GenerationCore>(*active, device, options);
-        }
-        finalize_phase.complete();
+        runtime::ConstructedBackend constructed =
+            models::construct_engine_backend(architecture, options, device);
+        backend             = std::move(constructed.backend);
+        load                = std::move(constructed.load);
+        model_metadata      = std::move(constructed.model_metadata);
+        load.cuda_sync_mode = device.sync_mode();
+        sampling_defaults   = backend->sampling_defaults();
     }
 
     // Options are checked before the artifact is opened; defaults that depend on the model (the
-    // hybrid prefix cache's) need the artifact's architecture, read once here. An unreadable
-    // artifact is reported by the (Qwen3.5) model construction, after option validation.
+    // hybrid prefix cache's) need the artifact's family, read once here. An unreadable artifact
+    // is reported by the default family's model construction, after option validation.
     EngineOptions normalize(EngineOptions engine_options) {
         try {
             architecture = models::detect_artifact_architecture(engine_options.artifact_path);
         } catch (const std::exception&) {}
-        runtime::validate_engine_options(engine_options, architecture);
-        return runtime::normalize_engine_options(std::move(engine_options), architecture);
+        const runtime::FamilyOptionRules& family = models::family_option_rules(architecture);
+        runtime::validate_engine_options(engine_options, family);
+        return runtime::normalize_engine_options(std::move(engine_options), family);
     }
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
-        const bool persists = persists_prefix_cache();
+        const bool persists = !backend->prefix_cache_save_notice(options).empty();
         stop();
-        // Joins the generation core's orderly stop, which saves the Host tier before dropping it.
-        core.emplace<std::monostate>();
+        // Joins the generation core's orderly stop, which saves the prefix cache before dropping
+        // it.
+        backend->release_core();
         try {
             device.synchronize();
         } catch (...) {}
@@ -307,42 +261,38 @@ public:
 
     void stop() noexcept {
         if (stop_requested.exchange(true)) { return; }
-        if (persists_prefix_cache()) {
-            const bool disk = std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core);
-            runtime::publish_diagnostic(
-                options.diagnostic_observer, DiagnosticLevel::Info,
-                !disk ? "saving the prefix cache to %s"
-                : options.context_cache.host_capacity_bytes.value_or(1U) == 0
-                    ? "finishing the prefix cache's writes to its Disk tier in %s"
-                    : "spilling the prefix cache to its Disk tier in %s",
-                (disk ? options.context_cache.hybrid.disk_directory : options.context_cache.hybrid.persistent_file)
-                    .string()
-                    .c_str());
-        }
-        std::visit(
-            [](auto& state) {
-                using CoreState = std::remove_cvref_t<decltype(state)>;
-                if constexpr (!std::is_same_v<CoreState, std::monostate>) { state->stop(); }
-            },
-            core);
-    }
-
-    // Qwen3.5 saves its Host tier to a file, Qwen3.8-Flash-Next spills it to its Disk tier.
-    [[nodiscard]] bool persists_prefix_cache() const noexcept {
-        if (!options.context_cache.enabled) { return false; }
-        if (std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core)) {
-            return !options.context_cache.hybrid.disk_directory.empty();
-        }
-        return std::holds_alternative<std::unique_ptr<GenerationCore>>(core) &&
-               !options.context_cache.hybrid.persistent_file.empty();
+        try {
+            if (const std::string notice = backend->prefix_cache_save_notice(options);
+                !notice.empty()) {
+                runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                            "%s", notice.c_str());
+            }
+        } catch (...) {}
+        backend->stop();
     }
 
     void report_prefix_cache_save() const noexcept {
         try {
-            if (qwen4) {
-                report_prefix_cache_save(qwen4->program->prefix_shutdown_spill());
+            const std::optional<runtime::PrefixCacheSave> result =
+                backend->prefix_cache_shutdown_save();
+            if (!result) {
+                runtime::publish_diagnostic(
+                    options.diagnostic_observer, DiagnosticLevel::Warning,
+                    "prefix cache not saved: the Engine did not stop cleanly");
+                return;
+            }
+            const runtime::PrefixCacheSave& saved = *result;
+            if (saved.ok) {
+                runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                            "prefix cache saved: %llu blocks, %llu snapshots, "
+                                            "%.1f MiB in %.1f s",
+                                            static_cast<unsigned long long>(saved.blocks),
+                                            static_cast<unsigned long long>(saved.snapshots),
+                                            static_cast<double>(saved.bytes) / 1048576.0,
+                                            saved.seconds);
             } else {
-                report_prefix_cache_save(active->program->hybrid_shutdown_save());
+                runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                            "prefix cache not saved: %s", saved.message.c_str());
             }
         } catch (const std::exception& error) {
             runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
@@ -350,44 +300,13 @@ public:
         } catch (...) {}
     }
 
-    // Either model's shutdown-save result (the same fields): Qwen3.5's file save, or
-    // Qwen3.8-Flash-Next's spill (what it wrote to the Disk tier).
-    template <class Result>
-    void report_prefix_cache_save(const std::optional<Result>& result) const {
-        if (!result) {
-            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
-                                        "prefix cache not saved: the Engine did not stop cleanly");
-            return;
-        }
-        const Result& saved = *result;
-        if (saved.ok) {
-            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                                        "prefix cache saved: %llu blocks, %llu snapshots, "
-                                        "%.1f MiB in %.1f s",
-                                        static_cast<unsigned long long>(saved.blocks),
-                                        static_cast<unsigned long long>(saved.snapshots),
-                                        static_cast<double>(saved.bytes) / 1048576.0, saved.seconds);
-        } else {
-            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
-                                        "prefix cache not saved: %s", saved.message.c_str());
-        }
-    }
-
-    [[nodiscard]] const models::qwen_common::Frontend& frontend() const {
-        return qwen4 != nullptr ? qwen4->frontend : active->frontend;
-    }
-
-    [[nodiscard]] std::uint32_t capacity() const { return qwen4 != nullptr ? qwen4->capacity : active->capacity; }
-
-    models::Architecture architecture = models::Architecture::Qwen3_5; // set by normalize
+    models::Architecture architecture = models::kDefaultArchitecture; // set by normalize
     EngineOptions options;
     DeviceContext device;
-    std::unique_ptr<runtime::ModelInstance> active;
-    std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
-    Core core;
+    std::unique_ptr<runtime::EngineBackend> backend;
     std::atomic<bool> stop_requested{false};
 };
 
@@ -407,16 +326,14 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto prepared      = impl_->frontend().prepare(std::move(input), control);
-    PromptSummary info = prepared.summary();
+    runtime::BackendPrepared prepared = impl_->backend->prepare(std::move(input), control);
     const SamplingMode sampling_mode =
-        info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    if (info.prompt_tokens > impl_->capacity()) {
+        prepared.summary.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
+    if (prepared.summary.prompt_tokens > impl_->backend->capacity()) {
         throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
     }
-    const PromptPreparationStats preparation = prepared.preparation_stats();
-    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
-                                                                 std::move(prepared)));
+    return PreparedPrompt(
+        std::make_unique<PreparedPrompt::Impl>(std::move(prepared), sampling_mode));
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
@@ -424,23 +341,23 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    if (token_ids.size() > impl_->capacity()) {
-        throw RequestError(ContextLengthDetails{.prompt_tokens = token_ids.size(),
-                                                .max_context   = impl_->capacity()});
+    const std::uint32_t capacity = impl_->backend->capacity();
+    if (token_ids.size() > capacity) {
+        throw RequestError(
+            ContextLengthDetails{.prompt_tokens = token_ids.size(), .max_context = capacity});
     }
-    auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity);
-    PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > impl_->capacity()) {
+    runtime::BackendPrepared prepared =
+        impl_->backend->prepare_tokens(std::move(token_ids), allow_prefix_identity);
+    if (prepared.summary.prompt_tokens > capacity) {
         throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
     }
-    const PromptPreparationStats preparation = prepared.preparation_stats();
-    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-        info, preparation, SamplingMode::Thinking, std::move(prepared)));
+    return PreparedPrompt(
+        std::make_unique<PreparedPrompt::Impl>(std::move(prepared), SamplingMode::Thinking));
 }
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().tokenize_text(text);
+    return impl_->backend->tokenize_text(text);
 }
 
 ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
@@ -470,17 +387,8 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     const std::size_t top_values       = positions * options.top_k;
     const std::size_t candidate_values = options.candidates.size();
     PreparedPrompt prompt              = prepare_tokens(std::move(tokens), false);
-    ScoreResult result                 = std::visit(
-        [&](auto& core) -> ScoreResult {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (Impl::kScoring<CoreState>) {
-                return core->score(std::move(prompt.impl_->value), first_target,
-                                   std::move(options));
-            } else {
-                throw std::logic_error("Engine scoring core is unavailable");
-            }
-        },
-        impl_->core);
+    ScoreResult result =
+        impl_->backend->score(std::move(prompt.impl_->value), first_target, std::move(options));
     if (result.logprobs.size() != positions || result.top_ids.size() != top_values ||
         result.top_logprobs.size() != top_values ||
         result.candidate_logprobs.size() != candidate_values) {
@@ -491,7 +399,7 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().count_tokens(std::move(input), control);
+    return impl_->backend->count_tokens(std::move(input), control);
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -563,23 +471,18 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             impl_, std::move(immediate), resolved_sampling));
     }
 
-    return std::visit(
-        [&](auto& core) -> GenerationHandle {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                throw std::logic_error("Engine core is unavailable");
-            } else if constexpr (Impl::kScoring<CoreState>) {
-                throw std::logic_error("Engine generation core is unavailable");
-            } else {
-                auto submission =
-                    core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
-                                 std::move(resolved_options), consumer_mode, std::move(observation),
-                                 pending_deadline);
-                return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                    impl_, std::move(submission), resolved_sampling));
-            }
-        },
-        impl_->core);
+    struct BackendSubmission {
+        std::unique_ptr<runtime::PendingGeneration> pending;
+
+        GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
+            return pending->wait(sink, cancellation);
+        }
+    } submission{impl_->backend->submit(std::move(prompt.impl_->value), prompt_summary,
+                                        prepare_seconds, std::move(resolved_options), consumer_mode,
+                                        std::move(observation), pending_deadline)};
+
+    return GenerationHandle(
+        std::make_unique<GenerationHandle::Impl>(impl_, std::move(submission), resolved_sampling));
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -607,105 +510,47 @@ ModelMetadata Engine::model_metadata() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& core) -> MemorySummary {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                throw std::logic_error("Engine core is unavailable");
-            } else {
-                return core->memory_summary();
-            }
-        },
-        impl_->core);
+    return impl_->backend->memory_summary();
 }
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().media_cache_summary();
+    return impl_->backend->media_cache_summary();
 }
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& core) -> RuntimeStats {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                throw std::logic_error("Engine core is unavailable");
-            } else {
-                return core->runtime_stats();
-            }
-        },
-        impl_->core);
+    return impl_->backend->runtime_stats();
 }
 
 bool Engine::is_available() const {
     if (impl_ == nullptr) { return false; }
-    return std::visit(
-        [](const auto& core) {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                return false;
-            } else {
-                return core != nullptr && core->is_available();
-            }
-        },
-        impl_->core);
+    return impl_->backend->is_available();
 }
 
 ExpertPlacementReport Engine::expert_placement_status() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& core) -> ExpertPlacementReport {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                return {};
-            } else {
-                return core->expert_placement_status();
-            }
-        },
-        impl_->core);
+    return impl_->backend->expert_placement_status();
 }
 
 bool Engine::request_expert_placement(const ExpertPlacementSwitch& request, std::string* error) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& core) -> bool {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                if (error != nullptr) { *error = "Engine core is unavailable"; }
-                return false;
-            } else {
-                return core->request_expert_placement(request, error);
-            }
-        },
-        impl_->core);
+    return impl_->backend->request_expert_placement(request, error);
 }
 
 bool Engine::export_expert_placement(const std::filesystem::path& path, std::string* error) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& core) -> bool {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                if (error != nullptr) { *error = "Engine core is unavailable"; }
-                return false;
-            } else {
-                return core->export_expert_placement(path, error);
-            }
-        },
-        impl_->core);
+    return impl_->backend->export_expert_placement(path, error);
+}
+
+ExpertPlacementPreview Engine::preview_expert_placement(const std::string& experts_spec) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->backend->preview_expert_placement(experts_spec);
 }
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
-    std::visit(
-        [](auto& core) {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (!std::is_same_v<CoreState, std::monostate>) {
-                core->reset_memory_peaks();
-            }
-        },
-        impl_->core);
+    impl_->backend->reset_memory_peaks();
 }
 
 void Engine::stop() noexcept {

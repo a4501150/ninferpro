@@ -32,6 +32,8 @@
 #include "models/qwen_common/frontend/prepared_prompt.h"
 #include "models/qwen_common/frontend/resources.h"
 #include "models/qwen4_exp/config.h"
+#include "models/qwen4_exp/options.h"
+#include "models/qwen4_exp/sampling_defaults.h"
 #include "models/registry.h"
 
 #include <cstdio>
@@ -47,7 +49,6 @@
 
 namespace {
 
-namespace q35  = infernix::models::qwen3_5;
 namespace q35c = infernix::models::qwen_common;
 namespace q4  = infernix::models::qwen4_exp;
 
@@ -132,10 +133,11 @@ infernix::PromptInput media_input(const std::vector<std::uint8_t>& image) {
     return input;
 }
 
-// The Engine's own frontend (construct_qwen4_exp) binds the artifact's tokenizer and processor
+// The Engine's own frontend (built by Qwen4ExpInstance) binds the artifact's tokenizer and processor
 // resources without any weight; the same binding here prepares the prompt without a second model
 // boot. The frontend's resource string views borrow the Reader's host backing, so the holder keeps
-// the Reader and Binder alive beside it. The field list mirrors construct_qwen4_exp's FrontendOptions.
+// the Reader and Binder alive beside it. The field list mirrors Qwen4ExpInstance's
+// FrontendOptions.
 struct FrontendHolder {
     std::unique_ptr<infernix::artifact::Reader> reader;
     std::unique_ptr<infernix::artifact::Binder> binder;
@@ -147,7 +149,7 @@ FrontendHolder artifact_frontend(const char* artifact, const infernix::EngineOpt
     auto binder  = std::make_unique<infernix::artifact::Binder>(*reader);
     const q4::Config config =
         q4::parse_config(reader->directory(),
-                         infernix::models::load_options(options, infernix::models::Architecture::Qwen4Exp));
+                         infernix::models::load_options(options, infernix::models::qwen4_exp::kVisionOffloadAuto));
     if (!config.vision) { throw std::runtime_error("the artifact carries no Vision component"); }
     const auto bytes = [&](std::string_view component, std::string_view role) {
         const auto span = binder->host_object(binder->resource(component, role));
@@ -160,19 +162,18 @@ FrontendHolder artifact_frontend(const char* artifact, const infernix::EngineOpt
     resources.generation_config_json         = bytes("text", "generation_config.json");
     resources.preprocessor_config_json       = bytes("vision", "preprocessor_config.json");
     resources.video_preprocessor_config_json = bytes("vision", "video_preprocessor_config.json");
-    q35::Config domain;
-    domain.text.vocab_size = config.text.vocab_size;
-    domain.vision          = config.vision;
-    q35c::parse_resources(resources, domain);
-    auto frontend = q35c::make_frontend(resources, {.chat_template_path       = options.chat_template_path,
-                                                   .architecture             = infernix::models::Architecture::Qwen4Exp,
-                                                   .vision_enabled           = true,
-                                                   .max_context              = options.max_context,
-                                                   .media_cache_bytes        = options.media_cache_bytes,
-                                                   .media_live_bytes         = options.media_live_bytes,
-                                                   .media_preprocess_threads = options.media_preprocess_threads,
-                                                   .vision_max_merged_tokens = options.vision_max_merged_tokens,
-                                                   .thinking_budget_message  = options.thinking_budget_message});
+    q35c::parse_resources(resources,
+                          {.vocab_size = config.text.vocab_size, .vision = &*config.vision});
+    auto frontend = q35c::make_frontend(
+        resources, {.chat_template_path       = options.chat_template_path,
+                    .sampling                 = q4::default_sampling(),
+                    .vision_enabled           = true,
+                    .max_context              = options.max_context,
+                    .media_cache_bytes        = options.media_cache_bytes,
+                    .media_live_bytes         = options.media_live_bytes,
+                    .media_preprocess_threads = options.media_preprocess_threads,
+                    .vision_max_merged_tokens = options.vision_max_merged_tokens,
+                    .thinking_budget_message  = options.thinking_budget_message});
     return {std::move(reader), std::move(binder), std::move(frontend)};
 }
 

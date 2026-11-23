@@ -25,6 +25,24 @@ void validate_draft_backend(const EngineOptions& options) {
     }
 }
 
+void validate_logits_dtype(const EngineOptions& options) {
+    // The head runs through ops::linear, whose output is BF16 for every head format, and the
+    // round buffers and CUDA Graphs are planned for BF16 logits; no FP32 head route exists (as
+    // upstream refuses a head format that cannot produce FP32 logits, the family refuses the
+    // dtype).
+    if (options.logits_dtype != LogitsDtype::BF16) {
+        throw std::invalid_argument(
+            "Qwen3.5/3.6/3.8 head logits are BF16; pass --logits-dtype bf16 (FP32 logits are "
+            "Qwen3.8-Flash-Next's)");
+    }
+}
+
+void validate_disk_tier(const EngineOptions& options) {
+    (void)options;
+    throw std::invalid_argument(
+        "the prefix cache Disk tier (--prefix-cache-disk) applies to Qwen3.8-Flash-Next only");
+}
+
 void validate_draft_min_p(const EngineOptions& options) {
     (void)options;
     throw std::invalid_argument(
@@ -41,6 +59,21 @@ void resolve_cache(ContextCacheOptions& cache, const EngineOptions& options, std
     if (cache.hybrid.device_snapshot_slots.value_or(0U) == 0U) {
         throw std::invalid_argument("hybrid device snapshot slots must be in [1,64]");
     }
+}
+
+const runtime::FamilyOptionRules& option_rules() {
+    static constexpr runtime::FamilyOptionRules rules{
+        .prefill_chunk                 = kPrefillChunk,
+        .draft_tokens_auto             = kDraftTokensAuto,
+        .validate_explicit_kv_capacity = validate_headroom,
+        .validate_logits_dtype         = validate_logits_dtype,
+        .validate_expert_tail_skip     = validate_expert_tail_skip,
+        .validate_draft_backend        = validate_draft_backend,
+        .validate_draft_min_p          = validate_draft_min_p,
+        .validate_disk_tier            = validate_disk_tier,
+        .resolve_cache                 = resolve_cache,
+    };
+    return rules;
 }
 
 } // namespace infernix::models::qwen3_5

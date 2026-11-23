@@ -38,7 +38,7 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
 // The heads' hidden widths: Qwen3.8-27B's (5120; Q8, FP8 and Q4 heads) and Qwen3.8-Flash-Next's
 // (2560; Q8 and Q4 heads).
 bool registered_hidden(std::int32_t input_rows) {
-    return input_rows == detail::kLinearTopKHidden || input_rows == detail::kLinearTopKFlashNextHidden;
+    return input_rows == detail::kLinearTopKHidden || input_rows == detail::kLinearTopKNarrowHidden;
 }
 
 HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t input_rows) {

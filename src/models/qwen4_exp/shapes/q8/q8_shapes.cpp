@@ -1,12 +1,13 @@
-// The Qwen4Exp (Qwen3.8-Flash-Next, recipe B) family's tuned q8 linear shapes: one row per
-// shape file in this directory. The table's external linkage (q8_shapes.h declares it extern;
-// the dispatch references it) forces the linker to extract this translation unit and, through
-// its rows, every shape file below.
-#include "ops/linear/q8/q8_shapes.h"
+// The Qwen4Exp (Qwen3.8-Flash-Next, recipe B) family's tuned q8 linear shapes: one row per shape
+// file in this directory. src/models/shapes.cpp registers this table with the dispatch, which
+// forces the linker to extract this translation unit and, through its rows, every shape file below.
+#include "models/qwen4_exp/shapes/shapes.h"
 
-namespace infernix::ops::detail {
+namespace infernix::models::qwen4_exp {
 
-const Q8ShapeEntry qwen4_exp_q8_shapes[] = {
+using namespace ops::detail;
+
+const Q8ShapeEntry q8_shapes[] = {
     {16384, 2560, select_q8_n16384_k2560, select_q8_n16384_k2560_fast},
     {12800, 2560, select_q8_n12800_k2560, nullptr, select_q8_n12800_k2560_invariant},
     {13952, 2560, select_q8_n13952_k2560, nullptr, select_q8_n13952_k2560_invariant},
@@ -28,7 +29,6 @@ const Q8ShapeEntry qwen4_exp_q8_shapes[] = {
     {10240, 2560, select_q8_n10240_k2560},
     {12288, 2560, select_q8_n12288_k2560},
 };
-const std::size_t qwen4_exp_q8_shapes_count =
-    sizeof(qwen4_exp_q8_shapes) / sizeof(qwen4_exp_q8_shapes[0]);
+const std::size_t q8_shapes_count = sizeof(q8_shapes) / sizeof(q8_shapes[0]);
 
-} // namespace infernix::ops::detail
+} // namespace infernix::models::qwen4_exp

@@ -19,14 +19,14 @@ struct RouteSpec {
     Q8AttnInputScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 4> kTargetRoutes{{
+constexpr std::array<RouteSpec, 4> kH2048Kv512Routes{{
     {1, 1, Q8AttnInputScheduleId::DecodeR8Direct},
     {2, 64, Q8AttnInputScheduleId::SplitKMmaDirect},
     {65, 128, Q8AttnInputScheduleId::MmaR32C128},
     {129, kAnyCols, Q8AttnInputScheduleId::MmaR64C128},
 }};
 
-constexpr std::array<RouteSpec, 9> kCompanionRoutes{{
+constexpr std::array<RouteSpec, 9> kH2048Kv1024Routes{{
     {1, 1, Q8AttnInputScheduleId::DecodeR8Direct},
     {2, 96, Q8AttnInputScheduleId::SplitKMmaDirect},
     {97, 192, Q8AttnInputScheduleId::MmaR32C64},
@@ -38,13 +38,13 @@ constexpr std::array<RouteSpec, 9> kCompanionRoutes{{
     {561, kAnyCols, Q8AttnInputScheduleId::MmaR64C128},
 }};
 
-constexpr std::array<RouteSpec, 6> kDFlash2Routes{{
-    {1, 48, Q8AttnInputScheduleId::DFlash2SmallT},
-    {49, 63, Q8AttnInputScheduleId::DFlash2MmaR16C64K128},
-    {64, 96, Q8AttnInputScheduleId::DFlash2MmaR32C32K128},
-    {97, 128, Q8AttnInputScheduleId::DFlash2MmaR32C64K128},
-    {129, 192, Q8AttnInputScheduleId::DFlash2MmaR32C64},
-    {193, kAnyCols, Q8AttnInputScheduleId::DFlash2MmaR64C128},
+constexpr std::array<RouteSpec, 6> kWideHiddenRoutes{{
+    {1, 48, Q8AttnInputScheduleId::WideHSmallT},
+    {49, 63, Q8AttnInputScheduleId::WideHMmaR16C64K128},
+    {64, 96, Q8AttnInputScheduleId::WideHMmaR32C32K128},
+    {97, 128, Q8AttnInputScheduleId::WideHMmaR32C64K128},
+    {129, 192, Q8AttnInputScheduleId::WideHMmaR32C64},
+    {193, kAnyCols, Q8AttnInputScheduleId::WideHMmaR64C128},
 }};
 
 template <std::size_t N>
@@ -57,19 +57,19 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) {
     return expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(kTargetRoutes),
-              "Q8 target attention input routes must be exact and closed");
-static_assert(catalog_is_closed(kCompanionRoutes),
-              "Q8 companion attention input routes must be exact and closed");
-static_assert(catalog_is_closed(kDFlash2Routes),
-              "Q8 DFlash2 attention input routes must be exact and closed");
+static_assert(catalog_is_closed(kH2048Kv512Routes),
+              "Q8 H2048 KV512 attention input routes must be exact and closed");
+static_assert(catalog_is_closed(kH2048Kv1024Routes),
+              "Q8 H2048 KV1024 attention input routes must be exact and closed");
+static_assert(catalog_is_closed(kWideHiddenRoutes),
+              "Q8 wide-H attention input routes must be exact and closed");
 
-bool is_companion_shape(const Q8AttnInputProblem& problem) noexcept {
+bool is_h2048_kv1024_shape(const Q8AttnInputProblem& problem) noexcept {
     return problem.input_rows == 2048 && problem.query_rows == 4096 && problem.kv_rows == 1024 &&
            problem.parent_rows == 6144 && problem.padded_k == 2048;
 }
 
-bool is_dflash2_shape(const Q8AttnInputProblem& problem) noexcept {
+bool is_wide_hidden_shape(const Q8AttnInputProblem& problem) noexcept {
     // Qwen3.8-27B's drafter (H 5120) and Qwen3.8-Flash-Next's (H 2560).
     return (problem.input_rows == 5120 || problem.input_rows == 2560) && problem.query_rows == 4096 &&
            problem.kv_rows == 1024 &&
@@ -80,7 +80,7 @@ bool supported_shape(const Q8AttnInputProblem& problem) noexcept {
     const bool target_qkgv =
         problem.query_rows == 4096 && problem.kv_rows == 512 && problem.parent_rows == 9216;
     const bool target_shape = problem.input_rows == 2048 && problem.padded_k == 2048 && target_qkgv;
-    return target_shape || is_companion_shape(problem) || is_dflash2_shape(problem);
+    return target_shape || is_h2048_kv1024_shape(problem) || is_wide_hidden_shape(problem);
 }
 
 } // namespace
@@ -107,18 +107,18 @@ const char* q8_attn_input_schedule_name(Q8AttnInputScheduleId schedule) noexcept
         return "attn_input_proj.q8.mma.r128.c64";
     case Q8AttnInputScheduleId::MmaR128C80:
         return "attn_input_proj.q8.mma.r128.c80";
-    case Q8AttnInputScheduleId::DFlash2SmallT:
-        return "attn_input_proj.q8.dflash2.small_t";
-    case Q8AttnInputScheduleId::DFlash2MmaR16C64K128:
-        return "attn_input_proj.q8.dflash2.mma.r16.c64.k128";
-    case Q8AttnInputScheduleId::DFlash2MmaR32C32K128:
-        return "attn_input_proj.q8.dflash2.mma.r32.c32.k128";
-    case Q8AttnInputScheduleId::DFlash2MmaR32C64K128:
-        return "attn_input_proj.q8.dflash2.mma.r32.c64.k128";
-    case Q8AttnInputScheduleId::DFlash2MmaR32C64:
-        return "attn_input_proj.q8.dflash2.mma.r32.c64";
-    case Q8AttnInputScheduleId::DFlash2MmaR64C128:
-        return "attn_input_proj.q8.dflash2.mma.r64.c128";
+    case Q8AttnInputScheduleId::WideHSmallT:
+        return "attn_input_proj.q8.wide_h.small_t";
+    case Q8AttnInputScheduleId::WideHMmaR16C64K128:
+        return "attn_input_proj.q8.wide_h.mma.r16.c64.k128";
+    case Q8AttnInputScheduleId::WideHMmaR32C32K128:
+        return "attn_input_proj.q8.wide_h.mma.r32.c32.k128";
+    case Q8AttnInputScheduleId::WideHMmaR32C64K128:
+        return "attn_input_proj.q8.wide_h.mma.r32.c64.k128";
+    case Q8AttnInputScheduleId::WideHMmaR32C64:
+        return "attn_input_proj.q8.wide_h.mma.r32.c64";
+    case Q8AttnInputScheduleId::WideHMmaR64C128:
+        return "attn_input_proj.q8.wide_h.mma.r64.c128";
     }
     return "attn_input_proj.q8.unknown";
 }
@@ -140,9 +140,9 @@ Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem) {
         }
         throw std::logic_error("Q8 attention input: admitted problem has no covering route");
     };
-    if (is_dflash2_shape(problem)) { return resolve_from(kDFlash2Routes); }
-    if (is_companion_shape(problem)) { return resolve_from(kCompanionRoutes); }
-    return resolve_from(kTargetRoutes);
+    if (is_wide_hidden_shape(problem)) { return resolve_from(kWideHiddenRoutes); }
+    if (is_h2048_kv1024_shape(problem)) { return resolve_from(kH2048Kv1024Routes); }
+    return resolve_from(kH2048Kv512Routes);
 }
 
 void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
@@ -177,12 +177,12 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     case Q8AttnInputScheduleId::MmaR64C96:
     case Q8AttnInputScheduleId::MmaR128C64:
     case Q8AttnInputScheduleId::MmaR128C80:
-    case Q8AttnInputScheduleId::DFlash2SmallT:
-    case Q8AttnInputScheduleId::DFlash2MmaR32C64:
-    case Q8AttnInputScheduleId::DFlash2MmaR64C128:
-    case Q8AttnInputScheduleId::DFlash2MmaR16C64K128:
-    case Q8AttnInputScheduleId::DFlash2MmaR32C32K128:
-    case Q8AttnInputScheduleId::DFlash2MmaR32C64K128:
+    case Q8AttnInputScheduleId::WideHSmallT:
+    case Q8AttnInputScheduleId::WideHMmaR32C64:
+    case Q8AttnInputScheduleId::WideHMmaR64C128:
+    case Q8AttnInputScheduleId::WideHMmaR16C64K128:
+    case Q8AttnInputScheduleId::WideHMmaR32C32K128:
+    case Q8AttnInputScheduleId::WideHMmaR32C64K128:
         throw std::logic_error("Q8 attention input: three-output schedule in four-output plan");
     }
     throw std::logic_error("Q8 attention input: unknown schedule");
@@ -201,34 +201,34 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
     const Q8AttnInputPlan resolved = q8_attn_input_resolve_plan(problem);
-    const bool companion           = is_companion_shape(problem);
-    const bool dflash2             = is_dflash2_shape(problem);
-    if ((!companion && !dflash2) || resolved.schedule != plan.schedule) {
+    const bool companion           = is_h2048_kv1024_shape(problem);
+    const bool wide_h              = is_wide_hidden_shape(problem);
+    if ((!companion && !wide_h) || resolved.schedule != plan.schedule) {
         throw std::invalid_argument(
             "Q8 attention input: plan does not match exact three-output problem");
     }
-    if (dflash2) {
+    if (wide_h) {
         switch (plan.schedule) {
-        case Q8AttnInputScheduleId::DFlash2SmallT:
-            q8_dflash2_attn_input_small_t_launch(x, weight, q, k, v, stream);
+        case Q8AttnInputScheduleId::WideHSmallT:
+            q8_attn_input_wide_h_small_t_launch(x, weight, q, k, v, stream);
             return;
-        case Q8AttnInputScheduleId::DFlash2MmaR16C64K128:
-            q8_dflash2_attn_input_mma_r16_c64_k128_launch(x, weight, q, k, v, stream);
+        case Q8AttnInputScheduleId::WideHMmaR16C64K128:
+            q8_attn_input_wide_h_mma_r16_c64_k128_launch(x, weight, q, k, v, stream);
             return;
-        case Q8AttnInputScheduleId::DFlash2MmaR32C32K128:
-            q8_dflash2_attn_input_mma_r32_c32_k128_launch(x, weight, q, k, v, stream);
+        case Q8AttnInputScheduleId::WideHMmaR32C32K128:
+            q8_attn_input_wide_h_mma_r32_c32_k128_launch(x, weight, q, k, v, stream);
             return;
-        case Q8AttnInputScheduleId::DFlash2MmaR32C64K128:
-            q8_dflash2_attn_input_mma_r32_c64_k128_launch(x, weight, q, k, v, stream);
+        case Q8AttnInputScheduleId::WideHMmaR32C64K128:
+            q8_attn_input_wide_h_mma_r32_c64_k128_launch(x, weight, q, k, v, stream);
             return;
-        case Q8AttnInputScheduleId::DFlash2MmaR32C64:
-            q8_dflash2_attn_input_mma_r32_c64_launch(x, weight, q, k, v, stream);
+        case Q8AttnInputScheduleId::WideHMmaR32C64:
+            q8_attn_input_wide_h_mma_r32_c64_launch(x, weight, q, k, v, stream);
             return;
-        case Q8AttnInputScheduleId::DFlash2MmaR64C128:
-            q8_dflash2_attn_input_mma_r64_c128_launch(x, weight, q, k, v, stream);
+        case Q8AttnInputScheduleId::WideHMmaR64C128:
+            q8_attn_input_wide_h_mma_r64_c128_launch(x, weight, q, k, v, stream);
             return;
         default:
-            throw std::logic_error("Q8 attention input: non-DFlash2 schedule in DFlash2 plan");
+            throw std::logic_error("Q8 attention input: non-wide-H schedule in wide-H plan");
         }
     }
     switch (plan.schedule) {
@@ -262,13 +262,13 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     case Q8AttnInputScheduleId::MmaR64C128:
         q8_attn_input_mma_r64_c128_launch(x, weight, q, k, v, stream);
         return;
-    case Q8AttnInputScheduleId::DFlash2SmallT:
-    case Q8AttnInputScheduleId::DFlash2MmaR32C64:
-    case Q8AttnInputScheduleId::DFlash2MmaR64C128:
-    case Q8AttnInputScheduleId::DFlash2MmaR16C64K128:
-    case Q8AttnInputScheduleId::DFlash2MmaR32C32K128:
-    case Q8AttnInputScheduleId::DFlash2MmaR32C64K128:
-        throw std::logic_error("Q8 attention input: DFlash2 schedule in companion plan");
+    case Q8AttnInputScheduleId::WideHSmallT:
+    case Q8AttnInputScheduleId::WideHMmaR32C64:
+    case Q8AttnInputScheduleId::WideHMmaR64C128:
+    case Q8AttnInputScheduleId::WideHMmaR16C64K128:
+    case Q8AttnInputScheduleId::WideHMmaR32C32K128:
+    case Q8AttnInputScheduleId::WideHMmaR32C64K128:
+        throw std::logic_error("Q8 attention input: wide-H schedule in H2048 KV1024 plan");
     }
     throw std::logic_error("Q8 attention input: unknown schedule");
 }

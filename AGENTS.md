@@ -148,6 +148,15 @@ Keep these ownership boundaries visible when selecting a design:
   queries and execution enforce actual Op support; there is no whole-artifact capability registry.
 - Runtime owns common execution contracts and Engine publication policy; product/serving own input
   acquisition and protocol translation. Model code does not acquire media or own transport.
+- Placement is strict (no exceptions; `tests/test_layering.py` checks it). Family code lives only in
+  `src/models/<family>/` and `tools/convert/<family>*.py`. Shared code (runtime, serve, product,
+  core, artifact, text, media, ops, `include/`, `apps/`) never includes, names or branches on a
+  family; it reaches one through `src/models/registry.*` (the artifact probe, `FamilyOptionRules`,
+  `construct_engine_backend`), and `src/models/shapes.cpp` registers the families' linear shape
+  tables. A family never includes another family. Ops identifiers name no model, caller or
+  speculative backend (`mtp_*` is an Op family name). Model code uses an Op's public contract,
+  never `ops/kernel/`, `ops/launcher/` or `ops/common/` (a family's `shapes/` files instantiate the
+  linear launch templates); tests and benchmarks never include `ops/kernel/` or `ops/launcher/`.
 
 Qwen3.8-Flash-Next is the model served today, and the structure must stay easy to extend to other
 models at zero runtime cost. A new model family gets its own directory under `src/models/<family>/`,

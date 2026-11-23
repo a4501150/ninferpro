@@ -1,4 +1,4 @@
-#include "core/gdn_replay_records.h"
+#include "infernix/ops/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 
 #include <cstddef>
@@ -72,9 +72,9 @@ int expect_throw(Fn&& fn, const char* label) {
     return 1;
 }
 
-std::size_t record_bytes(const infernix::GdnReplayRecordSpec& spec) {
+std::size_t record_bytes(const infernix::ops::GdnReplayRecordSpec& spec) {
     infernix::LayoutBuilder builder;
-    (void)infernix::plan_gdn_replay_records(builder, spec);
+    (void)infernix::ops::plan_gdn_replay_records(builder, spec);
     return builder.finish(256);
 }
 
@@ -83,7 +83,7 @@ std::size_t record_bytes(const infernix::GdnReplayRecordSpec& spec) {
 int main() {
     int failures = 0;
 
-    const infernix::GdnReplayRecordSpec spec{
+    const infernix::ops::GdnReplayRecordSpec spec{
         .layers          = 3,
         .record_capacity = 5,
         .width           = 4,
@@ -94,10 +94,10 @@ int main() {
         .value_dim       = 128,
     };
     infernix::LayoutBuilder builder;
-    const auto layout       = infernix::plan_gdn_replay_records(builder, spec);
+    const auto layout       = infernix::ops::plan_gdn_replay_records(builder, spec);
     const std::size_t bytes = builder.finish(256);
     auto backing            = make_backing(bytes);
-    const infernix::GdnReplayRecords records({backing.get(), bytes}, layout);
+    const infernix::ops::GdnReplayRecords records({backing.get(), bytes}, layout);
 
     failures += expect_shape(records.conv, 256, 4, 15, 1, "conv plane");
     failures += expect_shape(records.key, 128, 2, 4, 15, "key plane");
@@ -169,10 +169,10 @@ int main() {
     auto wide_spec  = spec;
     wide_spec.width = 64;
     infernix::LayoutBuilder wide_builder;
-    const auto wide_layout = infernix::plan_gdn_replay_records(wide_builder, wide_spec);
+    const auto wide_layout = infernix::ops::plan_gdn_replay_records(wide_builder, wide_spec);
     const auto wide_bytes  = wide_builder.finish(256);
     auto wide_backing      = make_backing(wide_bytes);
-    const infernix::GdnReplayRecords wide({wide_backing.get(), wide_bytes}, wide_layout);
+    const infernix::ops::GdnReplayRecords wide({wide_backing.get(), wide_bytes}, wide_layout);
     const auto row = wide.layer(2, 1);
     for (int width = 1; width <= 64; ++width) {
         const auto prefix = row.single_row_prefix(width);
@@ -233,7 +233,7 @@ int main() {
     failures += expect_throw(
         [&] {
             infernix::LayoutBuilder invalid;
-            (void)infernix::plan_gdn_replay_records(invalid, {.layers          = 1,
+            (void)infernix::ops::plan_gdn_replay_records(invalid, {.layers          = 1,
                                                             .record_capacity = 9,
                                                             .width           = 2,
                                                             .conv_channels   = 1,

@@ -733,7 +733,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     // A verification call projects its convolution inputs straight into the replay records (a
     // mixed call copies its decode rows' columns there).
     const ForwardPrefillPart* part = batch.prefill_part;
-    GdnReplayRecordLayer records;
+    ops::GdnReplayRecordLayer records;
     if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), batch.batch); }
     // gdn-conv-fused: a decode call's Q8 projection runs the causal convolution in its epilogue, from
     // the FP32 projection rather than its BF16 rounding. Verification, prefill and mixed calls stay

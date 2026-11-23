@@ -21,7 +21,7 @@ namespace {
 // (Qwen3.8-Flash-Next).
 constexpr std::int32_t kFirstSmallT = 1;
 constexpr std::int32_t kLastSmallT  = 40;
-using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using Launch                        = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int GateUpRows, int Hidden, int Capacity>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -49,25 +49,25 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_tile<GateUpRows, Hidden, 8 * (1 + static_cast<int>(Offsets))>...};
 }
 
-constexpr auto k27BLaunchers =
+constexpr auto kH5120Launchers =
     make_launchers<34816, 5120>(std::make_index_sequence<kLastSmallT / 8>{});
-constexpr auto kFlashNextLaunchers =
+constexpr auto kH2560Launchers =
     make_launchers<15360, 2560>(std::make_index_sequence<kLastSmallT / 8>{});
 
 } // namespace
 
-void q8_dflash2_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                             cudaStream_t stream) {
+void q8_linear_swiglu_wide_h_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                            cudaStream_t stream) {
     if (x.ne[1] < kFirstSmallT || x.ne[1] > kLastSmallT) {
-        throw std::invalid_argument("Q8 DFlash2 LinearSwiGLU small-T: unsupported T");
+        throw std::invalid_argument("Q8 wide-H LinearSwiGLU small-T: unsupported T");
     }
     const std::size_t index = static_cast<std::size_t>((x.ne[1] - 1) / 8);
     if (x.ne[0] == 5120) {
-        k27BLaunchers[index](x, weight, out, stream);
+        kH5120Launchers[index](x, weight, out, stream);
     } else if (x.ne[0] == 2560) {
-        kFlashNextLaunchers[index](x, weight, out, stream);
+        kH2560Launchers[index](x, weight, out, stream);
     } else {
-        throw std::invalid_argument("Q8 DFlash2 LinearSwiGLU small-T: unsupported H");
+        throw std::invalid_argument("Q8 wide-H LinearSwiGLU small-T: unsupported H");
     }
 }
 
