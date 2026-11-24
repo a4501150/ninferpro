@@ -71,7 +71,7 @@ struct Settings {
     std::vector<Shape> shapes{{1, 1}, {4, 1}};
     std::uint32_t context = 1024, chunk = 4096, rounds = 64, warm = 16, determinism = 1;
     KvCacheStorage kv   = KvCacheStorage::Int8Group64;
-    std::string experts = "vram=42%,ram=58%";
+    std::string experts = "vram=40%,ram=60%";
     std::filesystem::path check, record, report;
     bool profile = false;
 };

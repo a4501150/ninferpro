@@ -23,7 +23,7 @@ targets do not run for `qwen3_5`.
 
 `glm5_next` provides every piece with these differences. Its routed experts (159.5 GiB) do not fit
 in VRAM, so its round bench builds the family's instance with production's placement
-(`--experts`, default `vram=42%,ram=58%`) and times whole rounds through the Program (the Forward
+(`--experts`, default `vram=40%,ram=60%`) and times whole rounds through the Program (the Forward
 graph, CPU-served misses, sampling and commit) after warm rounds, reporting the expert hit rate
 instead of a speed of light; its hash covers every row's greedy tokens, and `--replays` (or
 `--determinism`) repeats a shape from a fresh binding. A shape `1xW` with W >= 2 is a one-row

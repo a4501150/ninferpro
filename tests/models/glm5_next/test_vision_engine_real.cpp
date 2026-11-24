@@ -83,7 +83,7 @@ engine_options(const char* artifact, std::uint32_t chunk,
     options.enable_vision                     = true;
     options.vision_offload                    = offload;
     options.kv_capacity                       = infernix::KvCapacityPolicy::automatic();
-    options.experts_spec                      = "vram=42%,ram=58%"; // production's split
+    options.experts_spec                      = "vram=40%,ram=60%"; // production's split
     options.context_cache.host_capacity_bytes = 512ULL << 20;
     return options;
 }

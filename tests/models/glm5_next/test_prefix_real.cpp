@@ -53,7 +53,7 @@ infernix::EngineOptions engine_options(const char* artifact) {
     options.max_pending_requests = 4;
     options.prefill_chunk        = 1024;
     options.kv_capacity          = infernix::KvCapacityPolicy::automatic();
-    options.experts_spec         = "vram=42%,ram=58%"; // production's split (no SSD-only experts)
+    options.experts_spec         = "vram=40%,ram=60%"; // production's split (no SSD-only experts)
     options.diagnostic_observer.callback = [](const infernix::Diagnostic& d) {
         const bool walk = d.message.rfind("prefill layer walk:", 0) == 0;
         if (walk || d.level != infernix::DiagnosticLevel::Debug) {

@@ -1,7 +1,7 @@
 // The T2 start-up and correctness smoke test (AGENTS.md "Iteration tiers") for GLM-5.3-Flash: the
 // public Engine on the real artifact with production's options
 // (~/src/super-quant/configs/GLM-5.3-Flash/model.env: INT8 KV, 4 x 262,144 tokens,
-// vram=42%,ram=58%, the prefix cache), in process. Skips unless INFERNIX_GLM_ARTIFACT and
+// vram=40%,ram=60%, the prefix cache), in process. Skips unless INFERNIX_GLM_ARTIFACT and
 // INFERNIX_GLM_DRAFT are set.
 //
 //   production  With DFlash2 (three draft tokens): the engine starts; four concurrent greedy
@@ -80,7 +80,7 @@ infernix::EngineOptions production_options(const char* artifact, const char* dra
     options.kv_capacity          = infernix::KvCapacityPolicy::automatic();
     options.max_concurrency      = kLanes;
     options.max_pending_requests = 2 * kLanes;
-    options.experts_spec         = "vram=42%,ram=58%";
+    options.experts_spec         = "vram=40%,ram=60%";
     if (drafter != nullptr) {
         options.speculative.backend      = infernix::SpeculativeBackend::DFlash2;
         options.speculative.draft_model  = drafter;

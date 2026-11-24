@@ -1,7 +1,7 @@
 // The in-process speed check between T1 and T3 (AGENTS.md "Iteration tiers") for GLM-5.3-Flash:
 // the public Engine on the real artifacts with production's options
 // (~/src/super-quant/configs/GLM-5.3-Flash/model.env: INT8 KV, 4 x 262,144 tokens, DFlash2 with
-// three draft tokens, vram=42%,ram=58%), and bench_infernix.py's concurrent phase: C chat requests
+// three draft tokens, vram=40%,ram=60%), and bench_infernix.py's concurrent phase: C chat requests
 // at once (default 4) of N output tokens (default 256), greedy, thinking off, each prompt with a
 // unique prefix so the prefix cache serves none of it. One warm-up set, then --repeat sets
 // (default 3). Each set reports its aggregate speed as bench_infernix.py's C6_agg does (output
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::uint32_t concurrency = 4, tokens = 256, repeat = 3, draft_tokens = 3;
-    std::string experts = "vram=42%,ram=58%";
+    std::string experts = "vram=40%,ram=60%";
     bool profile        = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
