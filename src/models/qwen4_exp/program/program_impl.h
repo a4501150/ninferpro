@@ -385,59 +385,27 @@ public:
     void settle_deferred_or_drop() noexcept;
 
 private:
-    // ---------------------------------------------------------------- VRAM monitor (§9.7; placement.cpp)
-    void start_vram_monitor(const VramDemand& demand);
-
-    // The monitor thread: wakes an idle engine so it returns idle KV pages to the frames. Free
-    // VRAM below the headroom is only reported -- the engine does not resize the expert cache
-    // under another program's pressure; the client owns the placement (--experts, or
-    // POST /admin/expert-placement).
-    void on_vram_snapshot(const VramSnapshot& snapshot);
-
-public:
-    void set_maintenance_waker(std::function<void()> waker);
-
-    // ---- warm start (design §9.2) ----
-    // Fills the frames from the saved state, before the first request; without one (a first start,
-    // or a state of another artifact), from the calibrated expert order when the model has its shape.
-    // With the SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies
-    // are released and their slots refilled with the next keys of the fill order, so the two levels
-    // hold different experts.
-    void warm_start_experts();
-
-private:
-    // Where the warm start's ranking and counts came from.
-    enum class SeedSource { None, Saved, Calibrated };
+    // ---------------------------------------------------------------- the placement runtime's hooks (placement.cpp)
+    // The shared placement runtime (models/offload/expert_placement_runtime.h) owns the VRAM
+    // monitor, the warm start and the saved state, the RAM tier's lifecycle and fills, and the
+    // placement switches; the hooks carry what stays with the family.
 
     // The calibrated order (qwen4_exp/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
     // applies to every model of that shape (NInfer's guard), whatever the artifact's formats.
     [[nodiscard]] bool has_calibrated_order() const noexcept;
 
-    // The SSD tier's startup fill: its key order, how many keys the first pass read, and its time.
-    struct TierFill {
-        std::vector<std::uint32_t> order;
-        std::uint32_t filled = 0;
-        double seconds       = 0;
-        SeedSource source    = SeedSource::None;
-    };
+    // The monitor's start hands the sizing baseline over: the spare-demand inputs grow_kv reads
+    // (design §9.7), moved by the elastic KV pool's mappings afterwards.
+    void capture_sizing_inputs(const VramDemand& demand, const VramSnapshot& snapshot);
 
-    // The SSD tier's RAM fill order (design §9.6, plan §4.9): the saved state's ranking (the last
-    // session's VRAM residents, best first), then every other key that session used, most used
-    // first, then the keys it never used one expert of every layer in turn, so that no layer is left
-    // wholly on the SSD (file order filled the first layers and left the last ones on disk).
-    [[nodiscard]] std::vector<std::uint32_t> tier_fill_order(const offload::expert_cache::SavedState* state) const;
+    // The runtime's tier hook: the CPU miss service reads its records through the tier, and a
+    // rebuilt tier retargets the prefill expert stream's callbacks (they captured the old one).
+    void on_tier_changed(offload::HostExpertTier* tier, bool rebuilt);
 
-    // The SSD tier's first RAM pass, before the frames' warm start reads from it.
-    TierFill prefill_tier(const offload::expert_cache::SavedState* state, SeedSource source);
-
-    // After the frames' warm start: the seeds are in VRAM, so their RAM copies (shadows) are
-    // released and their slots take the next keys of the fill order. A seed VRAM later evicts is
-    // demoted into RAM when it outranks the coldest resident (T4), as any key without a host copy.
-    void finish_tier_fill(const TierFill& fill, std::uint32_t seeded);
-
-    // The frames' warm start from the saved state or the calibrated order; returns how many experts
-    // it loaded.
-    std::uint32_t warm_start_frames(const offload::expert_cache::ExpertStateLoad& load, SeedSource source);
+public:
+    void set_maintenance_waker(std::function<void()> waker) {
+        placement_runtime_->set_maintenance_waker(std::move(waker));
+    }
 
 public:
     // After every synchronization of a round: a call that could not serve an expert (design §9.3:
@@ -449,9 +417,9 @@ public:
 
 public:
     // Writes the saved state (at stop, and from maintain_expert_state). Never throws.
-    void save_expert_state() noexcept;
+    void save_expert_state() noexcept { placement_runtime_->save_expert_state(); }
     // Between requests: saves when rounds ran since the last save and 10 minutes have passed.
-    void maintain_expert_state() noexcept;
+    void maintain_expert_state() noexcept { placement_runtime_->maintain_expert_state(); }
     // The prefix cache's Disk tier work outside requests (Program::background_poll).
     [[nodiscard]] bool prefix_background_pending() const noexcept { return prefix_ && prefix_->background_pending(); }
     void prefix_background_poll() {
@@ -462,76 +430,49 @@ public:
     // run, not one request) as one Engine diagnostic, beside report_cache's per-request line.
     void report_cache_layers() noexcept;
 
-private:
-    // A seeded count is capped, so an expert used heavily in an old session yields to new uses.
-    static constexpr std::uint32_t kSeedCountCap = 16;
-    // The share of the frames a warm start fills (the best-ranked experts); the rest stay free for
-    // the fill phase's landing (S4), so a workload unlike the saved state still fills quickly.
-    static constexpr double kSeedShare = 0.5;
-    static constexpr std::chrono::minutes kExpertStateInterval{10};
-    std::chrono::steady_clock::time_point expert_state_saved_{};
-    std::uint64_t expert_state_routed_ = 0;
-
 public:
     // Prefill calls up to this width are CPU-assisted (design §10.6); wider chunks route nearly
     // every expert, and their misses stream or stage on the GPU.
     static constexpr int kAssistMaxColumns = 255;
 
     // ---- expert placement (/admin/expert-placement; design §9.6) ----
-    // A switch requested from any thread (the HTTP handler), applied by the engine thread at the
-    // next maintenance boundary, where no round's kernels are in flight.
-    mutable std::mutex placement_mutex_;
-    offload::ExpertPlacementRequest placement_pending_;
-    bool placement_pending_set_ = false;
-
-    // A placement grow's resident refill (design §9.6): the switch backs new frames but does
-    // not fill them -- boot's warm start does -- so without a refill the keys arrive one miss at a
-    // time from the artifact. The refill walks the usage-rank order in bounded batches between
-    // rounds: seed every key the tier holds, free its slots, read the next batch (the boot fill's
-    // window walk, sliced so no round waits on it). `stall` counts ticks without progress (the
-    // order exhausted, or the tier cannot land more): two end the refill.
-    struct PlacementFill {
-        std::vector<std::uint32_t> order;   // keys in fill order (usage rank)
-        std::size_t at = 0;                 // cursor into `order`
-        offload::expert_cache::SavedState window{};  // counts for seeding; `ranked` holds the tier's keys
-        std::uint32_t seeded = 0;           // keys seeded so far
-        std::uint32_t total  = 0;           // keys the walk covers (progress reporting)
-        std::uint32_t stall  = 0;           // consecutive ticks without a seed or a read
-        std::uint32_t passes = 0;           // walks of the order so far (keys mid-copy are retried)
-        bool active = false;
-        std::chrono::steady_clock::time_point begin{};
-        // A grow from a tier smaller than one read batch stages through a temporary one; the
-        // RAM target the switch named is restored when the fill finishes.
-        bool restore_tier = false;
-        std::uint32_t tier_after = 0;
-        bool after_switch = false; // a placement switch's grow (else frames a lease left empty)
-    } placement_fill_;
-    static constexpr std::uint32_t kRefillBatch = 512; // keys read per tick (~0.1 s of artifacts)
-    // The last applied switch's outcome for GET (placement_mutex_).
-    bool placement_last_ok_ = true;
-    std::string placement_last_message_;
-    void record_switch(bool ok, std::string message);
-
-    // ---- the RAM tier's lifecycle (the placement switches own it) ----
-    // The boot tier's store (with its stripe) and options: a rebuild clones them with a new
-    // resident-slot count. `placement_wants_no_tier_`: a pending switch grows to every key
-    // resident in VRAM naming no RAM tier; the tier releases once that grow's refill completes.
-    const offload::ExpertStore* tier_store_   = nullptr;
-    offload::HostExpertTier::Options tier_options_{};
-    bool placement_wants_no_tier_     = false;
-
-    // Freed pageable tier memory stays in the allocator's arenas unless handed back.
-    static void trim_host_heap();
-
-    // The resident slots the current tier holds records in (0 without a tier).
-    [[nodiscard]] std::uint32_t tier_resident_slots() const {
-        return tier_ != nullptr ? tier_->resident_capacity() : 0;
+    // The shared placement runtime owns the switches, the RAM tier's lifecycle and the fills
+    // (models/offload/expert_placement_runtime.h); the family keeps the elastic KV interplay
+    // (apply_vram_target's tail) and the stream's bindings.
+    [[nodiscard]] bool request_placement(const offload::ExpertPlacementRequest& request, std::string* error) {
+        return placement_runtime_->request_placement(request, error);
     }
+
+    // The counts form (/admin/expert-placement {"vram": N, "ram": M}): the current ranking's top N
+    // hold VRAM frames and the next M the RAM tier's slots -- adaptive within the counts (the
+    // per-round policy swaps hot experts in), never pinned, so a workload shift moves the content
+    // while the counts stay what the client named. M 0 with N the whole cache releases the tier.
+    [[nodiscard]] bool request_count_placement(std::uint32_t vram_experts, std::uint32_t ram_experts,
+                                               std::string* error) {
+        return placement_runtime_->request_count_placement(vram_experts, ram_experts, error);
+    }
+
+    [[nodiscard]] offload::ExpertPlacementStatus placement_status() const {
+        return placement_runtime_->placement_status();
+    }
+
+    [[nodiscard]] bool export_placement(const std::filesystem::path& path, std::string* error) {
+        return placement_runtime_->export_placement(path, error);
+    }
+
+    // The maintenance waker from the engine thread: request_maintenance() only flags and notifies,
+    // so a tick that is not done can re-arm it and the fills also advance while the engine
+    // idles, when no round would call apply_vram_target.
+    void wake_maintenance() { placement_runtime_->wake_maintenance(); }
+
+    // A placement drifts from its named counts between switches (the runtime's
+    // placement_drifted): settled when the engine idles.
+    [[nodiscard]] bool placement_drifted() const { return placement_runtime_->placement_drifted(); }
 
     // The prefill expert stream's bindings for the tier as it is now: its records, stream slots and
     // bounce buffers, or the artifact banks' records without a tier. The callbacks capture the tier
-    // object, so a tier rebuild (ensure_tier) retargets the stream with a fresh set; the banks'
-    // record strides come from host_strides_.
+    // object, so a tier rebuild (the runtime's ensure_tier) retargets the stream with a fresh set;
+    // the banks' record strides come from host_strides_.
     struct StreamBindings {
         execution::ExpertStream::RecordOf record_of;
         execution::ExpertStream::Hold hold;
@@ -541,99 +482,10 @@ public:
     };
     [[nodiscard]] StreamBindings stream_bindings() const;
 
-    // Builds or rebuilds the tier to hold `residents` resident records beside its lists (the
-    // read ring, prefetch and demotion -- the boot derivation's). Engine thread, at a maintenance
-    // boundary: no round in flight, the device synced, no stream slots lent. An existing tier's
-    // records seed the new one best-first (a host copy, no artifact read); the rest fill by the
-    // tier fill and demand below. The old tier's pinned chunks release with it.
-    void ensure_tier(std::uint32_t residents);
-
-    // The resident placement still leaves one key without a frame (the pools hold one key fewer
-    // than the set), and artifact reads stage through the tier's lists: keep only those lists and
-    // one slot, caching no experts in RAM.
-    void shrink_tier_to_reader(const char* why);
-
-    // Releases the tier: every key is resident in a frame (or read from the artifact), so no host
-    // expert bytes remain. The record table republishes empty before the pinned chunks release.
-    void release_tier(const char* why);
-
-    // The tier fill: a rebuild or a demotion-dropping shrink leaves free resident slots; the
-    // ranking's keys that are neither in VRAM nor held read into them in bounded batches between
-    // rounds (the placement refill's cadence), so the tier converges on its named capacity.
-    struct TierBackfill {
-        std::vector<std::uint32_t> order; // keys in read order (the ranking, VRAM keys skipped)
-        std::size_t at  = 0;              // cursor into `order`
-        std::uint32_t stall = 0;          // consecutive ticks without a read
-        bool active = false;
-    } tier_backfill_;
-
-    void start_tier_fill();
-
-    // One bounded slice of the tier fill, at a maintenance boundary: read the next keys of the
-    // order that hold neither a frame nor a host copy. Ends when the tier is full or two ticks
-    // pass without a read.
-    void advance_tier_fill();
-
-    [[nodiscard]] bool request_placement(const offload::ExpertPlacementRequest& request, std::string* error);
-
-    // The counts form (/admin/expert-placement {"vram": N, "ram": M}): the current ranking's top N
-    // hold VRAM frames and the next M the RAM tier's slots -- adaptive within the counts (the
-    // per-round policy swaps hot experts in), never pinned, so a workload shift moves the content
-    // while the counts stay what the client named. M 0 with N the whole cache releases the tier.
-    [[nodiscard]] bool request_count_placement(std::uint32_t vram_experts, std::uint32_t ram_experts,
-                                                std::string* error);
-
-    // Engine thread, at a maintenance boundary: resize to the target and re-pin, with the RAM
-    // tier the switch names in place first -- a shrink's demotions land in its slots. A shrink
-    // evicts each pool's lowest-score residents (pinned keys never), demoting them through the
-    // RAM tier when it has room and dropping the rest to the artifact (the tier fill backfills
-    // them); a grow admits from use and refills between rounds. Freed VMM chunks release their
-    // VRAM. A switch that names no RAM tier while holding every key in VRAM releases it once
-    // the grow's refill completes.
-    void apply_pending_placement();
-
-    // Starts the resident refill after a placement grow: the usage-rank order to walk (the
-    // request's, else the session's saved ranking and the tier fill's spread), the seeding window
-    // the tier's keys fill, and the maintenance cadence that advances it between rounds and while
-    // the engine idles.
-    void start_placement_fill(const std::vector<std::uint32_t>& request_order);
-
-    // The maintenance waker from the engine thread: request_maintenance() only flags and notifies,
-    // so a tick that is not done can re-arm it and the refill also advances while the engine
-    // idles, when no round would call apply_vram_target.
-    void wake_maintenance();
-
-    // One bounded slice of the resident refill, at a maintenance boundary (no round's kernels in
-    // flight): seed every key the tier holds and free its slots, then read the next batch of the
-    // order -- only keys still without a frame. Ends when every frame is backed (the pools hold
-    // one key fewer than the set at the limit), or after two ticks without progress.
-    void advance_placement_fill();
-
-    void finish_placement_fill();
-
-    [[nodiscard]] Program::ExpertPlacementStatus placement_status() const;
-
-    [[nodiscard]] bool export_placement(const std::filesystem::path& path, std::string* error);
-
-    // A placement drifts from its named counts between switches. A long prompt's lease evicts the
-    // lowest-ranked VRAM experts without demoting them, and when it returns its frames stay empty
-    // until use promotes into them; the swapper's promotions keep their RAM copies (shadows) while
-    // the VRAM victims it does not demote (past a boundary's allowance) leave RAM for the artifact.
-    // VRAM then holds fewer experts than its frames, RAM fewer distinct ones than its slots, and
-    // the SSD more than the placement named (the measured after-state of a long prompt is design
-    // §9.6). True when a frame is empty with no
-    // lease out, or the tier holds a shadow or a free slot.
-    [[nodiscard]] bool placement_drifted() const;
-
-    // When the engine idles, the placement returns to its named counts: empty frames are refilled
-    // in the usage ranking (the grow's refill, which moves RAM experts up and frees their slots),
-    // then the unpinned shadows give their slots back and the tier fill reads the ranking's best
-    // SSD-only keys into the free slots, up to the tier's capacity (a placement with an SSD share
-    // keeps it).
-    void settle_placement();
-
     // At a boundary (no round's kernels in flight; `idle`: no request active): applies a pending
-    // expert-placement switch, then resizes the expert cache to the control law's decision.
+    // expert-placement switch, advances the placement grow's refill and the RAM tier's fill,
+    // settles the placement when idle, then resizes the expert cache to the control law's
+    // decision (the runtime's apply_placement returns whether the elastic KV control may run).
     void apply_vram_target(bool idle);
 
 private:
@@ -1137,20 +989,13 @@ private:
     DeviceLayout plan_;
     std::unique_ptr<VramBudgetSource> vram_;
     VramSizing sizing_;
-    // The control law, the waker and the cache size the monitor reads. Recursive: the control path
-    // resizes the KV pool (shrink_kv, grow_kv) with it held, and other callers take it there.
-    std::recursive_mutex vram_mutex_;
-    std::function<void()> waker_;
     // The sizing law's inputs for grow_kv's spare allowance (design §9.7): set at startup when
-    // the pool is elastic. `usage_at_sizing_` moves with the elastic KV pool's mappings, which are
+    // the pool is elastic, by the placement runtime's monitor start (capture_sizing_inputs).
+    // `usage_at_sizing_` moves with the elastic KV pool's mappings, which are
     // this process's growth but not the pool's.
     VramDemand spare_demand_{};
     std::uint64_t usage_at_sizing_ = 0;
     std::uint64_t pool_at_sizing_  = 0;
-    // The explicit placement's frame ceiling (ProgramOptions::expert_frame_ceiling), updated by
-    // each applied placement switch; read at round boundaries by apply_vram_target.
-    std::uint32_t placement_ceiling_ = 0;
-    bool pressure_warned_     = false;
 
     std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0, pages_per_row_ = 0;
     std::uint32_t beside_decode_chunk_ = 0; // prompt tokens per call while another lane decodes (0: no cap)
@@ -1468,15 +1313,18 @@ private:
     std::size_t work_capacity_ = 0;
     std::unique_ptr<WorkspaceArena> work_;
     // SSD tier mode (design §9.5): the fetch channel and the tier outlive everything that reads
-    // their memory (the residency's promotion copies, the stream, the CPU service), declared later.
-    // With an expert stripe the tier reads through this store, the Model's with each record's tail
-    // in the stripe file.
-    std::optional<offload::ExpertStore> striped_store_;
-    std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
-    std::unique_ptr<offload::HostExpertTier> tier_;
+    // their memory (the residency's promotion copies, the stream, the CPU service). The placement
+    // runtime owns them (and, with an expert stripe, the tier's store -- the Model's with each
+    // record's tail in the stripe file); these point at what it built, kept current by its hooks.
+    ops::offloaded_moe::FetchChannel* fetch_channel_ = nullptr;
+    offload::HostExpertTier* tier_ = nullptr;
     PinnedHostBuffer device_error_{1}; // mapped u32: every call's MoE error word and Forward's faults (check_device_error)
     bool clear_prefix_on_release_ = false;
-    std::unique_ptr<offload::ExpertResidency> residency_;
+    offload::ExpertResidency* residency_ = nullptr;
+    // The shared expert placement runtime (models/offload/expert_placement_runtime.h): the
+    // residency, the RAM tier and its fetch channel, the VRAM monitor, the warm start and the
+    // saved state, the placement switches and their fills.
+    std::unique_ptr<offload::ExpertPlacementRuntime> placement_runtime_;
     std::unique_ptr<execution::ExpertStream> expert_stream_;
     std::vector<std::uint64_t> host_strides_; // each bank's own record stride (a GGUF import's vary)
     // The stream's leases: the ring, the wide arena and a walk's area (each a run of one pool).

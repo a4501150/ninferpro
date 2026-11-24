@@ -458,7 +458,8 @@ On the constrained route, a call the grammar confirmed complete but the parser c
 same contract is an implementation inconsistency, never masked by falling back to content. The free
 route keeps its existing handling of malformed text.
 
-Ownership: `tool_contract` parses declarations and selects the contract; `tool_grammar` compiles it
+Ownership: `tool_contract` (`src/models/common/frontend/`, shared by every family) parses
+declarations and selects the contract; `tool_grammar` compiles it
 into the model language; `tool_call_parser` decodes committed text with the same argument encoding.
 Compiled grammars share the Frontend's budget and cold-compile limit. A non-strict grammar's identity
 uses only the names and the framing/call policy; schema normalization hints stay in the per-request

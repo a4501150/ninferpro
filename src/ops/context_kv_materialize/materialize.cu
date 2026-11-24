@@ -35,6 +35,8 @@ struct DeviceLayers {
     DeviceLayerView layer[kContextKVMaterializeLayers];
     // The rotation's inverse frequencies theta^(-2j/128), j < 64.
     double inv_frequency[64];
+    // The key norm's epsilon operand.
+    float key_norm_epsilon;
 };
 
 // rope_d128_theta1e7_sincos's range reduction over the call's frequencies.
@@ -55,7 +57,7 @@ __device__ __forceinline__ void store_key_head(const float* input, const DeviceL
     const int j    = lane * 2;
     float x0 = input[j], x1 = input[j + 1], y0 = input[j + 64], y1 = input[j + 65];
     float sum           = warp_reduce_sum(x0 * x0 + x1 * x1 + y0 * y0 + y1 * y1);
-    const float inverse = rsqrtf(__shfl_sync(0xffffffffU, sum, 0) / 128.0f + 1.e-6f);
+    const float inverse = rsqrtf(__shfl_sync(0xffffffffU, sum, 0) / 128.0f + layers.key_norm_epsilon);
     x0 *= inverse * __bfloat162float(layer.key_norm[j]);
     x1 *= inverse * __bfloat162float(layer.key_norm[j + 1]);
     y0 *= inverse * __bfloat162float(layer.key_norm[j + 64]);
@@ -438,9 +440,10 @@ __global__ __launch_bounds__(256) void context_kv_key_post_kernel(
 
 DeviceLayers make_device_layers(
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    const std::array<double, 64>& inv_frequency) {
+    const std::array<double, 64>& inv_frequency, float key_norm_epsilon) {
     DeviceLayers result{};
     for (int pair = 0; pair < 64; ++pair) { result.inv_frequency[pair] = inv_frequency[pair]; }
+    result.key_norm_epsilon = key_norm_epsilon;
     for (int index = 0; index < kLayers; ++index) {
         const ContextKVMaterializeLayerView& source = layers[static_cast<std::size_t>(index)];
         result.layer[index]                         = {
@@ -503,16 +506,21 @@ bool launch_projection(const Tensor& context, const Tensor& positions, const Ten
 void context_kv_materialize_launch(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    const std::array<double, 64>& inv_frequency, ContextKVMaterializeExecutionEnvelope envelope,
+    const std::array<double, 64>& inv_frequency, float key_norm_epsilon,
+    ContextKVMaterializeExecutionEnvelope envelope,
     ContextKVMaterializeRoute route, const Tensor& key_scratch, cudaStream_t stream) {
-    const DeviceLayers device_layers = make_device_layers(layers, inv_frequency);
-    const bool post = context.ne[0] == 5120
-                          ? launch_projection<5120>(context, positions, counts, state_slots,
-                                                    device_layers, envelope, route, key_scratch,
-                                                    stream)
-                          : launch_projection<2560>(context, positions, counts, state_slots,
-                                                    device_layers, envelope, route, key_scratch,
-                                                    stream);
+    const DeviceLayers device_layers = make_device_layers(layers, inv_frequency, key_norm_epsilon);
+    bool post = false;
+    if (context.ne[0] == 5120) {
+        post = launch_projection<5120>(context, positions, counts, state_slots, device_layers,
+                                       envelope, route, key_scratch, stream);
+    } else if (context.ne[0] == 4096) {
+        post = launch_projection<4096>(context, positions, counts, state_slots, device_layers,
+                                       envelope, route, key_scratch, stream);
+    } else {
+        post = launch_projection<2560>(context, positions, counts, state_slots, device_layers,
+                                       envelope, route, key_scratch, stream);
+    }
     if (!post) { return; }
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(envelope.max_count * context.ne[2], kLayers), dim3(256), 0, stream},

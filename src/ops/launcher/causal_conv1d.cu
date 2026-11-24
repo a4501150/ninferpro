@@ -136,6 +136,10 @@ void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
         smallt_split_launch<2048, 2048, 6144>(x, weight, conv_state_in, conv_state_out, out0, out1,
                                               out2, stream);
         return;
+    case CausalConvSplitGeometry::Rows8192x8192x8192:
+        smallt_split_launch<8192, 8192, 8192>(x, weight, conv_state_in, conv_state_out, out0, out1,
+                                              out2, stream);
+        return;
     }
     throw std::logic_error("causal_conv1d: unhandled split geometry");
 }
@@ -182,6 +186,10 @@ void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
         return;
     case CausalConvSplitGeometry::Rows2048x2048x6144:
         prefill_split_launch<2048, 2048, 6144>(x, weight, conv_state_in, conv_state_out, out0, out1,
+                                               out2, stream);
+        return;
+    case CausalConvSplitGeometry::Rows8192x8192x8192:
+        prefill_split_launch<8192, 8192, 8192>(x, weight, conv_state_in, conv_state_out, out0, out1,
                                                out2, stream);
         return;
     }
@@ -382,6 +390,12 @@ void causal_conv1d_snapshot_split_launch(const Tensor& x, const Tensor& weight, 
                         snapshot_base_slots, map, map, stream);
         return;
     }
+    case CausalConvSplitGeometry::Rows8192x8192x8192: {
+        const auto map = split_map<8192, 8192, 8192>(out0, out1, out2);
+        snapshot_launch(x, weight, conv_states, valid_columns, initial_state_slots,
+                        snapshot_base_slots, map, map, stream);
+        return;
+    }
     }
     throw std::logic_error("causal_conv1d: unhandled split geometry");
 }
@@ -409,8 +423,24 @@ void causal_conv1d_from_states_split_launch(const Tensor& x, const Tensor& weigh
         from_states_launch(x, weight, conv_states, initial_state_slots,
                            split_map<2048, 2048, 6144>(out0, out1, out2), stream);
         return;
+    case CausalConvSplitGeometry::Rows8192x8192x8192:
+        from_states_launch(x, weight, conv_states, initial_state_slots,
+                           split_map<8192, 8192, 8192>(out0, out1, out2), stream);
+        return;
     }
     throw std::logic_error("causal_conv1d: unhandled split geometry");
+}
+
+void causal_conv1d_commit_window_launch(const Tensor& x, Tensor& conv_states,
+                                        const CausalConvCommitRows& rows, int batch,
+                                        cudaStream_t stream) {
+    constexpr int kBlock = 256;
+    const std::int32_t C = x.ne[0];
+    const dim3 grid(static_cast<unsigned>((C + kBlock - 1) / kBlock), static_cast<unsigned>(batch));
+    causal_conv1d_commit_window_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(conv_states.data),
+        rows, C, x.ne[1], static_cast<std::int64_t>(C) * 3);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace infernix::ops::detail

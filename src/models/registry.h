@@ -17,7 +17,7 @@ struct ConstructedBackend;
 // option rules, and its Engine backend. Startup only.
 namespace infernix::models {
 
-enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp };
+enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp, Glm5Next };
 
 // The family whose config parser refines and refuses an artifact no probe claims.
 inline constexpr Architecture kDefaultArchitecture = Architecture::Qwen3_5;
@@ -26,7 +26,7 @@ inline constexpr Architecture kDefaultArchitecture = Architecture::Qwen3_5;
                                                 std::string_view model_type);
 [[nodiscard]] std::string_view architecture_name(Architecture architecture) noexcept;
 
-// The artifact's family: the Qwen4Exp probe, with the Qwen3.5 family as the default its config
+// The artifact's family: the Qwen4Exp and Glm5Next probes, with the Qwen3.5 family as the default its config
 // parser refines (Qwen3_5 vs Qwen3_5Moe) and where unknown architectures are refused. An
 // unreadable artifact throws; the Engine reports it from the model construction.
 [[nodiscard]] Architecture detect_artifact_architecture(const std::filesystem::path& artifact);

@@ -14,11 +14,32 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace infernix::runtime {
+
+// A model contract without n-gram drafting names no NgramArchive; the Engine then holds none.
+struct NoNgramArchive {
+    struct Request {};
+};
+
+template <class ModelContract>
+struct NgramArchiveOf {
+    using type = NoNgramArchive;
+};
+
+template <class ModelContract>
+    requires requires { typename ModelContract::NgramArchive; }
+struct NgramArchiveOf<ModelContract> {
+    using type = typename ModelContract::NgramArchive;
+};
+
+template <class ModelContract>
+inline constexpr bool kHasNgramArchive =
+    !std::is_same_v<typename NgramArchiveOf<ModelContract>::type, NoNgramArchive>;
 
 enum class RequestEngineHostPhase : std::uint8_t {
     Boundary,
@@ -164,7 +185,7 @@ struct RequestRecord {
     const std::uint64_t id;
     const std::uint64_t publication_order;
     PreparedPrompt prompt;
-    std::unique_ptr<typename ModelContract::NgramArchive::Request> ngram_archive;
+    std::unique_ptr<typename NgramArchiveOf<ModelContract>::type::Request> ngram_archive;
     OutputSession output;
     PromptSummary prompt_summary;
     double prepare_seconds = 0.0;

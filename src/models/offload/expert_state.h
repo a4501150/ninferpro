@@ -24,6 +24,10 @@ struct ExpertStateLoad {
 [[nodiscard]] std::string save_expert_state(const std::filesystem::path& path, std::string_view identity,
                                             const SavedState& state);
 
+// The identity a saved state belongs to: the artifact (absolute path, size and modification
+// time), not the build or KV format.
+[[nodiscard]] std::string artifact_identity(const std::filesystem::path& artifact);
+
 // Reads a state saved for `identity` with `keys` keys.
 [[nodiscard]] ExpertStateLoad load_expert_state(const std::filesystem::path& path, std::string_view identity,
                                                 std::uint32_t keys);

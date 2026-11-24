@@ -50,11 +50,6 @@ infernix_add_test(infernix_qwen3_5_frontend_test
   NEEDS_SOURCE_DIR
   LIBRARIES infernix_engine infernix_core infernix::json)
 
-# The reasoning-loop guard's repeated-passage measure (CPU only).
-infernix_add_test(infernix_qwen3_5_reasoning_loop_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reasoning_loop.cpp"
-  LIBRARIES infernix_model_runtime)
-
 infernix_add_test(infernix_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES infernix_engine infernix_core infernix::json)

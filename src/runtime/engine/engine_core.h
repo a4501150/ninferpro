@@ -53,7 +53,7 @@ public:
     using SourceCandidate    = typename ModelContract::SourceCandidate;
     using PendingBatch       = typename ModelContract::PendingBatch;
     using PreparedPrompt     = typename ModelContract::PreparedPrompt;
-    using NgramArchive       = typename ModelContract::NgramArchive;
+    using NgramArchive       = typename NgramArchiveOf<ModelContract>::type;
     using PublishedOutput    = typename ModelContract::PublishedOutput;
     using Request            = RequestRecord<ModelContract>;
     using Scheduling         = Scheduler<Request>;
@@ -106,10 +106,12 @@ public:
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         paused_.reserve(max_outstanding_);
-        if (options.speculative.ngram_archive_bytes != 0) {
-            ngram_archive_ = std::make_unique<NgramArchive>(typename NgramArchive::Limits{
-                .session_bytes = options.speculative.ngram_session_bytes,
-                .total_bytes   = options.speculative.ngram_archive_bytes});
+        if constexpr (kHasNgramArchive<ModelContract>) {
+            if (options.speculative.ngram_archive_bytes != 0) {
+                ngram_archive_ = std::make_unique<NgramArchive>(typename NgramArchive::Limits{
+                    .session_bytes = options.speculative.ngram_session_bytes,
+                    .total_bytes   = options.speculative.ngram_archive_bytes});
+            }
         }
         diagnostics_ = options.diagnostic_observer;
         if (options.context_cache.enabled &&
@@ -930,25 +932,27 @@ private:
         result.thinking                = request->output.thinking_stats();
         result.readout                 = std::move(request->readout);
         result.constrained_draws       = std::move(request->constrained_draws);
-        if (request->ngram_archive) {
-            result.ngram_archive.bound = true;
-            if (reason != FinishReason::Cancelled &&
-                !request->cancelled.load(std::memory_order_acquire)) {
-                result.ngram_archive.published =
-                    ngram_archive_->publish(std::move(request->ngram_archive),
-                                            result.generated_token_ids, result.reasoning_tokens);
-            } else {
-                request->ngram_archive.reset();
+        if constexpr (kHasNgramArchive<ModelContract>) {
+            if (request->ngram_archive) {
+                result.ngram_archive.bound = true;
+                if (reason != FinishReason::Cancelled &&
+                    !request->cancelled.load(std::memory_order_acquire)) {
+                    result.ngram_archive.published = ngram_archive_->publish(
+                        std::move(request->ngram_archive), result.generated_token_ids,
+                        result.reasoning_tokens);
+                } else {
+                    request->ngram_archive.reset();
+                }
             }
-        }
-        if (ngram_archive_) {
-            auto stats      = ngram_archive_->stats(request->options.ngram_session.key);
-            stats.bound     = result.ngram_archive.bound;
-            stats.published = result.ngram_archive.published;
-            if (!request->options.ngram_session.key.empty()) {
-                stats.sampling_seed = request->options.execution.sampling.seed;
+            if (ngram_archive_) {
+                auto stats      = ngram_archive_->stats(request->options.ngram_session.key);
+                stats.bound     = result.ngram_archive.bound;
+                stats.published = result.ngram_archive.published;
+                if (!request->options.ngram_session.key.empty()) {
+                    stats.sampling_seed = request->options.execution.sampling.seed;
+                }
+                result.ngram_archive = stats;
             }
-            result.ngram_archive = stats;
         }
         if (request->first_token) {
             result.timings.first_token_seconds =
@@ -1495,9 +1499,11 @@ private:
         if (!request->base_plan) {
             // The proposal-only ngram view binds once, before the prompt moves into its plan;
             // replay after a pause reuses the same snapshot.
-            if (ngram_archive_) {
-                request->ngram_archive =
-                    request->prompt.bind_ngram(*ngram_archive_, request->options.ngram_session);
+            if constexpr (kHasNgramArchive<ModelContract>) {
+                if (ngram_archive_) {
+                    request->ngram_archive =
+                        request->prompt.bind_ngram(*ngram_archive_, request->options.ngram_session);
+                }
             }
             request->base_plan.emplace(instance_.program->plan_request(std::move(request->prompt),
                                                                        request->options.execution));

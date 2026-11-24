@@ -14,7 +14,7 @@ template <bool Pair, class Coefficients = NativeRopeCoefficients>
 __global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
     const std::int32_t* __restrict__ positions, const __nv_bfloat16* __restrict__ q_norm,
     const __nv_bfloat16* __restrict__ k_norm, __nv_bfloat16* __restrict__ q,
-    __nv_bfloat16* __restrict__ k, Coefficients coefficients = {}) {
+    __nv_bfloat16* __restrict__ k, float epsilon, Coefficients coefficients = {}) {
     pdl::enter();
     constexpr int kPairs = 64;
     const int token      = blockIdx.x;
@@ -37,7 +37,7 @@ __global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
     const std::int64_t base = (static_cast<std::int64_t>(token) * (query ? 32 : 8) + head) * kPairs;
     const auto out    = detail::rmsnorm_rope_d128_head(data[base + lane], data[base + lane + 32],
                                                        weight_cache[lane], weight_cache[lane + 32],
-                                                       cos_cache, sin_cache, lane);
+                                                       cos_cache, sin_cache, lane, epsilon);
     data[base + lane] = out.first;
     data[base + lane + 32] = out.second;
 }

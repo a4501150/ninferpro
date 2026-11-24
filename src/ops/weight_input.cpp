@@ -161,9 +161,11 @@ SingleProjectionWeight prepare_attn_input_proj_weights(const WeightInput& query,
                                                        const WeightInput& key,
                                                        const WeightInput& value) {
     const auto& q = matrix(query);
-    // The 35B-A3B DFlash drafter (H 2048), Qwen3.8-27B's and Qwen3.8-Flash-Next's DFlash2 drafters
-    // (H 5120 and 2560).
-    require((q == std::vector<std::uint64_t>{4096, 2048} || q == std::vector<std::uint64_t>{4096, 2560} ||
+    // The 35B-A3B DFlash drafter (H 2048), Qwen3.8-27B's, GLM-5.3-Flash's and
+    // Qwen3.8-Flash-Next's DFlash2 drafters (H 5120, 4096 and 2560).
+    require((q == std::vector<std::uint64_t>{4096, 2048} ||
+             q == std::vector<std::uint64_t>{4096, 2560} ||
+             q == std::vector<std::uint64_t>{4096, 4096} ||
              q == std::vector<std::uint64_t>{4096, 5120}) &&
                 matrix(key) == std::vector<std::uint64_t>{1024, q[1]} &&
                 matrix(value) == matrix(key),

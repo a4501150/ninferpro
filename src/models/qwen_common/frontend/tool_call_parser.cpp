@@ -13,7 +13,7 @@ namespace infernix::models::qwen_common::frontend {
 namespace {
 
 using Json                = nlohmann::json;
-using Contract            = ToolCallOutputContract;
+using Contract            = common::frontend::ToolCallOutputContract;
 using FallbackReason      = ToolCallParseFallbackReason;
 using NormalizationPolicy = Contract::NormalizationPolicy;
 using SchemaType          = Contract::SchemaType;
@@ -1218,10 +1218,10 @@ bool contains_unquoted_tool_marker(std::string_view text) {
     return candidate != std::string_view::npos;
 }
 
-ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length,
-                                                 const ToolCallOutputContract& contract,
-                                                 bool tolerant, MarkdownCodeTracker code) {
+ParsedToolCallOutput
+parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
+                            const common::frontend::ToolCallOutputContract& contract, bool tolerant,
+                            MarkdownCodeTracker code) {
     const std::string_view source(text);
     // A marker inside Markdown code is a quoted example, never a call. Candidates
     // only move forward, so the tracker reads each byte once.
@@ -1308,8 +1308,9 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     return out;
 }
 
-ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
-                                             std::size_t max_tool_name_length, bool tolerant)
+ToolCallOutputDecoder::ToolCallOutputDecoder(
+    std::shared_ptr<const common::frontend::ToolCallOutputContract> contract,
+    std::size_t max_tool_name_length, bool tolerant)
     : contract_(std::move(contract)), max_tool_name_length_(max_tool_name_length),
       tolerant_(tolerant) {}
 

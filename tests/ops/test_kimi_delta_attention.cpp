@@ -496,6 +496,177 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     return failures;
 }
 
+// The verify and fold forms against successive one-token batch updates of the same rows, bit for
+// bit: verify's columns equal the updates' outputs and leave the pool alone, and the fold of a
+// row's first n columns publishes the state the updates published after n tokens.
+int verify_fold_case(const Case& shape, int width, const std::vector<int>& sources,
+                     const std::vector<int>& destinations, const std::vector<int>& columns,
+                     int slots, std::uint32_t seed) {
+    const int batch              = static_cast<int>(sources.size());
+    const int qheads             = shape.qheads();
+    const std::size_t state_size = static_cast<std::size_t>(kStateDim) * kStateDim * shape.heads;
+    const std::size_t qk_column  = static_cast<std::size_t>(kStateDim) * qheads;
+    const std::size_t v_column   = static_cast<std::size_t>(kStateDim) * shape.heads;
+    Case flat                    = shape;
+    flat.tokens                  = width * batch;
+    const kda_ref::Inputs in     = make_inputs(flat, seed);
+    DeviceInputs device(in);
+    std::vector<float> initial(state_size * static_cast<std::size_t>(slots));
+    std::mt19937 generator(seed ^ 0x9e3779b9U);
+    fill_uniform(initial, generator, -0.02F, 0.02F);
+
+    // Reference: W rounds of one-token updates, one row at a time.
+    GuardedDeviceBuffer reference_pool(initial.size() * sizeof(float));
+    reference_pool.copy_from_host(initial.data(), reference_pool.bytes());
+    GuardedDeviceBuffer reference_out(in.v.size() * sizeof(std::uint16_t));
+    std::vector<std::vector<std::vector<float>>> published(
+        static_cast<std::size_t>(batch), std::vector<std::vector<float>>(width + 1));
+    for (int b = 0; b < batch; ++b) {
+        const auto begin = initial.begin() + static_cast<std::ptrdiff_t>(sources[b] * state_size);
+        published[b][0].assign(begin, begin + static_cast<std::ptrdiff_t>(state_size));
+    }
+    Tensor a_log(device.a_log.p, DType::FP32, {shape.heads});
+    Tensor dt_bias(device.dt_bias.p, DType::FP32, {kStateDim, shape.heads});
+    Tensor reference_states(reference_pool.data(), DType::FP32,
+                            {kStateDim, kStateDim, shape.heads, slots});
+    for (int j = 0; j < width; ++j) {
+        for (int b = 0; b < batch; ++b) {
+            const std::size_t column = static_cast<std::size_t>(b) * width + j;
+            DeviceBuffer slot        = to_device_i32({sources[b]});
+            auto* q16                = static_cast<std::uint16_t*>(device.q.p);
+            auto* k16                = static_cast<std::uint16_t*>(device.k.p);
+            auto* v16                = static_cast<std::uint16_t*>(device.v.p);
+            auto* g16                = static_cast<std::uint16_t*>(device.g.p);
+            auto* b16                = static_cast<std::uint16_t*>(device.beta.p);
+            auto* o16                = static_cast<std::uint16_t*>(reference_out.data());
+            Tensor q(q16 + column * qk_column, DType::BF16, {kStateDim, qheads, 1, 1});
+            Tensor k(k16 + column * qk_column, DType::BF16, {kStateDim, qheads, 1, 1});
+            Tensor v(v16 + column * v_column, DType::BF16, {kStateDim, shape.heads, 1, 1});
+            Tensor g(g16 + column * v_column, DType::BF16, {kStateDim, shape.heads, 1, 1});
+            Tensor beta(b16 + column * shape.heads, DType::BF16, {shape.heads, 1, 1});
+            Tensor out(o16 + column * v_column, DType::BF16, {kStateDim, shape.heads, 1, 1});
+            Tensor slot_tensor(slot.p, DType::I32, {1});
+            ops::kimi_delta_attention_batch_update(q, k, v, g, beta, a_log, dt_bias,
+                                                   shape.lower_bound, kScale, reference_states,
+                                                   slot_tensor, out, nullptr);
+            cuda_synchronize();
+            const auto pool  = from_device<float>(reference_pool.data(), initial.size());
+            const auto begin = pool.begin() + static_cast<std::ptrdiff_t>(sources[b] * state_size);
+            published[b][j + 1].assign(begin, begin + static_cast<std::ptrdiff_t>(state_size));
+        }
+    }
+
+    const std::string label = case_label(shape) + " verify/fold W=" + std::to_string(width) +
+                              " B=" + std::to_string(batch);
+    GuardedDeviceBuffer pool(initial.size() * sizeof(float));
+    pool.copy_from_host(initial.data(), pool.bytes());
+    GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
+    out.fill(0xff);
+    DeviceBuffer slot_buffer = to_device_i32(sources);
+    Tensor q(device.q.p, DType::BF16, {kStateDim, qheads, width, batch});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, qheads, width, batch});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, shape.heads, width, batch});
+    Tensor g(device.g.p, DType::BF16, {kStateDim, shape.heads, width, batch});
+    Tensor beta(device.beta.p, DType::BF16, {shape.heads, width, batch});
+    Tensor states(pool.data(), DType::FP32, {kStateDim, kStateDim, shape.heads, slots});
+    Tensor slot_tensor(slot_buffer.p, DType::I32, {batch});
+    Tensor out_tensor(out.data(), DType::BF16, {kStateDim, shape.heads, width, batch});
+    ops::kimi_delta_attention_batch_verify(q, k, v, g, beta, a_log, dt_bias, shape.lower_bound,
+                                           kScale, states, slot_tensor, out_tensor, nullptr);
+    cuda_synchronize();
+    int failures = 0;
+    failures += verify_exact((label + " verify out").c_str(),
+                             from_device<std::uint16_t>(out.data(), in.v.size()),
+                             from_device<std::uint16_t>(reference_out.data(), in.v.size()));
+    failures += verify_exact((label + " verify leaves the pool").c_str(),
+                             from_device<float>(pool.data(), initial.size()), initial);
+    failures += out.verify_guards(label + " verify out");
+
+    std::vector<ops::KimiDeltaAttentionFoldRow> rows;
+    for (int b = 0; b < batch; ++b) { rows.push_back({sources[b], destinations[b], columns[b]}); }
+    ops::kimi_delta_attention_fold(k, v, g, beta, a_log, dt_bias, shape.lower_bound, states, rows,
+                                   nullptr);
+    cuda_synchronize();
+    const auto folded = from_device<float>(pool.data(), initial.size());
+    std::vector<bool> written(static_cast<std::size_t>(slots), false);
+    for (int b = 0; b < batch; ++b) {
+        if (columns[b] == 0) { continue; }
+        const auto begin =
+            folded.begin() + static_cast<std::ptrdiff_t>(destinations[b] * state_size);
+        failures += verify_exact(
+            (label + " fold row " + std::to_string(b) + " of " + std::to_string(columns[b]))
+                .c_str(),
+            std::vector<float>(begin, begin + static_cast<std::ptrdiff_t>(state_size)),
+            published[b][columns[b]]);
+        written[destinations[b]] = true;
+    }
+    for (int s = 0; s < slots; ++s) {
+        if (written[s]) { continue; }
+        const auto offset = static_cast<std::ptrdiff_t>(s * state_size);
+        failures += verify_exact(
+            (label + " fold leaves slot " + std::to_string(s)).c_str(),
+            std::vector<float>(folded.begin() + offset,
+                               folded.begin() + offset + static_cast<std::ptrdiff_t>(state_size)),
+            std::vector<float>(initial.begin() + offset,
+                               initial.begin() + offset + static_cast<std::ptrdiff_t>(state_size)));
+    }
+    failures += pool.verify_guards(label + " pool");
+    failures += verify_inputs_unchanged(label, in, device);
+    return failures;
+}
+
+int verify_fold_rejection_cases() {
+    constexpr int heads = 2, width = 17, batch = 9;
+    DeviceBuffer vectors(static_cast<std::size_t>(kStateDim) * heads * width * batch * 2);
+    DeviceBuffer beta_buffer(static_cast<std::size_t>(heads) * width * batch * 2);
+    DeviceBuffer a_log_buffer(static_cast<std::size_t>(heads) * sizeof(float));
+    DeviceBuffer dt_buffer(static_cast<std::size_t>(kStateDim) * heads * sizeof(float));
+    DeviceBuffer state_buffer(static_cast<std::size_t>(kStateDim) * kStateDim * heads * 4 *
+                              sizeof(float));
+    DeviceBuffer out_buffer(static_cast<std::size_t>(kStateDim) * heads * width * batch * 2);
+    DeviceBuffer slot_buffer(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    Tensor a_log(a_log_buffer.p, DType::FP32, {heads});
+    Tensor dt_bias(dt_buffer.p, DType::FP32, {kStateDim, heads});
+    Tensor states(state_buffer.p, DType::FP32, {kStateDim, kStateDim, heads, 4});
+    const auto verify_rejects = [&](int w, int b) {
+        Tensor x(vectors.p, DType::BF16, {kStateDim, heads, w, b});
+        Tensor beta(beta_buffer.p, DType::BF16, {heads, w, b});
+        Tensor out(out_buffer.p, DType::BF16, {kStateDim, heads, w, b});
+        Tensor slots(slot_buffer.p, DType::I32, {b});
+        try {
+            ops::kimi_delta_attention_batch_verify(x, x, x, x, beta, a_log, dt_bias, kLowerBound,
+                                                   kScale, states, slots, out, nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+    const auto fold_rejects = [&](std::vector<ops::KimiDeltaAttentionFoldRow> rows) {
+        const int b = static_cast<int>(rows.size());
+        Tensor x(vectors.p, DType::BF16, {kStateDim, heads, 4, b});
+        Tensor beta(beta_buffer.p, DType::BF16, {heads, 4, b});
+        try {
+            ops::kimi_delta_attention_fold(x, x, x, beta, a_log, dt_bias, kLowerBound, states, rows,
+                                           nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+    int failures      = 0;
+    const auto expect = [&](bool rejected, const char* what) {
+        if (!rejected) {
+            std::cerr << "kimi_delta_attention accepted " << what << '\n';
+            ++failures;
+        }
+    };
+    expect(verify_rejects(17, 1), "a W=17 verify");
+    expect(verify_rejects(2, 9), "a B=9 verify");
+    expect(fold_rejects({{0, 1, 5}}), "a fold past W");
+    expect(fold_rejects({{0, 2, 1}, {1, 2, 1}}), "a repeated fold destination");
+    expect(fold_rejects({{0, 1, 1}, {1, 2, 1}}), "a fold over another row's source");
+    expect(fold_rejects({{0, 4, 1}}), "a fold slot outside the pool");
+    return failures;
+}
+
 int graph_replay_case() {
     Case c{"chunked graph input updates", 48, 65};
     c.qk_heads            = 16;
@@ -678,6 +849,19 @@ int main() {
     failures +=
         batch_update_case({"Kimi K3 ordinary", 96, 1}, {10, 3, 7, 0, 9, 5, 1, 8}, 11, 96801U);
     failures += batch_update_case({"runtime head count", 5, 1}, {3, 0, 4}, 5, 50301U);
+    failures += verify_fold_rejection_cases();
+    // GLM-5.3-Flash's KDA geometry (64 heads), a speculative round's widths, in-place and moved
+    // commits, an untouched row and a full one.
+    failures +=
+        verify_fold_case({"GLM", 64, 1}, 8, {3, 0, 5, 1}, {3, 6, 5, 2}, {8, 3, 0, 1}, 7, 64801U);
+    failures += verify_fold_case({"GLM", 64, 1}, 2, {0}, {0}, {1}, 1, 64201U);
+    failures += verify_fold_case({"GLM", 64, 1}, 16, {1, 0}, {1, 0}, {16, 9}, 2, 64161U);
+    {
+        Case grouped{"grouped", 32, 1};
+        grouped.qk_heads = 16;
+        failures += verify_fold_case(grouped, 5, {2, 4, 0, 1, 3, 5, 6, 7}, {2, 4, 0, 1, 3, 5, 6, 7},
+                                     {5, 4, 3, 2, 1, 0, 5, 1}, 8, 32501U);
+    }
 
     for (const auto [qheads, vheads] :
          {std::pair{16, 48}, {16, 32}, {96, 96}, {64, 64}, {1, 32}, {5, 15}}) {

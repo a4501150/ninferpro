@@ -480,6 +480,36 @@ __global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* __restrict
     }
 }
 
+// The commit of a verified prefix: one block row per request, one thread per channel. A thread
+// reads its channel's source window before writing it, so a row may commit in place.
+__global__ void causal_conv1d_commit_window_kernel(const __nv_bfloat16* __restrict__ x,
+                                                   __nv_bfloat16* conv_states,
+                                                   const __grid_constant__ detail::CausalConvCommitRows rows,
+                                                   std::int32_t C,
+                                                   std::int32_t width, std::int64_t slot_stride) {
+    const std::int32_t batch   = static_cast<std::int32_t>(blockIdx.y);
+    const std::int32_t columns = rows.columns[batch];
+    const std::int64_t c64     = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t C64     = static_cast<std::int64_t>(C);
+    if (columns == 0 || c64 >= C64) { return; }
+    const __nv_bfloat16* source =
+        conv_states + static_cast<std::int64_t>(rows.source[batch]) * slot_stride;
+    __nv_bfloat16 s0 = source[c64];
+    __nv_bfloat16 s1 = source[C64 + c64];
+    __nv_bfloat16 s2 = source[2 * C64 + c64];
+    const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
+    for (std::int32_t column = 0; column < columns; ++column) {
+        s0 = s1;
+        s1 = s2;
+        s2 = x[row_base + static_cast<std::int64_t>(column) * C64 + c64];
+    }
+    __nv_bfloat16* destination =
+        conv_states + static_cast<std::int64_t>(rows.destination[batch]) * slot_stride;
+    destination[c64]           = s0;
+    destination[C64 + c64]     = s1;
+    destination[2 * C64 + c64] = s2;
+}
+
 // Small-T snapshot form. A CTA owns all token outputs for one channel tile. The selected history
 // is cached before any snapshot slot is written, so initial_slot may name any slot, including one
 // overwritten by this call.

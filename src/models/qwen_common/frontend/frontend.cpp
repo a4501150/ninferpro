@@ -10,7 +10,7 @@
 #include "models/qwen_common/frontend/tokenizer.h"
 #include "models/qwen_common/frontend/ngram_sources.h"
 #include "models/qwen_common/frontend/tool_call_parser.h"
-#include "models/qwen_common/frontend/tool_contract.h"
+#include "models/common/frontend/tool_contract.h"
 #include "models/qwen_common/frontend/tool_grammar.h"
 #include "models/qwen_common/program/prefix/block_keys.h"
 #include "text/unicode.h"
@@ -783,7 +783,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
     for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
-    const auto tool_call_output = fi::build_tool_call_output_contract(
+    const auto tool_call_output = common::frontend::build_tool_call_output_contract(
         options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names);
     const std::optional<std::uint32_t> leading_boundary =
         leading_instruction_boundary(message_roles);
@@ -1057,7 +1057,8 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
-    auto tool_contract = fi::select_tool_call_contract(prompt.data_->tool_call_output, tool_choice);
+    auto tool_contract =
+        common::frontend::select_tool_call_contract(prompt.data_->tool_call_output, tool_choice);
     if (constraint && tool_contract && tool_contract->tools.empty()) tool_contract.reset();
     const bool combined = constraint && tool_contract && !tool_contract->tools.empty();
     if (combined) {
@@ -1066,7 +1067,8 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
             throw RequestError(text::constraint_error_kind(constraint->kind),
                                "active tools can be combined with JSON output constraints");
         if (!tool_contract->constrained) {
-            auto structured         = std::make_shared<fi::ToolCallOutputContract>(*tool_contract);
+            auto structured =
+                std::make_shared<common::frontend::ToolCallOutputContract>(*tool_contract);
             structured->constrained = true;
             tool_contract           = std::move(structured);
         }

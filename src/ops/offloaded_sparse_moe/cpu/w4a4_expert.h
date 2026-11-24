@@ -39,6 +39,10 @@ void quantize_a4(const std::uint16_t* v, int n, float input_scale, canon::A4Bloc
 // AVX2 canonical functions on every vector ISA, the scalar functions on the scalar ISA and the tail.
 void swiglu_bf16_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, int n, std::uint16_t* h);
 
+// The clamped SwiGLU over n elements: canon::swiglu_bf16_clamped with `limit` (0: swiglu_bf16).
+void swiglu_bf16_clamped_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, int n,
+                           std::uint16_t* h, float limit);
+
 // Phase A for 16-intermediate units [unit_begin, unit_end): gate/up rows, SwiGLU, and A4 of h
 // with the down input scale. `x_gate[col]` / `x_up[col]` are x quantized with the gate and up
 // input scales (the same pointers when the scales are equal). Writes h_blocks[col][unit].

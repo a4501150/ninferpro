@@ -7,6 +7,8 @@
 #include "core/vram_budget.h"
 #include "models/load_options.h"
 #include "models/offload/expert_placement.h"
+#include "models/offload/expert_placement_report.h"
+#include "models/offload/expert_placement_startup.h"
 #include "models/qwen4_exp/calibrated_order.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/memory_plan.h"
@@ -216,14 +218,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.draft_min_p = options.speculative.draft_min_p.value_or(
         options.speculative.draft_tokens_auto && options.speculative.backend == SpeculativeBackend::Mtp ? 0.5F : 0.0F);
     if (!options.expert_state_path.empty()) {
-        // The state belongs to the artifact: its experts and their records, not the build or KV format.
-        std::error_code error;
-        const auto size = std::filesystem::file_size(options.artifact_path, error);
-        const auto time = std::filesystem::last_write_time(options.artifact_path, error);
         program_options.expert_state          = options.expert_state_path;
-        program_options.expert_state_identity = "artifact=" + std::filesystem::absolute(options.artifact_path).string() +
-                                                ";size=" + std::to_string(error ? 0U : size) +
-                                                ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
+        program_options.expert_state_identity = models::offload::expert_cache::artifact_identity(options.artifact_path);
     }
     program_options.ngram_volume = volume;
     program_options.ngram_table  = table;
@@ -291,155 +287,75 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const std::uint64_t stride = plan.pinned_expert_bytes() > 0 && placement_keys > 0
                                     ? plan.pinned_expert_bytes() / placement_keys
                                     : 0; // one expert record, the sizing unit of frames and slots
-    // The RAM tier's fixed lists beside its resident slots (ring, prefetch, demotion, bounce; the
-    // Program sizes them from the same ledger fields).
-    constexpr std::uint64_t kTierListAllowance = 1536;
-
-    if (options.expert_ram_bytes.has_value() &&
-        (!options.experts_spec.empty() || !options.expert_placement_path.empty())) {
-        throw std::runtime_error("--expert-ram-mib sizes the RAM tier by bytes; --experts and "
-                                 "--expert-placement name it by experts. Choose one");
-    }
-    // The ranking the spec's shares resolve by: the saved session's counts (the same state the
-    // warm start reads), else the calibrated order, else spread across the layers.
-    const auto load_ranking = [&](std::vector<std::uint32_t>& counts, std::vector<std::uint32_t>& ranked) {
-        if (!program_options.expert_state.empty()) {
-            const auto load = models::offload::expert_cache::load_expert_state(
-                program_options.expert_state, program_options.expert_state_identity,
-                static_cast<std::uint32_t>(placement_keys));
-            if (load.state) {
-                counts = load.state->counts;
-                ranked = load.state->ranked;
+    // Expert placement (design §9.6; --experts / --expert-placement): the shared resolution
+    // (models/offload/expert_placement_startup.h) turns a spec or file into the frame target and
+    // ceiling, the pinned keys, the tier order and the ledger's expert cap -- or the resident
+    // placement, when the family's device-plan probe holds every expert beside the fully-mapped
+    // KV pool. One of: Resident -- every routed expert in the frame pool, nothing lends or
+    // evicts, the KV pool fully mapped, the RAM tier at its floor; Placed -- an explicit count or
+    // file naming the VRAM set (pinned, the pool sized to it) and the RAM set; AutoHeadroom -- an
+    // explicit --vram-headroom-mib the card cannot pay beside every expert, so the frames it
+    // evicts hold a RAM hot set; Upstream -- a smaller card keeps the existing maximal RAM tier.
+    const models::offload::StartupPlacement placement = models::offload::resolve_startup_placement({
+        .layers         = placement_layers,
+        .experts        = placement_experts,
+        .stride         = stride,
+        .expert_banks   = demand.expert_banks,
+        .experts_spec   = options.experts_spec,
+        .expert_placement = options.expert_placement_path,
+        .expert_ram_bytes = options.expert_ram_bytes,
+        .lock_overhead  = demand.lock_overhead,
+        // The ranking the spec's shares resolve by: the saved session's counts (the same state
+        // the warm start reads), else the calibrated order, else spread across the layers.
+        .load_ranking = [&](std::vector<std::uint32_t>& counts, std::vector<std::uint32_t>& ranked) {
+            if (!program_options.expert_state.empty()) {
+                const auto load = models::offload::expert_cache::load_expert_state(
+                    program_options.expert_state, program_options.expert_state_identity,
+                    static_cast<std::uint32_t>(placement_keys));
+                if (load.state) {
+                    counts = load.state->counts;
+                    ranked = load.state->ranked;
+                }
             }
-        }
-        if (counts.empty() && ranked.empty() && text_config.hidden_size == 2560 &&
-            placement_layers == models::qwen4_exp::kCalibratedLayers &&
-            placement_experts == models::qwen4_exp::kCalibratedExperts) {
-            const auto calibrated = models::qwen4_exp::calibrated_expert_order();
-            counts = calibrated.counts;
-            ranked = calibrated.ranked;
-            return true;
-        }
-        return false;
-    };
-
-    models::offload::ExpertPlacementSpec spec;
-    bool placed = false;
-    bool all_in_vram = false; // the spec names vram=all: resident, or a startup error
-    std::string placement_origin;
-    if (!options.expert_placement_path.empty()) {
-        spec = models::offload::parse_expert_placement_file(options.expert_placement_path, placement_layers,
-                                                              placement_experts);
-        placed          = true;
-        placement_origin = options.expert_placement_path.string();
-    } else if (!options.experts_spec.empty()) {
-        // The exclusive three-tier spec: shares or counts by usage rank. vram=all (or 100%) is
-        // the resident placement; the probe below holds it or fails the start.
-        const runtime::ExpertsSpec experts = runtime::parse_experts_spec(options.experts_spec);
-        const auto [vram_count, ram_count] = runtime::experts_spec_counts(experts, placement_keys);
-        if (vram_count >= placement_keys) {
-            all_in_vram = true;
-            placement_origin = options.experts_spec;
-        } else {
-            std::vector<std::uint32_t> counts, ranked;
-            const bool calibrated = load_ranking(counts, ranked);
-            spec = models::offload::placement_from_counts(
-                static_cast<std::uint32_t>(vram_count), static_cast<std::uint32_t>(ram_count), placement_layers,
-                placement_experts, counts, ranked);
-            placed = true;
-            placement_origin = options.experts_spec + " by " + (calibrated ? "the calibrated order" : "the ranking");
-        }
-    }
-
-    const auto set_tier_cap = [&](std::uint64_t resident_slots) {
-        const std::uint64_t slots = resident_slots + kTierListAllowance;
-        demand.expert_cap = slots * stride +
-                            static_cast<std::uint64_t>(static_cast<double>(slots * stride) * demand.lock_overhead);
-        if (options.expert_ram_bytes.has_value()) {
-            demand.expert_cap = options.expert_ram_bytes; // --expert-ram-mib keeps byte-level control
-        }
-    };
-    if (placed) {
-        // The VRAM set must fit the frame pool; the RAM set the ledger. A file names exact keys,
-        // so its vram set pins; a counts/shares spec names sizes only, so its frames stay
-        // adaptive within the count (the per-round policy swaps hot experts in and cold out).
-        program_options.expert_frame_target = static_cast<std::uint32_t>(spec.vram.size());
-        if (!options.expert_placement_path.empty()) { program_options.expert_pinned_keys = spec.vram; }
-        program_options.expert_tier_order    = spec.order;
-        // The placement names the pool's size: the VRAM monitor never grows past it.
-        program_options.expert_frame_ceiling = static_cast<std::uint32_t>(spec.vram.size());
-        set_tier_cap(spec.ram.size());
-        report(options, DiagnosticLevel::Info,
-               "expert placement: " + placement_origin + " -- " + std::to_string(spec.vram.size()) +
-                   " experts pinned in VRAM, " + std::to_string(spec.ram.size()) + " in RAM, the rest from the artifact");
-    } else if (all_in_vram || (stride > 0 && demand.expert_banks > 0 && !options.expert_ram_bytes.has_value())) {
-        // The resident probe: the device plan with the KV pool fully mapped (no elasticity) must
-        // leave room for every expert beside it. vram=all demands it; the default falls back to
-        // the upstream maximal tier when the card cannot.
-        models::qwen4_exp::ProgramOptions probe_options = program_options;
-        probe_options.resident_experts    = true;
-        probe_options.expert_frame_target = 0;
-        const auto probe = models::qwen4_exp::Program::plan_device(probe_options, plan.config(),
-                                                                  plan.public_token_count());
-        models::qwen4_exp::VramDemand probe_demand;
-        probe_demand.headroom    = options.vram_headroom_bytes;
-        probe_demand.graphs      = probe.graph_bound;
-        probe_demand.fixed       = plan.device_bytes() + probe.fixed_bytes(); // includes the full KV pool
-        probe_demand.frame_bytes = probe.expert_frame_bytes;
-        probe_demand.max_frames  = probe.max_frames;
-        const auto fit = models::qwen4_exp::size_expert_frames(vram->query(), probe_demand);
-        const std::uint64_t experts = placement_keys;
-        constexpr std::uint32_t kFitMarginFrames = 512; // the probe's staging is sized as if tierless
-        const bool fits = fit.frames + kFitMarginFrames >= experts && fit.frame_bytes >= 0;
-        if (!fits && all_in_vram) {
-            throw std::runtime_error("--experts vram=all: every routed expert does not fit in VRAM beside "
-                                     "the fully-mapped KV pool and the fixed allocations; lower the spec's "
-                                     "vram share, or --max-context/--max-concurrency");
-        }
-        if (fits) {
-            program_options.resident_experts    = true;
-            program_options.expert_frame_target = probe.max_frames;
-            // Only the tier's floor: every expert lives in VRAM, so RAM holds its lists and the
-            // cold fill's landing staging, nothing else.
-            const std::uint64_t floor_slots = kTierListAllowance;
-            demand.expert_cap = floor_slots * stride +
-                                static_cast<std::uint64_t>(static_cast<double>(floor_slots * stride) *
-                                                           demand.lock_overhead);
-            demand.lean_auto_cap = false;
-            const std::uint64_t kv_gib = probe.fixed_bytes() >> 30;
-            report(options, DiagnosticLevel::Info,
-                   "every expert fits in VRAM beside the fully-mapped KV pool (" + std::to_string(kv_gib) +
-                       " GiB fixed): holding all " + std::to_string(experts) +
-                       " resident -- nothing is lent or evicted; the fill's ~" +
-                       std::to_string((floor_slots * stride) >> 20) +
-                       " MiB RAM reader releases once the experts are loaded, leaving 0 host expert bytes. "
-                       "Pass --experts vram=N%,ram=M% for a smaller set");
-        }
-        // Otherwise (a smaller card, or an explicit --expert-ram-mib): the existing maximal RAM
-        // tier, unchanged. Headroom no longer sizes the expert placement: name the placement
-        // with --experts and keep the headroom for the display and other programs.
-    }
-    if (placed && stride > 0) {
-        // The VRAM set must fit beside the fixed allocations.
-        const auto probe = models::qwen4_exp::Program::plan_device(program_options, plan.config(),
-                                                                  plan.public_token_count());
-        models::qwen4_exp::VramDemand probe_demand;
-        probe_demand.headroom    = options.vram_headroom_bytes;
-        probe_demand.graphs      = probe.graph_bound;
-        probe_demand.fixed       = plan.device_bytes() + probe.fixed_bytes();
-        probe_demand.frame_bytes = probe.expert_frame_bytes;
-        probe_demand.max_frames  = probe.max_frames;
-        const auto fit = models::qwen4_exp::size_expert_frames(vram->query(), probe_demand);
-        const std::uint64_t experts = placement_keys;
-        if (fit.frame_bytes < 0 || static_cast<std::uint64_t>(fit.frames) + 512 < spec.vram.size() ||
-            spec.vram.size() > experts) {
-            throw std::runtime_error(
-                "the expert placement pins " + std::to_string(spec.vram.size()) +
-                " experts in VRAM, but only " + std::to_string(fit.frames) +
-                " frames fit beside the fixed allocations; lower the spec's vram share (or the file's vram "
-                "rows), or --max-context/--max-concurrency");
-        }
-    }
+            if (counts.empty() && ranked.empty() && text_config.hidden_size == 2560 &&
+                placement_layers == models::qwen4_exp::kCalibratedLayers &&
+                placement_experts == models::qwen4_exp::kCalibratedExperts) {
+                const auto calibrated = models::qwen4_exp::calibrated_expert_order();
+                counts = calibrated.counts;
+                ranked = calibrated.ranked;
+                return true;
+            }
+            return false;
+        },
+        // The family's device plan beside the fixed allocations; `resident` probes it with the
+        // KV pool fully mapped (no elasticity, no frame target).
+        .probe = [&](bool resident_probe) -> models::offload::StartupPlacementInputs::Fit {
+            models::qwen4_exp::ProgramOptions probe_options = program_options;
+            if (resident_probe) {
+                probe_options.resident_experts    = true;
+                probe_options.expert_frame_target = 0;
+            }
+            const auto probe = models::qwen4_exp::Program::plan_device(probe_options, plan.config(),
+                                                                      plan.public_token_count());
+            models::qwen4_exp::VramDemand probe_demand;
+            probe_demand.headroom    = options.vram_headroom_bytes;
+            probe_demand.graphs      = probe.graph_bound;
+            probe_demand.fixed       = plan.device_bytes() + probe.fixed_bytes(); // includes the full KV pool
+            probe_demand.frame_bytes = probe.expert_frame_bytes;
+            probe_demand.max_frames  = probe.max_frames;
+            const auto fit = models::qwen4_exp::size_expert_frames(vram->query(), probe_demand);
+            return {.frame_bytes = fit.frame_bytes, .frames = fit.frames, .max_frames = probe.max_frames,
+                    .fixed_bytes = probe.fixed_bytes()};
+        },
+        .report = [&](DiagnosticLevel level, const std::string& text) { report(options, level, text); },
+    });
+    program_options.expert_frame_target = placement.frame_target;
+    if (!placement.pinned_keys.empty()) { program_options.expert_pinned_keys = placement.pinned_keys; }
+    program_options.expert_tier_order    = placement.tier_order;
+    program_options.expert_frame_ceiling = placement.frame_ceiling;
+    if (placement.tier_expert_cap) { demand.expert_cap = *placement.tier_expert_cap; }
+    if (placement.clear_lean_auto_cap) { demand.lean_auto_cap = false; }
+    program_options.resident_experts = placement.resident;
     bool ngram_in_ram   = false;
     if (options.ngram_residency != NgramResidency::Volume) {
         auto with_table         = demand;
@@ -686,56 +602,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     return {std::move(instance), std::move(summary), std::move(metadata), std::move(resolved)};
 }
 
-namespace {
-// The public report from the Program's status.
-ExpertPlacementReport to_report(const models::qwen4_exp::Program::ExpertPlacementStatus& status) {
-    ExpertPlacementReport report;
-    report.supported      = true;
-    report.resident      = status.resident;
-    report.switching     = status.target != 0;
-    report.frames        = status.frames;
-    report.frame_limit   = status.frame_limit;
-    report.target        = status.target;
-    report.pinned        = status.pinned;
-    report.residents     = status.residents;
-    report.tier_slots    = status.tier_slots;
-    report.tier_residents = status.tier_residents;
-    report.has_tier_target = status.has_tier_target;
-    report.tier_target   = status.tier_target;
-    report.fill_total    = status.fill_total;
-    report.fill_seeded   = status.fill_seeded;
-    report.total_experts = status.total_experts;
-    report.swap_routed     = status.swap_routed;
-    report.swap_hits      = status.swap_hits;
-    report.swap_promotions = status.swap_promotions;
-    report.swap_demotions  = status.swap_demotions;
-    report.swap_promotion_bytes = status.swap_promotion_bytes;
-    report.swap_demotion_bytes  = status.swap_demotion_bytes;
-    report.swap_admitted   = status.swap_admitted;
-    report.tier_shadows    = status.tier_shadows;
-    report.kv_bytes        = status.kv_bytes;
-    report.last_switch_ok      = status.last_switch_ok;
-    report.last_switch_message = status.last_switch_message;
-    report.expert_record_bytes = status.expert_record_bytes;
-    report.frame_bytes   = status.frame_bytes;
-    report.pool_bytes    = status.pool_bytes;
-    report.ssd_experts   = status.ssd_experts;
-    report.vram_free     = status.vram_free;
-    report.vram_total    = status.vram_total;
-    report.host_total    = status.host_total;
-    report.host_available = status.host_available;
-    report.landing_slots = status.landing_slots;
-    return report;
-}
-} // namespace
-
 const models::qwen4_exp::TextConfig& Qwen4ExpInstance::text_config_() const {
     return model->config().text;
 }
 
 ExpertPlacementReport Qwen4ExpInstance::expert_placement_status() const {
     if (!program) { return {}; }
-    return to_report(program->expert_placement_status());
+    return models::offload::to_expert_placement_report(program->expert_placement_status());
 }
 
 bool Qwen4ExpInstance::request_expert_placement(const ExpertPlacementSwitch& request, std::string* error) {
@@ -746,14 +619,10 @@ bool Qwen4ExpInstance::request_expert_placement(const ExpertPlacementSwitch& req
     if (!request.placement_file.empty()) {
         models::offload::ExpertPlacementRequest model_request;
         try {
-            const auto& text   = text_config_();
-            const auto spec   = models::offload::parse_expert_placement_file(
-                request.placement_file, text.num_hidden_layers, text.moe.experts);
-            model_request.frame_target = static_cast<std::uint32_t>(spec.vram.size());
-            model_request.pinned       = spec.vram;
-            model_request.order        = spec.order;
-            model_request.has_ram_target = true;
-            model_request.ram_target    = static_cast<std::uint32_t>(spec.ram.size());
+            const auto& text = text_config_();
+            model_request = models::offload::expert_placement_request_from_file(request.placement_file,
+                                                                                text.num_hidden_layers,
+                                                                                text.moe.experts);
         } catch (const std::exception& parse) {
             if (error != nullptr) { *error = parse.what(); }
             return false;
@@ -781,20 +650,7 @@ Qwen4ExpInstance::preview_expert_placement(const std::string& experts_spec,
     if (!now.supported || now.total_experts == 0) {
         throw std::invalid_argument("this model runs without the expert cache");
     }
-    const runtime::ExpertsSpec spec  = runtime::parse_experts_spec(experts_spec);
-    const auto [vram, ram]           = runtime::experts_spec_counts(spec, now.total_experts);
-    const std::uint64_t frames_bytes = vram * now.frame_bytes;
-    const std::uint64_t available    = now.vram_free + now.pool_bytes;
-    return {.total_experts     = now.total_experts,
-            .vram_experts      = vram,
-            .ram_experts       = ram,
-            .ssd_experts       = now.total_experts - vram - ram,
-            .vram_expert_bytes = frames_bytes,
-            .vram_free_after   = available > frames_bytes ? available - frames_bytes : 0,
-            .ram_expert_bytes  = ram * now.expert_record_bytes,
-            .ram_tier_slots    = now.tier_slots,
-            .fits              = frames_bytes <= available,
-            .ram_fits          = ram * now.expert_record_bytes <= now.host_available};
+    return models::offload::preview_expert_placement(experts_spec, now);
 }
 
 std::string Qwen4ExpInstance::prefix_cache_save_notice(const EngineOptions& options) const {

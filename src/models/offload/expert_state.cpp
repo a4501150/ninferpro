@@ -115,4 +115,12 @@ ExpertStateLoad load_expert_state(const std::filesystem::path& path, std::string
     return out;
 }
 
+std::string artifact_identity(const std::filesystem::path& artifact) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(artifact, error);
+    const auto time = std::filesystem::last_write_time(artifact, error);
+    return "artifact=" + std::filesystem::absolute(artifact).string() + ";size=" + std::to_string(error ? 0U : size) +
+           ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
+}
+
 } // namespace infernix::models::offload::expert_cache

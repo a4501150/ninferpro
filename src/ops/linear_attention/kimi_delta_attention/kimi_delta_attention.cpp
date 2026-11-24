@@ -179,6 +179,63 @@ BatchGeometry validate_batch_update(const Tensor& q, const Tensor& k, const Tens
     return geometry;
 }
 
+struct RowsGeometry {
+    std::int32_t qk_heads;
+    std::int32_t value_heads;
+    std::int32_t width;
+    std::int32_t batch;
+};
+
+// The [128,H,W,B] operands of the verify and fold forms; q and out are null for the fold.
+RowsGeometry validate_rows(const Tensor* q, const Tensor& k, const Tensor& v, const Tensor& g,
+                           const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
+                           float lower_bound, const Tensor& ssm_states, const Tensor* out) {
+    constexpr std::int32_t kMaximumBatch = 8;
+    constexpr std::int32_t kMaximumWidth = 16;
+    for (const Tensor* t : {q, &k, &v, &g, &beta, out}) {
+        if (t != nullptr) { require_dtype(*t, DType::BF16, "q/k/v/g/beta/out must be BF16"); }
+    }
+    require_dtype(a_log, DType::FP32, "A_log must be FP32");
+    require_dtype(dt_bias, DType::FP32, "dt_bias must be FP32");
+    require_dtype(ssm_states, DType::FP32, "ssm_states must be FP32");
+
+    const RowsGeometry geometry{k.ne[1], v.ne[1], k.ne[2], k.ne[3]};
+    if (k.ne[0] != kStateDim) {
+        throw std::invalid_argument("kimi_delta_attention: state/head dimension must be 128");
+    }
+    if (!detail::kimi_delta_attention::valid_heads(geometry.qk_heads, geometry.value_heads) ||
+        geometry.batch <= 0 || geometry.batch > kMaximumBatch || geometry.width <= 0 ||
+        geometry.width > kMaximumWidth) {
+        throw std::invalid_argument("kimi_delta_attention: verify/fold require Hqk>=1, Hv>=Hqk, "
+                                    "Hv%Hqk=0, B=1..8, and W=1..16");
+    }
+    const std::int32_t W = geometry.width, B = geometry.batch;
+    if (q != nullptr) { require_shape(*q, kStateDim, geometry.qk_heads, W, B, "q"); }
+    require_shape(k, kStateDim, geometry.qk_heads, W, B, "k");
+    require_shape(v, kStateDim, geometry.value_heads, W, B, "v");
+    require_shape(g, kStateDim, geometry.value_heads, W, B, "g");
+    if (out != nullptr) { require_shape(*out, kStateDim, geometry.value_heads, W, B, "out"); }
+    require_shape(beta, geometry.value_heads, W, B, 1, "beta");
+    require_shape(a_log, geometry.value_heads, 1, 1, 1, "A_log");
+    require_shape(dt_bias, kStateDim, geometry.value_heads, 1, 1, "dt_bias");
+    if (ssm_states.ne[0] != kStateDim || ssm_states.ne[1] != kStateDim ||
+        ssm_states.ne[2] != geometry.value_heads || ssm_states.ne[3] <= 0) {
+        throw std::invalid_argument("kimi_delta_attention: invalid shape for pooled ssm_states");
+    }
+    for (const Tensor* t : {q, &k, &v, &g, &beta, &a_log, &dt_bias, &ssm_states, out}) {
+        if (t != nullptr) { require_contiguous_nonnull(*t, "verify/fold operand"); }
+    }
+    for (const Tensor* t : {q, &k, &v, &g, &beta, out}) {
+        if (t != nullptr && overlaps(*t, ssm_states)) {
+            throw std::invalid_argument("kimi_delta_attention: an operand overlaps ssm_states");
+        }
+    }
+    if (!std::isfinite(lower_bound) || lower_bound < -5.0F || lower_bound > 0.0F) {
+        throw std::invalid_argument("kimi_delta_attention: lower_bound must be in [-5,0]");
+    }
+    return geometry;
+}
+
 detail::kimi_delta_attention::Arguments
 arguments(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
           const Tensor& a_log, const Tensor& dt_bias, float lower_bound, float scale,
@@ -258,6 +315,67 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
     detail::kimi_delta_attention::launch_batch_update(
         arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, states, states, out),
         static_cast<const std::int32_t*>(slots.data), geometry.batch, stream);
+}
+
+void kimi_delta_attention_batch_verify(const Tensor& q, const Tensor& k, const Tensor& v,
+                                       const Tensor& g, const Tensor& beta, const Tensor& a_log,
+                                       const Tensor& dt_bias, float lower_bound, float scale,
+                                       const Tensor& states, const Tensor& slots, Tensor& out,
+                                       cudaStream_t stream) {
+    const auto geometry =
+        validate_rows(&q, k, v, g, beta, a_log, dt_bias, lower_bound, states, &out);
+    require_control_parameters(lower_bound, scale);
+    require_dtype(slots, DType::I32, "state_slots must be I32");
+    require_shape(slots, geometry.batch, 1, 1, 1, "state_slots");
+    require_contiguous_nonnull(slots, "state_slots");
+    for (const Tensor* input : {&q, &k, &v, &g, &beta, &slots}) {
+        if (overlaps(*input, out)) {
+            throw std::invalid_argument("kimi_delta_attention: verify out overlaps an input");
+        }
+    }
+    Tensor& pool = const_cast<Tensor&>(states); // read only: launch_batch_verify reads state_in
+    detail::kimi_delta_attention::launch_batch_verify(
+        arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, states, pool, out),
+        static_cast<const std::int32_t*>(slots.data), geometry.batch, stream);
+}
+
+void kimi_delta_attention_fold(const Tensor& k, const Tensor& v, const Tensor& g,
+                               const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
+                               float lower_bound, Tensor& states,
+                               std::span<const KimiDeltaAttentionFoldRow> rows,
+                               cudaStream_t stream) {
+    const auto geometry =
+        validate_rows(nullptr, k, v, g, beta, a_log, dt_bias, lower_bound, states, nullptr);
+    if (rows.size() != static_cast<std::size_t>(geometry.batch)) {
+        throw std::invalid_argument("kimi_delta_attention_fold: one row per record row");
+    }
+    detail::kimi_delta_attention::FoldRows packed{};
+    const std::int32_t slots = states.ne[3];
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+        const auto& row = rows[b];
+        if (row.columns < 0 || row.columns > geometry.width || row.source_slot < 0 ||
+            row.source_slot >= slots || row.destination_slot < 0 || row.destination_slot >= slots) {
+            throw std::invalid_argument("kimi_delta_attention_fold: invalid row");
+        }
+        for (std::size_t other = 0; other < rows.size(); ++other) {
+            if (other == b || row.columns == 0 || rows[other].columns == 0) { continue; }
+            if (row.destination_slot == rows[other].destination_slot ||
+                row.destination_slot == rows[other].source_slot) {
+                throw std::invalid_argument(
+                    "kimi_delta_attention_fold: a destination repeats or overwrites another "
+                    "row's source");
+            }
+        }
+        packed.source[b]      = row.source_slot;
+        packed.destination[b] = row.destination_slot;
+        packed.columns[b]     = row.columns;
+    }
+    // The arguments' query and output slots are unused by the fold.
+    Tensor unused_out = v;
+    detail::kimi_delta_attention::launch_fold(
+        arguments(k, k, v, g, beta, a_log, dt_bias, lower_bound,
+                  1.0F / std::sqrt(static_cast<float>(kStateDim)), states, states, unused_out),
+        packed, geometry.batch, stream);
 }
 
 } // namespace infernix::ops

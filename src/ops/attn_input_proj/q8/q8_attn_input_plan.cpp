@@ -70,10 +70,11 @@ bool is_h2048_kv1024_shape(const Q8AttnInputProblem& problem) noexcept {
 }
 
 bool is_wide_hidden_shape(const Q8AttnInputProblem& problem) noexcept {
-    // Qwen3.8-27B's drafter (H 5120) and Qwen3.8-Flash-Next's (H 2560).
-    return (problem.input_rows == 5120 || problem.input_rows == 2560) && problem.query_rows == 4096 &&
-           problem.kv_rows == 1024 &&
-           problem.parent_rows == 6144 && problem.padded_k == problem.input_rows;
+    // Qwen3.8-27B's drafter (H 5120), GLM-5.3-Flash's (H 4096) and Qwen3.8-Flash-Next's (H 2560).
+    return (problem.input_rows == 5120 || problem.input_rows == 4096 ||
+            problem.input_rows == 2560) &&
+           problem.query_rows == 4096 && problem.kv_rows == 1024 && problem.parent_rows == 6144 &&
+           problem.padded_k == problem.input_rows;
 }
 
 bool supported_shape(const Q8AttnInputProblem& problem) noexcept {

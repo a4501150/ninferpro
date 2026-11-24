@@ -452,8 +452,9 @@ no cached prefix that external requests could hit.
 | Model config, binding and read-only data | `src/models/<family>/config.*`, `load*`, `model.*` |
 | Native parameters and fixed model calls | `src/models/<family>/execution/` |
 | Program planning, stores, context and model transactions | `src/models/<family>/program/` |
+| Model-independent frontend pieces every family uses unchanged (tool-declaration contract, reasoning-loop guard, SHA-256); names and includes no family | `src/models/common/` |
 | Shared Qwen frontend, n-gram archive and vision pieces | `src/models/qwen_common/` |
-| Shared expert-offload tier (placement, store, host cache, host and SSD tiers, residency, route trace, VRAM monitor), parameterized by `ExpertBankGeometry` | `src/models/offload/` |
+| Shared expert-offload tier (placement, store, host cache, host and SSD tiers, residency, route trace, VRAM monitor; the placement runtime, startup resolution and host/VRAM memory plans every offloaded family composes), parameterized by `ExpertBankGeometry` | `src/models/offload/` |
 | Model state layout | `src/models/<family>/state/` (qwen3_5); qwen4_exp keeps it in `program/` with the state image under `program/prefix/` |
 | Family-owned linear shape tuning, registered with the Ops dispatch's neutral per-format registries by `src/models/shapes.cpp` | `src/models/<family>/shapes/` |
 | Tensors, arenas, graphs, physical KV and raw transfers | `src/core/` |

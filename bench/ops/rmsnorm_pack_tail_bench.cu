@@ -49,7 +49,7 @@ void run(int width, int batch, const Options& options, cudaStream_t stream) {
     TimedGraph graph;
     constexpr int repeats = 32;
     graph.capture(stream, [&](cudaStream_t s) {
-        for (int i = 0; i < repeats; ++i) { ops::rmsnorm_pack_tail(x, w, y, s); }
+        for (int i = 0; i < repeats; ++i) { ops::rmsnorm_pack_tail(x, w, 1.0e-6F, y, s); }
     });
     const auto timing = measure_graph(graph, stream, options.warmup, options.repeat);
     std::printf("%d,%d,%d,%d,%.3f,%.3f,%.3f,%zu\n", width, batch, columns, 512,

@@ -1,6 +1,6 @@
 #include "models/qwen_common/frontend/output_session.h"
 #include "models/qwen_common/frontend/chat_template.h"
-#include "models/qwen_common/frontend/reasoning_loop.h"
+#include "models/common/frontend/reasoning_loop.h"
 #include "models/qwen_common/frontend/tokenizer.h"
 #include "models/qwen_common/frontend/tool_call_parser.h"
 #include "runtime/contract/execution.h"
@@ -241,7 +241,7 @@ struct SemanticThinkingState {
     std::string loop_partial;
     std::string loop_tail;
     std::vector<std::uint64_t> loop_round;
-    std::uint32_t loop_next_check      = kLoopCheckTokens;
+    std::uint32_t loop_next_check       = common::kLoopCheckTokens;
     bool loop_detected                 = false;
     std::uint32_t loop_thinking_tokens = 0;
     float loop_coverage                = 0.0F;
@@ -510,7 +510,7 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
-         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
+         std::shared_ptr<const common::frontend::ToolCallOutputContract> tool_call_output_,
          fi::OutputMarkerTokens markers_, std::unique_ptr<text::GrammarSession> grammar_,
          std::string_view continuation, bool combined_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
@@ -548,11 +548,12 @@ public:
 
     // The repeated-passage coverage of the committed thinking plus the previewed round's words.
     [[nodiscard]] double loop_coverage(const std::vector<std::uint64_t>& round) const {
-        const std::size_t keep = kLoopHistoryWords > round.size() ? kLoopHistoryWords - round.size() : 0;
+        const std::size_t keep =
+            common::kLoopHistoryWords > round.size() ? common::kLoopHistoryWords - round.size() : 0;
         std::vector<std::uint64_t> words(loop_words.end() - static_cast<std::ptrdiff_t>(std::min(keep, loop_words.size())),
                                          loop_words.end());
         words.insert(words.end(), round.begin(), round.end());
-        return repeated_passage_coverage(words);
+        return common::repeated_passage_coverage(words);
     }
 
     // Moves the committed round's words into the history (bounded); drops it once thinking ends.
@@ -566,9 +567,9 @@ public:
         }
         loop_words.insert(loop_words.end(), semantic.loop_round.begin(), semantic.loop_round.end());
         semantic.loop_round.clear();
-        if (loop_words.size() > 2 * kLoopHistoryWords) {
-            loop_words.erase(loop_words.begin(),
-                             loop_words.end() - static_cast<std::ptrdiff_t>(kLoopHistoryWords));
+        if (loop_words.size() > 2 * common::kLoopHistoryWords) {
+            loop_words.erase(loop_words.begin(), loop_words.end() - static_cast<std::ptrdiff_t>(
+                                                                        common::kLoopHistoryWords));
         }
     }
 
@@ -646,7 +647,7 @@ OutputSession::OutputSession(
     std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy, OutputOptions output,
     bool starts_in_reasoning, ThinkingControlOptions thinking,
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
-    std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
+    std::shared_ptr<const common::frontend::ToolCallOutputContract> tool_call_output,
     frontend::OutputMarkerTokens markers, std::unique_ptr<text::GrammarSession> grammar,
     std::string_view continuation, bool combined)
     : impl_(std::make_unique<Impl>(std::move(tokenizer), std::move(policy), output,
@@ -760,9 +761,9 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
             }
             if (impl_->preview_semantic.loop != ReasoningLoopAction::Off &&
                 !impl_->preview_semantic.loop_detected) {
-                append_words(decoded.bytes, impl_->preview_semantic.loop_partial,
-                             impl_->preview_semantic.loop_round);
-                append_tail(decoded.bytes, impl_->preview_semantic.loop_tail);
+                common::append_words(decoded.bytes, impl_->preview_semantic.loop_partial,
+                                     impl_->preview_semantic.loop_round);
+                common::append_tail(decoded.bytes, impl_->preview_semantic.loop_tail);
             }
             feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
         }
@@ -814,11 +815,13 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     SemanticThinkingState& semantic = impl_->preview_semantic;
     if (semantic.loop != ReasoningLoopAction::Off && semantic.in_reasoning && !semantic.applied &&
         !semantic.loop_detected && semantic.model_thinking_tokens >= semantic.loop_next_check) {
-        semantic.loop_next_check = (semantic.model_thinking_tokens / kLoopCheckTokens + 1) * kLoopCheckTokens;
+        semantic.loop_next_check = (semantic.model_thinking_tokens / common::kLoopCheckTokens + 1) *
+                                   common::kLoopCheckTokens;
         // Strata reads a periodic tail as full coverage before its word measure.
-        const double coverage =
-            periodic_tail(semantic.loop_tail) ? 1.0 : impl_->loop_coverage(semantic.loop_round);
-        if (coverage >= kLoopCoverage) {
+        const double coverage = common::periodic_tail(semantic.loop_tail)
+                                    ? 1.0
+                                    : impl_->loop_coverage(semantic.loop_round);
+        if (coverage >= common::kLoopCoverage) {
             semantic.loop_detected        = true;
             semantic.loop_thinking_tokens = semantic.model_thinking_tokens;
             semantic.loop_coverage        = static_cast<float>(coverage);

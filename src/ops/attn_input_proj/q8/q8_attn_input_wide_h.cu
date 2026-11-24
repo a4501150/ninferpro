@@ -19,8 +19,8 @@
 namespace infernix::ops::detail {
 namespace {
 
-// The DFlash2 drafters' Q/K/V parent [6144, H]: H = 5120 (Qwen3.8-27B) or 2560
-// (Qwen3.8-Flash-Next).
+// The DFlash2 drafters' Q/K/V parent [6144, H]: H = 5120 (Qwen3.8-27B), 4096
+// (GLM-5.3-Flash) or 2560 (Qwen3.8-Flash-Next).
 constexpr std::int32_t kQueryRows       = 4096;
 constexpr std::int32_t kKvRows          = 1024;
 constexpr std::int32_t kLastSmallTokens = 48;
@@ -29,7 +29,8 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
 
 // Exact input-load unrolling matters in the first two MMA column tiles. Wider blocks use
 // runtime live columns with one specialization per accumulator capacity. The narrowest columns
-// split K across 16 warps where H divides into 1024-wide blocks (5120), 8 otherwise (2560).
+// split K across 16 warps where H divides into 1024-wide blocks (5120 and 4096), 8 otherwise
+// (2560).
 template <int Hidden, int Columns, bool Exact>
 void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                   cudaStream_t stream) {
@@ -94,6 +95,8 @@ void q8_attn_input_wide_h_small_t_launch(const Tensor& x, const Weight& weight, 
     switch (x.ne[0]) {
     case 5120:
         return small_t<5120>(x, weight, q, k, v, stream);
+    case 4096:
+        return small_t<4096>(x, weight, q, k, v, stream);
     case 2560:
         return small_t<2560>(x, weight, q, k, v, stream);
     }

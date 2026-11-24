@@ -42,8 +42,12 @@ constexpr int kQueryHeads      = 32;
 constexpr int kKeyHeads        = 8;
 constexpr double kEpsilon      = 1.0e-6;
 constexpr double kTheta        = 1.0e7;
-// The prepared (PreparedRope) forms' theta: kTheta, or Qwen3.8-Flash-Next's DFlash2 1e4.
+// The prepared (PreparedRope) forms' theta: kTheta, or Qwen3.8-Flash-Next's / GLM-5.3-Flash's
+// DFlash2 1e4.
 double g_theta = kTheta;
+// The prepared forms' epsilon operand: kEpsilon, or GLM-5.3-Flash's drafter 1e-5 (the represented
+// float is 9.999999747e-6).
+double g_epsilon               = kEpsilon;
 constexpr double kRelativeL2   = 1.85e-3;
 constexpr double kPairRelative = 6.9e-3;
 
@@ -110,7 +114,7 @@ OracleResult fused_oracle(const std::vector<float>& input, const std::vector<flo
                 sum_squares += value * value;
             }
             const double inverse =
-                1.0 / std::sqrt(sum_squares / static_cast<double>(kHeadDim) + kEpsilon);
+                1.0 / std::sqrt(sum_squares / static_cast<double>(kHeadDim) + g_epsilon);
             for (int dim = 0; dim < kHeadDim; ++dim) {
                 normalized[static_cast<std::size_t>(dim)] =
                     static_cast<double>(input[dense_index(heads, token, head, dim)]) * inverse *
@@ -258,7 +262,7 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
         [&](cudaStream_t stream) {
             if (scaled_api) {
                 ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, prepared,
-                                  q_tensor, k_tensor, stream);
+                                  static_cast<float>(g_epsilon), q_tensor, k_tensor, stream);
             } else {
                 ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, q_tensor, k_tensor,
                                   stream);
@@ -281,7 +285,7 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
         verify_profile(label + " q", from_device_bf16(q_device.data(), q_count), q_expected);
     failures +=
         verify_profile(label + " k", from_device_bf16(k_device.data(), k_count), k_expected);
-    if (scaled_api && scaling.factor == 1.0F && g_theta == kTheta) {
+    if (scaled_api && scaling.factor == 1.0F && g_theta == kTheta && g_epsilon == kEpsilon) {
         const auto prepared_q = from_device<std::uint16_t>(q_device.data(), q_count);
         const auto prepared_k = from_device<std::uint16_t>(k_device.data(), k_count);
         q_device.copy_from_host(q_bits.data(), q_device.bytes());
@@ -328,7 +332,8 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
     execute(
         [&](cudaStream_t stream) {
             if (scaled_api) {
-                ops::rmsnorm_rope(position_tensor, weight_tensor, prepared, input_tensor, stream);
+                ops::rmsnorm_rope(position_tensor, weight_tensor, prepared,
+                                  static_cast<float>(g_epsilon), input_tensor, stream);
             } else {
                 ops::rmsnorm_rope(position_tensor, weight_tensor, input_tensor, stream);
             }
@@ -344,7 +349,7 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
                               " T=" + std::to_string(tokens) +
                               " P=" + std::to_string(first_position);
     int failures = verify_profile(label, from_device_bf16(input_device.data(), count), expected);
-    if (scaled_api && scaling.factor == 1.0F && g_theta == kTheta) {
+    if (scaled_api && scaling.factor == 1.0F && g_theta == kTheta && g_epsilon == kEpsilon) {
         const auto prepared_bits = from_device<std::uint16_t>(input_device.data(), count);
         input_device.copy_from_host(input_bits.data(), input_device.bytes());
         ops::rmsnorm_rope(position_tensor, weight_tensor, input_tensor, nullptr);
@@ -598,6 +603,20 @@ int main() {
         failures += run_single_case(2048, position, 0x6005U, true, {}, true);
     }
     g_theta = kTheta;
+
+    // GLM-5.3-Flash's DFlash2: theta 1e4 with the drafter's epsilon 1e-5 (its stored float is
+    // 9.999999747e-6), through the prepared forms against the same oracle.
+    g_theta   = 1.0e4;
+    g_epsilon = static_cast<double>(static_cast<float>(1.0e-5));
+    for (int position : {0, 2047, 262143}) {
+        failures += run_pair_case(2, 1, position, 0x7001U, false, {}, true);
+        failures += run_pair_case(8, 1, position, 0x7002U, true, {}, true);
+        failures += run_pair_case(16, 8, position, 0x7003U, true, {}, true);
+        failures += run_single_case(1, position, 0x7004U, false, {}, true);
+        failures += run_single_case(2048, position, 0x7005U, true, {}, true);
+    }
+    g_theta   = kTheta;
+    g_epsilon = kEpsilon;
 
     // Text profile: both registered head geometries, widths from one token to a prefill chunk,
     // and both graph modes.

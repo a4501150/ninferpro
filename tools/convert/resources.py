@@ -15,6 +15,24 @@ TEXT_RESOURCES = (
 VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
 
 
+def _check_qwen_vision_resource(
+    value: dict, vision_config: Mapping, path: Path
+) -> None:
+    """A Qwen-family vision resource must agree with the vision config record."""
+    for field, config_field in (
+        ("patch_size", "patch_size"),
+        ("temporal_patch_size", "temporal_patch_size"),
+        ("merge_size", "spatial_merge_size"),
+    ):
+        if (
+            type(value.get(field)) is not int
+            or value[field] != vision_config[config_field]
+        ):
+            raise ValueError(
+                f"{path}: {field} differs from Vision config"
+            )
+
+
 def token_domain(
     tokenizer: dict, config: dict, vocab_size: int
 ) -> tuple[int, tuple[int, ...]]:
@@ -67,6 +85,8 @@ def load_resources(
     *,
     vocab_size: int,
     vision_config: Mapping[str, int] | None = None,
+    vision_resources: tuple[str, ...] = VISION_RESOURCES,
+    vision_check: Callable[[dict, Mapping, Path], None] | None = None,
     overrides: Mapping[str, str | Path] | None = None,
     normalize: Callable[[dict[str, dict], dict[str, bytes]], None] | None = None,
 ) -> tuple[dict[str, dict[str, str]], dict[str, bytes], int, tuple[int, ...]]:
@@ -75,11 +95,16 @@ def load_resources(
     ``normalize`` is a family's tokenizer invariants (e.g.
     qwen_common.normalize_tokenizer): it may rewrite the parsed JSON resources and
     replace their stored payloads before the token domain is derived; this loader
-    itself knows no family."""
+    itself knows no family. ``vision_resources`` names the resource files of the
+    vision component and ``vision_check`` validates each parsed one against the
+    vision config record (default: the Qwen preprocessor check, applied to HF's
+    separate preprocessor/video preprocessor files; a family shipping a single
+    processor file supplies its own names and check).
+    """
     overrides = {} if overrides is None else dict(overrides)
     roles = {"text": TEXT_RESOURCES}
     if vision_config is not None:
-        roles["vision"] = VISION_RESOURCES
+        roles["vision"] = vision_resources
     allowed = {role for names in roles.values() for role in names}
     if overrides.keys() - allowed:
         raise ValueError(
@@ -88,6 +113,7 @@ def load_resources(
     references: dict[str, dict[str, str]] = {}
     payloads: dict[str, bytes] = {}
     parsed: dict[str, dict] = {}
+    check = vision_check if vision_check is not None else _check_qwen_vision_resource
     for component, names in roles.items():
         references[component] = {}
         for role in names:
@@ -102,18 +128,7 @@ def load_resources(
                     raise ValueError(f"{path}: resource must contain a JSON object")
                 parsed[role] = value
                 if component == "vision":
-                    for field, config_field in (
-                        ("patch_size", "patch_size"),
-                        ("temporal_patch_size", "temporal_patch_size"),
-                        ("merge_size", "spatial_merge_size"),
-                    ):
-                        if (
-                            type(value.get(field)) is not int
-                            or value[field] != vision_config[config_field]
-                        ):
-                            raise ValueError(
-                                f"{path}: {field} differs from Vision config"
-                            )
+                    check(value, vision_config, path)
             object_id = f"resource/{component}/{role}"
             references[component][role] = object_id
             payloads[object_id] = data

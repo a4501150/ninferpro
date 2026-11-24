@@ -102,6 +102,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                           (x.ne[0] == 2560 && out.ne[0] == 640 && gate_up_weight.n == 1280 &&
                            gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 1280 &&
                            gate_up_weight.padded_shape[1] == 2560) ||
+                          // GLM-5.3-Flash's DFlash2 MLP.
+                          (x.ne[0] == 4096 && out.ne[0] == 12288 && gate_up_weight.n == 24576 &&
+                           gate_up_weight.k == 4096 && gate_up_weight.padded_shape[0] == 24576 &&
+                           gate_up_weight.padded_shape[1] == 4096) ||
                           // Qwen3.8-Flash-Next's DFlash2 MLP.
                           (x.ne[0] == 2560 && out.ne[0] == 7680 && gate_up_weight.n == 15360 &&
                            gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 15360 &&

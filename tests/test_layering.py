@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CPP_SUFFIXES = {".h", ".hpp", ".cpp", ".cu", ".cuh", ".inl"}
-FAMILIES = ("qwen3_5", "qwen4_exp")
+FAMILIES = ("qwen3_5", "qwen4_exp", "glm5_next")
 SHARED_DIRS = ("src/runtime", "src/serve", "src/product", "src/core", "src/artifact", "src/text",
                "src/media", "src/ops", "include", "apps")
 FAMILY_NAMES = re.compile(r"qwen|flash_?next|27b|35b|glm", re.IGNORECASE)
@@ -39,7 +39,7 @@ def rel(path: Path) -> str:
 
 
 def strip_cpp(text: str) -> str:
-    """Removes comments, string and character literals (raw strings included)."""
+    """Removes comments, string, character and hex literals (raw strings included)."""
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
@@ -65,7 +65,8 @@ def strip_cpp(text: str) -> str:
         else:
             out.append(c)
             i += 1
-    return "".join(out)
+    # Hex literals such as SHA-256's round constants can spell "27b".
+    return re.sub(r"\b0[xX][0-9a-fA-F']+", "0", "".join(out))
 
 
 def includes(path: Path) -> list[str]:
@@ -107,6 +108,17 @@ def test_families_are_independent():
                         continue
                     bad.append(f"{rel(p)}: {inc}")
     assert not bad, "a family (or shared model code) includes another family:\n" + "\n".join(bad)
+
+
+def test_shared_model_code_is_model_independent():
+    bad = []
+    for p in sources("src/models/common"):
+        bad += [f"{rel(p)}: {inc}" for inc in includes(p)
+                if inc.startswith("models/") and not inc.startswith("models/common/")]
+        code = strip_cpp(p.read_text(encoding="utf-8", errors="replace"))
+        bad += [f"{rel(p)}:{n}: {line.strip()}" for n, line in enumerate(code.splitlines(), 1)
+                if FAMILY_NAMES.search(line)]
+    assert not bad, "src/models/common depends on or names a family:\n" + "\n".join(bad)
 
 
 def test_model_code_uses_public_op_contracts():

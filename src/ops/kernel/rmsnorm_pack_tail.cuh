@@ -9,12 +9,11 @@
 
 namespace infernix::ops {
 
-inline constexpr float kRmsnormPackTailEps = 1.0e-6F;
-
-// Rows: the hidden width, 5120 (Qwen3.8-27B's DFlash2) or 2560 (Qwen3.8-Flash-Next's).
+// Rows: the hidden width, 5120 (Qwen3.8-27B's DFlash2), 4096 (GLM-5.3-Flash's) or 2560
+// (Qwen3.8-Flash-Next's).
 template <int Rows, int kBlock>
 __device__ __forceinline__ float rmsnorm_pack_tail_inverse(float local_sum, float* warp_sums,
-                                                           float* inverse) {
+                                                           float* inverse, float epsilon) {
     constexpr int kWarps = kBlock / kWarpSize;
     const int lane       = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp       = static_cast<int>(threadIdx.x) / kWarpSize;
@@ -26,7 +25,7 @@ __device__ __forceinline__ float rmsnorm_pack_tail_inverse(float local_sum, floa
         float block_sum = lane < kWarps ? warp_sums[lane] : 0.0F;
         block_sum       = warp_reduce_sum(block_sum);
         if (lane == 0) {
-            *inverse = rsqrtf(block_sum * (1.0F / Rows) + kRmsnormPackTailEps);
+            *inverse = rsqrtf(block_sum * (1.0F / Rows) + epsilon);
         }
     }
     __syncthreads();
@@ -37,7 +36,7 @@ __device__ __forceinline__ float rmsnorm_pack_tail_inverse(float local_sum, floa
 template <int Rows, int kBlock>
 __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
     const __nv_bfloat162* __restrict__ input, const __nv_bfloat162* __restrict__ weight,
-    __nv_bfloat162* __restrict__ output, int width) {
+    __nv_bfloat162* __restrict__ output, int width, float epsilon) {
     pdl::enter();
     constexpr int kPairsPerRow    = Rows / 2;
     constexpr int kPairsPerThread = kPairsPerRow / kBlock;
@@ -64,7 +63,7 @@ __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
 
     __shared__ float warp_sums[kBlock / kWarpSize];
     __shared__ float inverse;
-    const float inv = rmsnorm_pack_tail_inverse<Rows, kBlock>(local_sum, warp_sums, &inverse);
+    const float inv = rmsnorm_pack_tail_inverse<Rows, kBlock>(local_sum, warp_sums, &inverse, epsilon);
 
 #pragma unroll
     for (int item = 0; item < kPairsPerThread; ++item) {

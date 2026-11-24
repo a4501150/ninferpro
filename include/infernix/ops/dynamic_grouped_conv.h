@@ -16,11 +16,11 @@ namespace infernix::ops {
  *
  * Exact (no flag) keeps the three-launch route (RMSNorm, split-K coefficient projection,
  * reduction) and its bits from release to release. FusedPrepare runs the whole prepare in one
- * kernel where it is registered (H 2560 at most 16 columns, every Qwen3.8-Flash-Next DFlash2
- * drafter call): the RMS scale factors out of the projection, so the sums of squares, the
- * coefficient products and the epilogue carry FP32 where the exact route rounds to BF16 between
- * the launches, and the reduction order differs; the bits differ from the exact route's. A shape
- * outside the fused route's domain runs the exact route under either flag.
+ * kernel where it is registered (H 2560 or 4096 at most 16 columns, every Qwen3.8-Flash-Next and
+ * GLM-5.3-Flash DFlash2 drafter call): the RMS scale factors out of the projection, so the sums of
+ * squares, the coefficient products and the epilogue carry FP32 where the exact route rounds to
+ * BF16 between the launches, and the reduction order differs; the bits differ from the exact
+ * route's. A shape outside the fused route's domain runs the exact route under either flag.
  */
 enum class DynamicConvRoutes : std::uint8_t {
     Exact        = 0,
@@ -29,10 +29,10 @@ enum class DynamicConvRoutes : std::uint8_t {
 
 /**
  * Returns the transient capacity required by rmsnorm_dynamic_grouped_conv_prepare at hidden width
- * H (5120 or 2560) for every width/batch pair in the inclusive intervals. Width endpoints lie in
- * [2,16], batch endpoints in [1,8]. Capacity covers every shape-selected route in the requested
- * domain; it is zero where every such route needs none (H 2560 with W x B <= 16 under
- * FusedPrepare: one kernel).
+ * H (5120, 4096 or 2560) for every width/batch pair in the inclusive intervals. Width endpoints
+ * lie in [2,16], batch endpoints in [1,8]. Capacity covers every shape-selected route in the
+ * requested domain; it is zero where every such route needs none (H 2560 or 4096 with W x B <= 16
+ * under FusedPrepare: one kernel).
  */
 [[nodiscard]] std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
     std::int32_t hidden, std::int32_t min_width, std::int32_t max_width,
@@ -43,8 +43,8 @@ enum class DynamicConvRoutes : std::uint8_t {
  * Op: rmsnorm_dynamic_grouped_conv_prepare
  *
  * Math / indexing:
- *   H=5120 (Qwen3.8-27B's DFlash2) or H=2560 (Qwen3.8-Flash-Next's), W=2..16, group width 16,
- *   G=H/16, sides=2, taps=2. For h=16*g+j:
+ *   H=5120 (Qwen3.8-27B's DFlash2), H=4096 (GLM-5.3-Flash's) or H=2560 (Qwen3.8-Flash-Next's),
+ *   W=2..16, group width 16, G=H/16, sides=2, taps=2. For h=16*g+j:
  *
  *     inv[i,b] = rsqrt(sum_h residual[h,i,b]^2 / H + eps)
  *     n[h,i,b] = residual[h,i,b] * inv[i,b] * norm_weight[h]
@@ -82,9 +82,10 @@ enum class DynamicConvRoutes : std::uint8_t {
  *   unused, so it may then hold the call's tensors.
  *
  * Routes:
- *   Under DynamicConvRoutes::FusedPrepare a shape in the fused route's domain (H 2560, at most
- *   16 columns) runs the one-kernel route, whose bits differ as the enum documents; every other
- *   shape and the default run the exact route. The two routes meet the same numerical criterion.
+ *   Under DynamicConvRoutes::FusedPrepare a shape in the fused route's domain (H 2560 or 4096, at
+ *   most 16 columns) runs the one-kernel route, whose bits differ as the enum documents; every
+ *   other shape and the default run the exact route. The two routes meet the same numerical
+ *   criterion.
  */
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const Tensor& base_kernel,
@@ -95,9 +96,9 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
- * pair in the inclusive intervals. (hidden, input_rows) is (5120, 4096|17408) or (2560,
- * 4096|7680), widths lie in [2,16], and batch sizes in [1,8]. Capacity follows every
- * shape-selected production route.
+ * pair in the inclusive intervals. (hidden, input_rows) is (5120, 4096|17408), (4096,
+ * 4096|12288) or (2560, 4096|7680), widths lie in [2,16], and batch sizes in [1,8]. Capacity
+ * follows every shape-selected production route.
  */
 [[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     std::int32_t hidden, std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
@@ -107,8 +108,9 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  * Op: linear_dynamic_grouped_conv_add
  *
  * Math / indexing:
- *   H=5120 with C in {4096, 17408} (Qwen3.8-27B's DFlash2) or H=2560 with C in {4096, 7680}
- *   (Qwen3.8-Flash-Next's), W=2..16, group width 16, G=H/16. For h=16*g+j:
+ *   H=5120 with C in {4096, 17408} (Qwen3.8-27B's DFlash2), H=4096 with C in {4096, 12288}
+ *   (GLM-5.3-Flash's) or H=2560 with C in {4096, 7680} (Qwen3.8-Flash-Next's), W=2..16, group
+ *   width 16, G=H/16. For h=16*g+j:
  *
  *     z[h,i,b] = sum_c projection_weight[h,c] * x[c,i,b]
  *

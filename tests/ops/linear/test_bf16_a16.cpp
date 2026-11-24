@@ -481,6 +481,24 @@ int run_general_bf16_linear() {
         failures += run_bf16_linear_case(weight, 1, true);
         failures += run_bf16_linear_case(weight, 8, true);
     }
+    // Glm5Next's BF16 projections (KDA, MLA with its DSA indexer, dense MLP, shared expert). The
+    // skinny decode route serves T <= 64; the tensor-core routes start at the first prefill
+    // interval, including an odd width (1,900 columns).
+    const std::vector<std::pair<int, int>> glm5_next_shapes = {
+        {24576, 4096}, {320, 4096},   {8192, 128},   {4096, 8192},  {2048, 4096}, {288, 4096},
+        {4096, 1536},  {16384, 1536}, {4096, 16384}, {4096, 12288}, {4096, 4096}, {4096, 2048},
+    };
+    for (const auto& [n, k] : glm5_next_shapes) {
+        DeviceWeight weight(make_patterned(n, k, 427U));
+        for (int tokens : {1, 2, 3, 5, 8, 9, 64, 65, 1900}) {
+            failures += run_bf16_linear_case(weight, tokens);
+        }
+        if (n <= 256) {
+            for (int tokens : {4, 6, 7}) { failures += run_bf16_linear_case(weight, tokens); }
+        }
+        failures += run_bf16_linear_case(weight, 1, true);
+        failures += run_bf16_linear_case(weight, 8, true);
+    }
     return failures;
 }
 
@@ -529,6 +547,20 @@ constexpr std::array kNewGeometries{
     Geometry{16384, 2560, {1, 8, 32, 64, 128, 256, 512}},
     Geometry{1280, 2560, {1, 8, 64, 128, 384, 512}},
     Geometry{2560, 640, {1, 8, 32, 192, 384, 512}},
+    // Infernix's Glm5Next shapes: the boundaries are their selectors' seams (T <= 64 is the general
+    // route's chunked skinny GEMV; the tensor-core intervals end at the last measured T).
+    Geometry{24576, 4096, {1, 8, 64, 128, 2048}},
+    Geometry{320, 4096, {1, 8, 64, 256, 1024, 2048}},
+    Geometry{8192, 128, {1, 8, 64, 256}},
+    Geometry{4096, 8192, {1, 8, 64, 128, 256}},
+    Geometry{2048, 4096, {1, 8, 64, 128, 256, 512}},
+    Geometry{288, 4096, {1, 8, 64, 256, 1024, 2048}},
+    Geometry{4096, 1536, {1, 8, 64, 128, 256, 1024}},
+    Geometry{16384, 1536, {1, 8, 64}},
+    Geometry{4096, 16384, {1, 8, 64, 128, 256}},
+    Geometry{4096, 12288, {1, 8, 64, 128, 256}},
+    Geometry{4096, 4096, {1, 8, 64, 128, 256}},
+    Geometry{4096, 2048, {1, 8, 64, 128, 256}},
 };
 
 infernix::test::quantized_weight::PackedWeight cancellation_weight(int n, int k, std::uint32_t seed) {

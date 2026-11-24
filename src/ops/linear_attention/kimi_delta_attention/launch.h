@@ -64,6 +64,19 @@ inline std::size_t chunked_workspace_bytes(int value_heads, int tokens) {
 void launch_recurrent(const Arguments& args, cudaStream_t stream);
 void launch_batch_update(const Arguments& args, const std::int32_t* slots, int batch,
                          cudaStream_t stream);
+// Arguments::tokens is W; state_in holds the slot pool (read only).
+void launch_batch_verify(const Arguments& args, const std::int32_t* slots, int batch,
+                         cudaStream_t stream);
+
+// The fold's rows, passed by value (B <= 8).
+struct FoldRows {
+    std::int32_t source[8];
+    std::int32_t destination[8];
+    std::int32_t columns[8];
+};
+
+// Arguments::tokens is W; state_out holds the slot pool; q and out are unused.
+void launch_fold(const Arguments& args, const FoldRows& rows, int batch, cudaStream_t stream);
 void launch_prepare(const Arguments& args, Chunk* workspace, cudaStream_t stream);
 void launch_chunk_recurrence(const Arguments& args, const Chunk* workspace,
                              DeviceExecutionView execution);

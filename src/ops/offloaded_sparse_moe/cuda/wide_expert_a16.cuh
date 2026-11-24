@@ -80,14 +80,18 @@ __device__ __forceinline__ unsigned a16_codes(const std::uint8_t* unit, int r, i
     return canon::e2m1_x2_quad((word >> (r < 8 ? 0 : 4)) & 0x0F0F0F0FU);
 }
 
-template <Matrix M, class Epilogue>
-__global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm) void grouped_kernel_a16(
-    const Call call, const std::int32_t pass, const Epilogue epilogue) {
+template <Matrix M, int H, int I, class Epilogue>
+__global__
+__launch_bounds__(ScheduleA16::kThreads,
+                  ScheduleA16::kMinBlocksPerSm) void grouped_kernel_a16(const Call call,
+                                                                        const std::int32_t pass,
+                                                                        const Epilogue epilogue) {
     using S                  = ScheduleA16;
-    using Shape              = MatrixShape<M>;
+    using Shape              = MatrixShapeG<M, H, I>;
     constexpr int kRowBlocks = Shape::kRowGroups / S::kRowGroups;
     constexpr int kKTiles    = Shape::kBlocks / S::kUnitsPerKTile;
-    constexpr int kRowBytes  = M == Matrix::GateUp ? kA16XRowBytes : kA16HRowBytes;
+    constexpr int kRowBytes =
+        M == Matrix::GateUp ? A16Rows<H, I>::kXRowBytes : A16Rows<H, I>::kHRowBytes;
     static_assert(Shape::kRowGroups % S::kRowGroups == 0 && Shape::kBlocks % S::kUnitsPerKTile == 0);
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
@@ -254,7 +258,9 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
 }
 
 // The gate and up outputs of each column (canonical, with its x exponent), SwiGLU into the entry's
-// BF16 h row: rows 2i and 2i + 1 of the matrix are gate_i and up_i, in the same thread (a16_tile_row).
+// BF16 h row: rows 2i and 2i + 1 of the matrix are gate_i and up_i, in the same thread
+// (a16_tile_row). kLimit clamps gate and up first (0: no clamp).
+template <float kLimit, int kHRowBytesT>
 struct GateUpEpilogueA16 {
     const ExpertScales* scales;
     const std::int32_t* entries;
@@ -273,12 +279,17 @@ struct GateUpEpilogueA16 {
                 if (column >= ctx.columns) { continue; }
                 const int entry = ctx.first + column;
                 const int emax  = x_emax[entries[entry] / top_k];
-                auto* h = reinterpret_cast<std::uint16_t*>(h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes);
+                auto* h         = reinterpret_cast<std::uint16_t*>(
+                    h_rows + static_cast<std::size_t>(entry) * kHRowBytesT);
 #pragma unroll
                 for (int r = 0; r < S::kMmaRows; ++r) {
                     const std::uint16_t gate = canon::a16_row_output(sums[m][r][2 * half], emax, sc.alpha_gate);
                     const std::uint16_t up   = canon::a16_row_output(sums[m][r][2 * half + 1], emax, sc.alpha_up);
-                    h[(ctx.row_block * S::kBlockRows + a16_tile_row(ctx.warp_n, r, ctx.tig)) / 2] = canon::swiglu_bf16(gate, up);
+                    const std::uint16_t hf = kLimit > 0.0F
+                                                 ? canon::swiglu_bf16_clamped(gate, up, kLimit)
+                                                 : canon::swiglu_bf16(gate, up);
+                    h[(ctx.row_block * S::kBlockRows + a16_tile_row(ctx.warp_n, r, ctx.tig)) / 2] =
+                        hf;
                 }
             }
         }
@@ -286,6 +297,7 @@ struct GateUpEpilogueA16 {
 };
 
 // The canonical down output of each column (with its h exponent) into the entry's output column.
+template <int H>
 struct DownEpilogueA16 {
     const ExpertScales* scales;
     const std::int32_t* entries;
@@ -302,7 +314,8 @@ struct DownEpilogueA16 {
                 const int column = ctx.warp_m * S::kWarpTokens + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 const int emax = h_emax[ctx.first + column];
-                std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * kHidden +
+                std::uint16_t* out = outputs +
+                                     static_cast<std::size_t>(entries[ctx.first + column]) * H +
                                      ctx.row_block * S::kBlockRows;
 #pragma unroll
                 for (int r = 0; r < S::kMmaRows; ++r) {
@@ -315,12 +328,13 @@ struct DownEpilogueA16 {
     }
 };
 
-template <Matrix M, class Epilogue>
-void launch_a16(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaStream_t stream) {
+template <Matrix M, int H, int I, class Epilogue>
+void launch_a16(const Call& call, std::int32_t pass, const Epilogue& epilogue,
+                cudaStream_t stream) {
     using S             = ScheduleA16;
     constexpr int bytes = static_cast<int>(sizeof(StorageA16));
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
-    static constexpr auto kernel = grouped_kernel_a16<M, Epilogue>;
+    static constexpr auto kernel = grouped_kernel_a16<M, H, I, Epilogue>;
     static const bool configured = [] {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,

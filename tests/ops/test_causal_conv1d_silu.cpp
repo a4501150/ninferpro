@@ -695,12 +695,12 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
 
 // The split snapshot and from-states entries against their contiguous forms on identical inputs:
 // every output row and every state slot must carry the same bits (the arithmetic is shared; only
-// where an output value is stored differs). C = 10240 split (2048, 2048, 6144).
+// where an output value is stored differs). `rows` is the registered split, C its total.
 int split_snapshot_case(std::int32_t width, const std::vector<std::int32_t>& initial_slots,
                         const std::vector<std::int32_t>& snapshot_bases,
                         const std::vector<std::int32_t>& valid_columns, std::int32_t slots,
-                        std::uint32_t seed) {
-    constexpr std::int32_t C = 10240, kRows0 = 2048, kRows1 = 2048, kRows2 = 6144;
+                        std::uint32_t seed, std::array<std::int32_t, 3> rows = {2048, 2048, 6144}) {
+    const std::int32_t kRows0 = rows[0], kRows1 = rows[1], kRows2 = rows[2], C = kRows0 + kRows1 + kRows2;
     const std::int32_t batch   = static_cast<std::int32_t>(initial_slots.size());
     const std::int32_t columns = width * batch;
     const bool masked          = !valid_columns.empty();
@@ -789,6 +789,79 @@ int split_snapshot_case(std::int32_t width, const std::vector<std::int32_t>& ini
     return failures;
 }
 
+// The verified-prefix commit against the exact host transition: row b's destination window is
+// tail_3(window[source] || x[:,0:columns,b]); every other slot keeps its bits.
+int commit_window_case(std::int32_t C, std::int32_t width, const std::vector<std::int32_t>& sources,
+                       const std::vector<std::int32_t>& destinations,
+                       const std::vector<std::int32_t>& columns, std::int32_t slots,
+                       std::uint32_t seed) {
+    const std::int32_t batch = static_cast<std::int32_t>(sources.size());
+    const LogicalInput input = make_input(C, width * batch, seed);
+    std::vector<float> states(static_cast<std::size_t>(C) * 3U * static_cast<std::size_t>(slots));
+    for (std::int32_t slot = 0; slot < slots; ++slot) {
+        const std::vector<float> one = make_state(C, seed + 10U + static_cast<std::uint32_t>(slot));
+        std::copy(one.begin(), one.end(), states.begin() + static_cast<std::size_t>(slot) * C * 3U);
+    }
+    std::vector<float> expected = states;
+    for (std::int32_t b = 0; b < batch; ++b) {
+        if (columns[b] == 0) { continue; }
+        for (std::int32_t c = 0; c < C; ++c) {
+            std::vector<float> sequence;
+            for (int i = 0; i < 3; ++i) {
+                sequence.push_back(states[(static_cast<std::size_t>(sources[b]) * 3 + i) * C + c]);
+            }
+            for (std::int32_t j = 0; j < columns[b]; ++j) {
+                sequence.push_back(input.x[offset(c, b * width + j, C)]);
+            }
+            for (int i = 0; i < 3; ++i) {
+                expected[(static_cast<std::size_t>(destinations[b]) * 3 + i) * C + c] =
+                    sequence[sequence.size() - 3 + i];
+            }
+        }
+    }
+    DeviceBuffer x             = to_device(bf16_bits(input.x));
+    DeviceBuffer device_states = to_device(bf16_bits(states));
+    Tensor tx(x.p, DType::BF16, {C, width, batch});
+    Tensor ts(device_states.p, DType::BF16, {C, 3, slots});
+    std::vector<ops::CausalConvCommitRow> rows;
+    for (std::int32_t b = 0; b < batch; ++b) {
+        rows.push_back({sources[b], destinations[b], columns[b]});
+    }
+    ops::causal_conv1d_commit_window(tx, ts, rows, nullptr);
+    cuda_synchronize();
+    return verify_bits("causal_conv1d commit window C=" + std::to_string(C) +
+                           " W=" + std::to_string(width) + " B=" + std::to_string(batch),
+                       device_states.p, bf16_bits(expected));
+}
+
+int commit_window_rejection_cases() {
+    constexpr std::int32_t C = 64, width = 4;
+    DeviceBuffer x(static_cast<std::size_t>(C) * width * 9 * 2),
+        states(static_cast<std::size_t>(C) * 3 * 4 * 2);
+    Tensor ts(states.p, DType::BF16, {C, 3, 4});
+    const auto rejects = [&](std::vector<ops::CausalConvCommitRow> rows) {
+        Tensor tx(x.p, DType::BF16, {C, width, static_cast<std::int32_t>(rows.size())});
+        try {
+            ops::causal_conv1d_commit_window(tx, ts, rows, nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+    int failures      = 0;
+    const auto expect = [&](bool rejected, const char* what) {
+        if (!rejected) {
+            std::cerr << "causal_conv1d commit accepted " << what << '\n';
+            ++failures;
+        }
+    };
+    expect(rejects({{0, 1, 5}}), "a commit past W");
+    expect(rejects({{0, 2, 1}, {1, 2, 1}}), "a repeated destination");
+    expect(rejects({{0, 1, 1}, {1, 2, 1}}), "a destination over another row's source");
+    expect(rejects({{0, 4, 1}}), "a slot outside the pool");
+    expect(rejects(std::vector<ops::CausalConvCommitRow>(9, {0, 0, 0})), "nine rows");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -816,6 +889,7 @@ int main() {
 
     // The peer 35B-A3B geometry is a separate real channel extent.
     constexpr std::int32_t kQwen35Channels = 8192;
+    constexpr std::int32_t kEqualThirdsChannels = 24576;
     failures += ordinary_case(kQwen35Channels, 257, StateCall::InPlaceEntry, 3257U);
 
     // Snapshot decode, small-T boundary/interior, sequence route, slot 0 initialization, and
@@ -845,6 +919,8 @@ int main() {
                                6000U + static_cast<std::uint32_t>(T));
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, false,
                                7000U + static_cast<std::uint32_t>(T));
+        failures += split_case(kEqualThirdsChannels, 8192, 8192, 8192, T, false, false,
+                               7500U + static_cast<std::uint32_t>(T));
     }
 
     // The exact-alias state form, on both geometries, across every route boundary.
@@ -853,6 +929,8 @@ int main() {
                                6100U + static_cast<std::uint32_t>(T));
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, true, false,
                                7100U + static_cast<std::uint32_t>(T));
+        failures += split_case(kEqualThirdsChannels, 8192, 8192, 8192, T, true, false,
+                               7600U + static_cast<std::uint32_t>(T));
     }
 
     // Destinations offset by a pair: four-byte aligned, which the contract admits, but not the
@@ -862,6 +940,8 @@ int main() {
                                6200U + static_cast<std::uint32_t>(T));
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, true,
                                7200U + static_cast<std::uint32_t>(T));
+        failures += split_case(kEqualThirdsChannels, 8192, 8192, 8192, T, false, true,
+                               7700U + static_cast<std::uint32_t>(T));
     }
 
     // The split snapshot and from-states entries (Qwen3.8-Flash-Next's GDN decode and verification):
@@ -873,6 +953,19 @@ int main() {
     failures += split_snapshot_case(5, {10, 11}, {0, 5}, {5, 2}, 12, 8004U);
     failures += split_snapshot_case(7, {9}, {1}, {}, 10, 8005U);
     failures += split_snapshot_case(40, {41}, {0}, {}, 42, 8006U);
+    // The equal-thirds split (24576 channels): decode of eight rows, masked small-W and one sequence.
+    failures += split_snapshot_case(1, {8, 9, 10, 11, 12, 13, 14, 15}, {0, 1, 2, 3, 4, 5, 6, 7}, {}, 16, 8101U,
+                                    {8192, 8192, 8192});
+    failures += split_snapshot_case(5, {10, 11}, {0, 5}, {5, 2}, 12, 8102U, {8192, 8192, 8192});
+    failures += split_snapshot_case(40, {41}, {0}, {}, 42, 8103U, {8192, 8192, 8192});
+
+    // The commit of a verified prefix (GLM-5.3-Flash's KDA convolution, 24576 channels): in place,
+    // moved, empty and full rows.
+    failures += commit_window_case(kEqualThirdsChannels, 8, {3, 0, 5, 1}, {3, 6, 5, 2},
+                                   {8, 3, 0, 1}, 7, 8201U);
+    failures += commit_window_case(kEqualThirdsChannels, 1, {0}, {0}, {1}, 1, 8202U);
+    failures += commit_window_case(kQwen35Channels, 2, {1, 0}, {1, 0}, {2, 1}, 2, 8203U);
+    failures += commit_window_rejection_cases();
 
     // Argument rejection, on both sides of the route bound.
     failures += split_rejection_case(16);

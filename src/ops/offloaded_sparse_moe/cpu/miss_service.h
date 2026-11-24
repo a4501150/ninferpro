@@ -45,8 +45,10 @@ public:
         int wide_from   = 0;     // calls of at least this many columns (0: none) take wide_jobs as their cap
         int wide_jobs   = 0;     // prefill assist cap, at most kMaxCpuJobs
         std::vector<int> cpus;   // optional CPU of worker i (worker 0 is the service thread)
-        // The arithmetic of every layer's experts; it must equal the calls' MoeExpertSource::activation.
+        // The arithmetic of every layer's experts; it must equal the calls' MoeExpertSource::
+        // activation. The records' geometry is the source's too (expert_layout.h).
         ExpertActivation activation = ExpertActivation::kA4;
+        Geometry geometry           = kDefaultGeometry;
         // Tiered requests (moe-offload-design.md §4.7): a job without a record pointer is read through `records`
         // (demanded before the other jobs run, computed after them); without a provider, or when a
         // read fails, the request is answered with an errno in the status word. The service keeps its

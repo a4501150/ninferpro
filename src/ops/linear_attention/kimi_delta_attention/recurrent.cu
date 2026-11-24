@@ -23,4 +23,24 @@ void launch_batch_update(const Arguments& a, const std::int32_t* slots, int batc
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_batch_verify(const Arguments& a, const std::int32_t* slots, int batch,
+                         cudaStream_t stream) {
+    const dim3 grid(a.value_heads, batch, kStateDim / kBlockDv);
+    const dim3 block(kWarpSize, kNumWarps);
+    recurrent_batch_verify_kernel<<<grid, block, 0, stream>>>(
+        a.q, a.k, a.v, a.g, a.beta, a.a_log, a.dt_bias, a.state_in, slots, a.out, a.qk_heads,
+        a.value_heads, a.tokens, static_cast<std::int64_t>(kStateDim) * kStateDim * a.value_heads,
+        a.lower_bound, a.scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_fold(const Arguments& a, const FoldRows& rows, int batch, cudaStream_t stream) {
+    const dim3 grid(a.value_heads, batch, kStateDim / kBlockDv);
+    const dim3 block(kWarpSize, kNumWarps);
+    recurrent_fold_kernel<<<grid, block, 0, stream>>>(
+        a.k, a.v, a.g, a.beta, a.a_log, a.dt_bias, a.state_out, rows, a.qk_heads, a.value_heads,
+        a.tokens, static_cast<std::int64_t>(kStateDim) * kStateDim * a.value_heads, a.lower_bound);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace infernix::ops::detail::kimi_delta_attention

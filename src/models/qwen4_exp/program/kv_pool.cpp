@@ -26,7 +26,7 @@ bool ProgramImpl::grow_kv(std::uint32_t need) {
     std::uint32_t target       = backed + (need - pool_->available_pages());
     target = std::min(pool_->capacity_pages(), (target + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
     if (target - backed < need - pool_->available_pages()) { return false; }
-    const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
+    const std::lock_guard<std::recursive_mutex> lock(placement_runtime_->vram_mutex());
     const std::size_t added    = kv_mapped_bytes(plan_, target) - kv_vmm_->mapped_bytes();
     const std::uint64_t stride = residency_->frame_bytes();
     const std::uint32_t frames = residency_->frames();
@@ -80,7 +80,7 @@ void ProgramImpl::shrink_kv(bool evict) {
     }
     target = std::max(target, plan_.kv_base_pages);
     if (target == pool_->backed_pages()) { return; }
-    const std::lock_guard<std::recursive_mutex> lock(vram_mutex_);
+    const std::lock_guard<std::recursive_mutex> lock(placement_runtime_->vram_mutex());
     device_.synchronize();
     const std::size_t before = kv_vmm_->mapped_bytes();
     pool_->set_backed_pages(target);

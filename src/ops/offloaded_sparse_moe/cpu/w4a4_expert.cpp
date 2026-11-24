@@ -443,6 +443,46 @@ void swiglu_bf16_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, i
     for (; i < n; ++i) { h[i] = canon::swiglu_bf16(g[i], u[i]); }
 }
 
+// The clamped SwiGLU (limit > 0), bits identical to canon::swiglu_bf16_clamped element for
+// element: the ordered compares blend the same clamps the scalar ternaries evaluate, and a NaN
+// operand fails every compare and stays itself.
+#if defined(INFERNIX_MOE_X86)
+INFERNIX_TARGET("avx2")
+
+int swiglu_clamped_avx2(const std::uint16_t* g, const std::uint16_t* u, int n, std::uint16_t* h,
+                        float limit) {
+    const __m256 lim = _mm256_set1_ps(limit), neg = _mm256_set1_ps(-limit);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 gu = bf16x8_to_f32(g + i), uu = bf16x8_to_f32(u + i);
+        const __m256 gc = _mm256_blendv_ps(gu, lim, _mm256_cmp_ps(gu, lim, _CMP_GT_OQ));
+        const __m256 uc =
+            _mm256_blendv_ps(_mm256_blendv_ps(uu, neg, _mm256_cmp_ps(uu, neg, _CMP_LT_OQ)), lim,
+                             _mm256_cmp_ps(uu, lim, _CMP_GT_OQ));
+        const __m256i w = f32_to_bf16_rn_avx2(_mm256_mul_ps(silu_c_avx2(gc), uc));
+        // Words 0..3 and 4..7 sit in quads 0 and 2 after the in-lane pack.
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(h + i),
+            _mm256_castsi256_si128(_mm256_permute4x64_epi64(_mm256_packus_epi32(w, w), 0x08)));
+    }
+    return i;
+}
+#endif
+
+void swiglu_bf16_clamped_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, int n,
+                           std::uint16_t* h, float limit) {
+    int i = 0;
+#if defined(INFERNIX_MOE_X86)
+    if (limit > 0.0F && isa != CpuIsa::kScalar) { i = swiglu_clamped_avx2(g, u, n, h, limit); }
+#else
+    (void)isa;
+#endif
+    for (; i < n; ++i) {
+        h[i] = limit > 0.0F ? canon::swiglu_bf16_clamped(g[i], u[i], limit)
+                            : canon::swiglu_bf16(g[i], u[i]);
+    }
+}
+
 void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
                    const canon::A4Block* const* x_gate, const canon::A4Block* const* x_up,
                    int ncols, int unit_begin, int unit_end, canon::A4Block* const* h_blocks,

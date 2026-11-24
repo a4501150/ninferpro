@@ -371,6 +371,12 @@ int main() {
         bf16_wide_case({7, 300, 1, 64}, 3072, 301, 41); // K at its limit, partial CTA range and pass
         bf16_wide_case({129}, 1024, 135, 43);
         bf16_tall_case(40000, 2560, 47);  // the tall mapping (a vocabulary head's width)
+        // K = 4096 (a 4,096-deep router and head): the extended chunk instantiations, whose staged
+        // columns pass the default shared memory limit from 7 columns on.
+        bf16_case({288}, 4096, 51);
+        bf16_wide_case({288}, 4096, 21, 53);
+        bf16_wide_case({288}, 4096, 513, 55);
+        bf16_tall_case(40000, 4096, 57);
         quantized_case(infernix::QType::Q8_G32_FP16, 1000, 2560, 17, false);
         quantized_case(infernix::QType::Q8_G32_FP16, 248320, 2560, 19, true); // the 8-bit lm_head, sampled rows
         quantized_case(infernix::QType::Q4_G64_FP16, 1000, 2560, 23, false);

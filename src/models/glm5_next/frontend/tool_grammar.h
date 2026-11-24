@@ -1,0 +1,12 @@
+#pragma once
+
+#include "models/common/frontend/tool_contract.h"
+#include "text/grammar.h"
+
+namespace infernix::models::glm5_next::frontend {
+[[nodiscard]] std::unique_ptr<text::GrammarSession>
+compile_tool_grammar(text::GrammarCompiler& compiler,
+                     const common::frontend::ToolCallOutputContract& contract,
+                     std::string_view reasoning_close, std::string_view continuation,
+                     const std::optional<OutputConstraint>& body = {});
+} // namespace infernix::models::glm5_next::frontend

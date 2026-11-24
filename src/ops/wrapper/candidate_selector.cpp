@@ -16,7 +16,12 @@ namespace {
 
 constexpr std::int32_t kCandidates   = 16;
 constexpr std::int32_t kRank         = 256;
-constexpr std::int32_t kCodebookRows = 248320;
+
+// The registered codebook vocabularies (Qwen3.8's 248320 rows, GLM-5.3-Flash's 154880).
+std::int32_t codebook_rows(const Tensor& codebook) {
+    const std::int32_t rows = codebook.ne[1];
+    return rows == 248320 || rows == 154880 ? rows : 248320;
+}
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -129,9 +134,9 @@ void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_sc
     require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");
     require_tensor(projected_hidden, DType::BF16, kRank, kSteps, batch_size, 1, "projected_hidden");
     require_tensor(anchors, DType::I32, batch_size, 1, 1, 1, "anchors");
-    require_tensor(predecessor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
-                   "predecessor_codebook");
-    require_tensor(successor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+    require_tensor(predecessor_codebook, DType::BF16, kRank, codebook_rows(predecessor_codebook), 1,
+                   1, "predecessor_codebook");
+    require_tensor(successor_codebook, DType::BF16, kRank, predecessor_codebook.ne[1], 1, 1,
                    "successor_codebook");
     require_tensor(base_positions, DType::I32, batch_size, 1, 1, 1, "base_positions");
     require_tensor(current_extents, DType::I32, batch_size, 1, 1, 1, "current_extents");
@@ -184,9 +189,9 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
     require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");
     require_tensor(projected_hidden, DType::BF16, kRank, kSteps, batch_size, 1, "projected_hidden");
     require_tensor(anchors, DType::I32, batch_size, 1, 1, 1, "anchors");
-    require_tensor(predecessor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
-                   "predecessor_codebook");
-    require_tensor(successor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+    require_tensor(predecessor_codebook, DType::BF16, kRank, codebook_rows(predecessor_codebook), 1,
+                   1, "predecessor_codebook");
+    require_tensor(successor_codebook, DType::BF16, kRank, predecessor_codebook.ne[1], 1, 1,
                    "successor_codebook");
     require_tensor(base_positions, DType::I32, batch_size, 1, 1, 1, "base_positions");
     require_tensor(drafts, DType::I32, kSteps, batch_size, 1, 1, "drafts");

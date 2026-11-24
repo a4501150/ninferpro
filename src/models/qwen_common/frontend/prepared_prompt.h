@@ -15,11 +15,11 @@
 #include <string_view>
 #include <vector>
 
-namespace infernix::models::qwen_common {
-
-namespace frontend {
+namespace infernix::models::common::frontend {
 struct ToolCallOutputContract;
 }
+
+namespace infernix::models::qwen_common {
 
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
@@ -159,7 +159,7 @@ struct PreparedPromptData {
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
     PreparedTapHints tap_hints;
-    std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
+    std::shared_ptr<const common::frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     std::string continuation_content;
     PrepareStats prepare;

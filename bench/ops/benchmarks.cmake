@@ -32,7 +32,7 @@ infernix_add_op_bench(infernix_cast_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/cas
 infernix_add_op_bench(infernix_argmax_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/argmax_bench.cu")
 infernix_add_op_bench(infernix_causal_conv1d_silu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_conv1d_silu_bench.cu")
 infernix_add_op_bench(infernix_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bench.cu")
-infernix_add_op_bench(infernix_bf16_flash_next_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/bf16_flash_next_sweep.cu")
+infernix_add_op_bench(infernix_bf16_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/bf16_sweep.cu")
 infernix_add_op_bench(infernix_projection_fp32_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/projection_fp32_bench.cu")
 infernix_add_op_bench(infernix_fp8_flash_next_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_flash_next_sweep.cu")
 infernix_add_op_bench(infernix_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_bench.cu")
@@ -57,6 +57,7 @@ infernix_add_op_bench(infernix_context_softmax_attention_bench
 infernix_add_op_bench(infernix_sliding_window_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/sliding_window_attention_bench.cu")
 infernix_add_op_bench(infernix_qsa_attention_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_attention_bench.cu")
+infernix_add_op_bench(infernix_mla_sparse_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mla_sparse_bench.cu")
 infernix_add_op_bench(infernix_kv_cache_append_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/kv_cache_append_bench.cu")
 infernix_add_op_bench(infernix_prepare_masked_block_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare_masked_block_bench.cu")
@@ -65,6 +66,7 @@ infernix_add_op_bench(infernix_sparse_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DI
 infernix_add_op_bench(infernix_offloaded_moe_wide_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/offloaded_moe_wide_bench.cu")
 infernix_add_op_bench(infernix_resident_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/resident_moe_bench.cu")
 infernix_add_op_bench(infernix_hyper_connection_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hyper_connection_bench.cu")
+infernix_add_op_bench(infernix_mhc_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mhc_bench.cu")
 infernix_add_op_bench(infernix_linear_pair_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_pair_bench.cu")
 infernix_add_op_bench(infernix_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")

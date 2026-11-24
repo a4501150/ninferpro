@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
-from . import qwen4_exp
+from . import glm5_next, qwen4_exp
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -127,9 +127,10 @@ def main(argv=None):
     )
     parser.add_argument(
         "--components",
-        default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2; dflash2 alone writes a Qwen4Exp "
-        "DFlash2 companion artifact (--model: the target checkpoint)",
+        default=None,
+        help="comma-separated text,vision,mtp,dflash,dflash2 (default: text,vision for a Glm5Next "
+        "checkpoint with a vision tower, text otherwise); dflash2 alone writes a Qwen4Exp or "
+        "Glm5Next DFlash2 companion artifact (--model: the target checkpoint)",
     )
     parser.add_argument(
         "--resource",
@@ -183,9 +184,6 @@ def main(argv=None):
         help="Qwen4Exp with --gguf and the vision component: the vision tower from this BF16 mmproj GGUF",
     )
     args = parser.parse_args(argv)
-    components = tuple(args.components.split(","))
-    if len(components) != len(set(components)):
-        raise ValueError("components must not repeat")
     paths = _pairs(args.source, "source")
     if "base" in paths:
         raise ValueError("select the base source with --model")
@@ -194,10 +192,19 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
         qwen4 = qwen4_exp.is_qwen4_exp(base.config)
+        glm = glm5_next.is_glm5_next(base.config)
+        if args.components is None:
+            # A Glm5Next checkpoint keeps its vision tower in the artifact by default; the other
+            # families (and a towerless checkpoint) convert the text component alone.
+            components = ("text", "vision") if glm and base.has("model.visual.patch_embed.proj.weight") else ("text",)
+        else:
+            components = tuple(args.components.split(","))
+        if len(components) != len(set(components)):
+            raise ValueError("components must not repeat")
         companion = "text" not in components
         if companion and (
             components != ("dflash2",)
-            or not qwen4
+            or not (qwen4 or glm)
             or args.gguf
             or args.mmproj
             or args.proposal
@@ -206,7 +213,7 @@ def main(argv=None):
             or overrides
         ):
             raise ValueError(
-                "without text, --components dflash2 writes a Qwen4Exp DFlash2 companion: --model is "
+                "without text, --components dflash2 writes a Qwen4Exp or Glm5Next DFlash2 companion: --model is "
                 "the target checkpoint and --source dflash2=PATH the drafter; no GGUF, proposal, "
                 "n-gram or resource options apply"
             )
@@ -227,7 +234,12 @@ def main(argv=None):
             mmproj = stack.enter_context(GGUFSource(args.mmproj))
         ngram_out = None
         if companion:
-            model = qwen4_exp.build_dflash2_companion(base, sources["dflash2"])
+            family = glm5_next if glm else qwen4_exp
+            model = family.build_dflash2_companion(base, sources["dflash2"])
+        elif glm:
+            if gguf_store is not None or args.ngram_out is not None or args.ngram_reuse is not None:
+                raise ValueError("Glm5Next converts from its safetensors checkpoint; no GGUF or n-gram options apply")
+            model = glm5_next.build_model(base, components=components, resource_overrides=overrides)
         elif qwen4:
             # A BF16 volume (tools/flash_next/ngram_bf16.py) binds the table as its unquantized rows.
             ngram_format = "fp8_e4m3fn"

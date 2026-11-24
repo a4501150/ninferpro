@@ -615,6 +615,10 @@ struct EngineOptions {
     // does the same by default at rank 7 (STRATA_ROUTE_TAIL_SKIP=7).
     std::uint32_t expert_tail_skip = 0;
     bool expert_swap = true; // --expert-swap off: the per-round expert policy never moves keys
+    // --prefill-expert-stream off: a prefill chunk's non-resident experts are staged with the MoE's
+    // SM kernel instead of being streamed to the device by copy-engine DMA ahead of compute. The
+    // records are the same bytes either way, so the outputs do not change.
+    bool prefill_expert_stream         = true;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

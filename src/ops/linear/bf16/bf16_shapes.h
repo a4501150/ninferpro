@@ -45,6 +45,21 @@ struct Bf16ShapeEntry {
 [[nodiscard]] Bf16Launch select_bf16_n640_k2560_invariant(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n640_k2560_index_mma(std::int32_t tokens);
 
+// Glm5Next (GLM-5.3-Flash) projections NVIDIA stores BF16: the KDA, MLA, dense-MLP and shared
+// expert projections (the routed experts are an NVFP4 bank).
+[[nodiscard]] Bf16Launch select_bf16_n24576_k4096(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n320_k4096(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n8192_k128(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k8192(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n2048_k4096(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n288_k4096(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k1536(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n16384_k1536(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k16384(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k12288(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k4096(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k2048(std::int32_t tokens);
+
 // The tuned shape tables, owned by the model families (src/models/<family>/shapes/) and listed
 // by src/models/shapes.cpp. The dispatch references this registry, which forces the linker to
 // extract the registry's translation unit and, through it, every table and shape file it

@@ -60,6 +60,8 @@ struct ServeOptions {
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_swap = true;             // EngineOptions::expert_swap (--expert-swap off freezes)
+    bool prefill_expert_stream =
+        true; // EngineOptions::prefill_expert_stream (--prefill-expert-stream off stages)
     std::uint32_t max_concurrency      = 1;
     // At most kMaximumPendingRequests: the HTTP pool starts a worker for each admitted or pending request.
     std::uint32_t max_pending_requests = 16;

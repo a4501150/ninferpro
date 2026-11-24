@@ -21,6 +21,20 @@ __device__ __forceinline__ __nv_bfloat162 silu_mul_pair(__nv_bfloat162 g, __nv_b
     return __floats2bfloat162_rn(r0, r1);
 }
 
+// silu_mul_clamped elementwise arithmetic: the gate clamps above only, the up value on both sides.
+__device__ __forceinline__ float silu_mul_clamped_element(float g, float u, float limit) {
+    const float gate_clamped = fminf(g, limit);
+    const float up_clamped   = fminf(fmaxf(u, -limit), limit);
+    return silu(gate_clamped) * up_clamped;
+}
+
+__device__ __forceinline__ __nv_bfloat162 silu_mul_clamped_pair(__nv_bfloat162 g, __nv_bfloat162 u,
+                                                                float limit) {
+    const float r0 = silu_mul_clamped_element(__low2float(g), __low2float(u), limit);
+    const float r1 = silu_mul_clamped_element(__high2float(g), __high2float(u), limit);
+    return __floats2bfloat162_rn(r0, r1);
+}
+
 __global__ void silu_and_mul_scalar_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up,
                                            __nv_bfloat16* out, std::int64_t n) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -116,6 +130,66 @@ __launch_bounds__(256) __global__
             const std::int64_t i = n - 1;
             out[i] = __float2bfloat16(silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
         }
+    }
+}
+
+// silu_mul_clamped kernels: same organization as the unclamped ones, with the clamp in the element
+// arithmetic (the unclamped instances' code is unchanged).
+__launch_bounds__(256) __global__
+    void silu_mul_clamped_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                                 __nv_bfloat16* out, std::int64_t n, float limit) {
+    const std::int64_t tid = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride =
+        static_cast<std::int64_t>(gridDim.x) * blockDim.x * kSiluAndMulPairsPerThread;
+    const std::int64_t n2 = n / 2;
+
+    const auto* gate2 = reinterpret_cast<const __nv_bfloat162*>(gate);
+    const auto* up2   = reinterpret_cast<const __nv_bfloat162*>(up);
+    auto* out2        = reinterpret_cast<__nv_bfloat162*>(out);
+    for (std::int64_t j = tid * kSiluAndMulPairsPerThread; j < n2; j += stride) {
+        out2[j] = silu_mul_clamped_pair(gate2[j], up2[j], limit);
+        if (j + 1 < n2) { out2[j + 1] = silu_mul_clamped_pair(gate2[j + 1], up2[j + 1], limit); }
+        if (j + 2 < n2) { out2[j + 2] = silu_mul_clamped_pair(gate2[j + 2], up2[j + 2], limit); }
+        if (j + 3 < n2) { out2[j + 3] = silu_mul_clamped_pair(gate2[j + 3], up2[j + 3], limit); }
+    }
+
+    if (tid == 0) {
+        if ((n & 1) != 0) {
+            const std::int64_t i = n - 1;
+            out[i] = __float2bfloat16(silu_mul_clamped_element(__bfloat162float(gate[i]),
+                                                               __bfloat162float(up[i]), limit));
+        }
+    }
+}
+
+__global__ void silu_mul_clamped_strided_input_kernel(
+    const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out, std::int64_t n,
+    std::int32_t ne0, std::int32_t ne1, std::int32_t ne2, std::int64_t gnb0, std::int64_t gnb1,
+    std::int64_t gnb2, std::int64_t gnb3, std::int64_t unb0, std::int64_t unb1, std::int64_t unb2,
+    std::int64_t unb3, float limit) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const auto* gate_bytes    = reinterpret_cast<const unsigned char*>(gate);
+    const auto* up_bytes      = reinterpret_cast<const unsigned char*>(up);
+    for (std::int64_t i = start; i < n; i += stride) {
+        std::int64_t rem = i;
+        const auto d0    = static_cast<std::int32_t>(rem % ne0);
+        rem /= ne0;
+        const auto d1 = static_cast<std::int32_t>(rem % ne1);
+        rem /= ne1;
+        const auto d2 = static_cast<std::int32_t>(rem % ne2);
+        const auto d3 = static_cast<std::int32_t>(rem / ne2);
+
+        const std::int64_t goff =
+            static_cast<std::int64_t>(d0) * gnb0 + static_cast<std::int64_t>(d1) * gnb1 +
+            static_cast<std::int64_t>(d2) * gnb2 + static_cast<std::int64_t>(d3) * gnb3;
+        const std::int64_t uoff =
+            static_cast<std::int64_t>(d0) * unb0 + static_cast<std::int64_t>(d1) * unb1 +
+            static_cast<std::int64_t>(d2) * unb2 + static_cast<std::int64_t>(d3) * unb3;
+        const auto gv = *reinterpret_cast<const __nv_bfloat16*>(gate_bytes + goff);
+        const auto uv = *reinterpret_cast<const __nv_bfloat16*>(up_bytes + uoff);
+        out[i]        = __float2bfloat16(
+            silu_mul_clamped_element(__bfloat162float(gv), __bfloat162float(uv), limit));
     }
 }
 

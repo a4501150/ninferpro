@@ -3567,13 +3567,23 @@ std::string tool_json_literal(const std::string& compact) {
   return result;
 }
 }  // namespace
+// Infernix: the Qwen and GLM formats are the engine's exact tool-call spellings: no free
+// whitespace, raw keys, protocol-bounded numbers, and string values that cannot hold their closer.
+bool XMLToolCallingConverter::InfernixExact() const {
+  return json_format_ == JSONFormat::kQwenXML || json_format_ == JSONFormat::kGlmXML;
+}
+
+std::string XMLToolCallingConverter::RawValueClose() const {
+  return json_format_ == JSONFormat::kQwenXML ? "\n</parameter>" : xml_wrapper_.parameter_suffix;
+}
+
 std::string XMLToolCallingConverter::XMLValue(const std::string& json_value) const {
   picojson::value value;
   std::string error = ParseJSON(value, json_value);
   if (error.empty() && value.is<std::string>()) {
     return value.get<std::string>();
   }
-  return json_format_ == JSONFormat::kQwenXML ? tool_json_literal(json_value) : json_value;
+  return InfernixExact() ? tool_json_literal(json_value) : json_value;
 }
 
 int32_t XMLToolCallingConverter::XMLKeySuffix(const std::optional<std::string>& pinned_type) {
@@ -3651,7 +3661,7 @@ void XMLToolCallingConverter::AddBasicRules() {
   // Add XML variable name rule
   builder_.UpdateRuleBody(
       kXMLVariableName,
-      json_format_ == JSONFormat::kQwenXML
+      InfernixExact()
           ? ExcludingString(R"([^<>\r\n\uD800-\uDFFF]+)", kXMLVariableName, false)
       : !excludes_.empty()
           ? ExcludingString("[a-zA-Z_][a-zA-Z0-9_]*", kXMLVariableName, false)
@@ -3687,7 +3697,7 @@ int32_t XMLToolCallingConverter::GetKeyPatternExcluding(
 
 std::string XMLToolCallingConverter::NextSeparator(bool is_end) {
   if (nested_object_level_ <= 1) {
-    if (json_format_ == JSONFormat::kQwenXML && !any_whitespace_) return "\"\"";
+    if (InfernixExact() && !any_whitespace_) return "\"\"";
     return GetWhitespacePattern();
   }
   return JSONSchemaConverter::NextSeparator(is_end);
@@ -3695,7 +3705,7 @@ std::string XMLToolCallingConverter::NextSeparator(bool is_end) {
 
 int32_t XMLToolCallingConverter::GenerateInteger(const IntegerSpec& spec,
                                                  const std::string& rule_name) {
-  if (json_format_ != JSONFormat::kQwenXML)
+  if (!InfernixExact())
     return JSONSchemaConverter::GenerateInteger(spec, rule_name);
   // Protocol adapters materialize argument integers in their exact signed 64-bit domain.
   auto bounded = spec;
@@ -3706,7 +3716,7 @@ int32_t XMLToolCallingConverter::GenerateInteger(const IntegerSpec& spec,
 
 int32_t XMLToolCallingConverter::GenerateNumber(const NumberSpec& spec,
                                                 const std::string& rule_name) {
-  if (json_format_ == JSONFormat::kQwenXML && !spec.range.lower && !spec.range.upper) {
+  if (InfernixExact() && !spec.range.lower && !spec.range.upper) {
     // Fixed notation for common values; normalized scientific notation covers the rest of
     // finite binary64. The upper exponent uses the largest round-trip decimal significand.
     // Arbitrary exponents such as 1e999 are valid JSON syntax but cannot be published as a
@@ -3746,13 +3756,13 @@ int32_t XMLToolCallingConverter::GenerateString(
     const StringSpec& spec, const std::string& rule_name
 ) {
   if (nested_object_level_ <= 1) {
-    if (json_format_ == JSONFormat::kQwenXML) {
+    if (InfernixExact()) {
       if (!spec.extra_patterns.empty() ||
           (spec.pattern && (spec.min_length != 0 || spec.max_length != -1))) {
         auto patterns = spec.extra_patterns;
         if (spec.pattern) patterns.insert(patterns.begin(), *spec.pattern);
         auto excluded = excludes_;
-        excluded.push_back("\n</parameter>");
+        excluded.push_back(RawValueClose());
         return AddSubGrammar(
             StringConstraints(patterns, spec.min_length, spec.max_length, excluded, false));
       }
@@ -3764,7 +3774,7 @@ int32_t XMLToolCallingConverter::GenerateString(
           : R"([^\uD800-\uDFFF])" + std::string("{") + std::to_string(spec.min_length) + "," +
               (spec.max_length < 0 ? "" : std::to_string(spec.max_length)) + "}";
       auto saved = excludes_;
-      excludes_.push_back("\n</parameter>");
+      excludes_.push_back(RawValueClose());
       const auto result = ExcludingString(regex, rule_name, false);
       excludes_ = std::move(saved);
       return result;
@@ -3845,11 +3855,11 @@ int32_t XMLToolCallingConverter::GenerateConst(
     }
   }
   if (nested_object_level_ <= 1) {
-    if (json_format_ == JSONFormat::kQwenXML) {
+    if (InfernixExact()) {
       picojson::value value;
       XGRAMMAR_CHECK(ParseJSON(value, spec.json_value).empty());
       if (value.is<std::string>() &&
-          value.get<std::string>().find("\n</parameter>") != std::string::npos)
+          value.get<std::string>().find(RawValueClose()) != std::string::npos)
         return Unsatisfiable();
     }
     if (!IsAllowedJSONLiteral(spec.json_value, /*raw_string=*/true)) {
@@ -3857,7 +3867,7 @@ int32_t XMLToolCallingConverter::GenerateConst(
     }
     return ByteString(XMLValue(spec.json_value));
   }
-  if (json_format_ == JSONFormat::kQwenXML) return ByteString(tool_json_literal(spec.json_value));
+  if (InfernixExact()) return ByteString(tool_json_literal(spec.json_value));
   return JSONSchemaConverter::GenerateConst(spec, rule_name);
 }
 
@@ -3890,7 +3900,7 @@ int32_t XMLToolCallingConverter::FormatPropertyKey(
     }
     return Sequence(
         {ByteString(xml_wrapper_.key_wrapper_prefix +
-                    (json_format_ == JSONFormat::kQwenXML ? key : EscapeAttrValue(key))),
+                    (InfernixExact() ? key : EscapeAttrValue(key))),
          XMLKeySuffix(pinned_type)}
     );
   }
@@ -3905,7 +3915,7 @@ int32_t XMLToolCallingConverter::FormatProperty(
     const SchemaSpecPtr& schema
 ) {
   if (nested_object_level_ <= 1) {
-    if (json_format_ == JSONFormat::kQwenXML && !any_whitespace_) {
+    if (InfernixExact() && !any_whitespace_) {
       return Sequence({FormatPropertyKey(key, schema), ByteString(xml_wrapper_.value_wrapper_prefix),
                        RuleRef(value_rule_id), ByteString(xml_wrapper_.parameter_suffix)});
     }
@@ -3946,7 +3956,7 @@ int32_t XMLToolCallingConverter::FormatOtherProperty(
     const SchemaSpecPtr& schema
 ) {
   if (nested_object_level_ <= 1) {
-    if (json_format_ == JSONFormat::kQwenXML && !any_whitespace_) {
+    if (InfernixExact() && !any_whitespace_) {
       return Sequence({ByteString(xml_wrapper_.key_wrapper_prefix), key_pattern_expr,
                        XMLKeySuffix(std::nullopt), ByteString(xml_wrapper_.value_wrapper_prefix),
                        RuleRef(value_rule_id), ByteString(xml_wrapper_.parameter_suffix)});
@@ -4005,7 +4015,7 @@ std::optional<int32_t> XMLToolCallingConverter::GetCache(const std::string& key)
   if (key.empty()) {
     return std::nullopt;
   }
-  if ((json_format_ == JSONFormat::kQwenXML || json_format_ == JSONFormat::kDeepSeekXML ||
+  if ((InfernixExact() || json_format_ == JSONFormat::kDeepSeekXML ||
        json_format_ == JSONFormat::kDeepSeekV41XML) &&
       nested_object_level_ == 0 && key == "{}") {
     // Unconstrained tool arguments are an XML parameter list, not one parameter's raw value.

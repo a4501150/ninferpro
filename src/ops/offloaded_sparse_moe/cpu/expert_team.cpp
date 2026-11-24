@@ -42,12 +42,12 @@ void pin_current_thread(int cpu) {
 #endif
 }
 
-std::size_t xs_index(int job, int col) {
-    return (static_cast<std::size_t>(job) * kMaxColumns + col) * kGateUpBlocks;
+std::size_t xs_index(const Geometry& geometry, int job, int col) {
+    return (static_cast<std::size_t>(job) * kMaxColumns + col) * geometry.gate_up_blocks();
 }
 
-std::size_t h_index(int job, int col) {
-    return (static_cast<std::size_t>(job) * kMaxColumns + col) * kHBlocks;
+std::size_t h_index(const Geometry& geometry, int job, int col) {
+    return (static_cast<std::size_t>(job) * kMaxColumns + col) * geometry.h_blocks();
 }
 
 } // namespace
@@ -55,10 +55,20 @@ std::size_t h_index(int job, int col) {
 CpuExpertTeam::CpuExpertTeam(Options options)
     : workers_(options.workers), isa_(options.isa), max_jobs_(options.max_jobs),
       spin_iterations_(options.spin_iterations), prefetch_bytes_(options.prefetch_bytes),
-      activation_(options.activation), ggml_(options.ggml) {
-    if (workers_ < 1 || workers_ > kHBlocks) { throw std::invalid_argument("CpuExpertTeam: workers must be in [1, 40]"); }
+      activation_(options.activation), ggml_(options.ggml), geometry_(options.geometry) {
+    if (workers_ < 1 || workers_ > geometry_.h_blocks()) {
+        throw std::invalid_argument("CpuExpertTeam: workers must be in [1, " +
+                                    std::to_string(geometry_.h_blocks()) + "]");
+    }
     if (max_jobs_ < 1) { throw std::invalid_argument("CpuExpertTeam: max_jobs must be positive"); }
     if (!cpu_isa_supported(isa_)) { throw std::invalid_argument("CpuExpertTeam: unsupported CPU ISA"); }
+    if ((ggml_ || activation_ != ExpertActivation::kA16) &&
+        (geometry_.hidden != kDefaultGeometry.hidden ||
+         geometry_.intermediate != kDefaultGeometry.intermediate ||
+         geometry_.swiglu_limit != 0.0F)) {
+        throw std::invalid_argument(
+            "CpuExpertTeam: only the A16 teams take a non-default geometry");
+    }
     if (ggml_ && activation_ != ExpertActivation::kA16) {
         throw std::invalid_argument("CpuExpertTeam: GGUF experts take the A16 activation");
     }
@@ -67,15 +77,15 @@ CpuExpertTeam::CpuExpertTeam(Options options)
         hg_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns * kGgmlHSlices);
     }
     if (activation_ == ExpertActivation::kA16) {
-        x16_.resize(xs_index(max_jobs_, 0));
-        h16_.resize(h_index(max_jobs_, 0));
-        hv_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns * kIntermediate);
+        x16_.resize(xs_index(geometry_, max_jobs_, 0));
+        h16_.resize(h_index(geometry_, max_jobs_, 0));
+        hv_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns * geometry_.intermediate);
         x_exp_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns);
         h_exp_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns);
     } else {
-        x_gate_.resize(xs_index(max_jobs_, 0));
-        x_up_.resize(xs_index(max_jobs_, 0));
-        h_.resize(h_index(max_jobs_, 0));
+        x_gate_.resize(xs_index(geometry_, max_jobs_, 0));
+        x_up_.resize(xs_index(geometry_, max_jobs_, 0));
+        h_.resize(h_index(geometry_, max_jobs_, 0));
     }
     round_columns_.reserve(static_cast<std::size_t>(max_jobs_) * kMaxColumns);
     a4_x_columns_.reserve(static_cast<std::size_t>(max_jobs_) * kMaxColumns * 2);
@@ -116,34 +126,37 @@ void CpuExpertTeam::work_a16(int w) {
     const auto column = [](int job, int col) { return static_cast<std::size_t>(job) * kMaxColumns + col; };
 
     // Phase 0: x encoded in slices of a column's blocks. Every slice derives the column exponent
-    // itself (a 2,560-element scan), so no slice waits for another; slice 0 stores it.
-    constexpr int kSlices = 8, kSliceBlocks = kGateUpBlocks / kSlices;
+    // itself (a whole-column scan), so no slice waits for another; slice 0 stores it.
+    constexpr int kSlices  = 8;
+    const int kSliceBlocks = geometry_.gate_up_blocks() / kSlices;
     const int encode_items = static_cast<int>(round_columns_.size()) * kSlices;
     for (int i = next_quantize_.fetch_add(1, std::memory_order_relaxed); i < encode_items;
          i = next_quantize_.fetch_add(1, std::memory_order_relaxed)) {
         const int slice = i % kSlices, packed = round_columns_[static_cast<std::size_t>(i / kSlices)];
         const int j = packed / kMaxColumns, c = packed % kMaxColumns;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
-        const int emax = canon::a16_column_exponent(job.x[c], kHidden);
+        const int emax          = canon::a16_column_exponent(job.x[c], geometry_.hidden);
         if (slice == 0) { x_exp_[column(j, c)] = emax; }
-        encode_a16_blocks(job.x[c], emax, slice * kSliceBlocks, (slice + 1) * kSliceBlocks, &x16_[xs_index(j, c)]);
+        encode_a16_blocks(job.x[c], emax, slice * kSliceBlocks, (slice + 1) * kSliceBlocks,
+                          &x16_[xs_index(geometry_, j, c)]);
         beat(w);
     }
     barrier();
     // Phase A: gate/up units with SwiGLU, h in BF16.
-    const int unit_items = n_jobs * kHBlocks;
+    const int unit_items = n_jobs * geometry_.h_blocks();
     for (int i = next_unit_.fetch_add(1, std::memory_order_relaxed); i < unit_items;
          i = next_unit_.fetch_add(1, std::memory_order_relaxed)) {
-        const int j = i / kHBlocks, u = i % kHBlocks;
+        const int h_blocks = geometry_.h_blocks();
+        const int j = i / h_blocks, u = i % h_blocks;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const canon::A16Block* xb[kMaxColumns];
         std::uint16_t* hv[kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) {
-            xb[c] = &x16_[xs_index(j, c)];
-            hv[c] = &hv_[column(j, c) * kIntermediate];
+            xb[c] = &x16_[xs_index(geometry_, j, c)];
+            hv[c] = &hv_[column(j, c) * geometry_.intermediate];
         }
-        gate_up_units_a16(isa_, job.record, job.scales, xb, &x_exp_[column(j, 0)], job.ncols, u, u + 1, hv,
-                          prefetch_bytes_);
+        gate_up_units_a16(isa_, job.record, job.scales, xb, &x_exp_[column(j, 0)], job.ncols, u,
+                          u + 1, hv, prefetch_bytes_, geometry_);
         beat(w);
     }
     barrier();
@@ -153,20 +166,22 @@ void CpuExpertTeam::work_a16(int w) {
          i = next_encode_h_.fetch_add(1, std::memory_order_relaxed)) {
         const int packed = round_columns_[static_cast<std::size_t>(i)];
         const int j = packed / kMaxColumns, c = packed % kMaxColumns;
-        h_exp_[column(j, c)] = encode_a16(&hv_[column(j, c) * kIntermediate], kIntermediate, &h16_[h_index(j, c)]);
+        h_exp_[column(j, c)] = encode_a16(&hv_[column(j, c) * geometry_.intermediate],
+                                          geometry_.intermediate, &h16_[h_index(geometry_, j, c)]);
         beat(w);
     }
     barrier();
     // Phase B: down row groups.
-    const int row_items = n_jobs * (kDownRowGroups / kRowsPerItem);
+    const int row_items = n_jobs * (geometry_.down_row_groups() / kRowsPerItem);
     for (int i = next_rows_.fetch_add(1, std::memory_order_relaxed); i < row_items;
          i = next_rows_.fetch_add(1, std::memory_order_relaxed)) {
-        const int j = i / (kDownRowGroups / kRowsPerItem), rg = (i % (kDownRowGroups / kRowsPerItem)) * kRowsPerItem;
+        const int rg_item = geometry_.down_row_groups() / kRowsPerItem;
+        const int j = i / rg_item, rg = (i % rg_item) * kRowsPerItem;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const canon::A16Block* hb[kMaxColumns];
-        for (int c = 0; c < job.ncols; ++c) { hb[c] = &h16_[h_index(j, c)]; }
-        down_rows_a16(isa_, job.record, job.scales, hb, &h_exp_[column(j, 0)], job.ncols, rg, rg + kRowsPerItem, job.y,
-                      prefetch_bytes_);
+        for (int c = 0; c < job.ncols; ++c) { hb[c] = &h16_[h_index(geometry_, j, c)]; }
+        down_rows_a16(isa_, job.record, job.scales, hb, &h_exp_[column(j, 0)], job.ncols, rg,
+                      rg + kRowsPerItem, job.y, prefetch_bytes_, geometry_);
         beat(w);
     }
 }
@@ -249,7 +264,8 @@ void CpuExpertTeam::work(int w) {
         const int j = column_item / (kMaxColumns * 2), c = (column_item / 2) % kMaxColumns, up = column_item % 2;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const std::uint16_t* x = job.x[c] + static_cast<std::size_t>(slice) * kSliceBlocks * 16;
-        const std::size_t first = xs_index(j, c) + static_cast<std::size_t>(slice) * kSliceBlocks;
+        const std::size_t first =
+            xs_index(geometry_, j, c) + static_cast<std::size_t>(slice) * kSliceBlocks;
         if (up) {
             quantize_a4(x, kSliceBlocks * 16, job.scales.input_up, &x_up_[first]);
         } else {
@@ -269,9 +285,9 @@ void CpuExpertTeam::work(int w) {
         const canon::A4Block* xu[kMaxColumns];
         canon::A4Block* hb[kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) {
-            xg[c] = &x_gate_[xs_index(j, c)];
-            xu[c] = shared ? xg[c] : &x_up_[xs_index(j, c)];
-            hb[c] = &h_[h_index(j, c)];
+            xg[c] = &x_gate_[xs_index(geometry_, j, c)];
+            xu[c] = shared ? xg[c] : &x_up_[xs_index(geometry_, j, c)];
+            hb[c] = &h_[h_index(geometry_, j, c)];
         }
         gate_up_units(isa_, job.record, job.scales, xg, xu, job.ncols, u, u + 1, hb, prefetch_bytes_);
         beat(w);
@@ -284,7 +300,7 @@ void CpuExpertTeam::work(int w) {
         const int j = i / (kDownRowGroups / kRowsPerItem), rg = (i % (kDownRowGroups / kRowsPerItem)) * kRowsPerItem;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const canon::A4Block* hb[kMaxColumns];
-        for (int c = 0; c < job.ncols; ++c) { hb[c] = &h_[h_index(j, c)]; }
+        for (int c = 0; c < job.ncols; ++c) { hb[c] = &h_[h_index(geometry_, j, c)]; }
         down_rows(isa_, job.record, job.scales, hb, job.ncols, rg, rg + kRowsPerItem, job.y, prefetch_bytes_);
         beat(w);
     }

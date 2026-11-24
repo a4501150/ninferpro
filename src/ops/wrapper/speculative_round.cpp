@@ -14,8 +14,12 @@ namespace {
 
 constexpr std::int32_t kSparseMaxDrafts        = 63;
 constexpr std::int32_t kSparseCandidates       = 16;
-constexpr std::int32_t kSparsePhysicalRows     = 248320;
-constexpr std::int32_t kSparseTokenDomain      = 248077;
+
+// The registered sparse vocabularies: the token domain and the logits' physical rows (Qwen3.8's
+// 248077 of 248320, GLM-5.3-Flash's 154856 of 154880). Zero: not registered.
+constexpr std::int32_t sparse_physical_rows(std::int32_t token_domain) {
+    return token_domain == 248077 ? 248320 : token_domain == 154856 ? 154880 : 0;
+}
 constexpr std::int32_t kSparseMaxBatch         = 8;
 
 std::size_t speculative_workspace_row_bytes(std::int32_t token_domain, std::int32_t min_drafts,
@@ -106,7 +110,7 @@ std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32
 std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
     std::int32_t token_domain, SpeculativeAcceptExecutionEnvelope envelope, std::int32_t min_drafts,
     std::int32_t max_drafts, std::int32_t min_batch, std::int32_t max_batch) {
-    if (token_domain != kSparseTokenDomain || min_drafts < 1 || max_drafts < min_drafts ||
+    if (sparse_physical_rows(token_domain) == 0 || min_drafts < 1 || max_drafts < min_drafts ||
         max_drafts > kSparseMaxDrafts || min_batch < 1 || max_batch < min_batch ||
         max_batch > kSparseMaxBatch) {
         throw std::invalid_argument("sparse speculative accept workspace: unsupported profile");
@@ -263,9 +267,9 @@ void speculative_accept_sparse_drafts(
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
     SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream) {
     constexpr const char* op = "speculative_accept_sparse_drafts";
-    if (token_domain != kSparseTokenDomain) {
+    if (sparse_physical_rows(token_domain) == 0) {
         throw std::invalid_argument(
-            "speculative_accept_sparse_drafts: token_domain must be 248077");
+            "speculative_accept_sparse_drafts: token_domain must be 248077 or 154856");
     }
     const std::int32_t k = drafts.ne[0];
     if (k < 1 || k > kSparseMaxDrafts)
@@ -277,7 +281,8 @@ void speculative_accept_sparse_drafts(
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
     require_logits_dtype(logits, op);
-    require_tensor3(logits, logits.dtype, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_tensor3(logits, logits.dtype, sparse_physical_rows(token_domain), columns, batch, op,
+                    "logits");
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
     require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");
@@ -305,7 +310,7 @@ std::size_t speculative_accept_sparse_tree_workspace_capacity_bytes(std::int32_t
                                                                     std::int32_t width,
                                                                     std::int32_t min_batch,
                                                                     std::int32_t max_batch) {
-    if (token_domain != kSparseTokenDomain || min_batch < 1 || max_batch < min_batch ||
+    if (sparse_physical_rows(token_domain) == 0 || min_batch < 1 || max_batch < min_batch ||
         max_batch > kSparseMaxBatch || width < 2 || width > kSpeculativeTreeMaxNodes) {
         throw std::invalid_argument("sparse speculative tree workspace: unsupported profile");
     }
@@ -347,8 +352,9 @@ void speculative_accept_sparse_tree(const Tensor& target_tokens, const Tensor& l
                                     std::int32_t token_domain, const SamplingConfig* configs,
                                     WorkspaceArena& workspace, cudaStream_t stream) {
     constexpr const char* op = "speculative_accept_sparse_tree";
-    if (token_domain != kSparseTokenDomain) {
-        throw std::invalid_argument("speculative_accept_sparse_tree: token_domain must be 248077");
+    if (sparse_physical_rows(token_domain) == 0) {
+        throw std::invalid_argument(
+            "speculative_accept_sparse_tree: token_domain must be 248077 or 154856");
     }
     const std::int32_t columns = logits.ne[1];
     const std::int32_t k       = columns - 1;
@@ -360,7 +366,8 @@ void speculative_accept_sparse_tree(const Tensor& target_tokens, const Tensor& l
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
     require_logits_dtype(logits, op);
-    require_tensor3(logits, logits.dtype, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_tensor3(logits, logits.dtype, sparse_physical_rows(token_domain), columns, batch, op,
+                    "logits");
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
     require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");

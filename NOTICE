@@ -49,6 +49,12 @@ Modifications made in this product (summary; see README.md for details):
   through ops::linear, whose output is BF16 for every head format; upstream's
   Qwen3.5 FP32 head needs kernel routes this fork has not ported).
 - Linux VRAM spill detection fix (no WDDM budget).
+- The GLM-5.3-Flash model family (src/models/glm5_next/, tools/convert/glm5_next.py):
+  its converter and FP64 reference forward, frontend, Program and Engine backend on
+  the shared expert placement runtime (lifted out of Qwen3.8-Flash-Next into
+  src/models/offload/), DFlash2 drafting and streamed prefill, with new Ops for
+  Kimi delta attention, sparse MLA over a BF16 or INT8-G64 latent cache, the pooled
+  DSA indexer and a second NVFP4 expert geometry.
 - The fast-path quality gate runs its default role on the fast run's kernel set (the
   exact route on the width-routed kernels, EngineOptions::width_routed_kernels, where
   it would run column-invariant ones), decides that kernel switch by a control against
@@ -62,6 +68,12 @@ Modifications made in this product (summary; see README.md for details):
   families share lives in src/models/qwen_common/; the runtime engine keeps only
   family-neutral code (src/runtime/engine/engine_options.* holds the shared
   artifact-free checks and defaults, and the registry detects the artifact architecture).
+- The mhc Op family (include/infernix/ops/mhc.h): a manifold-constrained
+  hyper-connection residual's per-block mixer (RMS over the whole residual,
+  fn . r gate row, sigmoid pre/post gates, Sinkhorn-normalized S x S comb) and
+  residual update, with a fused update+mix entry that is bit-identical to the
+  separate calls and column-invariant at every width, and a clamped SwiGLU
+  elementwise variant (silu_mul_clamped).
 - infernix-monitor (tools/monitor), a live status page for the server that also switches its
   expert placement and, through a control command, starts and stops it; its page is
   adapted from Basalt (https://github.com/jesdga95/basalt, MIT License; the notice is

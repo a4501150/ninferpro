@@ -15,6 +15,7 @@ namespace infernix::ops::detail {
 enum class CausalConvSplitGeometry {
     Rows2048x2048x4096,
     Rows2048x2048x6144,
+    Rows8192x8192x8192,
 };
 
 inline constexpr std::int32_t kCausalConvParallelMaxTokens = 32;
@@ -52,5 +53,16 @@ void causal_conv1d_from_states_split_launch(const Tensor& x, const Tensor& weigh
                                             const Tensor& initial_state_slots, Tensor& out0,
                                             Tensor& out1, Tensor& out2,
                                             CausalConvSplitGeometry geometry, cudaStream_t stream);
+
+// The commit's rows, passed by value (B <= 8).
+struct CausalConvCommitRows {
+    std::int32_t source[8];
+    std::int32_t destination[8];
+    std::int32_t columns[8];
+};
+
+void causal_conv1d_commit_window_launch(const Tensor& x, Tensor& conv_states,
+                                        const CausalConvCommitRows& rows, int batch,
+                                        cudaStream_t stream);
 
 } // namespace infernix::ops::detail

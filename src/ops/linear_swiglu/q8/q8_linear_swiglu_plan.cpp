@@ -81,9 +81,11 @@ bool is_h2048_shape(const Q8LinearSwiGluProblem& problem) noexcept {
 }
 
 bool is_wide_hidden_shape(const Q8LinearSwiGluProblem& problem) noexcept {
-    // Qwen3.8-27B's drafter and Qwen3.8-Flash-Next's.
+    // Qwen3.8-27B's drafter, GLM-5.3-Flash's and Qwen3.8-Flash-Next's.
     return (problem.gate_up_rows == 34816 && problem.output_rows == 17408 && problem.k == 5120 &&
             problem.padded_k == 5120) ||
+           (problem.gate_up_rows == 24576 && problem.output_rows == 12288 && problem.k == 4096 &&
+            problem.padded_k == 4096) ||
            (problem.gate_up_rows == 15360 && problem.output_rows == 7680 && problem.k == 2560 &&
             problem.padded_k == 2560);
 }

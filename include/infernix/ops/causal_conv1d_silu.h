@@ -4,6 +4,9 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+#include <span>
+
 namespace infernix::ops {
 
 /**
@@ -33,8 +36,8 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
 // Split-output form. `ideal` is unchanged; its rows are written to three destinations instead of
 // one, partitioned in row order as out0, out1, out2. Every destination is contiguous BF16 with the
 // column count of x, and every operand is four-byte aligned. The supported row profiles are
-// (2048, 2048, 4096) over C = 8192 and (2048, 2048, 6144) over C = 10240; any other profile is
-// rejected. conv_state_in and conv_state_out follow the family rule above: disjoint or exactly the
+// (2048, 2048, 4096) over C = 8192, (2048, 2048, 6144) over C = 10240 and (8192, 8192, 8192) over
+// C = 24576; any other profile is rejected. conv_state_in and conv_state_out follow the family rule above: disjoint or exactly the
 // same storage. No destination may overlap another, x, weight, or either state.
 void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                               Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
@@ -85,5 +88,21 @@ void causal_conv1d_silu_from_states_split(const Tensor& x, const Tensor& weight,
                                           const Tensor& conv_states,
                                           const Tensor& initial_state_slots, Tensor& out0,
                                           Tensor& out1, Tensor& out2, cudaStream_t stream);
+
+struct CausalConvCommitRow {
+    std::int32_t source_slot      = 0;
+    std::int32_t destination_slot = 0;
+    std::int32_t columns          = 0; // in [0,W]; zero leaves the row's window untouched
+};
+
+/**
+ * Commits a verified prefix of the read-only form. `x` is the verify call's contiguous BF16
+ * [C,W,B] input and `conv_states` contiguous BF16 [C,3,Slots]. Row b sets the window in
+ * destination_slot to tail_3(window[source_slot] || x[:,0:columns,b]), the window the snapshot
+ * form would leave after that many columns, exactly (pure data movement). rows.size() is B (1..8);
+ * a row may be in place; destinations are distinct and none is another row's source.
+ */
+void causal_conv1d_commit_window(const Tensor& x, Tensor& conv_states,
+                                 std::span<const CausalConvCommitRow> rows, cudaStream_t stream);
 
 } // namespace infernix::ops

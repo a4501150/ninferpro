@@ -17,8 +17,11 @@
 namespace infernix::ops {
 namespace {
 
-// The registered context widths: Qwen3.8-27B's DFlash2 (5120) and Qwen3.8-Flash-Next's (2560).
-bool registered_hidden(std::int32_t hidden) { return hidden == 5120 || hidden == 2560; }
+// The registered context widths: Qwen3.8-27B's DFlash2 (5120), GLM-5.3-Flash's (4096) and
+// Qwen3.8-Flash-Next's (2560).
+bool registered_hidden(std::int32_t hidden) {
+    return hidden == 5120 || hidden == 4096 || hidden == 2560;
+}
 constexpr std::int32_t kKVSize     = 1024;
 constexpr std::int32_t kHeadDim    = 128;
 constexpr std::int32_t kKVHeads    = 8;
@@ -125,16 +128,20 @@ std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_s
 void context_kv_materialize(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    float rope_theta, ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace,
-    cudaStream_t stream) {
+    float rope_theta, float key_norm_epsilon, ContextKVMaterializeExecutionEnvelope envelope,
+    WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t hidden = context.ne[0];
     const std::int32_t width  = context.ne[1];
     const std::int32_t batch  = context.ne[2];
     if (!registered_hidden(hidden)) {
-        throw std::invalid_argument("context_kv_materialize: H must be 5120 or 2560");
+        throw std::invalid_argument("context_kv_materialize: H must be 5120, 4096 or 2560");
     }
     if (!(rope_theta > 1.0F) || !std::isfinite(rope_theta)) {
         throw std::invalid_argument("context_kv_materialize: theta must be finite and above 1");
+    }
+    if (!(key_norm_epsilon > 0.0F) || !std::isfinite(key_norm_epsilon)) {
+        throw std::invalid_argument(
+            "context_kv_materialize: key_norm_epsilon must be finite and positive");
     }
     require_profile(width, batch);
     require_tensor(context, DType::BF16, hidden, width, batch, 1, 16, "context");
@@ -179,7 +186,8 @@ void context_kv_materialize(
         }
     }
     detail::context_kv_materialize_launch(context, positions, counts, state_slots, layers,
-                                          inv_frequency, envelope, route, key_scratch, stream);
+                                          inv_frequency, key_norm_epsilon, envelope, route,
+                                          key_scratch, stream);
 }
 
 } // namespace infernix::ops

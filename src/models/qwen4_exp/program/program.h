@@ -16,6 +16,7 @@
 #include "models/qwen_common/ngram.h"
 #include "models/qwen4_exp/config.h"
 #include "models/offload/expert_placement.h"
+#include "models/offload/expert_placement_runtime.h"
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/types.h"
@@ -563,38 +564,9 @@ public:
     [[nodiscard]] const VramSizing& vram_sizing() const noexcept;
 
     // ---- expert placement (design §9.6; /admin/expert-placement) ----
-    // The placement the Program serves now.
-    struct ExpertPlacementStatus {
-        bool resident = false;      // every routed expert held, nothing takes a frame
-        std::uint32_t frames        = 0; // average frames backed now
-        std::uint32_t frame_limit    = 0; // the pools' limit
-        std::uint32_t target         = 0; // a pending switch's frame target (0: none pending)
-        std::size_t pinned           = 0; // keys pinned by the placement
-        std::size_t residents        = 0; // keys resident in frames
-        std::uint32_t tier_slots     = 0; // the RAM tier's pinned slots
-        std::size_t tier_residents   = 0; // keys held only in the tier (no frame): the RAM tier's experts
-        std::size_t tier_shadows     = 0; // keys with both a frame and a tier copy (released by fills)
-        std::uint64_t kv_bytes       = 0; // VRAM the KV cache maps now
-        bool last_switch_ok = true;            // the last applied switch reached its target
-        std::string last_switch_message;       // what it did, or why it fell short or failed
-        bool has_tier_target = false;    // a pending switch names the RAM tier's size
-        std::uint32_t tier_target = 0;   // its resident-slot target
-        // The mechanism a client computes a placement from (the policy is client code):
-        std::uint32_t total_experts = 0;      // routed (layer, expert) keys
-        std::uint64_t expert_record_bytes = 0; // one expert's record
-        std::uint64_t frame_bytes = 0;         // one VRAM frame (the pools' average)
-        std::uint64_t pool_bytes  = 0;          // VRAM the frames occupy now
-        std::uint32_t ssd_experts = 0;          // keys with neither a frame nor a host copy
-        std::uint64_t vram_free = 0, vram_total = 0;       // cudaMemGetInfo, device-wide
-        std::uint64_t host_total = 0, host_available = 0; // the host's RAM
-        std::uint32_t landing_slots = 0; // transient landing frames a decode round reserves
-        std::uint32_t fill_total     = 0; // keys the placement grow's resident refill walks (0: none)
-        std::uint32_t fill_seeded    = 0; // keys the refill seeded so far
-        // The swap counters (expert moves within the current counts; 0 with --expert-swap off):
-        std::uint64_t swap_routed = 0, swap_hits = 0;
-        std::uint64_t swap_promotions = 0, swap_demotions = 0, swap_admitted = 0;
-        std::uint64_t swap_promotion_bytes = 0, swap_demotion_bytes = 0;
-    };
+    // The placement the Program serves now: the shared runtime's status struct
+    // (models/offload/expert_placement_runtime.h), aliased under the Program's name.
+    using ExpertPlacementStatus = models::offload::ExpertPlacementStatus;
     [[nodiscard]] ExpertPlacementStatus expert_placement_status() const;
     // Applies a new placement between rounds (the next maintenance tick): the frame target and
     // its pinned set. Validated now -- a target beyond the pools' limit, or one a pool's pinned

@@ -38,6 +38,16 @@ constexpr std::array<std::int32_t, 27> kRowCandidates{
 constexpr ReductionCriterion kCriterion{/*relative_l2=*/3.2e-3,
                                         /*gross_absolute=*/1.0e-3,
                                         /*gross_relative=*/2.0e-3};
+// GLM-5.3-Flash's MLP add (k 12288). The qualified Q8 A16 arithmetic rounds each dequantized
+// code x FP16-scale weight to BF16 before the MMA, so an element's error grows with the reduction
+// length; its relative L2 (2.80e-3) matches the other profiles' (2.67e-3 to 2.86e-3), and an oracle
+// with the projection rounded to BF16 fits the kernel no better (the private BF16 projection is not
+// the cause). This profile's data has a smaller largest reference (0.30, Qwen3.8-27B's MLP 0.37),
+// so its worst element (1.68e-3, one BF16 step at -0.258) exceeds the shared limit; the gross
+// relative term sits 13% above it.
+constexpr ReductionCriterion kGlmMlpCriterion{/*relative_l2=*/3.2e-3,
+                                              /*gross_absolute=*/1.0e-3,
+                                              /*gross_relative=*/3.0e-3};
 
 std::uint32_t mix32(std::uint32_t value) {
     value ^= value >> 16;
@@ -182,7 +192,8 @@ int verify_preserved(std::string_view label, const DeviceBuffer& device,
                         std::vector<std::uint16_t>(expected.begin(), expected.end()));
 }
 
-int run_profile(std::int32_t hidden, std::int32_t input_rows) {
+int run_profile(std::int32_t hidden, std::int32_t input_rows,
+                const ReductionCriterion& criterion = kCriterion) {
     g_hidden = hidden;
     g_groups = hidden / 16;
     g_sampled_rows.clear();
@@ -270,7 +281,7 @@ int run_profile(std::int32_t hidden, std::int32_t input_rows) {
                                           " graph=" + std::to_string(replay);
                 failures += verify_reduction(
                     label, gather_actual(residual_device.data(), width, batch_size), expected,
-                    kCriterion);
+                    criterion);
                 failures += residual_device.verify_guards(label);
                 failures += scratch.verify_guards(label + " workspace");
                 if (workspace.used() != 0 || workspace.peak_used() != exact) {
@@ -297,8 +308,10 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        // Qwen3.8-27B's drafter and Qwen3.8-Flash-Next's.
+        // Qwen3.8-27B's drafter, GLM-5.3-Flash's and Qwen3.8-Flash-Next's. GLM-5.3-Flash's MLP add
+        // carries its own measured criterion (kGlmMlpCriterion).
         const int failures = run_profile(5120, 4096) + run_profile(5120, 17408) +
+                             run_profile(4096, 4096) + run_profile(4096, 12288, kGlmMlpCriterion) +
                              run_profile(2560, 4096) + run_profile(2560, 7680);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
         return failures == 0 ? 0 : 1;

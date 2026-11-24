@@ -2,6 +2,7 @@ set(infernix_op_tests
   add_bias
   gelu
   silu_mul
+  mhc
   residual_add
   sigmoid_mul
   rmsnorm
@@ -298,6 +299,18 @@ foreach(part index bf16 int8 fp8 nvfp4 k8v4 vq2 k4v2)
   set_tests_properties(infernix_qsa_${part}_test PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 
+# Sparse latent attention (append, absorbed projections, split attention with fused output
+# projection) against FP64 oracles.
+infernix_add_op_test(infernix_mla_sparse_attention_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mla_sparse_attention.cpp"
+  LIBRARIES infernix_ops)
+
+# The pooled-key indexer of sparse latent attention (LayerNorm-fused update, pooled keys, exact
+# top-pool selection) against FP64 oracles.
+infernix_add_op_test(infernix_dsa_indexer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dsa_indexer.cpp"
+  LIBRARIES infernix_ops)
+
 # QSA block selection against the kernel it replaced (bit for bit), the exact top-k of its own
 # scores and an FP64 oracle, also under CUDA Graph replay.
 infernix_add_op_test(infernix_qsa_select_test
@@ -316,6 +329,13 @@ infernix_add_op_test(infernix_offloaded_moe_wide_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_wide.cu"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_offloaded_moe_wide_test PROPERTIES TIMEOUT 900)
+
+# The second registered NVFP4 expert geometry (hidden 4096, intermediate 2048, SwiGLU clamp 10):
+# CPU == GPU bits at the resident, zero-copy and staged routes, plus the noaux_tc routing oracle.
+infernix_add_op_test(infernix_offloaded_moe_geometry_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_geometry.cu"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_offloaded_moe_geometry_test PROPERTIES TIMEOUT 900)
 
 # Width equality of the construction-exact route (model-quality.md section 6.8): every Op Flash-Next's
 # recipe C exact route runs, on its column-invariant routes, at width W against width 1, and the

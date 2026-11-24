@@ -6,23 +6,26 @@
 
 namespace infernix::ops::detail {
 
+// The theta-1e7 fixed forms' epsilon; the prepared forms take theirs as an operand.
+inline constexpr float kRmsnormRopeD128Epsilon = 1.0e-6F;
+
 struct RmsnormRopeD128Pair {
     __nv_bfloat162 first;
     __nv_bfloat162 second;
 };
 
 // One warp owns one represented BF16 D128 head. Each lane carries adjacent pairs from the first
-// and second split halves and returns the corresponding full-head RoPE pairs.
+// and second split halves and returns the corresponding full-head RoPE pairs. The theta-1e7 fixed
+// forms pass kEpsilon; the prepared forms pass their caller's epsilon operand.
 __device__ __forceinline__ RmsnormRopeD128Pair rmsnorm_rope_d128_head(
     __nv_bfloat162 input0, __nv_bfloat162 input1, __nv_bfloat162 weight0, __nv_bfloat162 weight1,
-    const float* cos_cache, const float* sin_cache, int lane) {
-    constexpr float kEpsilon = 1.0e-6F;
+    const float* cos_cache, const float* sin_cache, int lane, float epsilon) {
     const float2 input0_f32  = __bfloat1622float2(input0);
     const float2 input1_f32  = __bfloat1622float2(input1);
     float sum                = input0_f32.x * input0_f32.x + input0_f32.y * input0_f32.y +
                 input1_f32.x * input1_f32.x + input1_f32.y * input1_f32.y;
     sum           = warp_reduce_sum(sum);
-    float inverse = lane == 0 ? rsqrtf(sum * (1.0F / 128.0F) + kEpsilon) : 0.0F;
+    float inverse = lane == 0 ? rsqrtf(sum * (1.0F / 128.0F) + epsilon) : 0.0F;
     inverse       = __shfl_sync(kFullWarpMask, inverse, 0);
 
     const float2 weight0_f32  = __bfloat1622float2(weight0);

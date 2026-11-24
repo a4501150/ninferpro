@@ -68,14 +68,21 @@ static_assert(kHRowStride % 16 == 0 && kHRowStride >= kHCodeBytes + kHScaleMapBy
 // 64t .. 64t+63 per 64-element K tile t as 64 H1 bytes, 64 L1 bytes and 64 H0 | L0 << 4 bytes, with
 // X = 2^14 H1 + 2^11 H0 + 8 L1 + L0 (wide_expert_a16.cuh).
 inline constexpr int kA16KTile        = 64;
-inline constexpr int kA16LimbTileBytes = 3 * kA16KTile;                              // 192
-inline constexpr int kA16XRowBytes    = kHidden / kA16KTile * kA16LimbTileBytes;       // 7,680
-inline constexpr int kA16HRowBytes    = kIntermediate / kA16KTile * kA16LimbTileBytes; // 1,920
-// An entry's h row first holds its BF16 h (narrow and wide gate/up write it); the wide route then
-// rewrites a wide entry's row in place as limbs.
-inline constexpr int kA16HRowElements = kA16HRowBytes / 2;
-static_assert(kHidden % kA16KTile == 0 && kIntermediate % kA16KTile == 0);
-static_assert(kA16HRowBytes >= kIntermediate * 2 && kA16HRowBytes % 16 == 0 && kA16XRowBytes % 16 == 0);
+inline constexpr int kA16LimbTileBytes = 3 * kA16KTile; // 192
+
+template <int H, int I>
+struct A16Rows {
+    static constexpr int kXRowBytes    = H / kA16KTile * kA16LimbTileBytes;
+    static constexpr int kHRowBytes    = I / kA16KTile * kA16LimbTileBytes;
+    static constexpr int kHRowElements = kHRowBytes / 2;
+    static_assert(H % kA16KTile == 0 && I % kA16KTile == 0);
+    static_assert(kHRowBytes >= I * 2 && kHRowBytes % 16 == 0 && kXRowBytes % 16 == 0);
+};
+
+using A16RowsDefault                  = A16Rows<kHidden, kIntermediate>;
+inline constexpr int kA16XRowBytes    = A16RowsDefault::kXRowBytes; // 7,680
+inline constexpr int kA16HRowBytes    = A16RowsDefault::kHRowBytes; // 1,920
+inline constexpr int kA16HRowElements = A16RowsDefault::kHRowElements;
 
 // The 16-element A4 block b of a plane row is stored at block position plane_block(b): within each
 // group of four blocks (one 64-wide MMA K step) the middle two are swapped, so that the record's
@@ -142,12 +149,17 @@ struct ExpertsWorkspace {
 inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rounded to 256
 
 [[nodiscard]] std::int32_t max_tiles(std::int32_t max_jobs, std::int32_t entries);
-// `columns` is the call's T (entries = top_k * T); the activation and W4A16 wide route select the planes.
-[[nodiscard]] std::size_t experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
-                                                  ExpertActivation activation, WideA16 wide_a16);
-[[nodiscard]] ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std::int32_t entries,
-                                                       std::int32_t columns, ExpertActivation activation,
-                                                       WideA16 wide_a16);
+// `columns` is the call's T (entries = top_k * T); the activation, the W4A16 wide route and the
+// record geometry select the planes.
+[[nodiscard]] std::size_t experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries,
+                                                  std::int32_t columns, ExpertActivation activation,
+                                                  WideA16 wide_a16,
+                                                  const Geometry& geometry = kDefaultGeometry);
+[[nodiscard]] ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs,
+                                                       std::int32_t entries, std::int32_t columns,
+                                                       ExpertActivation activation,
+                                                       WideA16 wide_a16,
+                                                       const Geometry& geometry = kDefaultGeometry);
 
 // Device and host state of one moe_experts call's wide route; a plain value, valid until the call's
 // workspace is released. `descriptors` points to the call's staged TMA descriptors (W4A4 only).
@@ -162,6 +174,7 @@ struct Call {
     const void* descriptors                   = nullptr;
     std::int32_t passes                       = 0;
     bool a16                                  = false;
+    Geometry geometry                         = kDefaultGeometry; // a16's record geometry
     // W4A16 (wide_expert_a16.cuh)
     const std::uint8_t* x_limbs = nullptr; // [T][kA16XRowBytes]
     std::uint8_t* h_rows        = nullptr; // [entries][kA16HRowBytes]

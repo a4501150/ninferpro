@@ -300,7 +300,8 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
     experts become exact ``nvfp4_mul`` banks in ``nvfp4_expert_rg16_v1`` with each matrix's own
     ModelOpt input scale; the FP8 n-gram table is written to its own volume) and every BF16 or FP32
     tensor keeps its dtype. Only the MTP drafter is re-quantized (``_flash_next_drafter``)."""
-    from .qwen4_exp import Fp8ExpertBankSource, import_expert_bank, weight_only_bank
+    from .qwen4_exp import Fp8ExpertBankSource
+    from .sources.nvfp4_banks import import_expert_bank, weight_only_bank
 
     if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
@@ -389,7 +390,7 @@ def qwen3_8_flash_next_nvfp4_orcarouter(model, recipe, sources):
     The QSA query/gate/key/value projections (FP8) and the indexer (BF16) form two parents, which the
     model runs as two projections."""
 
-    from .qwen4_exp import import_expert_bank, weight_only_bank
+    from .sources.nvfp4_banks import import_expert_bank, weight_only_bank
 
     if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
@@ -495,6 +496,41 @@ def qwen3_8_flash_next_dflash2(model, recipe, sources):
     _optional(model, recipe)
 
 
+
+def glm5_3_flash_nvfp4_orcarouter(model, recipe, sources):
+    """GLM-5.3-Flash from orcarouter/GLM-5.3-Flash-Uncensored-NVFP4 (docs/maintainer/glm5_3-flash-design.md
+    §7), a weight-only compressed-tensors export served with BF16 activations. The routed experts of
+    layers 3-44 keep their NVFP4 codes and block scales (W4A16 ``nvfp4_mul`` banks in
+    ``nvfp4_expert_rg16_v1``, the global scale stored as its FP32 reciprocal); every other tensor keeps
+    its stored dtype (BF16, or FP32 for the mHC bases and scales, the KDA ``A_log`` and ``dt_bias``
+    and the routers' correction biases). The converter selects the ``vision`` component by default
+    for this checkpoint, so the artifact also carries the vision tower and its processor config,
+    every tower tensor BF16 direct (the recipe assigns nothing there)."""
+
+    from .sources.nvfp4_banks import import_expert_bank, weight_only_bank
+
+    if model.config.get("architectures") != ["Glm5NextForCausalLM"]:
+        raise ValueError("this official recipe requires Glm5Next mathematics")
+    banks = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/experts")]
+    if not banks or not all(weight_only_bank(model.parameters[name].source) for name in banks):
+        raise ValueError("this recipe imports weight-only compressed-tensors experts (W4A16 banks)")
+    for name in banks:
+        recipe.assign(name, format="nvfp4_mul", layout="nvfp4_expert_rg16_v1", method=import_expert_bank,
+                      activation_policy="A16Only")
+        recipe.group(name, shape=model.parameters[name].shape)
+
+
+def glm5_3_flash_dflash2(model, recipe, sources):
+    """A GLM-5.3-Flash DFlash2 drafter (incoai/GLM-5.3-Flash-DFlash2) as a companion artifact
+    (``tools.convert --components dflash2``), stored as the Qwen3.8-Flash-Next drafter is: every
+    projection in ``q8_g32_fp16`` except the dynamic-convolution kernel projections and the selector's
+    hidden projection, which stay BF16 with the norms, base kernels and codebooks."""
+
+    if set(model.components) != {"dflash2"} or model.config.get("architectures") != ["Glm5NextForCausalLM"]:
+        raise ValueError("this recipe converts a Glm5Next DFlash2 companion (--components dflash2)")
+    _optional(model, recipe)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -510,4 +546,6 @@ RECIPES = {
     "qwen3_8_flash_next_fp8": qwen3_8_flash_next_fp8,
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
+    "glm5_3_flash_nvfp4_orcarouter": glm5_3_flash_nvfp4_orcarouter,
+    "glm5_3_flash_dflash2": glm5_3_flash_dflash2,
 }

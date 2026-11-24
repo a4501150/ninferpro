@@ -132,6 +132,33 @@ run_recurrent_token(float (&state)[kDvPerWarp][kQkPerLane], const __nv_bfloat16*
     store_readout(state, query, output, dv_base, lane, scale);
 }
 
+// The state half of run_recurrent_token: the same key normalization, gates and transition with
+// no query or readout, so the state it leaves equals run_recurrent_token's bit for bit.
+__device__ __forceinline__ void
+run_recurrent_transition(float (&state)[kDvPerWarp][kQkPerLane], const __nv_bfloat16* key_source,
+                         const __nv_bfloat16* value_source, const __nv_bfloat16* gate_source,
+                         const __nv_bfloat16* beta_source, const float* dt_bias_source,
+                         GateStage& gate_stage, int stage, int lane, int thread, int dv_base,
+                         int dqk_base, float a_scale, float lower_bound) {
+    float key[kQkPerLane];
+    load_bf16x4(key, key_source + dqk_base);
+    normalize_qk(key, lane);
+
+    const float gate_raw = __bfloat162float(gate_source[thread]);
+    const float log_alpha =
+        lower_bound * sigmoid_approx(a_scale * (gate_raw + dt_bias_source[thread]));
+    gate_stage.alpha[stage][thread] = exp_approx_ftz(log_alpha);
+    if (thread == 0) { gate_stage.beta[stage] = sigmoid_approx(__bfloat162float(*beta_source)); }
+    __syncthreads();
+
+    float alpha[kQkPerLane];
+    store_vec(alpha, load_vec<float4>(gate_stage.alpha[stage] + dqk_base));
+
+    float value_local = 0.0F;
+    if (lane < kDvPerWarp) { value_local = __bfloat162float(value_source[dv_base + lane]); }
+    apply_transition(state, key, alpha, value_local, gate_stage.beta[stage]);
+}
+
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_direct_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ g,
@@ -211,6 +238,98 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_batch_updat
                         lower_bound, scale);
 
     store_state(state, states + state_offset, dv_base, dqk_base);
+}
+
+// Row b (blockIdx.y) runs its W tokens from the state in state_slots[b] and writes nothing back.
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_batch_verify_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ g,
+    const __nv_bfloat16* __restrict__ beta, const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias, const float* __restrict__ states,
+    const std::int32_t* __restrict__ state_slots, __nv_bfloat16* __restrict__ out,
+    std::int32_t qk_heads, std::int32_t heads, std::int32_t width, std::int64_t state_slot_stride,
+    float lower_bound, float scale) {
+    __shared__ GateStage gate_stage;
+
+    const int lane       = threadIdx.x;
+    const int warp       = threadIdx.y;
+    const int thread     = warp * kWarpSize + lane;
+    const int head       = static_cast<int>(blockIdx.x);
+    const int batch      = static_cast<int>(blockIdx.y);
+    const int state_tile = static_cast<int>(blockIdx.z);
+    const int dv_base    = state_tile * kBlockDv + warp * kDvPerWarp;
+    const int dqk_base   = lane * kQkPerLane;
+    const std::int64_t state_offset =
+        static_cast<std::int64_t>(state_slots[batch]) * state_slot_stride +
+        static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    load_state(state, states + state_offset, dv_base, dqk_base);
+
+    if (thread == 0) { gate_stage.a_log_exp = expf(a_log[head]); }
+    __syncthreads();
+    const float a_scale = gate_stage.a_log_exp;
+
+    for (std::int32_t token = 0; token < width; ++token) {
+        const std::int64_t column = static_cast<std::int64_t>(batch) * width + token;
+        const std::int64_t vector_offset = (column * heads + head) * kStateDim;
+        const std::int64_t query_offset =
+            (column * qk_heads + head / (heads / qk_heads)) * kStateDim;
+        run_recurrent_token(state, q + query_offset, k + query_offset, v + vector_offset,
+                            g + vector_offset, beta + column * heads + head,
+                            dt_bias + static_cast<std::int64_t>(head) * kStateDim,
+                            out + vector_offset, gate_stage, token & 1, lane, thread, dv_base,
+                            dqk_base, a_scale, lower_bound, scale);
+    }
+}
+
+// Row b (blockIdx.y) replays its first columns[b] tokens from source[b] into destination[b].
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_fold_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ g, const __nv_bfloat16* __restrict__ beta,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, float* states,
+    const __grid_constant__ FoldRows rows, std::int32_t qk_heads, std::int32_t heads, std::int32_t width,
+    std::int64_t state_slot_stride, float lower_bound) {
+    __shared__ GateStage gate_stage;
+
+    const int batch            = static_cast<int>(blockIdx.y);
+    const std::int32_t columns = rows.columns[batch];
+    if (columns == 0) { return; }
+    const int lane       = threadIdx.x;
+    const int warp       = threadIdx.y;
+    const int thread     = warp * kWarpSize + lane;
+    const int head       = static_cast<int>(blockIdx.x);
+    const int state_tile = static_cast<int>(blockIdx.z);
+    const int dv_base    = state_tile * kBlockDv + warp * kDvPerWarp;
+    const int dqk_base   = lane * kQkPerLane;
+    const std::int64_t head_offset = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    load_state(state,
+               states + static_cast<std::int64_t>(rows.source[batch]) * state_slot_stride +
+                   head_offset,
+               dv_base, dqk_base);
+
+    if (thread == 0) { gate_stage.a_log_exp = expf(a_log[head]); }
+    __syncthreads();
+    const float a_scale = gate_stage.a_log_exp;
+
+    for (std::int32_t token = 0; token < columns; ++token) {
+        const std::int64_t column = static_cast<std::int64_t>(batch) * width + token;
+        const std::int64_t vector_offset = (column * heads + head) * kStateDim;
+        const std::int64_t key_offset =
+            (column * qk_heads + head / (heads / qk_heads)) * kStateDim;
+        run_recurrent_transition(state, k + key_offset, v + vector_offset, g + vector_offset,
+                                 beta + column * heads + head,
+                                 dt_bias + static_cast<std::int64_t>(head) * kStateDim,
+                                 gate_stage, token & 1, lane, thread, dv_base, dqk_base, a_scale,
+                                 lower_bound);
+    }
+
+    store_state(state,
+                states + static_cast<std::int64_t>(rows.destination[batch]) * state_slot_stride +
+                    head_offset,
+                dv_base, dqk_base);
 }
 
 } // namespace infernix::ops::detail::kimi_delta_attention

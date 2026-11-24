@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace infernix::ops {
 
@@ -80,5 +81,40 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                                        const Tensor& dt_bias, float lower_bound, float scale,
                                        Tensor& states, const Tensor& slots, Tensor& out,
                                        cudaStream_t stream);
+
+/**
+ * Read-only W-token form for speculative verification, whose state is committed later by
+ * kimi_delta_attention_fold. q/k BF16 [128,Hqk,W,B], v/g/out BF16 [128,Hv,W,B], beta BF16
+ * [Hv,W,B], states FP32 [128,128,Hv,Slots] (only read), device I32 slots [B]. B is 1..8 and W is
+ * 1..16. Row b starts from the state in slots[b] and runs its W tokens in order; every token uses
+ * the one-token update's arithmetic, so column j of a row equals the output that j+1 successive
+ * batch-update calls from the same state would produce, bit for bit. No state is written and no
+ * workspace is used; out does not overlap any input.
+ */
+void kimi_delta_attention_batch_verify(const Tensor& q, const Tensor& k, const Tensor& v,
+                                       const Tensor& g, const Tensor& beta, const Tensor& A_log,
+                                       const Tensor& dt_bias, float lower_bound, float scale,
+                                       const Tensor& states, const Tensor& slots, Tensor& out,
+                                       cudaStream_t stream);
+
+struct KimiDeltaAttentionFoldRow {
+    std::int32_t source_slot      = 0;
+    std::int32_t destination_slot = 0;
+    std::int32_t columns          = 0; // in [0,W]; zero leaves the row's states untouched
+};
+
+/**
+ * Commits a verified prefix: row b replays its first rows[b].columns tokens of the verify call's
+ * k/v/g/beta (the same [128,H,W,B] / [Hv,W,B] layout) from the state in source_slot and writes
+ * the final state to destination_slot. The state equals the one that many successive batch-update
+ * calls from the source state would publish, bit for bit (the query does not enter the state, so
+ * it is not an operand). rows.size() is B (1..8); a row may be in place; destinations are
+ * distinct and none is another row's source. No output and no workspace.
+ */
+void kimi_delta_attention_fold(const Tensor& k, const Tensor& v, const Tensor& g,
+                               const Tensor& beta, const Tensor& A_log, const Tensor& dt_bias,
+                               float lower_bound, Tensor& states,
+                               std::span<const KimiDeltaAttentionFoldRow> rows,
+                               cudaStream_t stream);
 
 } // namespace infernix::ops

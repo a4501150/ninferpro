@@ -1,0 +1,356 @@
+{
+ "cases": [
+  {
+   "name": "effort_None",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "options": {
+    "add_generation_prompt": true
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q<|assistant|><think>"
+  },
+  {
+   "name": "effort_low",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "options": {
+    "add_generation_prompt": true,
+    "reasoning_effort": "low"
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>q<|assistant|><think>"
+  },
+  {
+   "name": "effort_high",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "options": {
+    "add_generation_prompt": true,
+    "reasoning_effort": "high"
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>q<|assistant|><think>"
+  },
+  {
+   "name": "effort_medium",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "options": {
+    "add_generation_prompt": true,
+    "reasoning_effort": "medium"
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q<|assistant|><think>"
+  },
+  {
+   "name": "effort_max",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "options": {
+    "add_generation_prompt": true,
+    "reasoning_effort": "max"
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q<|assistant|><think>"
+  },
+  {
+   "name": "assistant_reasoning",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "The answer.",
+     "reasoning_content": "Let me think."
+    },
+    {
+     "role": "user",
+     "content": "thanks"
+    }
+   ],
+   "options": {},
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q<|assistant|><think>Let me think.</think>The answer.<|user|>thanks"
+  },
+  {
+   "name": "clear_thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "content": "a1",
+     "reasoning_content": "old reasoning"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "options": {
+    "clear_thinking": true
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q1<|assistant|><think></think>a1<|user|>q2"
+  },
+  {
+   "name": "tools",
+   "messages": [
+    {
+     "role": "user",
+     "content": "weather?"
+    }
+   ],
+   "options": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "deferred_tool",
+       "description": "deferred",
+       "defer_loading": true,
+       "strict": true,
+       "parameters": {
+        "type": "object",
+        "properties": {}
+       }
+      }
+     }
+    ],
+    "add_generation_prompt": true
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>weather?<|assistant|><think>"
+  },
+  {
+   "name": "tool_calls_and_results",
+   "messages": [
+    {
+     "role": "user",
+     "content": "weather?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "b",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Oslo"
+        }
+       }
+      },
+      {
+       "id": "a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "rainy",
+     "tool_call_id": "b"
+    },
+    {
+     "role": "tool",
+     "content": "{\"temp\": 21}",
+     "tool_call_id": "a"
+    }
+   ],
+   "options": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "deferred_tool",
+       "description": "deferred",
+       "defer_loading": true,
+       "strict": true,
+       "parameters": {
+        "type": "object",
+        "properties": {}
+       }
+      }
+     }
+    ]
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>weather?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call><|observation|><tool_response>rainy</tool_response><tool_response>{\"temp\": 21}</tool_response>"
+  },
+  {
+   "name": "tool_results_unmatched",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "known",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "orphan",
+     "tool_call_id": "unknown"
+    }
+   ],
+   "options": {},
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q<|assistant|><think></think><tool_call>f</tool_call><|observation|><tool_response>orphan</tool_response>"
+  },
+  {
+   "name": "continuation",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "partial answer"
+    }
+   ],
+   "options": {
+    "add_generation_prompt": false,
+    "continue_final_message": true
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q<|assistant|><think></think>partial answer",
+   "continuation_content": "partial answer"
+  },
+  {
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "content": "a1",
+     "reasoning_content": "r1"
+    },
+    {
+     "role": "tool",
+     "content": "t1",
+     "tool_call_id": "c1"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "options": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "deferred_tool",
+       "description": "deferred",
+       "defer_loading": true,
+       "strict": true,
+       "parameters": {
+        "type": "object",
+        "properties": {}
+       }
+      }
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "low"
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>Be brief.<|user|>q1<|assistant|><think>r1</think>a1<|observation|><tool_response>t1</tool_response><|user|>q2<|assistant|><think>"
+  }
+ ]
+}

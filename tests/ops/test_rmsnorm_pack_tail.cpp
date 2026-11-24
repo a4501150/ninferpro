@@ -18,6 +18,9 @@ using namespace infernix::test::norm;
 
 // The hidden width under test: Qwen3.8-27B's 5120, then Qwen3.8-Flash-Next's 2560.
 std::int32_t g_rows = 5120;
+// The epsilon operand under test: kEps, then GLM-5.3-Flash's drafter 1e-5 (its stored float is
+// 9.999999747e-6).
+double g_eps = kEps;
 constexpr ReductionCriterion kCriterion{/*relative_l2*/ 1.85e-3,
                                         /*gross_absolute*/ 1.0e-5,
                                         /*gross_relative_to_max_reference*/ 3.4e-3};
@@ -36,7 +39,8 @@ std::vector<double> oracle(const std::vector<float>& input, const std::vector<fl
                 const double value = input[input_base + d];
                 sum_squares += value * value;
             }
-            const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(g_rows) + kEps);
+            const double inverse =
+                1.0 / std::sqrt(sum_squares / static_cast<double>(g_rows) + g_eps);
             for (std::int32_t d = 0; d < g_rows; ++d) {
                 output[output_base + d] = static_cast<double>(input[input_base + d]) * inverse *
                                           static_cast<double>(weight[d]);
@@ -80,7 +84,8 @@ int run_case(std::int32_t width, std::int32_t batch, std::uint32_t seed, bool gr
             DecodeGraphDefinition definition;
             DecodeGraphExecutable executable;
             definition.capture(stream, [&] {
-                ops::rmsnorm_pack_tail(input_tensor, weight_tensor, output_tensor, stream);
+                ops::rmsnorm_pack_tail(input_tensor, weight_tensor, static_cast<float>(g_eps),
+                                       output_tensor, stream);
             });
             executable.instantiate(definition);
             for (int replay = 0; replay < 2; ++replay) {
@@ -90,7 +95,8 @@ int run_case(std::int32_t width, std::int32_t batch, std::uint32_t seed, bool gr
         }
         cuda_check(cudaStreamDestroy(stream), "destroy stream");
     } else {
-        ops::rmsnorm_pack_tail(input_tensor, weight_tensor, output_tensor, nullptr);
+        ops::rmsnorm_pack_tail(input_tensor, weight_tensor, static_cast<float>(g_eps),
+                               output_tensor, nullptr);
         cuda_synchronize();
     }
 
@@ -124,6 +130,14 @@ int main() {
                 failures += run_case(width, batch, 1900U + width * 8 + batch);
         failures += run_case(8, 1, 1901U, true);
         failures += run_case(16, 8, 1908U, true);
+        // GLM-5.3-Flash's drafter: H 4096 with epsilon 1e-5 (stored float 9.999999747e-6).
+        g_rows = 4096;
+        g_eps  = static_cast<double>(static_cast<float>(1.0e-5));
+        for (int width = 2; width <= 16; ++width)
+            for (int batch = 1; batch <= 8; ++batch)
+                failures += run_case(width, batch, 2100U + width * 8 + batch);
+        failures += run_case(8, 1, 2101U, true);
+        failures += run_case(16, 8, 2108U, true);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " rmsnorm_pack_tail\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

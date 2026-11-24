@@ -1,5 +1,7 @@
 target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
+  # Shared Op building blocks (src/ops/common): one owner per translation unit.
+  "${CMAKE_CURRENT_LIST_DIR}/common/exact_topk_select.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/add_bias.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/argmax.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/cast.cu"

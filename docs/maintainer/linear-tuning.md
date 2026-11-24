@@ -182,5 +182,5 @@ Measured with that sweep (RTX 5090, cold-L2 CUDA graphs, median of 7): `[13952,2
 4,836 us at T = 16,384; `[96,2560]` 222-443 us -> 6.8-36 us from T = 9 to 8,192 (the fallback's
 32x32 tiles leave most SMs idle at N = 96). The QSA index projection's BF16 tiles
 (`Bf16IndexMma`, `[640,2560]`, from 9 columns) measured 4-7x faster than the runtime-shape GEMM
-(`bench/ops/bf16_flash_next_sweep.cu --shape qsaidx`, RTX PRO 6000, 2026-10-25: 8 against 33-74 us
+(`bench/ops/bf16_sweep.cu --shape qsaidx`, RTX PRO 6000, 2026-10-25: 8 against 33-74 us
 at 32-65 columns, 18 against 84 at 1,024, 178 against 926 at 16,384).

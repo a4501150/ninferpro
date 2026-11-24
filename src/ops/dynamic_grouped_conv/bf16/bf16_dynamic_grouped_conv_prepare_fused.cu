@@ -8,7 +8,8 @@
 #include <cuda_bf16.h>
 #include <stdexcept>
 
-// The prepare in one kernel for Qwen3.8-Flash-Next's drafter (H = 2560, at most 16 columns): the RMS
+// The prepare in one kernel for the Qwen3.8-Flash-Next and GLM-5.3-Flash drafters (H = 2560 or
+// 4096, at most 16 columns): the RMS
 // scale factors out of the projection, d = inv * sum_h W[row, h] * (r[h] * w[h]), so every CTA projects
 // the raw residual times the norm weight and accumulates each column's sum of squares on the way,
 // instead of an RMSNorm kernel, a split-K projection and a reduction. A CTA owns four groups: their
@@ -259,20 +260,29 @@ void launch(const Tensor& residual, const Tensor& norm, float eps, const Tensor&
 } // namespace
 
 bool bf16_dynamic_grouped_conv_prepare_fused_supported(int hidden, int tokens) {
-    return hidden == 2560 && tokens <= 16;
+    return (hidden == 2560 || hidden == 4096) && tokens <= 16;
 }
 
 void bf16_dynamic_grouped_conv_prepare_fused_launch(const Tensor& residual, const Tensor& norm, float eps,
                                                     const Tensor& base, const Weight& weight, Tensor& prepared,
                                                     Tensor& finish, cudaStream_t stream) {
     const int tokens = residual.ne[1] * residual.ne[2];
-    if (residual.ne[0] != 2560 || tokens > 16) {
-        throw std::logic_error("dynamic grouped conv prepare: the fused route takes H 2560 and at most 16 columns");
+    if ((residual.ne[0] != 2560 && residual.ne[0] != 4096) || tokens > 16) {
+        throw std::logic_error("dynamic grouped conv prepare: the fused route takes H 2560 or 4096 "
+                               "and at most 16 columns");
     }
     if (tokens <= 8) {
-        launch<2560, 8>(residual, norm, eps, base, weight, prepared, finish, stream);
+        if (residual.ne[0] == 2560) {
+            launch<2560, 8>(residual, norm, eps, base, weight, prepared, finish, stream);
+        } else {
+            launch<4096, 8>(residual, norm, eps, base, weight, prepared, finish, stream);
+        }
     } else {
-        launch<2560, 16>(residual, norm, eps, base, weight, prepared, finish, stream);
+        if (residual.ne[0] == 2560) {
+            launch<2560, 16>(residual, norm, eps, base, weight, prepared, finish, stream);
+        } else {
+            launch<4096, 16>(residual, norm, eps, base, weight, prepared, finish, stream);
+        }
     }
 }
 } // namespace infernix::ops::detail

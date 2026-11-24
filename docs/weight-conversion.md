@@ -46,7 +46,9 @@ python3 -m tools.convert \
   --out models/qwen3_6_27b.ninfer
 ```
 
-`--components` defaults to `text`. Include only the optional components you want to distribute.
+`--components` defaults to `text`; a Glm5Next checkpoint that carries a vision tower defaults to
+`text,vision` (its tower is stored in the artifact, BF16, with its `processor_config.json`
+resource). Include only the optional components you want to distribute.
 `--proposal` adds the indexed proposal head used by speculative decoding. Its rows are the most
 frequent tokens of a token ranking, the repository's by default
 (`--ranking tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64`), and it keeps 131,072 of
@@ -121,6 +123,18 @@ MTP and Vision use the main source. DFlash and DFlash2 use the corresponding nam
 as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
+
+Keep a checkpoint's MTP layer in the artifact: convert it whenever the checkpoint has one, even when
+another drafter (DFlash2) will run. MTP is optional at run time, never at conversion: the Engine
+binds the MTP weights and allocates their state only with `--spec mtp`, so an unused MTP layer costs
+disk space and nothing else, and the artifact can still run MTP later without a reconversion.
+GLM-5.3-Flash's converter stores the layer (component `mtp`) with the text model; its engine runs
+DFlash2 only. The same converter stores the checkpoint's vision tower as a `vision` component
+(every tower tensor BF16 as the checkpoint keeps it, and the checkpoint's `processor_config.json`
+— a single file holding the image and the video processor — kept byte for byte as the component's
+one resource) by default; `--components text` converts text only, and a checkpoint without
+`model.visual.*` tensors converts text only regardless. The GLM engine does not bind `vision` yet,
+so the component costs disk space and nothing else until a later track loads it.
 
 A Qwen3.8-Flash-Next DFlash2 drafter is converted on its own, into a companion artifact that runs
 beside any Flash-Next artifact (`--spec dflash2 --draft-model FILE`): `--components dflash2` alone,

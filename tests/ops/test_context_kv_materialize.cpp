@@ -34,6 +34,8 @@ constexpr int kPaddedCapacity     = 2056;
 constexpr std::uint16_t kSentinel = 0xa5a5U;
 constexpr double kEpsilon         = 1.0e-6;
 double g_theta                    = 0.0;
+// The key norm's epsilon operand: kEpsilon, or GLM-5.3-Flash's 1e-5 (stored float 9.999999747e-6).
+double g_epsilon = kEpsilon;
 
 constexpr ReductionCriterion kKeyCriterion{
     3.0e-3,
@@ -206,7 +208,7 @@ void append_key_oracle(const LayerStorage& layer, const float* input, int head, 
         raw[static_cast<std::size_t>(dim)] = logical_dot(layer.key_logical, row, input);
         square_sum += raw[static_cast<std::size_t>(dim)] * raw[static_cast<std::size_t>(dim)];
     }
-    const double inverse = 1.0 / std::sqrt(square_sum / kHeadDim + kEpsilon);
+    const double inverse = 1.0 / std::sqrt(square_sum / kHeadDim + g_epsilon);
     for (int pair = 0; pair < kHeadDim / 2; ++pair) {
         const double first = raw[static_cast<std::size_t>(pair)] * inverse *
                              layer.norm_host[static_cast<std::size_t>(pair)];
@@ -410,8 +412,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
                : static_cast<std::uint32_t>(width)};
     const auto launch = [&](cudaStream_t stream) {
         ops::context_kv_materialize(context_tensor, positions_tensor, counts_tensor, slots_tensor,
-                                    fixture.views, static_cast<float>(g_theta), envelope, workspace,
-                                    stream);
+                                    fixture.views, static_cast<float>(g_theta),
+                                    static_cast<float>(g_epsilon), envelope, workspace, stream);
     };
     launch(nullptr);
     cuda_synchronize();
@@ -481,9 +483,10 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     return failures;
 }
 
-int run_geometry(int hidden, double theta) {
-    g_hidden = hidden;
-    g_theta  = theta;
+int run_geometry(int hidden, double theta, double epsilon = kEpsilon) {
+    g_hidden  = hidden;
+    g_theta   = theta;
+    g_epsilon = epsilon;
     Fixture fixture;
     int failures = 0;
     const std::vector<int> widths{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
@@ -566,8 +569,12 @@ int main() {
             std::cout << "context_kv_materialize: SKIP (CUDA unavailable)\n";
             return 77;
         }
-        // Qwen3.8-27B's drafter (H 5120, theta 1e7) and Qwen3.8-Flash-Next's (H 2560, theta 1e4).
-        const int failures = run_geometry(5120, 1.0e7) + run_geometry(2560, 1.0e4);
+        // Qwen3.8-27B's drafter (H 5120, theta 1e7), GLM-5.3-Flash's (H 4096, theta 1e4, epsilon
+        // 1e-5) and Qwen3.8-Flash-Next's (H 2560, theta 1e4).
+        const int failures =
+            run_geometry(5120, 1.0e7) +
+            run_geometry(4096, 1.0e4, static_cast<double>(static_cast<float>(1.0e-5))) +
+            run_geometry(2560, 1.0e4);
         if (failures != 0) {
             std::cerr << "context_kv_materialize failures=" << failures << '\n';
             return 1;

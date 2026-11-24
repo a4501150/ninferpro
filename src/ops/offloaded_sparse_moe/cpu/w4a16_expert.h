@@ -1,13 +1,17 @@
 #pragma once
 
 // CPU narrow route of offloaded_sparse_moe for experts stored without activation scales: one routed
-// expert of Qwen3.8-Flash-Next computed in place from its `nvfp4_expert_rg16_v1` host record with
-// the canonical W4A16 arithmetic of docs/maintainer/qwen3_8-flash-next-design.md §17.3. Every ISA
-// variant returns the same bits, and so does the GPU narrow route.
+// expert computed in place from its `nvfp4_expert_rg16_v1` host record with the canonical W4A16
+// arithmetic of docs/maintainer/qwen3_8-flash-next-design.md §17.3. Every ISA variant returns the
+// same bits, and so does the GPU narrow route.
 //
 // The record layout, ISA selection and per-expert scalars are those of the W4A4 route
 // (w4a4_expert.h). An A16 expert's ExpertScales carry no input scales (zero) and its alpha_* words
 // are the record's multipliers m = fl32(1 / weight global scale).
+//
+// The record's geometry is a parameter (expert_layout.h): the default-geometry record is the one
+// the layout constants describe, and the second registered geometry takes its own sizes and the
+// SwiGLU limit its experts clamp gate and up with (0: no clamp).
 
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -34,17 +38,21 @@ void rg16_row_sums_a16(CpuIsa isa, const std::uint8_t* matrix, int blocks, int r
 // the encoded x of column col with exponent x_exp[col]; writes h[col][16 * unit + i] in BF16.
 void gate_up_units_a16(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
                        const canon::A16Block* const* x, const int* x_exp, int ncols, int unit_begin,
-                       int unit_end, std::uint16_t* const* h, int prefetch_bytes = kDefaultPrefetchBytes);
+                       int unit_end, std::uint16_t* const* h,
+                       int prefetch_bytes       = kDefaultPrefetchBytes,
+                       const Geometry& geometry = kDefaultGeometry);
 
 // Phase B for down row groups [rg_begin, rg_end): `h[col]` is the encoded h of column col with
 // exponent h_exp[col]; writes y[col][row] in BF16 for those rows.
 void down_rows_a16(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
-                   const canon::A16Block* const* h, const int* h_exp, int ncols, int rg_begin, int rg_end,
-                   std::uint16_t* const* y, int prefetch_bytes = kDefaultPrefetchBytes);
+                   const canon::A16Block* const* h, const int* h_exp, int ncols, int rg_begin,
+                   int rg_end, std::uint16_t* const* y, int prefetch_bytes = kDefaultPrefetchBytes,
+                   const Geometry& geometry = kDefaultGeometry);
 
-// Whole expert on one thread: y[col][0..2560) from x[col][0..2560), both BF16.
-void expert_forward_a16(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales, int ncols,
-                        const std::uint16_t* const* x, std::uint16_t* const* y,
-                        int prefetch_bytes = kDefaultPrefetchBytes);
+// Whole expert on one thread: y[col][0..hidden) from x[col][0..hidden), both BF16.
+void expert_forward_a16(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+                        int ncols, const std::uint16_t* const* x, std::uint16_t* const* y,
+                        int prefetch_bytes       = kDefaultPrefetchBytes,
+                        const Geometry& geometry = kDefaultGeometry);
 
 } // namespace infernix::ops::offloaded_moe

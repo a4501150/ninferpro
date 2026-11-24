@@ -295,29 +295,38 @@ void rg16_row_sums_a16(CpuIsa isa, const std::uint8_t* matrix, int blocks, int r
 }
 
 void gate_up_units_a16(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
-                       const canon::A16Block* const* x, const int* x_exp, int ncols, int unit_begin, int unit_end,
-                       std::uint16_t* const* h, int prefetch_bytes) {
+                       const canon::A16Block* const* x, const int* x_exp, int ncols, int unit_begin,
+                       int unit_end, std::uint16_t* const* h, int prefetch_bytes,
+                       const Geometry& geometry) {
+    const int blocks  = geometry.gate_up_blocks();
+    const float limit = geometry.swiglu_limit;
     std::int64_t s[32 * kMaxColumns]; // one unit's sums: no allocation on the miss path
     for (int u = unit_begin; u < unit_end; ++u) {
         // Unit u is row groups 2u, 2u+1: rows 32u..32u+31, gate_i at even rows, up_i at odd rows.
-        rg16_row_sums_a16(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x, ncols, s, prefetch_bytes);
+        rg16_row_sums_a16(isa, record, blocks, 2 * u, 2 * u + 2, x, ncols, s, prefetch_bytes);
         for (int c = 0; c < ncols; ++c) {
             std::uint16_t g[16], p[16];
             for (int i = 0; i < 16; ++i) {
                 g[i] = canon::a16_row_output(s[static_cast<std::size_t>(2 * i) * ncols + c], x_exp[c], scales.alpha_gate);
                 p[i] = canon::a16_row_output(s[static_cast<std::size_t>(2 * i + 1) * ncols + c], x_exp[c], scales.alpha_up);
             }
-            swiglu_bf16_n(isa, g, p, 16, &h[c][16 * u]);
+            if (limit > 0.0F) {
+                swiglu_bf16_clamped_n(isa, g, p, 16, &h[c][16 * u], limit);
+            } else {
+                swiglu_bf16_n(isa, g, p, 16, &h[c][16 * u]);
+            }
         }
     }
 }
 
 void down_rows_a16(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
-                   const canon::A16Block* const* h, const int* h_exp, int ncols, int rg_begin, int rg_end,
-                   std::uint16_t* const* y, int prefetch_bytes) {
+                   const canon::A16Block* const* h, const int* h_exp, int ncols, int rg_begin,
+                   int rg_end, std::uint16_t* const* y, int prefetch_bytes,
+                   const Geometry& geometry) {
     std::int64_t s[16 * kMaxColumns]; // one row group at a time
     for (int rg = rg_begin; rg < rg_end; ++rg) {
-        rg16_row_sums_a16(isa, record + kGateUpBytes, kDownBlocks, rg, rg + 1, h, ncols, s, prefetch_bytes);
+        rg16_row_sums_a16(isa, record + geometry.gate_up_bytes(), geometry.down_blocks(), rg,
+                          rg + 1, h, ncols, s, prefetch_bytes);
         for (int r = 0; r < 16; ++r) {
             for (int c = 0; c < ncols; ++c) {
                 y[c][rg * 16 + r] = canon::a16_row_output(s[r * ncols + c], h_exp[c], scales.alpha_down);
@@ -326,27 +335,33 @@ void down_rows_a16(CpuIsa isa, const std::uint8_t* record, const ExpertScales& s
     }
 }
 
-void expert_forward_a16(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales, int ncols,
-                        const std::uint16_t* const* x, std::uint16_t* const* y, int prefetch_bytes) {
+void expert_forward_a16(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+                        int ncols, const std::uint16_t* const* x, std::uint16_t* const* y,
+                        int prefetch_bytes, const Geometry& geometry) {
+    const int gate_up_blocks = geometry.gate_up_blocks(), h_blocks = geometry.h_blocks();
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
-    std::vector<canon::A16Block> xb(static_cast<std::size_t>(ncols) * kGateUpBlocks);
-    std::vector<canon::A16Block> hb(static_cast<std::size_t>(ncols) * kHBlocks);
-    std::vector<std::uint16_t> hv(static_cast<std::size_t>(ncols) * kIntermediate);
+    std::vector<canon::A16Block> xb(static_cast<std::size_t>(ncols) * gate_up_blocks);
+    std::vector<canon::A16Block> hb(static_cast<std::size_t>(ncols) * h_blocks);
+    std::vector<std::uint16_t> hv(static_cast<std::size_t>(ncols) * geometry.intermediate);
     const canon::A16Block* x_ptr[kMaxColumns];
     const canon::A16Block* h_ptr[kMaxColumns];
     std::uint16_t* hv_ptr[kMaxColumns];
     int x_exp[kMaxColumns], h_exp[kMaxColumns];
     for (int c = 0; c < ncols; ++c) {
-        x_exp[c]  = encode_a16(x[c], kHidden, &xb[static_cast<std::size_t>(c) * kGateUpBlocks]);
-        x_ptr[c]  = &xb[static_cast<std::size_t>(c) * kGateUpBlocks];
-        hv_ptr[c] = &hv[static_cast<std::size_t>(c) * kIntermediate];
-        h_ptr[c]  = &hb[static_cast<std::size_t>(c) * kHBlocks];
+        x_exp[c] =
+            encode_a16(x[c], geometry.hidden, &xb[static_cast<std::size_t>(c) * gate_up_blocks]);
+        x_ptr[c]  = &xb[static_cast<std::size_t>(c) * gate_up_blocks];
+        hv_ptr[c] = &hv[static_cast<std::size_t>(c) * geometry.intermediate];
+        h_ptr[c]  = &hb[static_cast<std::size_t>(c) * h_blocks];
     }
-    gate_up_units_a16(isa, record, scales, x_ptr, x_exp, ncols, 0, kHBlocks, hv_ptr, prefetch_bytes);
+    gate_up_units_a16(isa, record, scales, x_ptr, x_exp, ncols, 0, h_blocks, hv_ptr, prefetch_bytes,
+                      geometry);
     for (int c = 0; c < ncols; ++c) {
-        h_exp[c] = encode_a16(hv_ptr[c], kIntermediate, &hb[static_cast<std::size_t>(c) * kHBlocks]);
+        h_exp[c] = encode_a16(hv_ptr[c], geometry.intermediate,
+                              &hb[static_cast<std::size_t>(c) * h_blocks]);
     }
-    down_rows_a16(isa, record, scales, h_ptr, h_exp, ncols, 0, kDownRowGroups, y, prefetch_bytes);
+    down_rows_a16(isa, record, scales, h_ptr, h_exp, ncols, 0, geometry.down_row_groups(), y,
+                  prefetch_bytes, geometry);
 }
 
 } // namespace infernix::ops::offloaded_moe

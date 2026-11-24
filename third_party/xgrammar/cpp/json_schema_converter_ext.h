@@ -193,6 +193,9 @@ class XMLToolCallingConverter : public JSONSchemaConverter {
   // Track if we're at the root object level
   int nested_object_level_ = 0;
   const XMLWrapper xml_wrapper_;
+ private:
+  bool InfernixExact() const;
+  std::string RawValueClose() const;
 };
 
 /*!

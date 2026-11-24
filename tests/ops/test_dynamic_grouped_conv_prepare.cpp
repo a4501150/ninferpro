@@ -31,6 +31,8 @@ std::int32_t g_rows = 0;
 constexpr std::int32_t kMaximumBatch    = 8;
 constexpr std::int32_t kMaximumTokens   = kMaximumWidth * kMaximumBatch;
 constexpr float kEps                    = 1.0e-6F;
+// The epsilon operand under test: kEps, then GLM-5.3-Flash's 1e-5 (stored float 9.999999747e-6).
+float g_eps = kEps;
 
 constexpr ReductionCriterion kFinishDeltaCriterion{/*relative_l2=*/3.2e-3,
                                                    /*gross_absolute=*/4.0e-3,
@@ -132,7 +134,7 @@ Reference compute_reference(const std::vector<std::uint16_t>& residual,
             const double value = bf16_to_f32(residual[token_begin + hidden]);
             sum_squares += value * value;
         }
-        const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(g_hidden) + kEps);
+        const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(g_hidden) + g_eps);
         for (std::int32_t hidden = 0; hidden < g_hidden; ++hidden) {
             normalized[token_begin + hidden] =
                 static_cast<double>(bf16_to_f32(residual[token_begin + hidden])) * inverse *
@@ -229,10 +231,11 @@ void set_reference_width(Reference& reference, const std::vector<std::uint16_t>&
     }
 }
 
-int run_geometry(std::int32_t hidden) {
+int run_geometry(std::int32_t hidden, float epsilon = kEps) {
     g_hidden = hidden;
     g_groups = hidden / 16;
     g_rows   = 4 * g_groups;
+    g_eps                    = epsilon;
     const auto residual_host = make_residual(), norm_host = make_norm_weight(),
                base_host = make_base_kernel();
     direct_bf16_weight::DeviceWeight projection_weight(make_projection_weight());
@@ -268,7 +271,7 @@ int run_geometry(std::int32_t hidden) {
                 cuda_check(cudaStreamSynchronize(nullptr), "fixture fill synchronize");
                 workspace.reset_peak();
                 const auto launch = [&] {
-                    ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, kEps, base, weight,
+                    ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, g_eps, base, weight,
                                                               prepared, finish, workspace, stream);
                 };
                 if (replay) {
@@ -305,11 +308,11 @@ int run_geometry(std::int32_t hidden) {
             }
         }
     }
-    // The fused fast route (DynamicConvRoutes::FusedPrepare): H 2560 and at most 16 columns run the
-    // one-kernel route against the same oracle; wider calls and H 5120 keep the exact route (the
-    // flag changes no capacity there). The drafter captures its proposal rounds in a graph, so the
-    // route replays from one too.
-    if (g_hidden == 2560) {
+    // The fused fast route (DynamicConvRoutes::FusedPrepare): H 2560 or 4096 at most 16 columns run
+    // the one-kernel route against the same oracle; wider calls and H 5120 keep the exact route
+    // (the flag changes no capacity there). The drafter captures its proposal rounds in a graph, so
+    // the route replays from one too.
+    if (g_hidden == 2560 || g_hidden == 4096) {
         for (int width = 2; width <= 16; ++width) {
             set_reference_width(reference, base_host, width);
             for (int batch = 1; batch * width <= 16; ++batch) {
@@ -326,9 +329,9 @@ int run_geometry(std::int32_t hidden) {
                     cuda_check(cudaStreamSynchronize(nullptr), "fixture fill synchronize");
                     workspace.reset_peak();
                     const auto launch = [&] {
-                        ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, kEps, base, weight,
-                                                                  prepared, finish, workspace, stream,
-                                                                  ops::DynamicConvRoutes::FusedPrepare);
+                        ops::rmsnorm_dynamic_grouped_conv_prepare(
+                            residual, norm, g_eps, base, weight, prepared, finish, workspace,
+                            stream, ops::DynamicConvRoutes::FusedPrepare);
                     };
                     if (replay) {
                         DecodeGraphDefinition definition;
@@ -341,10 +344,10 @@ int run_geometry(std::int32_t hidden) {
                     } else
                         launch();
                     cuda_synchronize();
-                    const std::string label = "dynamic conv prepare fused H=2560 W=" +
-                                              std::to_string(width) +
-                                              " B=" + std::to_string(batch) +
-                                              " graph=" + std::to_string(replay);
+                    const std::string label =
+                        "dynamic conv prepare fused H=" + std::to_string(g_hidden) +
+                        " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
+                        " graph=" + std::to_string(replay);
                     failures += verify_reduction(label + " prepared", from_device_bf16(pd.data(), pe),
                                                  std::span<const double>(reference.prepared.data(), pe),
                                                  kPreparedCriterion);
@@ -394,8 +397,9 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        // Qwen3.8-27B's drafter and Qwen3.8-Flash-Next's.
-        const int failures = run_geometry(5120) + run_geometry(2560);
+        // Qwen3.8-27B's drafter, GLM-5.3-Flash's (epsilon 1e-5) and Qwen3.8-Flash-Next's.
+        const int failures = run_geometry(5120) + run_geometry(4096, static_cast<float>(1.0e-5)) +
+                             run_geometry(2560);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " rmsnorm_dynamic_grouped_conv_prepare\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

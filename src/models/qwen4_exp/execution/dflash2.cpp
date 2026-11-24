@@ -136,7 +136,8 @@ void DFlash2::materialize(const DFlash2ContextCall& call) {
         const auto& layer = p_.layers[l];
         layers[l]         = {layer.context_key.weight, layer.context_value.weight, layer.key_norm, ring_[l]};
     }
-    ops::context_kv_materialize(context, call.positions, call.counts, call.slots, layers, config_.rope_theta,
+    ops::context_kv_materialize(context, call.positions, call.counts, call.slots, layers,
+                                config_.rope_theta, config_.rms_norm_eps,
                                 {call.min_count, call.max_count}, work_, s);
 }
 
@@ -219,7 +220,8 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
                 Tensor qf = q.view({D * Hq, columns}), kf = k.view({D * Hk, columns}), vf = v.view({D * Hk, columns});
                 ops::attn_input_proj(prepared.view({H, columns}), layer.query_key_value, qf, kf, vf, s);
             }
-            ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, p_.rope, q, k, s);
+            ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, p_.rope,
+                              config_.rms_norm_eps, q, k, s);
             Tensor attention = work_.alloc(DType::BF16, {D, Hq, W, B});
             ops::sliding_window_attention(q, k, v, positions, call.valid_columns, call.slots, {D, Hq, Hk},
                                           config_.window, scale, ring_[l], envelope, work_, attention, s);
@@ -247,7 +249,7 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
     }
     // The mask columns' final hidden, their head candidates and the selector's conditional path.
     Tensor hidden = work_.alloc(DType::BF16, {H, K * B});
-    ops::rmsnorm_pack_tail(residual, p_.final_norm, hidden, s);
+    ops::rmsnorm_pack_tail(residual, p_.final_norm, config_.rms_norm_eps, hidden, s);
     Tensor candidates = call.candidates;
     Tensor ids_flat   = candidates.view({kCandidates, K * B});
     Tensor scores     = work_.alloc(DType::FP32, {kCandidates, K * B});

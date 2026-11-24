@@ -150,6 +150,8 @@ void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute ro
     switch (input.ne[0]) {
     case 5120:
         return launch_route<5120>(route, input, weight, partial, stream);
+    case 4096:
+        return launch_route<4096>(route, input, weight, partial, stream);
     case 2560:
         return launch_route<2560>(route, input, weight, partial, stream);
     }

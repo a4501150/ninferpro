@@ -3,6 +3,7 @@
 #include "ops/rmsnorm_rope/launch.h"
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -111,11 +112,15 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
 }
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
-                  const PreparedRope& prepared, Tensor& q, Tensor& k, cudaStream_t stream) {
+                  const PreparedRope& prepared, float epsilon, Tensor& q, Tensor& k,
+                  cudaStream_t stream) {
     if (prepared.rotary_dim != 128) {
         throw std::invalid_argument("rmsnorm_rope: prepared RoPE must have R128");
     }
-    if (prepared.factor == 1.0F && prepared.theta == 1.0e7F) {
+    if (!std::isfinite(epsilon) || epsilon <= 0.0F) {
+        throw std::invalid_argument("rmsnorm_rope: epsilon must be finite and positive");
+    }
+    if (prepared.factor == 1.0F && prepared.theta == 1.0e7F && epsilon == 1.0e-6F) {
         return rmsnorm_rope(positions, q_norm_weight, k_norm_weight, q, k, stream);
     }
     const int batch = q.ne[3];
@@ -130,15 +135,18 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
     require_tensor(positions, DType::I32, {width, batch, 1, 1}, "positions");
     require_pair_nonoverlap(positions, q_norm_weight, k_norm_weight, q, k);
     detail::rmsnorm_rope_prepared_launch(positions, &q_norm_weight, k_norm_weight, prepared,
-                                    &q, k, width * batch, stream);
+                                         epsilon, &q, k, width * batch, stream);
 }
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, const PreparedRope& prepared,
-                  Tensor& x, cudaStream_t stream) {
+                  float epsilon, Tensor& x, cudaStream_t stream) {
     if (prepared.rotary_dim != 128) {
         throw std::invalid_argument("rmsnorm_rope: prepared RoPE must have R128");
     }
-    if (prepared.factor == 1.0F && prepared.theta == 1.0e7F) {
+    if (!std::isfinite(epsilon) || epsilon <= 0.0F) {
+        throw std::invalid_argument("rmsnorm_rope: epsilon must be finite and positive");
+    }
+    if (prepared.factor == 1.0F && prepared.theta == 1.0e7F && epsilon == 1.0e-6F) {
         return rmsnorm_rope(positions, norm_weight, x, stream);
     }
     const int tokens = x.ne[2];
@@ -149,7 +157,8 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, const Prep
     require_tensor(norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "norm weight");
     require_tensor(positions, DType::I32, {tokens, 1, 1, 1}, "positions");
     require_single_nonoverlap(positions, norm_weight, x);
-    detail::rmsnorm_rope_prepared_launch(positions, nullptr, norm_weight, prepared, nullptr, x, tokens, stream);
+    detail::rmsnorm_rope_prepared_launch(positions, nullptr, norm_weight, prepared, epsilon,
+                                         nullptr, x, tokens, stream);
 }
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,

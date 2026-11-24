@@ -35,6 +35,10 @@ One tier, owned by no family. What it is:
 | In-place expert records and the expert stripe (`ExpertStore`, `ExpertStripe`) | `src/models/offload/expert_store.*` |
 | RAM level: decayed-LFU ranking, pinned slots, pins, landings (`HostTier`); the read agent, tickets, stream slots (`HostExpertTier`) | `src/models/offload/host_tier.*`, `host_expert_tier.*` |
 | Saved cache state (a family may ship a calibrated order that seeds it, e.g. `src/models/qwen4_exp/calibrated_order.*`) | `src/models/offload/expert_state.*` |
+| The orchestration a family composes (`ExpertPlacementRuntime`: the residency, the RAM tier and its fetch channel and stripe, the VRAM monitor, the warm start, the tier fills, the placement switches and their refill, the status and export; family hooks for diagnostics, the fallback seed order, the tier's consumers, the round-cost reset and the elastic KV interplay) | `src/models/offload/expert_placement_runtime.*` |
+| The startup placement resolution (`resolve_startup_placement`: the `--experts` spec or `--expert-placement` file to the frame target and ceiling, pinned keys, tier order and tier cap, over the family's ranking and device-plan probe hooks) | `src/models/offload/expert_placement_startup.*` |
+| The host RAM ledger and the VRAM sizing (`HostMemoryDemand`, `HostMemoryLedger`, `plan_host_memory`, `pin_room`, `size_expert_frames`, `frame_target`, `display_headroom`) | `src/models/offload/memory_plan.*` |
+| The status's public conversions (the `GET` report, the switch's file form, the counts preview) | `src/models/offload/expert_placement_report.h` |
 | Route trace for offline replay | `src/models/offload/route_trace.*` |
 | VRAM monitor | `src/models/offload/vram_monitor.*` |
 | Routed-expert MoE op: routing, dispatch, narrow and wide GPU kernels, staging, CPU engine, miss and fetch channels | `include/infernix/ops/offloaded_sparse_moe.h`; `src/ops/offloaded_sparse_moe/` (`cuda/`, `cpu/`) |
@@ -43,13 +47,19 @@ One tier, owned by no family. What it is:
 
 What stays with a family: its mathematics, config, binding, recipes and stored formats, its
 Program (which owns the tier's instances and calls them at its own round boundaries), its
-memory-plan constants, its KV and prefix machinery, and its measurements.
+memory-plan constants (the `graph_bound` of its CUDA graphs), its KV and prefix machinery, and
+its measurements.
 
 **Composition.** A family's Program constructs the tier's pieces directly — no base class, no
 virtual model interface, no plugin discovery — hands each its `ExpertBankGeometry` and record
 strides, and drives them at its own round boundaries (`before_round` before the round's
-kernels, `after_round` on the downloaded route log, `tier_step` inside a layer walk, the
-placement switch at a maintenance boundary). The public contract the MoE kernels consume is
+kernels, `after_round` on the downloaded route log, `tier_step` inside a layer walk). The
+between-rounds and startup orchestration is shared: the family constructs the
+`ExpertPlacementRuntime` from its options and hooks, which owns the residency, the RAM tier,
+the VRAM monitor and the placement switches, and the family keeps the per-round residency
+calls, its hooks (diagnostics, its fallback seed order, the tier's consumers, the round-cost
+reset, the elastic KV interplay, its device-error codes) and the wiring of the tier's tables
+into its own Forward. The public contract the MoE kernels consume is
 `MoeExpertSource` ([op development](op-development.md)); the tier is an execution resource of
 the op, like a stream or a workspace.
 
@@ -121,6 +131,17 @@ the CPU and the GPU compile, so both read the same words and the epilogue multip
 identical on both. A new stored format adds a trait and its kernels beside the existing ones
 (`src/ops/offloaded_sparse_moe/`), not a new engine; a loader check keeps every layer's bank
 one kind and its activation policy consistent with the presence of activation scales.
+
+**Expert geometry.** The routed-expert Op's NVFP4 activation-16 routes take the bank's expert
+geometry — hidden size, intermediate size, and the SwiGLU clamp the family applies to the gate
+and up limbs — as a compile-time parameter over a small registered set (Qwen3.8-Flash-Next's
+2560×640 with no clamp, GLM-5.3-Flash's 4096×2048 with clamp 10); the other bank formats keep
+their kernels at their own geometry. A per-call `Geometry` value is validated against the
+registered set and selects the kernels — one branch per call, never per token — and every
+route that reads an NVFP4 record (the narrow dp4a and tensor-core kernels, the wide prefill
+route, the CPU W4A16 engine, the miss service and the staging, landing and fetch paths)
+computes the same bits at either geometry. A bank whose geometry no instance covers is
+rejected at call time with the registered sizes in the message.
 
 **The artifact is the SSD tier's source.** `ExpertStore` describes every record as file
 segments — one, or two for a record straddling part files — each 4 KiB-aligned in offset and

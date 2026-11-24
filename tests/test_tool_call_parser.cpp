@@ -1,5 +1,5 @@
 #include "models/qwen_common/frontend/tool_call_parser.h"
-#include "models/qwen_common/frontend/tool_contract.h"
+#include "models/common/frontend/tool_contract.h"
 
 #include <nlohmann/json.hpp>
 
@@ -16,9 +16,10 @@ namespace {
 
 using Json   = nlohmann::json;
 namespace fi = infernix::models::qwen_common::frontend;
+namespace tool_contract = infernix::models::common::frontend;
 
 // An empty contract: no declared tools, the parser's untyped legacy policy.
-const fi::ToolCallOutputContract kLegacyContract;
+const tool_contract::ToolCallOutputContract kLegacyContract;
 
 int fail(const std::string& message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -36,19 +37,19 @@ std::string tool_definition(const std::string& tool_name, Json properties,
         .dump();
 }
 
-std::shared_ptr<const fi::ToolCallOutputContract>
+std::shared_ptr<const tool_contract::ToolCallOutputContract>
 contract_from_definitions(const std::vector<std::string>& definitions) {
-    return fi::build_tool_call_output_contract(definitions);
+    return tool_contract::build_tool_call_output_contract(definitions);
 }
 
-std::shared_ptr<const fi::ToolCallOutputContract> output_contract_for(const std::string& tool_name,
-                                                                      Json properties) {
+std::shared_ptr<const tool_contract::ToolCallOutputContract>
+output_contract_for(const std::string& tool_name, Json properties) {
     const std::vector<std::string> definitions = {
         tool_definition(tool_name, std::move(properties))};
     return contract_from_definitions(definitions);
 }
 
-fi::ToolCallOutputContract contract_for(const std::string& tool_name, Json properties) {
+tool_contract::ToolCallOutputContract contract_for(const std::string& tool_name, Json properties) {
     return *output_contract_for(tool_name, std::move(properties));
 }
 
@@ -69,7 +70,7 @@ tool_call(std::string_view tool_name,
     return text;
 }
 
-int check_rejected(const std::string& text, const fi::ToolCallOutputContract& contract,
+int check_rejected(const std::string& text, const tool_contract::ToolCallOutputContract& contract,
                    infernix::ToolCallParseFallbackReason reason, std::string_view message) {
     const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
     return check(!parsed.is_tool_call_response && parsed.content == text &&
@@ -78,7 +79,7 @@ int check_rejected(const std::string& text, const fi::ToolCallOutputContract& co
                  std::string(message));
 }
 
-int check_parameter_schema_mismatch(const fi::ToolCallOutputContract& contract,
+int check_parameter_schema_mismatch(const tool_contract::ToolCallOutputContract& contract,
                                     std::string_view parameter_name, std::string_view value,
                                     std::string_view expected_json_value,
                                     std::string_view message) {
@@ -533,7 +534,7 @@ int test_root_union_type_hints() {
               {"function", Json{{"name", "fetch"}, {"parameters", remote}}}}
                  .dump()});
     const auto constrained =
-        fi::select_tool_call_contract(declarations, infernix::ToolChoice{});
+        tool_contract::select_tool_call_contract(declarations, infernix::ToolChoice{});
     int failures = 0;
     if (!constrained) { return check(false, "default tool choice did not constrain the calls"); }
     // Each call's text and the JSON its arguments must decode to.
@@ -584,14 +585,16 @@ int test_argument_nesting_bound() {
                           "' was not kept as JSON up to 256 levels and as text beyond");
         }
     }
-    const auto strict = fi::select_tool_call_contract(
+    const auto strict = tool_contract::select_tool_call_contract(
         contract_from_definitions({Json{{"type", "function"},
-                                        {"function", {{"name", "store"},
-                                                      {"strict", true},
-                                                      {"parameters", {{"type", "object"},
-                                                                      {"properties", {{"list", {{"type", "array"}}}}},
-                                                                      {"required", Json::array({"list"})},
-                                                                      {"additionalProperties", false}}}}}}
+                                        {"function",
+                                         {{"name", "store"},
+                                          {"strict", true},
+                                          {"parameters",
+                                           {{"type", "object"},
+                                            {"properties", {{"list", {{"type", "array"}}}}},
+                                            {"required", Json::array({"list"})},
+                                            {"additionalProperties", false}}}}}}
                                        .dump()}),
         infernix::ToolChoice{});
     for (const int levels : {256, 257}) {
@@ -941,13 +944,15 @@ int test_incremental_fallback_preserves_bytes() {
     auto malformed_terminal = malformed.finish();
     restored += malformed_terminal.content;
 
-    fi::ToolCallOutputDecoder ordinary(std::make_shared<fi::ToolCallOutputContract>(), 64);
+    fi::ToolCallOutputDecoder ordinary(std::make_shared<tool_contract::ToolCallOutputContract>(),
+                                       64);
     std::string ordinary_text;
     ordinary_text += ordinary.feed("ordinary text  ");
     ordinary_text += ordinary.finish().content;
 
     const std::string partial_original = "  <tool_x then <tool_";
-    fi::ToolCallOutputDecoder partial(std::make_shared<fi::ToolCallOutputContract>(), 64);
+    fi::ToolCallOutputDecoder partial(std::make_shared<tool_contract::ToolCallOutputContract>(),
+                                      64);
     std::string partial_restored;
     partial_restored += partial.feed("  <too");
     partial_restored += partial.feed("l_x then <tool_");
@@ -1038,7 +1043,8 @@ int test_streamed_marker_boundaries() {
                               result.tool_calls[0].arguments_json == R"({"value":"hello"})",
                           "a broken marker prefix swallowed the marker that followed it");
     }
-    const auto constrained = fi::select_tool_call_contract(free_tool, infernix::ToolChoice{});
+    const auto constrained =
+        tool_contract::select_tool_call_contract(free_tool, infernix::ToolChoice{});
     failures += check(constrained && constrained->constrained,
                       "default tool choice did not constrain tool calls");
     const std::string prose = "Quote <invoke name=\"echo\"> and <function_calls> as text.";
@@ -1256,7 +1262,7 @@ int test_claude_code_plan_and_task_create_exact_repro() {
 
 int test_duplicate_parameter_keeps_last_value() {
     int failures = 0;
-    const fi::ToolCallOutputContract contract =
+    const tool_contract::ToolCallOutputContract contract =
         contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
     const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
     const auto parsed = fi::parse_qwen_tool_call_output(duplicate, 64, contract);
@@ -1467,7 +1473,7 @@ int test_tolerant_undeclared_and_value_cut() {
     // A client that knows tools it does not declare (PromptOptions::open_tool_names: Claude Code's
     // deferred MCP tools, SY-05) gets the call even from the strict parser, not as a repair; a
     // drifted opener still needs a declared name.
-    auto open        = std::make_shared<fi::ToolCallOutputContract>(*contract);
+    auto open         = std::make_shared<tool_contract::ToolCallOutputContract>(*contract);
     open->open_names = true;
     const auto opened = fi::parse_qwen_tool_call_output(undeclared, 64, *open);
     failures += check(opened.is_tool_call_response && opened.tool_calls.size() == 1 &&
@@ -1617,8 +1623,9 @@ int test_markdown_quoted_calls() {
     const std::vector<std::string> definitions = {
         tool_definition("write", Json{{"path", Json{{"type", "string"}}}})};
     const auto free_contract = contract_from_definitions(definitions);
-    const auto constrained   = fi::select_tool_call_contract(free_contract, infernix::ToolChoice{});
-    using Contract           = std::shared_ptr<const fi::ToolCallOutputContract>;
+    const auto constrained =
+        tool_contract::select_tool_call_contract(free_contract, infernix::ToolChoice{});
+    using Contract = std::shared_ptr<const tool_contract::ToolCallOutputContract>;
     const std::vector<std::pair<Contract, bool>> routes{
         {free_contract, false}, {free_contract, true}, {constrained, false}};
     const auto call     = tool_call("write", {{"path", "/tmp/a.txt"}});
@@ -1705,8 +1712,9 @@ int test_quoted_call_closers() {
         "write_file", Json{{"path", Json{{"type", "string"}}},
                            {"content", Json{{"type", "string"}}}})};
     const auto free_contract = contract_from_definitions(definitions);
-    const auto constrained   = fi::select_tool_call_contract(free_contract, infernix::ToolChoice{});
-    using Contract           = std::shared_ptr<const fi::ToolCallOutputContract>;
+    const auto constrained =
+        tool_contract::select_tool_call_contract(free_contract, infernix::ToolChoice{});
+    using Contract              = std::shared_ptr<const tool_contract::ToolCallOutputContract>;
     const std::string plain     = tool_call("write_file", {{"path", "/tmp/a"}, {"content", "x"}});
     const std::string closers   = plain.substr(plain.rfind("\n</parameter>"));
     const std::string document  = "# Format\nA call ends with:" + closers + "\nThen the reply goes on.";

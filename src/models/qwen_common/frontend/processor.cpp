@@ -1,7 +1,7 @@
 #include "models/qwen_common/frontend/processor.h"
 
 #include "media/decode/decode.h"
-#include "models/qwen_common/frontend/digest.h"
+#include "models/common/frontend/digest.h"
 #include "models/qwen_common/frontend/media_cache.h"
 
 #include <algorithm>
@@ -993,8 +993,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     for (ChatPart* part : parts) {
         try {
             check_preparation_control(control);
-            const auto digest =
-                sha256(part->media.bytes, [&control] { check_preparation_control(control); });
+            const auto digest = common::frontend::sha256(
+                part->media.bytes, [&control] { check_preparation_control(control); });
             const ChatPartKind kind = part->kind;
             const MediaCacheKey key{
                 .digest   = digest,

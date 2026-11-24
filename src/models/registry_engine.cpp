@@ -1,3 +1,4 @@
+#include "models/glm5_next/instance.h"
 #include "models/qwen3_5/instance.h"
 #include "models/qwen4_exp/instance.h"
 #include "models/registry.h"
@@ -14,6 +15,8 @@ construct_engine_backend(Architecture architecture, EngineOptions& options, Devi
         return runtime::construct_qwen3_5_backend(options, device);
     case Architecture::Qwen4Exp:
         return runtime::construct_qwen4_exp_backend(options, device);
+    case Architecture::Glm5Next:
+        return runtime::construct_glm5_next_backend(options, device);
     }
     throw std::invalid_argument("unknown model architecture");
 }

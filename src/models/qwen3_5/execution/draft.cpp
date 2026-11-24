@@ -171,9 +171,9 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 replace_local_window ? positions.slice(0, local_offset, local_width) : positions;
             ops::context_kv_materialize(
                 context.view({dimension(target.hidden_size), local_width, batch}), local_positions,
-                local_counts, lanes, layers, config.rope_theta,
-                {local_envelope.min_count, local_envelope.max_count},
-                state.execution.work, state.execution.device.stream);
+                local_counts, lanes, layers, config.rope_theta, config.rms_norm_eps,
+                {local_envelope.min_count, local_envelope.max_count}, state.execution.work,
+                state.execution.device.stream);
         } else {
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
                 auto layer_scope = state.execution.work.scope();
@@ -334,8 +334,8 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                 ops::attn_input_proj(branch.prepared.view({dimension(target.hidden_size), columns}),
                                      layer.query_key_value.weight, query_flat, key_flat, value_flat,
                                      stream);
-                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm,
-                                  weights.rope, query, key, stream);
+                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, weights.rope,
+                                  config.rms_norm_eps, query, key, stream);
                 Tensor attention = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
                                   dimension(config.attention.num_attention_heads), width, batch});
@@ -369,7 +369,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
             }
         }
         Tensor hidden = work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});
-        ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, stream);
+        ops::rmsnorm_pack_tail(residual, weights.final_norm, config.rms_norm_eps, hidden, stream);
         // A proposal landing in another frame keeps the lattice's per-position candidates apart
         // from the per-column candidates the verifier reads.
         const bool staged = into != nullptr;

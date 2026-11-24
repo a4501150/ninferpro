@@ -17,8 +17,8 @@
 namespace infernix::ops::detail {
 namespace {
 
-// The DFlash2 drafters' gate/up parents: [34816, 5120] (Qwen3.8-27B) and [15360, 2560]
-// (Qwen3.8-Flash-Next).
+// The DFlash2 drafters' gate/up parents: [34816, 5120] (Qwen3.8-27B), [24576, 4096]
+// (GLM-5.3-Flash) and [15360, 2560] (Qwen3.8-Flash-Next).
 constexpr std::int32_t kFirstSmallT = 1;
 constexpr std::int32_t kLastSmallT  = 40;
 using Launch                        = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -51,6 +51,8 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 
 constexpr auto kH5120Launchers =
     make_launchers<34816, 5120>(std::make_index_sequence<kLastSmallT / 8>{});
+constexpr auto kH4096Launchers =
+    make_launchers<24576, 4096>(std::make_index_sequence<kLastSmallT / 8>{});
 constexpr auto kH2560Launchers =
     make_launchers<15360, 2560>(std::make_index_sequence<kLastSmallT / 8>{});
 
@@ -64,6 +66,8 @@ void q8_linear_swiglu_wide_h_small_t_launch(const Tensor& x, const Weight& weigh
     const std::size_t index = static_cast<std::size_t>((x.ne[1] - 1) / 8);
     if (x.ne[0] == 5120) {
         kH5120Launchers[index](x, weight, out, stream);
+    } else if (x.ne[0] == 4096) {
+        kH4096Launchers[index](x, weight, out, stream);
     } else if (x.ne[0] == 2560) {
         kH2560Launchers[index](x, weight, out, stream);
     } else {

@@ -77,6 +77,8 @@ void bf16_dynamic_grouped_conv_prepare_reduce_launch(DynamicConvPrepareRoute rou
     switch (prepared.ne[0]) {
     case 5120:
         return launch_width<5120>(route, base, partial, prepared, finish, stream);
+    case 4096:
+        return launch_width<4096>(route, base, partial, prepared, finish, stream);
     case 2560:
         return launch_width<2560>(route, base, partial, prepared, finish, stream);
     }

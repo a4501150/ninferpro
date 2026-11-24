@@ -38,6 +38,7 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/offload/expert_residency.h"
+#include "models/offload/expert_placement_runtime.h"
 #include "models/offload/host_expert_tier.h"
 #include "models/qwen4_exp/calibrated_order.h"
 #include "models/offload/expert_state.h"

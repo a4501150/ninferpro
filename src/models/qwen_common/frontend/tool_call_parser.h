@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/qwen_common/frontend/tool_contract.h"
+#include "models/common/frontend/tool_contract.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -51,8 +51,8 @@ private:
 // the text before `text`.
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
-                            const ToolCallOutputContract& contract, bool tolerant = false,
-                            MarkdownCodeTracker code = {});
+                            const common::frontend::ToolCallOutputContract& contract,
+                            bool tolerant = false, MarkdownCodeTracker code = {});
 
 // Whether `text` holds a tool-call marker outside Markdown code. The constraint grammar's
 // reasoning section refuses such a marker inside thinking, so a thinking control message
@@ -70,7 +70,7 @@ public:
         ToolCallParseDiagnostics diagnostics;
     };
 
-    ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
+    ToolCallOutputDecoder(std::shared_ptr<const common::frontend::ToolCallOutputContract> contract,
                           std::size_t max_tool_name_length, bool tolerant = false);
 
     [[nodiscard]] bool in_tool_region() const noexcept {
@@ -81,7 +81,7 @@ public:
     [[nodiscard]] Terminal finish(FinishReason reason = FinishReason::StopToken);
 
 private:
-    std::shared_ptr<const ToolCallOutputContract> contract_;
+    std::shared_ptr<const common::frontend::ToolCallOutputContract> contract_;
     std::string trailing_whitespace_;
     std::string tool_region_;
     std::string pending_tag_;

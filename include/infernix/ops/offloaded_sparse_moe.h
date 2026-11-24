@@ -50,6 +50,16 @@ struct MoeRouting {
 /// logits: FP32 [E + 1, T], the router rows followed by the shared-expert gate row.
 void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream);
 
+/// The noaux_tc routing variant: logits FP32 [E, T] (no shared-gate row) and bias FP32 [E]; column
+/// t selects the top-k of sigmoid(logit_i) + bias_i (larger score first, the lower expert id on
+/// exact ties) and weights w_i = routed_scale * s_i / (sum of the k selected s + 1e-20), the sum
+/// added in selection order. routing.shared_gate is 1 for every column, so moe_combine computes
+/// y = bf16(sum_i w_i y_i + shared) unchanged (an ungated shared expert's addition). Router logits
+/// stay FP32 and the selection's order is fixed, so a column's routing never depends on the batch
+/// shape. Oracle: the formula in FP64, exact ids.
+void moe_route_noaux_tc(const Tensor& logits, const Tensor& bias, float routed_scale,
+                        std::int32_t top_k, MoeRouting& routing, cudaStream_t stream);
+
 /// Device-side dispatch of the routed (column, slot) entries by expert. Every array is
 /// caller-owned device memory sized for `max_entries = k * T` entries and E experts.
 struct MoeDispatch {
@@ -73,6 +83,11 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 /// verification widths.
 void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
                         std::int32_t* route_log, cudaStream_t stream);
+
+/// moe_route_noaux_tc then moe_dispatch in one kernel for decode and verification widths.
+void moe_route_dispatch_noaux_tc(const Tensor& logits, const Tensor& bias, float routed_scale,
+                                 std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
+                                 std::int32_t* route_log, cudaStream_t stream);
 
 /// The layer's routed expert records: expert e's record is at frame_base + frames[e] *
 /// record_stride when frames[e] >= 0, else at host_records + e * record_stride (pinned host
@@ -209,6 +224,13 @@ struct MoeExpertSource {
     // W4A16 experts' wide route: exact (default) or the two-term A4 fast path (design §13.4); the
     // workspace must be sized for the same choice. Narrow routes and W4A4 experts ignore it.
     offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact;
+    // The record's geometry (offloaded_moe::kGeometries; the layout the constants describe by
+    // default): every record-reading route - the NVFP4 A16 kernels' instantiations, the staging
+    // copies' record bytes, the CPU channel's mapped x/y planes and the CPU miss service - takes
+    // it. Validated against the registered instances per call (one host-side branch); other
+    // geometries are refused. W4A4, block-FP8 and ggml banks and the A16 fast-path wide routes are
+    // the default geometry's.
+    offloaded_moe::Geometry geometry = offloaded_moe::kDefaultGeometry;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;
@@ -261,9 +283,11 @@ struct MoeExpertSource {
 
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries
 /// with the layer's expert arithmetic.
-[[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
-                                                      offloaded_moe::ExpertActivation activation,
-                                                      offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact);
+[[nodiscard]] std::size_t moe_experts_workspace_bytes(
+    std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
+    offloaded_moe::ExpertActivation activation,
+    offloaded_moe::WideA16 wide_a16         = offloaded_moe::WideA16::kExact,
+    const offloaded_moe::Geometry& geometry = offloaded_moe::kDefaultGeometry);
 
 /// x: BF16 [H, T]. outputs: BF16 [H, k*T], column t*k + slot receives expert ids[slot, t]'s
 /// output for column t. max_jobs bounds the job count the grid covers (min(E, k*T)).
@@ -301,6 +325,16 @@ void moe_experts_prepare(const Tensor& x, const MoeExpertSource& source, std::in
                                            MoeDispatch& dispatch, std::int32_t* route_log, const Tensor& x,
                                            const MoeExpertSource& source, std::int32_t max_jobs, void* workspace,
                                            const Tensor& outputs, cudaStream_t stream);
+
+/// moe_route_dispatch_noaux_tc and, at decode or verification width, the plan of the moe_experts
+/// call with these x, source, max_jobs, workspace and outputs, in one kernel (as
+/// moe_route_dispatch_plan is for the softmax route).
+[[nodiscard]] MoeRoutePlan
+moe_route_dispatch_plan_noaux_tc(const Tensor& logits, const Tensor& bias, float routed_scale,
+                                 std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
+                                 std::int32_t* route_log, const Tensor& x,
+                                 const MoeExpertSource& source, std::int32_t max_jobs,
+                                 void* workspace, const Tensor& outputs, cudaStream_t stream);
 
 /// Waits for the host's answer to a moe_experts call made with wait_for_cpu == false and places
 /// its outputs; a no-op when that call published no request.

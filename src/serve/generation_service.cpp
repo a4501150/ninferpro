@@ -332,6 +332,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.vram_past_budget         = options_.vram_past_budget;
     engine_options.expert_tail_skip         = options_.expert_tail_skip;
     engine_options.expert_swap              = options_.expert_swap;
+    engine_options.prefill_expert_stream         = options_.prefill_expert_stream;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;

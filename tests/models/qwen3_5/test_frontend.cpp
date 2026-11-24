@@ -2,7 +2,7 @@
 #include "models/qwen_common/frontend/resources.h"
 
 #include "models/qwen_common/frontend/chat_template.h"
-#include "models/qwen_common/frontend/digest.h"
+#include "models/common/frontend/digest.h"
 #include "models/qwen_common/frontend/media_cache.h"
 #include "models/qwen_common/frontend/processor.h"
 #include "models/qwen_common/frontend/test_access.h"

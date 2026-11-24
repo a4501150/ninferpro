@@ -13,4 +13,8 @@ namespace infernix::ops::detail {
 // Host entry; assumes inputs already validated by the wrapper.
 void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream);
 
+// Host entry of the clamped variant; assumes inputs already validated by the wrapper.
+void silu_and_mul_clamped_launch(const Tensor& gate, const Tensor& up, float limit, Tensor& out,
+                                 cudaStream_t stream);
+
 } // namespace infernix::ops::detail

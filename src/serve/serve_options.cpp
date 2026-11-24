@@ -91,6 +91,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-ram-mib"},
     ServeOptionArity{"--experts"},
     ServeOptionArity{"--expert-swap"},
+    ServeOptionArity{"--prefill-expert-stream"},
     ServeOptionArity{"--expert-placement"},
     ServeOptionArity{"--expert-pin-mib"},
     ServeOptionArity{"--kv-dtype"},
@@ -290,7 +291,9 @@ std::optional<std::size_t> parse_vram_headroom(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.infernix> [options]\n"
-           "       " + argv0 + " --config FILE [options]   (FILE gives the model)\n"
+           "       " +
+           argv0 +
+           " --config FILE [options]   (FILE gives the model)\n"
            "\n"
            "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
            "  --help, -h                 show this help and exit\n"
@@ -410,6 +413,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             hot experts into VRAM (and into RAM) and cold ones\n"
            "                             out, within the counts --experts or a switch named\n"
            "                             (off freezes the content; misses still read)\n"
+           "  --prefill-expert-stream on|off\n"
+           "                             stream a prefill chunk's non-resident experts to\n"
+           "                             the device by copy-engine DMA ahead of compute (on,\n"
+           "                             the default) or stage them with the MoE's SM kernel\n"
+           "                             as decode does; the outputs are the same either way\n"
            "  --expert-ram-mib N|auto    Qwen3.8-Flash-Next: Host RAM in MiB for the routed\n"
            "                             experts (the SSD tier's slots), overriding the\n"
            "                             expert-count sizing. auto: the placement's share\n"
@@ -513,17 +521,17 @@ std::string serve_usage_text(const char* argv0) {
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
            "  --draft-tokens N|auto      drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
-           "                             dflash/dflash2 1-15 (Qwen3.8-Flash-Next\n"
-           "                             dflash2 1-7)\n"
+           "                             dflash/dflash2 1-15 (Qwen3.8-Flash-Next and\n"
+           "                             GLM-5.3-Flash dflash2 1-7; GLM-5.3-Flash refuses auto)\n"
            "                               N     every round drafts and verifies N\n"
            "                               auto  mtp: each round picks 0-7 from recent\n"
            "                                     acceptance (Qwen3.5/3.6: 1-5 where\n"
            "                                     qualified, else the model's fastest\n"
            "                                     fixed length); Qwen3.8-Flash-Next\n"
            "                                     dflash2 likewise\n"
-           "  --draft-model FILE         Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
-           "                             companion artifact (Qwen3.5/3.6 artifacts bundle\n"
-           "                             theirs)\n"
+           "  --draft-model FILE         Qwen3.8-Flash-Next and GLM-5.3-Flash dflash2: the\n"
+           "                             DFlash2 drafter's companion artifact (Qwen3.5/3.6\n"
+           "                             artifacts bundle theirs)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
            "  --spec-min-p P             Qwen3.8-Flash-Next mtp: verify drafts only up to\n"
            "                             the first below probability P, 0-1 (default 0.5\n"
@@ -593,7 +601,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             pre-parse)\n"
            "  --max-pending-requests N   max queued requests (default 16)\n"
            "  --pending-timeout-ms N     queue timeout in ms (default 30000)\n"
-           "  --keep-alive-timeout-sec N seconds an HTTP connection stays open after its response,\n"
+           "  --keep-alive-timeout-sec N seconds an HTTP connection stays open after its "
+           "response,\n"
            "                             advertised as Keep-Alive: timeout=N and closed 10 s\n"
            "                             later (default 360, longer than common client pools'\n"
            "                             idle timeouts; range 1..3600)\n"
@@ -1002,6 +1011,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (text == "on") { options.expert_swap = true; }
             else if (text == "off") { options.expert_swap = false; }
             else { throw std::invalid_argument("--expert-swap must be on or off"); }
+        } else if (arg == "--prefill-expert-stream") {
+            const std::string text = require_value("--prefill-expert-stream");
+            if (text == "on") {
+                options.prefill_expert_stream = true;
+            } else if (text == "off") {
+                options.prefill_expert_stream = false;
+            } else {
+                throw std::invalid_argument("--prefill-expert-stream must be on or off");
+            }
         } else if (arg == "--experts") {
             const std::string text = require_value("--experts");
             if (text == "auto") {

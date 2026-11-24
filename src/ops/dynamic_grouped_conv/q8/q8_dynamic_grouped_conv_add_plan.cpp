@@ -10,17 +10,18 @@ struct Plan {
     std::size_t workspace_bytes;
 };
 
-// The registered drafters: H = 5120 with C in {4096, 17408} (Qwen3.8-27B) and H = 2560 with C in
-// {4096, 7680} (Qwen3.8-Flash-Next).
+// The registered drafters: H = 5120 with C in {4096, 17408} (Qwen3.8-27B), H = 4096 with C in
+// {4096, 12288} (GLM-5.3-Flash) and H = 2560 with C in {4096, 7680} (Qwen3.8-Flash-Next).
 bool registered(int hidden, int input_rows) {
     return (hidden == 5120 && (input_rows == 4096 || input_rows == 17408)) ||
+           (hidden == 4096 && (input_rows == 4096 || input_rows == 12288)) ||
            (hidden == 2560 && (input_rows == 4096 || input_rows == 7680));
 }
 
 Plan resolve_plan(int hidden, int input_rows, int width, int batch) {
     if (!registered(hidden, input_rows))
-        throw std::invalid_argument(
-            "linear dynamic grouped conv add: (H, C) must be (5120, 4096|17408) or (2560, 4096|7680)");
+        throw std::invalid_argument("linear dynamic grouped conv add: (H, C) must be "
+                                    "(5120, 4096|17408), (4096, 4096|12288) or (2560, 4096|7680)");
     if (width < 2 || width > 16 || batch < 1 || batch > 8)
         throw std::invalid_argument("linear dynamic grouped conv add: invalid W/B profile");
     const int columns = width * batch;

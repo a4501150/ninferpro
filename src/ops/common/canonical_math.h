@@ -292,6 +292,19 @@ INFERNIX_CANON_HD std::uint16_t swiglu_bf16(std::uint16_t gate_bf16, std::uint16
     return f32_to_bf16_rn(mul_rn(silu_c(bf16_to_f32(gate_bf16)), bf16_to_f32(up_bf16)));
 }
 
+// SwiGLU with a clamp on the two products' operands: h = bf16_rn(silu_c(min(g, limit)) *
+// clamp(u, -limit, limit)), the clamps on the FP32 view of the BF16 row outputs. Comparisons
+// exclude NaN, so a non-finite operand keeps the unclamped arithmetic's NaN. The CPU AVX2 path
+// blends on the same ordered compares, so every ISA returns these bits.
+INFERNIX_CANON_HD std::uint16_t swiglu_bf16_clamped(std::uint16_t gate_bf16, std::uint16_t up_bf16,
+                                                    float limit) {
+    const float g  = bf16_to_f32(gate_bf16);
+    float u        = bf16_to_f32(up_bf16);
+    const float gc = g > limit ? limit : g;
+    u              = u > limit ? limit : (u < -limit ? -limit : u);
+    return f32_to_bf16_rn(mul_rn(silu_c(gc), u));
+}
+
 // ---------------------------------------------------------------------------- A4 codes
 
 // The A4 rule of quantize_a4_block split into its two steps and returning the 4-bit E2M1 code

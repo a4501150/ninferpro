@@ -1,6 +1,8 @@
 #include "models/registry.h"
 
 #include "artifact/reader.h"
+#include "models/glm5_next/load.h"
+#include "models/glm5_next/options.h"
 #include "models/qwen3_5/options.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/options.h"
@@ -13,6 +15,7 @@ namespace infernix::models {
 Architecture detect_artifact_architecture(const std::filesystem::path& artifact) {
     const artifact::Reader reader(artifact);
     if (models::qwen4_exp::is_qwen4_exp(reader)) { return Architecture::Qwen4Exp; }
+    if (models::glm5_next::is_glm5_next(reader)) { return Architecture::Glm5Next; }
     return Architecture::Qwen3_5;
 }
 
@@ -26,6 +29,9 @@ Architecture resolve_architecture(std::string_view architecture, std::string_vie
     if (architecture == "Qwen4ExpForCausalLM" && model_type == "qwen4_exp_text") {
         return Architecture::Qwen4Exp;
     }
+    if (architecture == "Glm5NextForCausalLM" && model_type == "glm5_next_text") {
+        return Architecture::Glm5Next;
+    }
     throw std::invalid_argument("unsupported architecture/config pair " +
                                 std::string(architecture) + "/" + std::string(model_type));
 }
@@ -37,6 +43,8 @@ const runtime::FamilyOptionRules& family_option_rules(Architecture architecture)
         return qwen3_5::option_rules();
     case Architecture::Qwen4Exp:
         return qwen4_exp::option_rules();
+    case Architecture::Glm5Next:
+        return glm5_next::option_rules();
     }
     throw std::invalid_argument("unknown model architecture");
 }
@@ -49,6 +57,8 @@ std::string_view architecture_name(Architecture architecture) noexcept {
         return "Qwen3_5MoeForCausalLM";
     case Architecture::Qwen4Exp:
         return "Qwen4ExpForCausalLM";
+    case Architecture::Glm5Next:
+        return "Glm5NextForCausalLM";
     }
     return {};
 }

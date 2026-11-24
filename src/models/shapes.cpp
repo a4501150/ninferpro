@@ -1,6 +1,7 @@
 // Registers every model family's tuned linear shape tables with the linear dispatch. The
 // dispatch references these registries, so linking it extracts this translation unit and, through
 // it, each family's tables and shape files from the archive.
+#include "models/glm5_next/shapes/shapes.h"
 #include "models/qwen3_5/shapes/shapes.h"
 #include "models/qwen4_exp/shapes/shapes.h"
 
@@ -11,6 +12,7 @@ namespace infernix::ops::detail {
 const LinearShapeSet<Bf16ShapeEntry> bf16_linear_shape_sets[] = {
     {models::qwen3_5::bf16_shapes, &models::qwen3_5::bf16_shapes_count},
     {models::qwen4_exp::bf16_shapes, &models::qwen4_exp::bf16_shapes_count},
+    {models::glm5_next::bf16_shapes, &models::glm5_next::bf16_shapes_count},
 };
 const std::size_t bf16_linear_shape_set_count = std::size(bf16_linear_shape_sets);
 

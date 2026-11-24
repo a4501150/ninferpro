@@ -18,7 +18,8 @@ void bf16_dynamic_grouped_conv_prepare_reduce_launch(DynamicConvPrepareRoute rou
                                                      const Tensor& base, const float* partial,
                                                      Tensor& prepared, Tensor& finish,
                                                      cudaStream_t stream);
-// The whole prepare in one kernel (bf16_dynamic_grouped_conv_prepare_fused.cu): H 2560, at most 16 columns.
+// The whole prepare in one kernel (bf16_dynamic_grouped_conv_prepare_fused.cu): H 2560 or 4096, at
+// most 16 columns.
 bool bf16_dynamic_grouped_conv_prepare_fused_supported(int hidden, int tokens);
 void bf16_dynamic_grouped_conv_prepare_fused_launch(const Tensor& residual, const Tensor& norm, float eps,
                                                     const Tensor& base, const Weight& weight, Tensor& prepared,

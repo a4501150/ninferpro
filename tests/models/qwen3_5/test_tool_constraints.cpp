@@ -1,5 +1,5 @@
 #include "models/qwen_common/frontend/chat_template.h"
-#include "models/qwen_common/frontend/tool_contract.h"
+#include "models/common/frontend/tool_contract.h"
 #include "models/qwen_common/frontend/tool_grammar.h"
 #include "models/qwen_common/frontend/tool_call_parser.h"
 #include "text/grammar.h"
@@ -10,6 +10,7 @@
 
 namespace {
 namespace frontend = infernix::models::qwen_common::frontend;
+namespace tool_contract = infernix::models::common::frontend;
 using Json         = nlohmann::ordered_json;
 
 void require(bool value, const char* message) {
@@ -28,12 +29,12 @@ auto contract(const Json& schema, bool strict, infernix::ToolChoice choice = {})
         Json{{"type", "function"},
              {"function", {{"name", "call"}, {"parameters", schema}, {"strict", strict}}}}
             .dump()};
-    return frontend::select_tool_call_contract(
-        frontend::build_tool_call_output_contract(definitions), choice);
+    return tool_contract::select_tool_call_contract(
+        tool_contract::build_tool_call_output_contract(definitions), choice);
 }
 
 bool accepts(infernix::text::GrammarCompiler& compiler,
-             const frontend::ToolCallOutputContract& contract, std::string_view value) {
+             const tool_contract::ToolCallOutputContract& contract, std::string_view value) {
     auto matcher = frontend::compile_tool_grammar(compiler, contract, {}, {});
     std::vector<std::uint32_t> words(matcher->mask_words());
     for (unsigned char c : value) {
@@ -143,11 +144,11 @@ void selected_contracts(infernix::text::GrammarCompiler& compiled) {
                    {"strict", std::string_view(name) != "loose"}}}}
                 .dump());
     }
-    const auto declarations = frontend::build_tool_call_output_contract(definitions);
+    const auto declarations = tool_contract::build_tool_call_output_contract(definitions);
     infernix::ToolChoice choice;
     choice.constraints   = infernix::ToolConstraintMode::Automatic;
     choice.allowed_names = std::vector<std::string>{"strict", "loose"};
-    const auto selected  = frontend::select_tool_call_contract(declarations, choice);
+    const auto selected  = tool_contract::select_tool_call_contract(declarations, choice);
     require(accepts(compiled, *selected, "ordinary answer"), "selection forced an auto call");
     require(!accepts(compiled, *selected, call("wrong", "strict")),
             "non-strict sibling relaxed strict values");
@@ -165,7 +166,7 @@ void selected_contracts(infernix::text::GrammarCompiler& compiled) {
     choice.allowed_names = std::vector<std::string>{"loose"};
     choice.mode          = infernix::ToolChoiceMode::Required;
     choice.parallel      = false;
-    const auto single    = frontend::select_tool_call_contract(declarations, choice);
+    const auto single    = tool_contract::select_tool_call_contract(declarations, choice);
     require(accepts(compiled, *single, call("wrong", "loose")) &&
                 !accepts(compiled, *single, call("2", "strict")) &&
                 !accepts(compiled, *single, "ordinary answer"),
@@ -174,7 +175,7 @@ void selected_contracts(infernix::text::GrammarCompiler& compiled) {
         choice.allowed_names = names;
         bool rejected        = false;
         try {
-            (void)frontend::select_tool_call_contract(declarations, choice);
+            (void)tool_contract::select_tool_call_contract(declarations, choice);
         } catch (const infernix::RequestError&) { rejected = true; }
         require(rejected, "required selection accepted an empty or unknown function set");
     }
@@ -188,7 +189,7 @@ struct Fed {
 };
 
 Fed feed(infernix::text::GrammarCompiler& compiler,
-         const frontend::ToolCallOutputContract& contract, std::string_view close,
+         const tool_contract::ToolCallOutputContract& contract, std::string_view close,
          std::string_view text, const std::optional<infernix::OutputConstraint>& body = {}) {
     auto matcher = frontend::compile_tool_grammar(compiler, contract, close, {}, body);
     std::vector<std::uint32_t> words(matcher->mask_words());

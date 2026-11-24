@@ -14,10 +14,13 @@ namespace infernix::text {
 class GrammarSession;
 }
 
+namespace infernix::models::common::frontend {
+struct ToolCallOutputContract;
+}
+
 namespace infernix::models::qwen_common {
 namespace frontend {
 class Tokenizer;
-struct ToolCallOutputContract;
 // The model tokens the output session's reasoning-end exclusion names: the close token that ends
 // thinking, and the model's default end-of-turn tokens (generation_config.json's first two), which
 // take no probability while thinking is open (OutputSession::reasoning_ban). -1: none.
@@ -107,7 +110,7 @@ private:
     OutputSession(std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy,
                   OutputOptions output, bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
-                  std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
+                  std::shared_ptr<const common::frontend::ToolCallOutputContract> tool_call_output,
                   frontend::OutputMarkerTokens markers,
                   std::unique_ptr<text::GrammarSession> grammar = {},
                   std::string_view continuation = {}, bool combined = false);

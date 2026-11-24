@@ -60,7 +60,10 @@ commit from Infernix commit `accbd1e3` ([Wallawalla47/Infernix](https://github.c
   - tool-call grammar fixes: a call opener inside Markdown code is text, and the constraint
     grammar's reasoning section refuses an unquoted opener, so a call cannot start inside
     thinking and the turn cannot end there; the thinking-recovery machinery is gone;
-  - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail).
+  - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail);
+  - the GLM-5.3-Flash family (`glm5_next`, docs/maintainer/glm5_3-flash-design.md): KDA, sparse
+    MLA with the pooled indexer, mHC and NVFP4 experts on the shared three-tier placement, DFlash2
+    drafting, causal scoring; no prefix cache or vision yet.
 
 ### Mechanism and policy
 
@@ -113,7 +116,8 @@ engine for maximum single-GPU performance. It implements
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
 use the same architecture, binding and execution path. It also implements `Qwen4ExpForCausalLM`
 (Qwen3.8-Flash-Next, model family `qwen4_exp`), whose routed experts are offloaded to host memory or
-the SSD. The implementation targets `sm_120a`. Infernix tunes on an RTX 5090 (32 GB, Windows); this
+the SSD, and GLM-5.3-Flash (model family `glm5_next`, in progress: status in its design document)
+on the same offload tier. The implementation targets `sm_120a`. Infernix tunes on an RTX 5090 (32 GB, Windows); this
 repository runs and tunes on one RTX PRO 6000 Blackwell (96 GB, PCIe Gen5 x16) under Linux, where every
 expert fits in VRAM and placement decides how much to give back to other programs. Changes must keep
 the smaller-card path working even though it is not measured here.
@@ -153,7 +157,8 @@ Keep these ownership boundaries visible when selecting a design:
   core, artifact, text, media, ops, `include/`, `apps/`) never includes, names or branches on a
   family; it reaches one through `src/models/registry.*` (the artifact probe, `FamilyOptionRules`,
   `construct_engine_backend`), and `src/models/shapes.cpp` registers the families' linear shape
-  tables. A family never includes another family. Ops identifiers name no model, caller or
+  tables. A family never includes another family; model-independent pieces every family uses
+  unchanged live in `src/models/common/`, which names and includes no family. Ops identifiers name no model, caller or
   speculative backend (`mtp_*` is an Op family name). Model code uses an Op's public contract,
   never `ops/kernel/`, `ops/launcher/` or `ops/common/` (a family's `shapes/` files instantiate the
   linear launch templates); tests and benchmarks never include `ops/kernel/` or `ops/launcher/`.

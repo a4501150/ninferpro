@@ -18,14 +18,15 @@ namespace infernix::ops {
  * out[n, t] = sum_k FP32(w[n, k]) * FP32(x[k, t]) for the rows n of `weights` concatenated in
  * order. `x` is contiguous BF16 [K, T]; each weight is contiguous BF16 [K, N_i] (one row per
  * column of the view); `out` is contiguous FP32 [sum N_i, T]. K is a multiple of 8 and at most
- * 3072; at most four weights; every operand is 16-byte aligned.
+ * 4096 (past 3072 the row mappings take their extended chunk bodies); at most four weights; every
+ * operand is 16-byte aligned.
  *
  * Each output is one FP32 dot product whose summation order depends only on K, so a column's
  * results are bitwise identical in every batch shape and column position. The one exception: a
- * BF16 vocabulary head given as one weight of at least 32,768 rows sums in tensor-core order at 1..16
- * columns; its columns are identical across those widths but may differ in rounding from a call of
- * more than 16 columns. Oracle: the FP64 dot product, with the FP32 accumulation error bound
- * sum_k |w x| * K * 2^-24.
+ * BF16 vocabulary head given as one weight of at least 32,768 rows sums in tensor-core order
+ * at 1..16 columns; its columns are identical across those widths but may differ in rounding from a
+ * call of more than 16 columns. Oracle: the FP64 dot product, with the FP32 accumulation error
+ * bound sum_k |w x| * K * 2^-24.
  */
 void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
                      cudaStream_t stream);

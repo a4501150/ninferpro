@@ -15,7 +15,7 @@
 namespace infernix::models::qwen_common::frontend {
 namespace {
 using Json     = nlohmann::ordered_json;
-using Contract = ToolCallOutputContract;
+using Contract = common::frontend::ToolCallOutputContract;
 
 constexpr std::string_view kCallOpen = "<tool_call>";
 

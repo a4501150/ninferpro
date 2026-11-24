@@ -55,6 +55,9 @@ public:
         ExpertActivation activation = ExpertActivation::kA4; // of every job's expert
         bool ggml = false; // jobs may be GGUF records (ggml_expert.h; activation kA16)
         std::vector<int> cpus;         // optional: CPU of worker i (worker 0 is the caller, not pinned)
+        // The record geometry of the non-ggml jobs (expert_layout.h); A4 jobs and ggml records
+        // are the default geometry's.
+        Geometry geometry = kDefaultGeometry;
     };
 
     explicit CpuExpertTeam(Options options);
@@ -98,6 +101,7 @@ private:
     std::vector<CpuLimbSlice> xg_, hg_; // ggml jobs: [job][col][kGgmlXSlices], [job][col][kGgmlHSlices]
     ExpertActivation activation_;
     bool ggml_ = false;
+    Geometry geometry_ = kDefaultGeometry; // the non-ggml jobs' record geometry
     std::span<const CpuExpertJob> jobs_;
     CpuExpertHeartbeat heartbeat_;
     // NVFP4 rounds' per-column phases hand out only the round's real columns (set by run()): every

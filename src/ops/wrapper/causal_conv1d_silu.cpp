@@ -168,6 +168,9 @@ detail::CausalConvSplitGeometry resolve_split_geometry(std::int32_t channels, st
     if (channels == 10240 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 6144) {
         return detail::CausalConvSplitGeometry::Rows2048x2048x6144;
     }
+    if (channels == 24576 && out0.ne[0] == 8192 && out1.ne[0] == 8192 && out2.ne[0] == 8192) {
+        return detail::CausalConvSplitGeometry::Rows8192x8192x8192;
+    }
     throw std::invalid_argument("causal_conv1d: split received an unregistered row profile");
 }
 
@@ -488,6 +491,48 @@ void causal_conv1d_silu_from_states_split(const Tensor& x, const Tensor& weight,
     require_split_destinations({&x, &weight, &conv_states, &initial_state_slots}, out0, out1, out2);
     detail::causal_conv1d_from_states_split_launch(x, weight, conv_states, initial_state_slots, out0,
                                                    out1, out2, geometry, stream);
+}
+
+void causal_conv1d_commit_window(const Tensor& x, Tensor& conv_states,
+                                 std::span<const CausalConvCommitRow> rows, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || conv_states.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_conv1d: commit operands must be BF16");
+    }
+    const std::int32_t width = x.ne[1], batch = x.ne[2];
+    if (x.ne[0] <= 0 || width <= 0 || batch <= 0 || batch > 8 || x.ne[3] != 1 ||
+        !x.is_contiguous() || !conv_states.is_contiguous()) {
+        throw std::invalid_argument("causal_conv1d: unsupported commit [C,W,B] shape");
+    }
+    if (conv_states.ne[0] != x.ne[0] || conv_states.ne[1] != 3 || conv_states.ne[2] <= 0 ||
+        conv_states.ne[3] != 1) {
+        throw std::invalid_argument("causal_conv1d: conv_states must have shape [C,3,S]");
+    }
+    if (rows.size() != static_cast<std::size_t>(batch)) {
+        throw std::invalid_argument("causal_conv1d: the commit names one row per input row");
+    }
+    require_accessible(x, "x");
+    require_accessible(conv_states, "conv_states");
+    detail::CausalConvCommitRows packed{};
+    const std::int32_t slots = conv_states.ne[2];
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+        const CausalConvCommitRow& row = rows[b];
+        if (row.columns < 0 || row.columns > width || row.source_slot < 0 ||
+            row.source_slot >= slots || row.destination_slot < 0 || row.destination_slot >= slots) {
+            throw std::invalid_argument("causal_conv1d: invalid commit row");
+        }
+        for (std::size_t other = 0; other < rows.size(); ++other) {
+            if (other == b || row.columns == 0 || rows[other].columns == 0) { continue; }
+            if (row.destination_slot == rows[other].destination_slot ||
+                row.destination_slot == rows[other].source_slot) {
+                throw std::invalid_argument("causal_conv1d: a commit destination repeats or "
+                                            "overwrites another row's source");
+            }
+        }
+        packed.source[b]      = row.source_slot;
+        packed.destination[b] = row.destination_slot;
+        packed.columns[b]     = row.columns;
+    }
+    detail::causal_conv1d_commit_window_launch(x, conv_states, packed, batch, stream);
 }
 
 } // namespace infernix::ops

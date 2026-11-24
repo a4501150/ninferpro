@@ -17,8 +17,9 @@ void rmsnorm_rope_single_launch(const Tensor& positions, const Tensor& norm_weig
                                 std::int32_t tokens, cudaStream_t stream);
 
 void rmsnorm_rope_prepared_launch(const Tensor& positions, const Tensor* q_norm_weight,
-                              const Tensor& k_norm_weight, const PreparedRope& prepared,
-                              Tensor* q, Tensor& k, std::int32_t tokens, cudaStream_t stream);
+                                  const Tensor& k_norm_weight, const PreparedRope& prepared,
+                                  float epsilon, Tensor* q, Tensor& k, std::int32_t tokens,
+                                  cudaStream_t stream);
 
 void rmsnorm_rope_text_launch(const Tensor& positions, const Tensor& q_norm_weight,
                               const Tensor& k_norm_weight, const Tensor& q_in, const Tensor& k_in,

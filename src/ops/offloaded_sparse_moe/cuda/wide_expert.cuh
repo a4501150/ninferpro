@@ -67,6 +67,26 @@ struct MatrixShape<Matrix::Down> {
     static constexpr std::size_t kOffset = kGateUpBytes;
 };
 
+// The matrix shapes of the record at geometry <H, I> (the A16 routes instantiate over the
+// registered geometries; the shapes above stay the default geometry's).
+template <Matrix M, int H, int I>
+struct MatrixShapeG;
+
+template <int H, int I>
+struct MatrixShapeG<Matrix::GateUp, H, I> {
+    static constexpr int kRowGroups      = 2 * I / 16;
+    static constexpr int kBlocks         = H / 16; // K blocks
+    static constexpr std::size_t kOffset = 0;
+};
+
+template <int H, int I>
+struct MatrixShapeG<Matrix::Down, H, I> {
+    static constexpr int kRowGroups = H / 16;
+    static constexpr int kBlocks    = I / 16; // K blocks
+    static constexpr std::size_t kOffset =
+        static_cast<std::size_t>(2 * I / 16) * (H / 16) * kUnitBytes;
+};
+
 // The tile shape follows Nvfp4A4TmaMmaSchedule (128 rows, 128-wide K tiles of two 64-wide MMA
 // steps, one producer warp beside the consumers) with a 64-column token tile: an expert sees
 // about 20 columns per 1K-token chunk and 80 per 4K chunk, where the dense schedule's 128- or

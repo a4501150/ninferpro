@@ -665,9 +665,9 @@ itself, a shared offload tier, and a shared Qwen frontend.
 | Component | Owner | Location |
 |---|---|---|
 | Mathematics, config, binding, block order, MTP/DFlash2 alignment, tuned shapes | Model | `src/models/qwen4_exp/` (`config.*`, `load.*`, `instance.*`, `model.h`; `execution/` forward and parameters; `shapes/`) |
-| Program: mutable state, placement, residency, tiers, CUDA graphs, prefix cache, n-gram volume, vision window, scoring, draft-length policy, fast paths | Program (allocated at startup) | `src/models/qwen4_exp/program/` (`program_impl.h` declares the Program, `internal.h` its layouts and plans; topic files `program_impl.cpp`, `binding.cpp`, `decode.cpp`, `verify.cpp`, `mtp.cpp`, `exec.cpp`, `placement.cpp`, `reports.cpp`, `kv_pool.cpp`, `cpu_rates.*`; `prefix/`, `ngram_volume.*`, `vision_window.*`, `score.cpp`, `dflash2_program.cpp`, `draft_length.h`, `fast_paths.*`, `prefill_walk.cpp`, `rope_positions.*`, `constraint.cpp`) |
+| Program: mutable state, placement, residency, tiers, CUDA graphs, prefix cache, n-gram volume, vision window, scoring, draft-length policy, fast paths | Program (allocated at startup) | `src/models/qwen4_exp/program/` (`program_impl.h` declares the Program, `internal.h` its layouts and plans; topic files `program_impl.cpp`, `binding.cpp`, `decode.cpp`, `verify.cpp`, `mtp.cpp`, `exec.cpp`, `placement.cpp` (the family hooks and the elastic KV tail beside the shared placement runtime of `models/offload/expert_placement_runtime.*`), `reports.cpp`, `kv_pool.cpp`, `cpu_rates.*`; `prefix/`, `ngram_volume.*`, `vision_window.*`, `score.cpp`, `dflash2_program.cpp`, `draft_length.h`, `fast_paths.*`, `prefill_walk.cpp`, `rope_positions.*`, `constraint.cpp`) |
 | Expert residency machinery shared by the flash families: LFRU policy, VRAM frames and tables, placement, SSD records, RAM/SSD tier controllers, warm-start state, route trace, VRAM monitor | Offload tier (composed by each Program; no base class, no virtual interface; [MoE offload design](moe-offload-design.md) §1) | `src/models/offload/` (`expert_cache.*`, `expert_residency.*`, `expert_placement.*`, `expert_store.*`, `host_tier.*`, `host_expert_tier.*`, `expert_state.*`, `route_trace.*`, `vram_monitor.*`, `geometry.h`) |
-| Frontend shared by the Qwen families: tokenizer, chat template, processor, prompt layout, tool grammar, reasoning loop, media cache, vision tower and weight stream, n-gram proposer, prefix block keys | Shared Qwen frontend | `src/models/qwen_common/` (`frontend/`, `execution/`, `program/`, `load/`) |
+| Frontend shared by the Qwen families: tokenizer, chat template, processor, prompt layout, tool grammar, media cache, vision tower and weight stream, n-gram proposer, prefix block keys | Shared Qwen frontend | `src/models/qwen_common/` (`frontend/`, `execution/`, `program/`, `load/`) |
 | Routed-expert MoE: routing, residency classification, narrow and wide GPU kernels, CPU engine, placement-invariant contract (output = MoE(x) independent of residency) | Op family `offloaded_sparse_moe` | `include/infernix/ops/offloaded_sparse_moe.h`; `src/ops/offloaded_sparse_moe/` (`cuda/moe_layer.cu`, `cuda/narrow_expert.cu`, `cuda/wide_expert.cu`, `cpu/` the expert team and miss service) |
 | Canonical routed-expert arithmetic (A4 quantizer, E2M1/E4M3 integer decode, int64 block sums; one header for CPU and GPU) | Op common code | `src/ops/common/canonical_math.h` |
 | Drafter's resident experts | Op `resident_moe` | `include/infernix/ops/resident_moe.h`, `src/ops/resident_moe/` |
@@ -1153,7 +1153,7 @@ and compute).
 ### 9.7 Device memory budget
 
 The sizing law, the spill guard and the monitor's role are MoE §4.9; one sizing function
-(`size_expert_frames`, `models/qwen4_exp/memory_plan.h`) implements it at startup. This
+(`size_expert_frames`, `models/offload/memory_plan.h`) implements it at startup. This
 family's inputs and measurements:
 
 - `fixed` is `Program::plan_device`'s (the single authority for constructor sizes);
@@ -1175,7 +1175,7 @@ The ledger's law — one reserve, every pin re-checked against memory available 
 it is made, the experts capped by full mode and split into pinned and pageable bytes at the
 pin room, the tier floor refused with a reason, an explicit `--expert-ram-mib` above the
 ledger an error — is MoE §4.10. This family's terms (`plan_host_memory`,
-`models/qwen4_exp/memory_plan.cpp`; reserve `--ram-headroom-mib`, default 2 GiB):
+`models/offload/memory_plan.cpp`; reserve `--ram-headroom-mib`, default 2 GiB):
 
 | Term | Default |
 |---|---|

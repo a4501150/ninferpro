@@ -527,19 +527,80 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
                                          [&](std::uint64_t s) { return s != record_stride; }))) {
         throw std::logic_error("Qwen4Exp: the expert banks' record stride differs from their format's");
     }
+    // The shared expert placement runtime (models/offload/expert_placement_runtime.h): it owns
+    // the residency, the RAM tier and its fetch channel, the VRAM monitor, the warm start and
+    // the placement orchestration; the hooks carry what stays with the family (diagnostics, the
+    // calibrated order, the tier's consumers, the round-cost reset, the elastic KV interplay).
+    offload::ExpertPlacementRuntime::Options placement;
+    placement.label                   = "Qwen3.8-Flash-Next";
+    placement.geometry                = bank_geometry(c_);
+    placement.expert_state            = options_.expert_state;
+    placement.expert_state_identity   = options_.expert_state_identity;
+    placement.expert_cache            = options_.expert_cache;
+    placement.resident_experts        = options_.resident_experts;
+    placement.expert_frame_target     = options_.expert_frame_target;
+    placement.expert_frame_ceiling    = options_.expert_frame_ceiling;
+    placement.expert_pinned_keys      = options_.expert_pinned_keys;
+    placement.expert_tier_order       = options_.expert_tier_order;
+    placement.expert_swap             = options_.expert_swap;
+    placement.vram_monitor            = options_.vram_monitor;
+    placement.vram_headroom           = options_.vram_headroom;
+    placement.expert_ram_bytes        = options_.expert_ram_bytes;
+    placement.expert_unpinned_bytes   = options_.expert_unpinned_bytes;
+    placement.later_pinned_bytes      = options_.later_pinned_bytes;
+    placement.expert_stripe           = options_.expert_stripe;
+    placement.stripe_artifact_id      = parameters_.model.info().artifact_id;
+    placement.prefill_stream          = options_.prefill_stream;
+    placement.staging_slots           = static_cast<std::uint32_t>(plan_.staging_slots);
+    placement.cpu_workers             = options_.cpu_expert_workers;
+    placement.cpu_jobs                = options_.cpu_expert_jobs;
+    placement.cpu_assist_jobs         = options_.cpu_assist_jobs;
+    placement.layer_walk_tokens       = kWalkMaxTokens;
+    placement.chunk_columns           = static_cast<std::uint32_t>(chunk_);
+    placement.stream_read_slots       = kStreamReadSlots;
+    placement.min_tier_slots          = kMinTierSlots;
+    // The prefill stream's bounce per part: a wide chunk streams about a layer's unpinned share
+    // of its experts (the stream copies two halves of a layer's unpinned records per call).
+    if (options_.prefill_stream && options_.expert_cache) {
+        if (const auto& store = parameters_.model.expert_store(); store.has_value()) {
+            const std::uint64_t keys = static_cast<std::uint64_t>(store->layers()) * store->experts();
+            const double share = std::min(1.0, static_cast<double>(options_.expert_unpinned_bytes / record_stride) /
+                                                   static_cast<double>(keys));
+            placement.stream_bounce_per_part = std::clamp<std::uint32_t>(
+                (static_cast<std::uint32_t>(std::ceil(share * store->experts())) + 15U) / 16U * 16U,
+                kStreamBounceMin, kStreamBounceMax);
+            placement.stream_bounce_parts = execution::ExpertStream::kBounceParts;
+        }
+    }
+    offload::ExpertPlacementRuntime::Hooks placement_hooks;
+    placement_hooks.diagnostic = [this](const std::string& text, DiagnosticLevel level) {
+        diagnostic(text, level);
+    };
+    placement_hooks.fallback_seed_order = [this]() -> std::optional<offload::expert_cache::SavedState> {
+        if (!has_calibrated_order()) { return std::nullopt; }
+        return qwen4_exp::calibrated_expert_order();
+    };
+    placement_hooks.on_tier_changed = [this](offload::HostExpertTier* tier, bool rebuilt) {
+        on_tier_changed(tier, rebuilt);
+    };
+    placement_hooks.on_switch_settled = [this](const char* reason) { reset_round_costs(reason); };
+    placement_hooks.all_lanes_idle = [this] {
+        return std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; });
+    };
+    placement_hooks.kv_idle_due = [this] { return kv_idle_due(); };
+    placement_hooks.kv_bytes = [this] { return kv_vmm_ != nullptr ? kv_vmm_->mapped_bytes() : plan_.kv; };
+    placement_hooks.capture_sizing = [this](const VramDemand& demand, const VramSnapshot& snapshot) {
+        capture_sizing_inputs(demand, snapshot);
+    };
+    placement_runtime_ = std::make_unique<offload::ExpertPlacementRuntime>(device_, *vram_, std::move(placement),
+                                                                           std::move(placement_hooks));
     // Staging slots for each layer call's misses (copied with a compact read window, design
     // 8.6), allocated before the frames take the remaining memory.
     allocate(staging_, plan_.staging, allocated);
     experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
     experts.staging_slots = plan_.staging_slots;
     // The expert cache's tables and route log; its frames come last (below).
-    residency_ = std::make_unique<offload::ExpertResidency>(bank_geometry(c_), std::move(banks), record_stride, columns_, device_.device,
-                                                   host_strides);
-    // An explicit placement pins its vram set; a resident placement also stops every frame
-    // lender (the wide workspace falls back to a temporary allocation).
-    if (!options_.expert_pinned_keys.empty()) { residency_->pin_keys(options_.expert_pinned_keys); }
-    if (options_.resident_experts) { residency_->mark_resident(); }
-    residency_->set_swap_enabled(options_.expert_swap);
+    residency_ = &placement_runtime_->create_residency(std::move(banks), record_stride, columns_, host_strides);
     allocated += plan_.bytes.residency;
     if (allocated != plan_.bytes.fixed_bytes()) {
         throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
@@ -575,90 +636,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
     }
     // The SSD expert tier (design §9.5): the banks were not pinned; RAM slots hold the
     // records the tier keeps and the rest are read from the artifact when a round needs them.
+    // The tier's sizing and construction are the shared placement runtime's (create_tier).
     if (const auto& store = parameters_.model.expert_store(); store.has_value()) {
         for (std::uint32_t l = 0; l < store->layers(); ++l) {
             if (store->record_bytes(l) != host_strides[l]) {
                 throw std::logic_error("Qwen4Exp: the expert store's records differ from the banks' strides");
             }
         }
-        // Slots of the largest record (a GGUF import's layers differ); a VRAM victim's demotion
-        // copies a whole frame (that pitch) into one.
-        // A call's CPU jobs hold their ring slots until the call's answer, and a pass's fetched
-        // records until the pass has copied them: the ring holds both with a pass to spare.
-        const std::uint32_t cpu_cap =
-            options_.cpu_expert_workers > 0 && options_.cpu_expert_jobs > 0
-                ? std::min<std::uint32_t>(std::max(options_.cpu_expert_jobs, options_.cpu_assist_jobs),
-                                          static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuJobs))
-                : 0U;
-        offload::HostExpertTier::Options tier;
-        tier.ring = std::max<std::uint32_t>(128, cpu_cap + 2U * static_cast<std::uint32_t>(plan_.staging_slots));
-        const std::uint32_t lists = tier.ring + tier.prefetch + tier.demotion;
-        const std::uint64_t keys  = static_cast<std::uint64_t>(store->layers()) * store->experts();
-        // Pinned slots up to every key besides the lists; unpinned records for the keys they leave.
-        // With unpinned records, tier.bounce of the pinned slots stage their promotions and
-        // tier.stream_bounce the prefill stream's copies of them.
-        if (options_.prefill_stream && options_.expert_cache) {
-            // A wide chunk streams about a layer's unpinned share of its experts.
-            const double share = std::min(1.0, static_cast<double>(options_.expert_unpinned_bytes / record_stride) /
-                                                   static_cast<double>(keys));
-            const auto per_part = std::clamp<std::uint32_t>(
-                (static_cast<std::uint32_t>(std::ceil(share * store->experts())) + 15U) / 16U * 16U,
-                kStreamBounceMin, kStreamBounceMax);
-            tier.stream_bounce = execution::ExpertStream::kBounceParts * per_part;
-        }
-        tier.slots    = static_cast<std::uint32_t>(std::min<std::uint64_t>(options_.expert_ram_bytes / record_stride, keys + lists));
-        // The prefill stream's reads of SSD-only experts (one per layer walk span instead of one
-        // per call) borrow RAM slots for the span (the lowest-ranked residents leave RAM).
-        if (options_.prefill_stream && options_.expert_cache) { tier.stream = std::min(kStreamReadSlots, tier.slots / 8); }
-        const std::uint32_t reserved =
-            options_.expert_unpinned_bytes >= record_stride ? lists + tier.bounce + tier.stream_bounce : lists;
-        tier.unpinned = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            options_.expert_unpinned_bytes / record_stride, keys - std::min<std::uint64_t>(keys, tier.slots - std::min(tier.slots, reserved))));
-        tier.min_slots    = std::max<std::uint32_t>(kMinTierSlots, lists + kMinTierSlots / 2);
-        tier.pin_reserve  = options_.later_pinned_bytes;
-        const std::uint32_t needed = tier.min_slots + (tier.unpinned > 0 ? tier.bounce + tier.stream_bounce : 0U);
-        if (tier.slots < needed) {
-            throw std::runtime_error(
-                "Qwen3.8-Flash-Next: the SSD expert tier needs RAM for at least " + std::to_string(needed) +
-                " pinned expert slots (" + std::to_string(tier.slots) +
-                " fit in the RAM ledger's page-locked expert share; on Windows page-locked memory is limited to "
-                "the GPU's shared memory, so lower --host-context-mib or close programs that use it)");
-        }
-        fetch_channel_ = std::make_unique<ops::offloaded_moe::FetchChannel>();
-        tier.fetch     = fetch_channel_.get();
-        // A layer walk's step calls ceil(layers / n) layers once per chunk of its n-chunk span (one
-        // tier round per step): at most layers + n - 1 layer calls.
-        tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(chunk_, 1)) + 1U;
-        // An expert stripe on a second drive: each record's tail is read from it while its head
-        // is read from the artifact, at the same depth per drive.
-        const offload::ExpertStore* records = &*store;
-        if (!options_.expert_stripe.empty()) {
-            striped_store_.emplace(offload::with_stripe(*store, offload::read_expert_stripe(options_.expert_stripe),
-                                               parameters_.model.info().artifact_id));
-            records = &*striped_store_;
-            tier.io.demand_depth *= 2;
-            tier.io.total_depth = tier.io.demand_depth + tier.io.prefetch_depth;
-            diagnostic("SSD tier: expert record tails from " + options_.expert_stripe.string(),
-                       DiagnosticLevel::Info);
-        }
-        tier_ = std::make_unique<offload::HostExpertTier>(*records, std::move(tier));
-        residency_->attach_tier(tier_.get());
-        // A placement switch rebuilds the tier from the boot options (the rebuild's clone):
-        // the store (with its stripe), the queue depths, the ring sizing.
-        tier_store_  = records;
-        tier_options_ = tier_->options();
-        if (tier_->refused_slots() > 0) {
-            diagnostic("SSD expert tier: Windows refused to page-lock " + std::to_string(tier_->refused_slots()) +
-                           " of the planned expert slots (its limit is the GPU's shared memory); they are kept as "
-                           "unpinned records the CPU serves",
-                       DiagnosticLevel::Warning);
-        }
-        if (!tier_->unpinned_lock_failure().empty()) {
-            diagnostic("SSD expert tier: the OS would not lock the " + std::to_string(tier_->unpinned_records()) +
-                           " unpinned expert records in RAM (" + tier_->unpinned_lock_failure() +
-                           "); they still work, but under memory pressure the OS may page them out and responses slow down",
-                       DiagnosticLevel::Warning);
-        }
+        placement_runtime_->create_tier(*store);
+        tier_ = placement_runtime_->tier();
+        fetch_channel_ = placement_runtime_->fetch_channel();
     }
     // After the tier (whose pinned slots are the probe's source when the banks stay in the
     // artifact), before the CPU service and the split take the measured rate.
@@ -714,7 +701,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
                 .wide_jobs   = assist ? static_cast<int>(std::min<std::uint32_t>(assist_jobs, ops::offloaded_moe::kMaxCpuJobs)) : 0,
                 .cpus        = {},
                 .activation  = parameters_.layers.front().moe.bank->activation,
-                .records     = tier_.get()}); // tier mode: SSD-only jobs read through the tier
+                .records     = tier_}); // tier mode: SSD-only jobs read through the tier
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
             experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l)));
             // Plain decode's divisor follows the context (plain_divisor): the calls read it from
@@ -737,38 +724,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
     // memory since the reading) is given back and the cache stops growing there.
     if (options_.expert_cache) {
         const VramDemand demand = expert_frame_demand(residency_->frame_bytes());
-        sizing_                 = size_expert_frames(vram_->query(), demand);
-        // Each pool maps whole chunks: one chunk of slack per pool beyond the first.
-        const auto slack = static_cast<std::uint32_t>((residency_->pools() - 1) * offload::ExpertResidency::kChunkBytes /
-                                                      residency_->frame_bytes());
-        sizing_.frames   = sizing_.frames > slack ? sizing_.frames - slack : 0U;
-        // An explicit placement names the pool's exact size; the startup resolution validated
-        // it against the same sizing, so a clamp here only guards a stray direct use.
-        if (options_.expert_frame_target != 0) {
-            if (options_.expert_frame_target > sizing_.frames) {
-                diagnostic("expert placement: the frame target " +
-                           std::to_string(options_.expert_frame_target) + " exceeds what fits (" +
-                           std::to_string(sizing_.frames) + "); starting at the fit", DiagnosticLevel::Warning);
-            }
-            sizing_.frames = std::min(options_.expert_frame_target, sizing_.frames);
-        }
-        const auto grown = residency_->resize(sizing_.frames, device_.stream, *vram_);
-        if (grown.spilled != 0) {
-            diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory "
-                   "and given back; the expert cache starts with " + std::to_string(grown.frames) + " of " +
-                   std::to_string(sizing_.frames) + " frames", DiagnosticLevel::Warning);
-        } else if (grown.refused) {
-            diagnostic("the GPU refused expert-cache memory; the cache starts with " +
-                                                 std::to_string(grown.frames) + " of " +
-                                                 std::to_string(sizing_.frames) + " frames", DiagnosticLevel::Warning);
-        }
-        sizing_.frames = grown.frames;
-        // An explicit placement names the pool's size: the VRAM monitor's pressure-driven
-        // resizes are policy and stay off; the placement's own switches move the pool.
-        placement_ceiling_ = options_.expert_frame_ceiling;
-        start_vram_monitor(demand);
+        // The sizing, the resize and the monitor's start are the shared placement runtime's
+        // (start_expert_frames); the workspace's lending follows the frames it started with.
+        const auto started = placement_runtime_->start_expert_frames(demand);
+        sizing_ = started.sizing;
         // The pool the workspace is lent from (one of several for a GGUF import's record sizes).
-        if (grown.frames > 0) {
+        if (started.resized.frames > 0) {
             fit_wide_work_to_cache(residency_->lend_capacity_bytes() / residency_->lend_pitch(), residency_->lend_pitch());
         }
         if (options_.resident_experts) {
@@ -793,7 +754,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
             experts.fetch.push_back(fetch_channel_->channel(static_cast<int>(l)));
         }
     }
-    warm_start_experts();
+    placement_runtime_->warm_start_experts();
     // The CPU team's rates, read until they settle (cpu_rates.cpp) on the pinned banks or the SSD
     // tier's RAM copies (it has none before its fill), so the decode miss split follows this record
     // size and CPU, not the reference. Both layouts measure here, after the warm start; the service

@@ -5,9 +5,6 @@ infernix_add_test(infernix_qwen4_exp_expert_cache_test
   NEEDS_SOURCE_DIR)
 
 # The SSD tier's host level (design §9.5, R10 host part): slots, read agent, admission. CPU and disk.
-infernix_add_test(infernix_qwen4_exp_host_expert_tier_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_expert_tier.cpp"
-  LIBRARIES infernix_model_runtime)
 
 # The SSD tier's RAM-level controller (design §9.5), host only.
 infernix_add_test(infernix_qwen4_exp_host_tier_test
@@ -95,10 +92,10 @@ infernix_add_test(infernix_qwen4_exp_expert_placement_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_placement.cpp"
   LIBRARIES infernix_offload infernix_model_loading)
 
-# The startup RAM ledger (host only).
-infernix_add_test(infernix_qwen4_exp_memory_plan_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"
-  LIBRARIES infernix_model_loading)
+# The SSD tier's host level (design §9.5, R10 host part): slots, read agent, admission. CPU and disk.
+infernix_add_test(infernix_qwen4_exp_host_expert_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_expert_tier.cpp"
+  LIBRARIES infernix_model_runtime)
 
 # Qwen4Exp's prefix index (prefix/prefix_index.h): tree, choice and the VRAM/RAM/Disk residency
 # rules of hybrid-prefix-cache-spec §17.1, CPU only.
