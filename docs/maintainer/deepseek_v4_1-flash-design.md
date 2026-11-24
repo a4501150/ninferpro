@@ -587,7 +587,7 @@ What transfers:
 ### 4.3 Lessons from Flash-Next and the GLM design
 
 The Flash-Next lessons that transfer are the shared tier's rules (MoE §2, §4-§7) and Flash-Next's
-standing lessons (FN §3.4). They hold here; these change weight:
+standing lessons (FN §3.3). They hold here; these change weight:
 
 | Lesson | Where it lives | Consequence here |
 |---|---|---|

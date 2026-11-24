@@ -1,4 +1,4 @@
-// QSA block selection (docs/maintainer/qwen3_8-flash-next-design.md §14.1, §3.1, §3.2, steps
+// QSA block selection (docs/maintainer/qwen3_8-flash-next-design.md §14.1, §3.1, §19.1, steps
 // Q1/Q2): the production selection, ops::detail::qsa_select, against three oracles:
 //   - the one-CTA-per-column kernel it replaced, kept below verbatim as the reference: counts and
 //     selected ids bitwise equal in every case, FP32 scores bitwise equal where both expose them;
