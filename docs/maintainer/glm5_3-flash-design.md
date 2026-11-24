@@ -52,8 +52,9 @@ Every measurement ran on the production machine — one RTX PRO 6000 Blackwell (
 ## 1. Status and measured performance
 
 **Serving configuration** (`configs/GLM-5.3-Flash/model.env`): `--experts vram=40%,ram=60%`,
-INT8 latents, `--max-context 262144`, four lanes, DFlash2 with three draft tokens, the prefix cache
-with a 2 GiB Host tier, `--vision` with the tower streamed from pinned RAM. The placement puts
+INT8 latents, `--max-context 262144`, four lanes, plain decode by default (the DFlash2 drafter at
+three draft tokens is opt-in, §10.2), the prefix cache with a 2 GiB Host tier, and `--vision` with
+the tower streamed from pinned RAM. The placement puts
 4,838 experts in VRAM, 7,258 in RAM and none on the SSD. The whole process stays under the 95 %
 VRAM cap (92,993 MiB). KV is allocated for every lane at the full context at startup, and with the
 prefix cache on, its KV holds every lane's full context (6.36 GiB INT8 at 4 × 262,144).
@@ -579,7 +580,12 @@ BF16 and resident; it never touches the expert tiers.
 
 The draft length is fixed: `--spec dflash2 --draft-tokens N` with N in 1-7 (no automatic length,
 no trees, no `--spec-min-p`). Only one-row rounds draft; a round of several rows decodes plainly,
-since two rows of K = 3 already reach 8 columns, the fork route's limit (§6.4). Serving uses N = 3.
+since since two rows of K = 3 already reach 8 columns, the fork route's limit (§6.4).
+
+Serving (`configs/GLM-5.3-Flash/model.env`) decodes plainly by default and opts in with
+`INFERNIX_SPEC=dflash2`: the drafter lifts a single stream by about 37 % (§10.3), it never runs
+beside several streams, and the speed headroom is in plain decode itself — close that gap first
+(the §17.2 8-bit dense recipe is the largest lever), then re-enable the drafter on top.
 
 ### 10.3 Measurements
 
