@@ -1,4 +1,4 @@
-// The Program side of Glm5Next's prefix cache (docs/maintainer/glm5_3-flash-design.md §18):
+// The Program side of Glm5Next's prefix cache (docs/maintainer/glm5_3-flash-design.md §12):
 // admission against the index, activation with per-layer restores, block publication, Host-born
 // taps and the prompt-end captures of the zero-token resume, and release. The binding
 // (prefix/prefix_cache.h) moves the bytes.
@@ -101,7 +101,7 @@ void ProgramImpl::pc_make_room(std::uint32_t pages) {
 // ---- admission ---------------------------------------------------------------------------------------
 
 // Chooses the resume source for `prompt` in lane `lane`: the deepest affordable snapshot, else the
-// root, or nothing when even the root does not fit now (design §18).
+// root, or nothing when even the root does not fit now (design §12).
 std::optional<PrefixSelection> ProgramImpl::prefix_select(const PreparedPromptData& prompt,
                                                           const BasePlanImpl& base, std::uint32_t lane) {
     pc::PrefixCacheIndex& index = prefix_->index();
@@ -359,7 +359,7 @@ void ProgramImpl::prefix_unpin(const PrefixSelection& s) noexcept {
 }
 
 // Activates a pinned selection in a lane whose pages are reserved: maps shared pages, stages
-// restores and copy-on-write sources, and sets the lane's frontier (design §18).
+// restores and copy-on-write sources, and sets the lane's frontier (design §12).
 void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixSelection& s,
                                   DeviceKVPageReservation& reservation, std::uint32_t pages) {
     pc::PrefixCacheIndex& cache = prefix_->index();

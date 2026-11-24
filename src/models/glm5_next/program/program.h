@@ -2,7 +2,7 @@
 
 // The Glm5Next (GLM-5.3-Flash) Program: the Engine-facing execution contract of the common
 // EngineCore over the HybridResourceManager surface (docs/maintainer/engine-architecture.md §2.4,
-// §3.3; docs/maintainer/glm5_3-flash-design.md §14). It owns the physical lanes (one per
+// §3.3; docs/maintainer/glm5_3-flash-design.md §4.1). It owns the physical lanes (one per
 // concurrency slot), their KV pages (the MLA latent and the DSA indexer's planes), their KDA
 // recurrent state, sampling state and the one pending model unit, and the routed experts' VRAM
 // frames and RAM/SSD tier.
@@ -337,7 +337,7 @@ struct ProgramOptions {
     std::uint32_t prefill_chunk_beside_decode = 0;
     // A prefill chunk of at least 256 columns streams its non-resident experts to the device by
     // copy-engine DMA two layers ahead of compute, into frames the expert cache lends
-    // (glm5_3-flash-design.md §17.2); off, the MoE stages them with its SM kernel as before. The
+    // (glm5_3-flash-design.md §11.2); off, the MoE stages them with its SM kernel as before. The
     // records a chunk copies are the same bytes either way, so the outputs do not change.
     bool prefill_stream = true;
     // Consecutive streamed calls of a prompt run layer-major (prefill_walk.cpp): each expert
@@ -366,7 +366,7 @@ struct ProgramOptions {
     // with the instance's placement, warm start, VRAM headroom and RAM tier sizing; the Program
     // fills the family's own fields (label, geometry, staging, chunk, tier floor, stripe identity).
     offload::ExpertPlacementRuntime::Options placement;
-    // The prefix cache (glm5_3-flash-design.md §18): requests resume from and publish to a shared
+    // The prefix cache (glm5_3-flash-design.md §12): requests resume from and publish to a shared
     // block tree with state snapshots in a pinned Host slab pool of prefix_host_bytes (the family's
     // only snapshot residency; there is no Disk tier). GLM resumes only from prefill-computed state
     // on the chunk grid — its projection routes are chosen by call width, so a snapshot's frontier

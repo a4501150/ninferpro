@@ -332,7 +332,7 @@ public:
     void pin_snapshot(SnapshotRef snapshot);
     void unpin_snapshot(SnapshotRef snapshot);
 
-    // ---- tree mutation (§7.6) ------------------------------------------------------------------
+    // ---- tree mutation (§7.4) ------------------------------------------------------------------
     [[nodiscard]] std::optional<NodeRef> find_child(NodeRef parent, std::uint64_t lookup_hash,
                                                     std::span<const TokenId> block_tokens,
                                                     std::uint64_t extra) const;
@@ -434,7 +434,7 @@ public:
     // Returns the device id to the backend.
     void abort_tail_device_fill(SnapshotRef snapshot);
 
-    // ---- snapshots (§5.3, §7.4, §7.7, §9.2)
+    // ---- snapshots (§5.3, §7.2, §7.5, §9.2)
     // ------------------------------------------------------- Returns a device snapshot slot for a
     // tap/endpoint destination (staging): a free one, else a superseded owner's, else the least
     // valuable Device-only owner's when the new snapshot's `claim` priority is at least its GDSF

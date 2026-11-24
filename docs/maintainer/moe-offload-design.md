@@ -832,8 +832,7 @@ Each entry names the option and the reason or measurement that decided it.
 ### 10.4 Tier extensions (§9)
 
 - **Expert records striped over several drives** (more segments per record, one read queue per
-  drive) — not built. It is designed in
-  [GLM-5.3-Flash §11](glm5_3-flash-design.md#11-multi-ssd-expert-streaming) for the RTX 5090
-  machine's two drives, and the
+  drive) — not built. It was designed for the RTX 5090 machine's drives
+  ([GLM-5.3-Flash §17.2](glm5_3-flash-design.md#172-not-built)), and the
   [DeepSeek-V4.1-Flash proposal](deepseek_v4_1-flash-design.md) needs it. The production machine
   has one drive.

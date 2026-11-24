@@ -1,4 +1,4 @@
-// The Program side of the vision tower (docs/maintainer/glm5_3-flash-design.md §21.1): binding
+// The Program side of the vision tower (docs/maintainer/glm5_3-flash-design.md §15.2): binding
 // plans the segments past the reused prefix, the lane's first prefill call encodes them in one
 // pass into the handoff (with vision offload, streaming the tower's weights through the same
 // memory), every call scatters its columns of it over the token embeddings, and the handoff goes

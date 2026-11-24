@@ -16,7 +16,7 @@ namespace infernix::models::glm5_next::detail {
 namespace {
 
 // Misses staged per pass of a layer's experts: frame-sized slots, so each costs a cached expert's
-// VRAM (glm5_3-flash-design.md §10.3). A decode or verify call keeps the fork route of
+// VRAM (glm5_3-flash-design.md §6.4). A decode or verify call keeps the fork route of
 // ops::moe_experts (staging beside the resident experts, staged misses landing in the cache) only
 // while its top_k x columns jobs fit the slots, and that route covers calls of at most
 // kForkColumns columns.

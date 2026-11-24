@@ -146,7 +146,7 @@ public:
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
-    // The steps run() composes, for a prefill layer walk (glm5_3-flash-design.md §17.1): a walk
+    // The steps run() composes, for a prefill layer walk (glm5_3-flash-design.md §11.1): a walk
     // runs each layer over every chunk of its span before the next layer, so the chunk's residual
     // stream and its mHC state live in caller memory between steps. Chunk c's layer l reads what
     // the chunk-major call c reads there (its own columns, the layer's caches and state after

@@ -122,7 +122,7 @@ struct DFlash2Config {
     }
 };
 
-// The vision tower (docs/maintainer/glm5_3-flash-design.md §21.1): 24 blocks of RMSNorm, Q/K/V
+// The vision tower (docs/maintainer/glm5_3-flash-design.md §15.2): 24 blocks of RMSNorm, Q/K/V
 // with biases, per-head q/k norms, 2-D axial RoPE and a clamped SwiGLU MLP, then a post norm,
 // the m x m downsample and a gated merger into the text width. Patches are 3 x t x p x p pixels.
 struct VisionConfig {

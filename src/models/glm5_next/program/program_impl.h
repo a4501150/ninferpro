@@ -409,7 +409,7 @@ private:
     // held. Decode and verification rounds never stream.
     bool stream_chunk(std::int32_t width);
 
-    // ---- prefill layer walk (prefill_walk.cpp; glm5_3-flash-design.md §17.1)
+    // ---- prefill layer walk (prefill_walk.cpp; glm5_3-flash-design.md §11.1)
     // A span of consecutive streamed calls of one prompt, run layer-major: chunk c's layer l runs
     // after chunk c - 1's, and every chunk's layer l before any chunk's layer l + 1. Each step
     // (advance_prefill call) enqueues a few layers of every chunk and synchronizes, so other lanes'
@@ -622,7 +622,7 @@ private:
                       bool hand_over_tail, DeviceKVPageLease* fresh_tail = nullptr);
     void prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F);
     bool prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary);
-    // The zero-token resume's prompt-end capture (design §18): a snapshot at the prompt's own
+    // The zero-token resume's prompt-end capture (design §12): a snapshot at the prompt's own
     // frontier n whose image carries the head's saved residual, that an exact repeat resumes from
     // with no prefill at all.
     void prefix_prompt_end_capture(Lane& lane, std::uint32_t index);

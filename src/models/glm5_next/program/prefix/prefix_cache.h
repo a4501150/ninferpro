@@ -1,7 +1,7 @@
 #pragma once
 
 // Physical binding of the generic prefix index (runtime/prefix_cache) to Glm5Next's KV page pool,
-// lane state and pinned Host slab pool (docs/maintainer/glm5_3-flash-design.md §18). The index
+// lane state and pinned Host slab pool (docs/maintainer/glm5_3-flash-design.md §12). The index
 // decides; this class holds what its opaque ids name and moves the bytes its decisions imply.
 //
 // - A block id owns one Device page lease: a cached full block, or a snapshot's Device tail. Lanes

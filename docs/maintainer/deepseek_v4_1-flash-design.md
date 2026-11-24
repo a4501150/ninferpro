@@ -10,10 +10,12 @@ The offload tier this family composes — the VRAM expert cache, residency, plac
 SSD tiers, the CPU expert engine — is designed once for every offloaded MoE family and lives in
 [MoE offload design](moe-offload-design.md), cited below as **MoE §N**. This document keeps
 DeepSeek-V4.1-Flash's constants, kernels, recipes and models of its own speed, and points to the
-MoE document for the shared machinery. The one implemented family,
-[Qwen3.8-Flash-Next](qwen3_8-flash-next-design.md), is cited as **FN §x** (its superseded content
-remains in git at base commit `0273fb5`); the parallel [GLM-5.3-Flash design](glm5_3-flash-design.md)
-is cited as **GLM §x**. DwarfStar (`antirez/ds4`), the local engine whose V4.1 implementation this
+MoE document for the shared machinery. [Qwen3.8-Flash-Next](qwen3_8-flash-next-design.md) is
+cited as **FN §x** (its superseded content remains in git at base commit `0273fb5`).
+[GLM-5.3-Flash](glm5_3-flash-design.md) is cited as **GLM §x** at commit `3872061ee`
+(`git show 3872061ee:docs/maintainer/glm5_3-flash-design.md`): that version holds the RTX 5090
+machine's storage probes and the multi-drive striping, lookahead and approximate-mode designs this
+proposal builds on, which the current GLM design lists as not built (its §17.2). DwarfStar (`antirez/ds4`), the local engine whose V4.1 implementation this
 design studied most closely, is cited as **DS4** (§4.1).
 
 Labels used for numbers: **measured** (on the named machine, with the method named), **upstream**

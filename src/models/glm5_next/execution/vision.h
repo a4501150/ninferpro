@@ -1,6 +1,6 @@
 #pragma once
 
-// The GLM-5.3-Flash vision tower (docs/maintainer/glm5_3-flash-design.md §21.1): patch embedding,
+// The GLM-5.3-Flash vision tower (docs/maintainer/glm5_3-flash-design.md §15.2): patch embedding,
 // 24 blocks, the post norm, the m x m downsample and the gated merger, run as a resumable
 // layer-major pass over the items of one prompt. Every Op runs per item with its own patch count,
 // so an item's embeddings are the same alone or beside other items. Program-free: the caller owns

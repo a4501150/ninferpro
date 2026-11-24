@@ -499,7 +499,7 @@ def qwen3_8_flash_next_dflash2(model, recipe, sources):
 
 def glm5_3_flash_nvfp4_orcarouter(model, recipe, sources):
     """GLM-5.3-Flash from orcarouter/GLM-5.3-Flash-Uncensored-NVFP4 (docs/maintainer/glm5_3-flash-design.md
-    §7), a weight-only compressed-tensors export served with BF16 activations. The routed experts of
+    §3), a weight-only compressed-tensors export served with BF16 activations. The routed experts of
     layers 3-44 keep their NVFP4 codes and block scales (W4A16 ``nvfp4_mul`` banks in
     ``nvfp4_expert_rg16_v1``, the global scale stored as its FP32 reciprocal); every other tensor keeps
     its stored dtype (BF16, or FP32 for the mHC bases and scales, the KDA ``A_log`` and ``dt_bias``

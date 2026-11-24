@@ -350,8 +350,8 @@ observes. It does not count:
 - intermediate traffic of the workspace, split/reduce or composite launchers;
 - the DRAM traffic reduction from cache hits.
 
-These questions need NCU to answer. The benchmark no longer derives `weight_replay_lower_bound_bytes`
-from the launcher column tile.
+These questions need NCU to answer, so the benchmark does not derive a weight-replay lower bound from
+the launcher column tile.
 
 `1792 GB/s` remains the fixed hardware specification, used for the existing `DRAM_%` and the fixed-spec
 roofline. The additional `READ_%` uses `1674.5 GB/s`, the result of the 4 GiB `uint4` pure-read run of

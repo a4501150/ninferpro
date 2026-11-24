@@ -1,4 +1,4 @@
-// The layer walk of Glm5Next's prefill (docs/maintainer/glm5_3-flash-design.md §17.1): a span of
+// The layer walk of Glm5Next's prefill (docs/maintainer/glm5_3-flash-design.md §11.1): a span of
 // consecutive streamed calls of one prompt runs layer-major, so each MoE layer's non-resident
 // experts cross PCIe once per span instead of once per call. A chunk-major prompt of 4,096-token
 // calls re-streams nearly every non-resident expert for every call (about 100 GB at vram=42%),

@@ -119,7 +119,7 @@ engine for maximum single-GPU performance. It implements
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
 use the same architecture, binding and execution path. It also implements `Qwen4ExpForCausalLM`
 (Qwen3.8-Flash-Next, model family `qwen4_exp`), whose routed experts are offloaded to host memory or
-the SSD, and GLM-5.3-Flash (model family `glm5_next`, in progress: status in its design document)
+the SSD, and GLM-5.3-Flash (model family `glm5_next`, status in its design document's §1)
 on the same offload tier. The implementation targets `sm_120a`. Infernix tunes on an RTX 5090 (32 GB, Windows); this
 repository runs and tunes on one RTX PRO 6000 Blackwell (96 GB, PCIe Gen5 x16) under Linux, where every
 expert fits in VRAM and placement decides how much to give back to other programs. Changes must keep

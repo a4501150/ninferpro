@@ -1,6 +1,6 @@
 #pragma once
 
-// Prefill expert streaming (docs/maintainer/glm5_3-flash-design.md §17; the shared design
+// Prefill expert streaming (docs/maintainer/glm5_3-flash-design.md §11; the shared design
 // moe-offload-design.md §7.1-7.3, the Flash-Next variant it ports docs/maintainer/qwen3_8-flash-next-design.md
 // §13.3): the records of a prefill chunk's non-resident experts reach the device by copy-engine
 // DMA, two layers ahead, into a ring of borrowed device memory (frames lent by the expert cache),

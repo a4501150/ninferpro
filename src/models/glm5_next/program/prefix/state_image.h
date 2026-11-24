@@ -1,7 +1,7 @@
 #pragma once
 
 // The packed state image of one Glm5Next lane at a frontier (docs/maintainer/glm5_3-flash-design.md
-// §18): every byte of the lane's state that its KV pages do not hold — the KDA recurrence and
+// §12): every byte of the lane's state that its KV pages do not hold — the KDA recurrence and
 // convolution window of every KDA block, the DSA indexer's raw key and gate ring of every MLA
 // block (the incomplete pool's inputs), and the DFlash2 drafter's context ring. Parts follow the
 // forward pass, so a restore lands each decoder layer's state as one group the forward pass can

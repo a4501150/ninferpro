@@ -1831,15 +1831,15 @@ outside its prefill call is a warning at any log level.
 ## 18. GLM-5.3-Flash binding
 
 `glm5_next` forks Qwen4Exp's index (`src/models/glm5_next/program/prefix/prefix_index.*`) and owns
-its physical binding; the [GLM-5.3-Flash design §18](glm5_3-flash-design.md#18-prefix-cache) is
+its physical binding; the [GLM-5.3-Flash design §12](glm5_3-flash-design.md#12-prefix-cache) is
 its authority. The differences from §17 that a change here must respect:
 
 - **Taps on the chunk grid only.** GLM's projection routes are chosen by call width, so a resume is
   exact only when its calls repeat the publishing run's call boundaries. Every tap lands on a
   multiple of the prefill chunk (itself a multiple of 64), and the finish endpoints are not
   published. The prompt-end capture and the zero-token resume are built.
-- **Host tier only.** The Disk tier and the persistence file are refused; `--host-context-mib`
-  defaults to 2 GiB.
+- **Host tier only.** The Disk tier, the persistence file, Device snapshot slots, packed Host
+  state and tool-call holds are refused; `--host-context-mib` defaults to 2 GiB.
 - **Mixed rounds are refused for a lane that publishes**, for the same call-grid reason.
-- Eviction, supersession, queue holds and the blocked-head prefetch are this design's (§9, §6.6,
-  §9.6).
+- Eviction, supersession, queue holds and the blocked-head prefetch are this design's (§9, §9.6,
+  §6.6).

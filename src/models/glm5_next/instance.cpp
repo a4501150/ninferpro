@@ -34,7 +34,7 @@ namespace offload = models::offload;
 constexpr std::uint64_t kProgramPinnedAllowance = 256ULL << 20;
 // The materializer's upload slots and direct-read bounce buffer during the load.
 constexpr std::uint64_t kLoadStagingBytes = 4ULL * (64ULL << 20) + (8ULL << 20);
-// Below this many expert frames most routed experts miss the VRAM cache (design §10.1).
+// Below this many expert frames most routed experts miss the VRAM cache (design §6).
 constexpr std::uint32_t kFewFrames = 2048;
 
 unsigned long long mib(std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20); }
@@ -173,7 +173,7 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
                                        ? options.speculative.draft_tokens
                                        : 0;
     program_options.diagnostics                 = options.diagnostic_observer;
-    // The hybrid prefix cache (design §18). Snapshots are born in the pinned Host slab pool; the
+    // The hybrid prefix cache (design §12). Snapshots are born in the pinned Host slab pool; the
     // cost constants rate a resume's restore against a re-prefill of the same tokens, at the
     // measured prefill and link rates of this family.
     if (options.context_cache.enabled) {

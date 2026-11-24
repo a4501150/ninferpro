@@ -238,7 +238,7 @@ void ProgramImpl::run(std::int32_t batch, std::int32_t width, std::int32_t logit
     CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), plan_.io.bytes, cudaMemcpyHostToDevice, s));
     before_call(decode_round);
     // A prefill call wide enough streams its non-resident experts by copy-engine DMA two layers
-    // ahead of compute (glm5_3-flash-design.md §17.2); decode and verification rounds never do.
+    // ahead of compute (glm5_3-flash-design.md §11.2); decode and verification rounds never do.
     const bool streamed = !decode_round && !walk_.active && stream_chunk(width);
     if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s); }
     try {
@@ -496,7 +496,7 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
     if (drafter_) {
         // A one-row round drafts what its row has room for. A round of several rows, or of a
         // token-constrained row, decodes plainly: with experts beyond VRAM a verify column's routes
-        // cost more than its accepted tokens save (glm5_3-flash-design.md §16.3).
+        // cost more than its accepted tokens save (glm5_3-flash-design.md §10.3).
         std::int32_t room = plan_.draft;
         bool plain        = batch > 1 || budgets.size() != sequences.size();
         for (std::int32_t b = 0; b < batch && !plain; ++b) {
