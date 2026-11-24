@@ -227,9 +227,11 @@ __global__ void __launch_bounds__(kScoreThreads)
     const int tiles_per_row = (width + kScoreTileColumns - 1) / kScoreTileColumns;
     const int tile          = tile_base + static_cast<int>(blockIdx.y);
     const int row = tile / tiles_per_row, col_in = (tile % tiles_per_row) * kScoreTileColumns;
-    const int c0 = group_begin + row * width + col_in;
-    const int nc = min(min(kScoreTileColumns, width - col_in), group_begin + group_columns - c0);
-    if (nc <= 0) { return; }
+    // The tile's first flat column; a pass that begins inside the tile skips its earlier columns.
+    const int c0   = row * width + col_in;
+    const int nc   = min(min(kScoreTileColumns, width - col_in), group_begin + group_columns - c0);
+    const int skip = max(0, group_begin - c0);
+    if (nc <= skip) { return; }
     const int slot_width = kIdxHeadDim / pool;
 
     for (int i = static_cast<int>(threadIdx.x); i < nc * heads * kIdxHeadDim; i += kScoreThreads) {
@@ -250,7 +252,7 @@ __global__ void __launch_bounds__(kScoreThreads)
     }
     __syncthreads();
     int tile_pools = 0;
-    for (int c = 0; c < nc; ++c) { tile_pools = max(tile_pools, column_pools[c]); }
+    for (int c = skip; c < nc; ++c) { tile_pools = max(tile_pools, column_pools[c]); }
     const int steps = (tile_pools + kScoreStepPools - 1) / kScoreStepPools;
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
     const int first_step = static_cast<int>(blockIdx.x) * kScoreWarps + warp;
@@ -275,7 +277,7 @@ __global__ void __launch_bounds__(kScoreThreads)
                     *pooled_element_const(pooled, table, pool * b + j, slot_width, lane));
             }
         }
-        for (int c = 0; c < nc; ++c) {
+        for (int c = skip; c < nc; ++c) {
             const int blocks = column_pools[c];
             if (b0 >= blocks) { continue; } // warp-uniform: this column sees none of the step
             float total = 0.0F;
@@ -309,8 +311,8 @@ __global__ void __launch_bounds__(kScoreThreads)
             total += __shfl_xor_sync(0xFFFFFFFFU, total, 2);
             const int b = b0 + lane / kScoreHeadSlots;
             if (lane % kScoreHeadSlots == 0 && b < blocks) {
-                // The group-relative column of this tile entry.
-                scores[static_cast<std::size_t>(row * width + col_in + c) * score_stride + b] =
+                // The pass-relative column of this tile entry.
+                scores[static_cast<std::size_t>(c0 + c - group_begin) * score_stride + b] =
                     total * scale;
             }
         }

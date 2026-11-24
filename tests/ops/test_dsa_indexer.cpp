@@ -32,6 +32,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -631,6 +632,46 @@ void test_select() {
             }
         }
         expect(same, "select: verification widths and lanes select the exact top-512 pools");
+    }
+    // Prompt-wide calls, several select passes of columns each (one lane, and two lanes whose
+    // width is not a multiple of the score tile): every column with a well-separated budget
+    // boundary selects the exact top-512 pools.
+    for (const auto& [batch, width, contexts] : {std::tuple{1, 200, std::vector<int>{2400}},
+                                                 std::tuple{2, 98, std::vector<int>{3000, 2300}}}) {
+        Fixture w(batch, width, contexts, 95);
+        w.fill_pooled_random(95);
+        w.run_select(stream);
+        w.read_cache();
+        int checked = 0, wrong = 0;
+        for (int c = 0; c < w.batch * w.width; ++c) {
+            const int pools_n = (w.positions_host[c] + 1) / kPool;
+            if (pools_n <= kTopPools) {
+                if (w.counts_host[c] != -1) { ++wrong; }
+                continue;
+            }
+            if (w.counts_host[c] != kTopPools) { ++wrong; }
+            std::vector<double> scores(pools_n);
+            for (int b = 0; b < pools_n; ++b) { scores[b] = score_reference(w, c, b); }
+            std::vector<double> sorted(scores);
+            std::sort(sorted.begin(), sorted.end(), std::greater<double>());
+            if (sorted[kTopPools - 1] - sorted[kTopPools] <=
+                1.0e-4 * std::max(std::abs(sorted.front()), 1.0e-30)) {
+                continue;
+            }
+            ++checked;
+            const auto want = top_pools(scores, kTopPools);
+            for (int k = 0; k < kTopPools; ++k) {
+                if (w.pools_host[static_cast<std::size_t>(k) +
+                                 static_cast<std::size_t>(c) * kTopPools] != want[k]) {
+                    ++wrong;
+                    break;
+                }
+            }
+        }
+        expect(wrong == 0 && checked >= w.batch * w.width / 4,
+               "select: a " + std::to_string(w.batch) + "x" + std::to_string(w.width) +
+                   " prompt call selects the exact top-512 pools in every select pass (" +
+                   std::to_string(wrong) + " wrong, " + std::to_string(checked) + " checked)");
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
