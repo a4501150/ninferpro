@@ -64,6 +64,7 @@ prefix cache on, its KV holds every lane's full context (6.36 GiB INT8 at 4 × 2
 | Decode, four requests of 256 tokens (rounds of several rows decode plainly) | median 59.9 tok/s aggregate, sets 56.5-62.0 |
 | Same bench at `vram=42%,ram=58%` (5,080 / 7,016 / 0 experts), one request, by draft length | K = 0 35.0, K = 1 40.9, K = 2 44.4, K = 3 47.8, K = 4 43.2, K = 5 37.7 tok/s (§10.3) |
 | Process VRAM while serving: four 1,024-token decodes beside a 9.4K prompt and its cached repeat | peak 92,412 MiB; at vram=42 % it sat at 95,672 MiB |
+| Same with `--vision`: two decodes, the 9.4K prompt and an image (551-token prompt), then a video (1,544 tokens) | peak 92,412 MiB; the image answer reads the chart's title |
 | Prefill, fresh prompts of 10K-38K tokens, walk spans, `vram=42%,ram=58%` | 2.35-2.43k tok/s, compute-bound (§11.1) |
 | One 255,771-token prompt, INT8 KV, `vram=42%,ram=58%` | prefill 2.09k tok/s (TTFT 2 min 2 s), then 256 tokens at 33.3 tok/s |
 | Decode after a 130,164-token prompt against after a 3,964-token one (one lane, 256 tokens) | 36.8 against 38.1 tok/s (97 %) |
@@ -742,7 +743,8 @@ embedding stays host-resident (pinned, one row read per token). `vram=100%` is r
 The serving split's ledger (§1): model 16.70 GiB (the dense BF16 weights, the drafter, workspace),
 KV 6.36 GiB at 4 × 262,144 INT8 tokens with the prefix cache on (1.59 GiB at one lane), and the
 expert cache 63.8 GiB (4,838 frames of 13.5 MiB, staging included). The measured process peak while
-serving is 92,412 MiB against the 92,993 MiB cap; 42 % VRAM sat at 95,672 MiB. KV is allocated for
+serving is 92,412 MiB against the 92,993 MiB cap, with or without image and video requests; 42 %
+VRAM sat at 95,672 MiB. KV is allocated for
 every lane at the full context at startup, so the VRAM share must be re-measured whenever
 `--max-context` or `--max-concurrency` changes. Each lane also holds its KDA state (141 MB).
 
