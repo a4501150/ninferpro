@@ -55,7 +55,7 @@ Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Infernix against NIn
 study; nothing current runs those builds), official Qwen3.8-27B NVFP4 artifact unless stated. The
 reference in these runs lifted only the 4-bit (MLP) sites to 16-bit activations; `a16_activations`
 lifts the 8-bit sites too, so it is a stricter reference. The KL figures in sections 1, 3.1 and
-3.4 are against the narrower one; the decode comparison (3.3) was repeated with
+7.1 are against the narrower one; the decode comparison (3.3) was repeated with
 `a16_activations`.
 
 ### 3.1 Where the activation error comes from
@@ -92,52 +92,6 @@ references, so they are within noise. Builds share their first 54-68 generated t
 before rounding noise makes them diverge; Infernix with and without n-gram drafting shares 267 of
 384.
 
-### 3.4 Rejected: adaptive (4 or 6) activation block scaling
-
-Each 16-value activation block chooses the scale that maps its largest magnitude to 6 or to 4,
-whichever reconstructs the block with less squared error. On the official artifact, over seven
-chunk sizes, KL to the reference fell 4.3 % (not significant) and top-1 agreement rose 0.10
-points at all seven, with perplexity unchanged. On the production NVIDIA artifact KL rose 12 %
-(0.0191 to 0.0214) and perplexity 0.6 %. With `infernix_bench` (3 alternating passes, INT8 KV,
-DFlash2), prefill was 0.4-0.75 % slower at 16K, 64K and 2K prompts in every pass and decode about
-0.4 % slower per round. Not adopted: `quantize_nvfp4_k16` keeps the single amax-to-6 scale.
-
-Also rejected for the same trade-off: 16-bit MLP activations in prefill (table 3.1). An 8-bit
-activation path would need FP4 x FP8 block-scaled MMA, which takes UE8M0 scales per 32 values,
-not NVFP4's E4M3 scales per 16.
-
-### 3.5 Rejected: truncated QSA index planes
-
-QSA selects the blocks a query attends to by scoring every complete 4-token block against its pooled
-index key, one 128-wide BF16 key per block per QSA layer (256 B per block, 13 planes per lane, 832 B
-per token; [the design record](qwen3_8-flash-next-design.md#141-selection-over-the-pooled-index-key-plane) owns the
-plane's geometry). A coarser plane would read fewer bytes and return frames to the expert cache if
-the key's low-order bits carried little ranking information. Fedor Suchkov evaluated the idea on the
-`kido5217/Infernix` fork ([#5](https://github.com/kido5217/Infernix/issues/5), map
-[#36](https://github.com/kido5217/Infernix/issues/36), prototype branch `proto/qsa-index-truncation`)
-against a bar pre-registered in [#39](https://github.com/kido5217/Infernix/issues/39):
-selected-set agreement with the full-BF16 top-512 selection, per layer per step, must reach a
-cross-layer mean of 0.95, with no layer below 0.90 and a best-to-worst layer spread of at most 0.10,
-on keys, selections and FP32 scores captured from the engine at 16K and 140K contexts (an RTX 5090).
-
-Not adopted. The arm the bar gated — a uniform 4-bit code, four planes, 80 B per block (3.2x) —
-fails both agreement conditions at >= 128K contexts (mean 0.9213, worst layer 0.8951); it clears
-the bar at 16K (0.9536 mean, worst layer 0.9209), and the failure is at long context, where the
-saving would matter. The only *byte-saving* arm that meets the three numeric conditions is the
-12-bit BF16 cut (192 B, 1.33x, mean 0.9618, worst layer 0.9485) — about 0.9 % of the expert cache
-at 256K with four lanes, far less at shorter contexts — while requiring the pooled plane's layout
-to change and every reader (the pooling writer, the Program's plane allocation, selection,
-attention and prompt) to unpack it. A smaller plane's byte saving is plausible as a time saving
-but was never evidenced (the engine's scan curve is latency-dominated, not bandwidth-bound), and
-the bar did not require it.
-
-Support would require a representation that reaches 0.95 agreement at a materially larger byte
-saving (at least 3x), or index-plane pressure the deployed contexts do not have: the plane is
-208 MiB per lane at 256K and 832 MiB at 1M, against an expert pool of roughly 8,300 frames
-([the design record](qwen3_8-flash-next-design.md) §14.4). The bar's numbers come from a CPU-only
-prototype over captures (2026-10-13), not from the GPU measurement the rest of this section
-describes; scan time was not measured and was deliberately non-gating.
-
 ## 4. Qwen3.8-Flash-Next: NVFP4 artifact against the Unsloth UD-Q4_K_XL GGUF
 
 This compares Infernix's Flash-Next artifact, which imports NVIDIA's NVFP4 checkpoint
@@ -164,9 +118,7 @@ tokens.
 
 Infernix ties Strata on code and the document and is better on chat. Recipe B (8-bit dense) cost
 +0.008 ± 0.010 nats against recipe A on an earlier checkpoint with the same BF16 dense weights;
-recipe A was not converted from NVIDIA's checkpoint. The figures recorded here before 2026-10-07
-(recipe A 4.564 against Strata 0.1.39's 4.864) were measured on `RadixArk/Qwen3.8-Flash-Next-NVFP4`,
-whose routed experts carry a different calibration.
+recipe A was not converted from NVIDIA's checkpoint.
 
 **This compares engines as well as weights.** Several of Strata's numerical choices differ from
 Infernix's:
@@ -202,66 +154,6 @@ the MTP drafter excluded since the GGUF files hold neither):
 | `nvidia/Qwen3.8-Flash-Next-NVFP4` | 4.50 | 16.00 | 8.00 | 5.83 | 4.95 |
 | Infernix recipe B + n-gram volume | 4.50 | 10.34 | 8.19 (4 KiB block padding) | 5.73 | 4.73 |
 | Unsloth UD-Q4_K_XL | 5.10 | 8.90 | 4.50 | 5.03 | 5.25 |
-
-### 4.3 Conclusion
-
-- **Quality.** A bit-exact UD-Q4_K_XL artifact in Infernix would likely land near Strata's quality,
-  perhaps slightly above it, because Infernix can run every Q8_0 tensor exactly. It would likely
-  stay below the NVFP4 artifacts, particularly on chat. This is unmeasured. Before such an
-  artifact could be adopted, it would have to pass the same design §17.7 comparison.
-- **Speed** (estimates, against recipe B on the RTX 5090; nothing measured). Offloading narrows
-  the gap. The causes are:
-  - 13 % more bytes per expert;
-  - about 12 % fewer VRAM frames (roughly 9,400 → 8,300), so more misses, each carrying more
-    bytes;
-  - expert GEMMs in prefill would run on INT8 tensor cores (half the FP4 rate) instead of
-    `mxf4nvf4`.
-
-  | Workload | Estimated slowdown |
-  |---|---|
-  | Warm decode (dense-path-bound, identical bytes) | ~5-10 % |
-  | Cold or first-time decode and MTP verification (miss- and link-bound) | ~10-25 % |
-  | Link-bound prefill | ~12-15 % |
-  | GPU-bound long-prompt prefill | ~5-15 % |
-
-  Strata's 72-80 tok/s on this file therefore reflects its engine, not the format.
-- **Overall.** Such an artifact would probably be both slower and lower quality than recipe B.
-  Its value would be a like-for-like comparison with Strata and a smaller n-gram table on disk.
-  It is not built.
-
-### 4.4 What support would require
-
-Most of the machinery is built. The GGUF import path exists (`tools/convert/qwen4_exp_gguf.py`):
-the encoded raw-block reader (`sources/gguf_raw.py`, bit-exact import of the stored bytes), the
-`qwen4exp` name map with llama.cpp's export transforms undone and checked, the block formats
-`q2_0`, `q4_k`, `q5_k`, `q6_k`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_xs` and `iq4_nl` with exact
-decode oracles (`src/ops/ggml/ggml_exact.h`), Q8_0 copied into `q8_g32_fp16`, expert records with
-per-layer record bytes and frame slots sized by the largest record, and the MTP head (from the
-`--model` checkpoint) and vision tower (from the GGUF repository's BF16 `mmproj`). The GGML expert
-family in `offloaded_sparse_moe` is built too: a GPU narrow route, a GPU wide route, AVX-VNNI CPU
-miss kernels and the canonical block arithmetic, so placement invariance holds
-([design §17.3](qwen3_8-flash-next-design.md#173-w4a16-and-exact-block-arithmetic),
-[§6.3](qwen3_8-flash-next-design.md#63-expert-banks-and-model-role-tensors)).
-
-What a UD-Q4_K_XL artifact still lacks:
-
-- the `q5_1` format (codec, oracle, kernels), for its down blocks;
-- expert-bank pairs for its Q4_K/Q5_K gate-up and Q5_1/Q8_0 down: the built pairs are IQ gate/up
-  with IQ4_NL or Q2_0 down (`cuda/ggml_expert.cuh`);
-- the artifact: the conversion has not been run. It needs about 72.4 GiB of pinned RAM instead of
-  64.5 GiB — about 77 GiB free at startup, or 81 GiB with `infernix-serve` — or the SSD expert
-  tier.
-
-**Native GGUF loading.**
-- Loading this one file in place, as Strata does, is feasible. It is an explicit product change:
-    `.ninfer` is the only artifact, and runtime repacking is forbidden. The 2-byte-aligned 34-byte
-    Q8_0 blocks would slow the dense kernels unless repacked.
-  - The preferred form is a thin `.ninfer`. It would reference the GGUF's byte ranges for the
-    experts and the PLE table and embed only the repacked dense weights and the MTP layer. It adds
-    about 6 GB on disk instead of about 106 GB. Each expert matrix is a whole number of 4 KiB
-    pages, but tensor bases are only 32-byte aligned, so reads need aligned over-reads.
-  - Arbitrary GGUFs would need every ggml type on every kernel route, plus each architecture's
-    export conventions. That is not recommended.
 
 ## 5. Repeating the measurements
 
@@ -318,9 +210,8 @@ different route may ship, what it is measured against, how much it may cost, and
   arithmetic differs is a fast path. The exact route is the quality
   reference's route, and every gate's default run is the exact route on the fast run's kernel set
   (6.2). Prompt attention there runs P×V in FP16 for every
-  KV format; until 2026-10-13 NVFP4, K8V4 and VQ2 KV defaulted to their 8-bit forms, which are now
-  the prompt-pv8 fast path. The fast INT8 and NVFP4 prompt kernels, measured when adopted, remain
-  part of the exact route.
+  KV format; the 8-bit P×V forms of NVFP4, K8V4 and VQ2 KV are the prompt-pv8 fast path. The
+  fast INT8 and NVFP4 prompt kernels, measured when adopted, remain part of the exact route.
 - **The fast paths** (`infernix::FastPath`) are routes whose arithmetic differs from the exact
   route's. By default (no `--disable-fast-paths`) the Engine runs every fast path qualified for the
   loaded **configuration**, the kernels the artifact runs and its KV format. On Qwen3.5 that is the
@@ -1239,18 +1130,6 @@ and plain decode at eight): the retiled qualified set ran 1,788, 1,288 and 922 t
 (1,787, 1,217, 887 and 70.3 before); with two-term A8 1,915, 1,548 and 1,034 and 70.4, against the
 old route's 1,995, 1,650, 1,286 and 72.6 (-4.0, -6.2, -19.6 and -3.0 %).
 
-**Rejected for wide rounds** (2026-10-15, the same artifact; op-level tables in git history):
-one-term A4 gate/up beside two-term down with "four over six" block scales (each block keeps the
-better of its max-to-6 and max-to-4 encodings; halves one-term op error and faster with two-term
-A8, but fails the INT8 spec arm: TV excess 1.14e-2 against 2.4e-3, top-1 +1.17 of 0.22);
-alternative two-term tiles — 32x64 warp tiles and deeper K stages for the NVFP4 MMA, 32x128
-tiles for the FP8 input projections — within 2 % of the shipped tiles, or faster only at Op
-level with nothing measurable end to end; a warp-specialized TMA route with two activation planes
-(faster on the widest gate/up calls, within one run-to-run standard deviation end to end); and a
-per-token activation scale for one-term A4, not built because one-term's failure is the 4-bit
-grid itself (a 4x or 16x wider static range moves its INT8 spec TV excess only from 1.73e-2 to
-1.68e-2, top-1 from +2.02 to +1.86 points).
-
 **VQ2 KV** (2026-10-15, the same artifact, corpus and arms; 1,024 segments): the exact route is
 request-invariant there (96 segments bit-identical at concurrency 8, under DFlash2 with n-gram
 copies at 4, resuming from a warm request, and under the two-lane pool), and every path that acts
@@ -1686,20 +1565,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
   budget, is the closest margin). Speed beside `expert-a4-residual` was measured on INT8 KV (+5.4 /
   +6.0 % at 32K / 64K above); the other formats were not timed. It is request-coupling: a dense
   call takes the pair route from its problem's admission width, which batched rounds share.
-- **A third h term for `expert-a4-residual` (2 + 3, tried 2026-10-17, not kept).** Faster beside
-  `fp8-a8-pair` (+3.2 / +3.7 % at pp32768 / pp65536) and no worse in prefill, but its INT8 decode
-  gate over 1,024 segments failed more clearly than 2 + 2's (top-1 bound 5.66e-3, p99.9 ratio
-  1.56, TV excess 2.6e-3 against 8.2e-4), so two terms stayed.
-- **Rejected: max/448 scale pairs (gated 2026-10-15/16, superseded by the power-of-two scales on
-  2026-10-17).** Prefill passed beside `expert-a4-residual`, but the INT8 decode gate failed over
-  1,024 segments (top-1 bound 5.31e-3 of 5.0e-3, NLL excess 1.23e-2 of the 1.0e-2 cap, p99.9 KL
-  ratio 1.261): the pair's NLL shift on top of the top-1 and tail budget `expert-a4-residual`
-  already used. A bit-exact alternative cannot recover the speed — the gain is the FP8 Tensor
-  Core rate (0.69-0.78 of the exact route's time at 4,096 columns, its BF16 MMAs already level
-  with the Tensor Core pipe) — so the scales were made powers of two instead.
 
-**`ggml-bf16-prefill`: BF16 tensor-core tiles in Flash-Next's GGUF prefill (IQ3_S with INT8, FP8,
-NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
 - **What changes:** eager prefill calls of 32 or more columns run the GGUF dense projections
   (`ops::ggml_linear`, `LinearRoutes::GgmlBf16Wide`) as BF16 m16n8k16 MMAs with FP32 accumulation over
   the exact route's decoded planes: each code is exact in BF16, x is read as stored, each
@@ -2066,3 +1932,143 @@ oracle predicts. Under 6.1's rule for a change to the reference route, the new r
 precise one (its Op error is lower), so the new-build rows decide: every excess estimate is at most
 zero and every criterion passes on both formats. The change stays on the exact route as a
 precision fix, and the new route is the reference.
+
+## 7. Rejected and not built
+
+Each entry names the option and the measurement that decided it.
+
+### 7.1 Adaptive (4 or 6) activation block scaling
+
+Each 16-value activation block chooses the scale that maps its largest magnitude to 6 or to 4,
+whichever reconstructs the block with less squared error. On the official artifact, over seven
+chunk sizes, KL to the reference fell 4.3 % (not significant) and top-1 agreement rose 0.10
+points at all seven, with perplexity unchanged. On the production NVIDIA artifact KL rose 12 %
+(0.0191 to 0.0214) and perplexity 0.6 %. With `infernix_bench` (3 alternating passes, INT8 KV,
+DFlash2), prefill was 0.4-0.75 % slower at 16K, 64K and 2K prompts in every pass and decode about
+0.4 % slower per round. Not adopted: `quantize_nvfp4_k16` keeps the single amax-to-6 scale.
+
+Also rejected for the same trade-off: 16-bit MLP activations in prefill (table 3.1). An 8-bit
+activation path would need FP4 x FP8 block-scaled MMA, which takes UE8M0 scales per 32 values,
+not NVFP4's E4M3 scales per 16.
+
+### 7.2 Truncated QSA index planes
+
+QSA selects the blocks a query attends to by scoring every complete 4-token block against its pooled
+index key, one 128-wide BF16 key per block per QSA layer (256 B per block, 13 planes per lane, 832 B
+per token; [the design record](qwen3_8-flash-next-design.md#141-selection-over-the-pooled-index-key-plane) owns the
+plane's geometry). A coarser plane would read fewer bytes and return frames to the expert cache if
+the key's low-order bits carried little ranking information. Fedor Suchkov evaluated the idea on the
+`kido5217/Infernix` fork ([#5](https://github.com/kido5217/Infernix/issues/5), map
+[#36](https://github.com/kido5217/Infernix/issues/36), prototype branch `proto/qsa-index-truncation`)
+against a bar pre-registered in [#39](https://github.com/kido5217/Infernix/issues/39):
+selected-set agreement with the full-BF16 top-512 selection, per layer per step, must reach a
+cross-layer mean of 0.95, with no layer below 0.90 and a best-to-worst layer spread of at most 0.10,
+on keys, selections and FP32 scores captured from the engine at 16K and 140K contexts (an RTX 5090).
+
+Not adopted. The arm the bar gated — a uniform 4-bit code, four planes, 80 B per block (3.2x) —
+fails both agreement conditions at >= 128K contexts (mean 0.9213, worst layer 0.8951); it clears
+the bar at 16K (0.9536 mean, worst layer 0.9209), and the failure is at long context, where the
+saving would matter. The only *byte-saving* arm that meets the three numeric conditions is the
+12-bit BF16 cut (192 B, 1.33x, mean 0.9618, worst layer 0.9485) — about 0.9 % of the expert cache
+at 256K with four lanes, far less at shorter contexts — while requiring the pooled plane's layout
+to change and every reader (the pooling writer, the Program's plane allocation, selection,
+attention and prompt) to unpack it. A smaller plane's byte saving is plausible as a time saving
+but was never evidenced (the engine's scan curve is latency-dominated, not bandwidth-bound), and
+the bar did not require it.
+
+Support would require a representation that reaches 0.95 agreement at a materially larger byte
+saving (at least 3x), or index-plane pressure the deployed contexts do not have: the plane is
+208 MiB per lane at 256K and 832 MiB at 1M, against an expert pool of roughly 8,300 frames
+([the design record](qwen3_8-flash-next-design.md) §14.4). The bar's numbers come from a CPU-only
+prototype over captures (2026-10-13), not from the GPU measurement the rest of this section
+describes; scan time was not measured and was deliberately non-gating.
+
+### 7.3 Fast-path variants that failed their gates
+
+Recipe C, wide rounds (2026-10-15; op-level tables in git history): one-term A4 gate/up beside two-term down with "four over six" block scales (each block keeps the
+better of its max-to-6 and max-to-4 encodings; halves one-term op error and faster with two-term
+A8, but fails the INT8 spec arm: TV excess 1.14e-2 against 2.4e-3, top-1 +1.17 of 0.22);
+alternative two-term tiles — 32x64 warp tiles and deeper K stages for the NVFP4 MMA, 32x128
+tiles for the FP8 input projections — within 2 % of the shipped tiles, or faster only at Op
+level with nothing measurable end to end; a warp-specialized TMA route with two activation planes
+(faster on the widest gate/up calls, within one run-to-run standard deviation end to end); and a
+per-token activation scale for one-term A4, not built because one-term's failure is the 4-bit
+grid itself (a 4x or 16x wider static range moves its INT8 spec TV excess only from 1.73e-2 to
+1.68e-2, top-1 from +2.02 to +1.86 points).
+
+A third h term for `expert-a4-residual` (2 + 3, 2026-10-17): Faster beside
+  `fp8-a8-pair` (+3.2 / +3.7 % at pp32768 / pp65536) and no worse in prefill, but its INT8 decode
+  gate over 1,024 segments failed more clearly than 2 + 2's (top-1 bound 5.66e-3, p99.9 ratio
+  1.56, TV excess 2.6e-3 against 8.2e-4), so two terms stayed.
+
+max/448 scale pairs for `fp8-a8-pair` (gated 2026-10-15/16; the scales are powers of two instead): Prefill passed beside `expert-a4-residual`, but the INT8 decode gate failed over
+1,024 segments (top-1 bound 5.31e-3 of 5.0e-3, NLL excess 1.23e-2 of the 1.0e-2 cap, p99.9 KL
+ratio 1.261): the pair's NLL shift on top of the top-1 and tail budget `expert-a4-residual`
+already used. A bit-exact alternative cannot recover the speed — the gain is the FP8 Tensor
+Core rate (0.69-0.78 of the exact route's time at 4,096 columns, its BF16 MMAs already level
+with the Tensor Core pipe) — so the scales were made powers of two instead.
+
+**`ggml-bf16-prefill`: BF16 tensor-core tiles in Flash-Next's GGUF prefill (IQ3_S with INT8, FP8,
+NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
+
+### 7.4 A UD-Q4_K_XL artifact for Qwen3.8-Flash-Next (not built)
+
+The quality comparison and the file's contents are §4.1-§4.2.
+
+- **Quality.** A bit-exact UD-Q4_K_XL artifact in Infernix would likely land near Strata's quality,
+  perhaps slightly above it, because Infernix can run every Q8_0 tensor exactly. It would likely
+  stay below the NVFP4 artifacts, particularly on chat. This is unmeasured. Before such an
+  artifact could be adopted, it would have to pass the same design §17.7 comparison.
+- **Speed** (estimates, against recipe B on the RTX 5090; nothing measured). Offloading narrows
+  the gap. The causes are:
+  - 13 % more bytes per expert;
+  - about 12 % fewer VRAM frames (roughly 9,400 → 8,300), so more misses, each carrying more
+    bytes;
+  - expert GEMMs in prefill would run on INT8 tensor cores (half the FP4 rate) instead of
+    `mxf4nvf4`.
+
+  | Workload | Estimated slowdown |
+  |---|---|
+  | Warm decode (dense-path-bound, identical bytes) | ~5-10 % |
+  | Cold or first-time decode and MTP verification (miss- and link-bound) | ~10-25 % |
+  | Link-bound prefill | ~12-15 % |
+  | GPU-bound long-prompt prefill | ~5-15 % |
+
+  Strata's 72-80 tok/s on this file therefore reflects its engine, not the format.
+- **Overall.** Such an artifact would probably be both slower and lower quality than recipe B.
+  Its value would be a like-for-like comparison with Strata and a smaller n-gram table on disk.
+  It is not built.
+
+**What support would require.**
+
+Most of the machinery is built. The GGUF import path exists (`tools/convert/qwen4_exp_gguf.py`):
+the encoded raw-block reader (`sources/gguf_raw.py`, bit-exact import of the stored bytes), the
+`qwen4exp` name map with llama.cpp's export transforms undone and checked, the block formats
+`q2_0`, `q4_k`, `q5_k`, `q6_k`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_xs` and `iq4_nl` with exact
+decode oracles (`src/ops/ggml/ggml_exact.h`), Q8_0 copied into `q8_g32_fp16`, expert records with
+per-layer record bytes and frame slots sized by the largest record, and the MTP head (from the
+`--model` checkpoint) and vision tower (from the GGUF repository's BF16 `mmproj`). The GGML expert
+family in `offloaded_sparse_moe` is built too: a GPU narrow route, a GPU wide route, AVX-VNNI CPU
+miss kernels and the canonical block arithmetic, so placement invariance holds
+([design §17.3](qwen3_8-flash-next-design.md#173-w4a16-and-exact-block-arithmetic),
+[§6.3](qwen3_8-flash-next-design.md#63-expert-banks-and-model-role-tensors)).
+
+What a UD-Q4_K_XL artifact still lacks:
+
+- the `q5_1` format (codec, oracle, kernels), for its down blocks;
+- expert-bank pairs for its Q4_K/Q5_K gate-up and Q5_1/Q8_0 down: the built pairs are IQ gate/up
+  with IQ4_NL or Q2_0 down (`cuda/ggml_expert.cuh`);
+- the artifact: the conversion has not been run. It needs about 72.4 GiB of pinned RAM instead of
+  64.5 GiB — about 77 GiB free at startup, or 81 GiB with `infernix-serve` — or the SSD expert
+  tier.
+
+**Native GGUF loading.**
+- Loading this one file in place, as Strata does, is feasible. It is an explicit product change:
+    `.ninfer` is the only artifact, and runtime repacking is forbidden. The 2-byte-aligned 34-byte
+    Q8_0 blocks would slow the dense kernels unless repacked.
+  - The preferred form is a thin `.ninfer`. It would reference the GGUF's byte ranges for the
+    experts and the PLE table and embed only the repacked dense weights and the MTP layer. It adds
+    about 6 GB on disk instead of about 106 GB. Each expert matrix is a whole number of 4 KiB
+    pages, but tensor bases are only 32-byte aligned, so reads need aligned over-reads.
+  - Arbitrary GGUFs would need every ggml type on every kernel route, plus each architecture's
+    export conventions. That is not recommended.

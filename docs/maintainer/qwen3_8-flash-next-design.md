@@ -1829,7 +1829,7 @@ profile and one 64-token page group for all of them
   of the call's 580-700 µs (op bench, `infernix_qsa_attention_bench`): the scan grows with context,
   the attention does not.
 - A truncated pooled plane (4-bit codes, partial BF16) was evaluated and rejected
-  ([model-quality.md §3.5](model-quality.md#35-rejected-truncated-qsa-index-planes)).
+  ([model-quality.md §7.2](model-quality.md#72-truncated-qsa-index-planes)).
 
 ### 14.2 Attention routes and kernels
 
@@ -3052,7 +3052,7 @@ it belongs to. The rejections that decided the shared offload tier are
   about 8 columns per row (1.35-1.5x); not ported (2026-10-14).
 - Truncated pooled index-key planes: fails the selection-agreement bar at >= 128K context (0.9213
   mean against 0.95 required, worst layer 0.8951 against 0.90) —
-  [model-quality.md §3.5](model-quality.md#35-rejected-truncated-qsa-index-planes) (2026-10-13).
+  [model-quality.md §7.2](model-quality.md#72-truncated-qsa-index-planes) (2026-10-13).
 - 8-CTA cluster per column in the selection (distributed shared memory): slower at every context
   (2026-10-06).
 - Live KV host tier with CLOCK over hot pages: only the ops page spaces were built; the
