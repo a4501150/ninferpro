@@ -3,10 +3,10 @@
 This document is the design authority for the offload tier that every offloaded MoE family
 composes: the VRAM expert cache, the RAM and SSD tiers, expert placement, the CPU expert
 engine, and the miss and fetch channels between the device and the host. It states the design
-in the present tense and keeps only what is true of the code today. A family document — today
-[qwen3_8-flash-next-design.md](qwen3_8-flash-next-design.md) — keeps that family's constants,
-kernels, recipes and measurements, and cites this document as "MoE §N" for the shared
-machinery.
+in the present tense and keeps only what is true of the code today. A family document —
+[qwen3_8-flash-next-design.md](qwen3_8-flash-next-design.md) and
+[glm5_3-flash-design.md](glm5_3-flash-design.md) — keeps that family's constants, kernels,
+recipes and measurements, and cites this document as "MoE §N" for the shared machinery.
 
 ## Contents
 
@@ -19,6 +19,7 @@ machinery.
 7. [Prefill on an offloaded MoE](#7-prefill-on-an-offloaded-moe)
 8. [Performance method](#8-performance-method)
 9. [Adding a family](#9-adding-a-family)
+10. [Rejected and not built](#10-rejected-and-not-built)
 
 ---
 
@@ -231,8 +232,7 @@ is worth ~0 at batch 1; the gain lies in choosing victims. Belady's gap is the h
 learned next-use predictors measured below LFRU in the same replay study and stay research
 options. Hard per-layer quotas lost 3-34 % in replay; per-layer routing entropy is high but
 static, while the order the cache exploits is temporal, which one global LFRU already tracks.
-Host-shadow replays of the policies with parameter dueling were planned and never built;
-replay stays offline.
+Replay stays offline (§10.1).
 
 **Admission budget.** One promotion per layer call per decode round, the interval scaled to
 the measured link (a promotion moves as many PCIe bytes as serving the expert once
@@ -282,10 +282,6 @@ a frame retires; if the policy evicts it first it leaves the queue.
 status word; the Program checks the word after each round's synchronization and fails the
 round's requests while keeping the engine serving (the prefix cache is cleared, since the
 failed round may have published state it never computed).
-
-**Rejected:** the packed u32 residency entry (state, generation, frame bits) with a LOADING
-state and expected-landing-time gating — superseded by the I32 frame table with
-publish-after-copy and the landing table; slack frames for an asynchronous agent (0 as built).
 
 ### 4.5 Frame leases
 
@@ -352,13 +348,6 @@ follow each other in a file coalesce into one scatter read. A layer walk's span 
 SSD-only expert once through lent stream slots. An agent that stops fails its pending and
 later demands at once and the tier is treated as failed.
 
-**Rejected:** an OS mapped-file expert tier (measured slower than the read queue with
-identical flags, Strata); any SSD expert cache, spill or swap file (the artifact already holds
-the exact bytes; writes only add wear); inclusive or independent tier residency (2-2.5× more
-SSD reads in replay); long-half-life LFU or LFRU for the RAM ranking (wrong order for a
-time-varying ranking); a fixed pool of stream-read slots (−8 % decode; per-span lending
-streams them all).
-
 ### 4.8 Placement forms and the runtime switch
 
 **Startup forms**, resolved by the family's instance construction:
@@ -391,10 +380,6 @@ memory, the fill's progress, the swap counters and the last switch's outcome; `?
 writes the current placement as a loadable file whose row order reproduces the ranking. The
 boot warm start fills the frames from the saved state and the tier fill tops the RAM tier up
 between requests.
-
-**Rejected:** a runtime VRAM shrink/regrow law inside the engine (contradicted the
-mechanism/policy split; removed 2026-10-30); two-phase pool shrink in full-RAM mode (the
-shrink completes at the boundary in 1-3 ms).
 
 ### 4.9 Device memory sizing law
 
@@ -587,14 +572,10 @@ shares are fixed family constants, not measured rates; they are upstream's, deri
 host (i9-13900K, RTX 5090 over Gen5 x8, DFlash2 auto): 51/256 from eight columns added struct
 +2.5 %, conv +0.7 % on W4A16 and +4.3 %, and after 16K +1.7 % against the divisor rule on W4A4
 (2026-11-02), and a measured fractional share flipped calls' splits at floor(M·share) between
-startups (3 workers: 100.8 against 107.5 tok/s). They need re-deriving on this machine
-(9950X3D2, Gen5 x16) at T3 in a RAM/SSD placement; Qwen3.8-Flash-Next's own re-derivation and
-its caveat are its design §10.5.
-
-**Rejected:** a MEASURED fractional share `1/(1+C·t)` (floor flips between startups);
-`round(1 + C·t)` (the switch lands inside the startup noise); a divisor following the expert
-hit rate over eight-token windows (below the best fixed divisor at every length); a
-cost-based CPU/link split chosen per call while a cost model says it pays.
+startups (3 workers: 100.8 against 107.5 tok/s). A family may set its own share instead:
+Qwen3.8-Flash-Next's re-derivation on this machine (9950X3D2, Gen5 x16) and its caveat are its
+design §10.5; GLM-5.3-Flash keeps 128/256 of every decode call's host-memory misses on the link
+(its design §10.2).
 
 ### 5.7 The prefill CPU split
 
@@ -611,15 +592,6 @@ the idle link between a layer's routing and its copies does not shrink); wider c
 assist cap instead (calls from `wide_from` columns take `wide_jobs` as their cap, still
 narrow-route jobs), and wider chunks stream or stage on the GPU (§7). The share, the width
 cap and the assist caps are family constants.
-
-### 5.8 Rejected
-
-- Static worker ownership (E-cores held P-cores back; dynamic counters, cold 41 vs 52 µs per
-  expert at 12+ workers, bits unchanged, i9-13900K).
-- An AVX-VNNI-INT8 kernel variant (never built).
-- CPU L2 warming of predicted misses (the GPU warms its own L2 during the wait instead).
-- Full or fitted rates for the split (overload the CPU; a fitted line starved it, pp256
-  +13 %, 2026-10-10); a split width cap above the measured optimum (pp2048 +2.4 %).
 
 ## 6. Decode on an offloaded MoE
 
@@ -681,11 +653,6 @@ gives a family's speculation:
   fits reset on every placement switch or tier refill.
 - A prompt's prefill credits its experts (§4.3), so the first decode rounds after a prompt
   find the answer's experts ranked, not the prompt's alone.
-
-**Rejected:** lookahead prefetch of next-layer experts by the router (never built — the host
-owns expert movement, and the CPU wait's L2 warming covers the same window); victim landing
-(one-off misses push out residents that still earn hits; promoting less gained more);
-per-layer cache quotas.
 
 ## 7. Prefill on an offloaded MoE
 
@@ -808,9 +775,65 @@ The checklist, in order:
    machinery and keeping the family's constants, kernels and measurements; a user guide
    (flags, placements, measured speeds) linked from `docs/README.md`.
 9. **Tier extensions**: a family that needs the tier to grow names each addition, where it
-   lands and why it costs the existing families nothing. Two planned families' additions are
-   designed but not built:
-   [GLM-5.3-Flash §8.2](glm5_3-flash-design.md#82-the-shared-offload-tier-and-what-it-gains-here)
-   and [DeepSeek-V4.1-Flash §8.2](deepseek_v4_1-flash-design.md#82-the-shared-offload-tier-what-exists-what-this-family-adds).
-   Both need expert records striped over several drives (more segments per record, one read
-   queue per drive), designed in GLM §11. An addition moves into this document when it is built.
+   lands and why it costs the existing families nothing, and the addition moves into this
+   document when it is built. GLM-5.3-Flash added the compile-time expert geometry (§3).
+   Multi-drive striping is not built (§10.4).
+
+## 10. Rejected and not built
+
+Each entry names the option and the reason or measurement that decided it.
+
+### 10.1 Residency (§4)
+
+- **Online host-shadow replays with parameter dueling** — not built. Policy replay runs offline
+  against recorded route traces.
+- **Packed u32 residency entry** (state, generation, frame bits) with a LOADING state and
+  expected-landing-time gating — rejected. The built design is the I32 frame table with
+  publish-after-copy and the landing table (§4.4).
+- **Slack frames for an asynchronous agent** — rejected; 0 as built.
+- **OS mapped-file expert tier** — rejected. It measured slower than the read queue with
+  identical flags (Strata).
+- **SSD expert cache, spill or swap file** — rejected. The artifact already holds the exact
+  bytes, and writes only add drive wear.
+- **Inclusive or independent tier residency** — rejected. It caused 2-2.5× more SSD reads in
+  replay.
+- **Long-half-life LFU or LFRU for the RAM ranking** — rejected. It gives the wrong order for a
+  ranking that changes over time.
+- **Fixed pool of stream-read slots** — rejected. Decode lost 8 %; per-span lending streams all
+  of them.
+- **Runtime VRAM shrink/regrow law inside the engine** — rejected. It contradicts the
+  mechanism/policy split (§4.8).
+- **Two-phase pool shrink in full-RAM mode** — rejected. The shrink completes at the boundary in
+  1-3 ms.
+
+### 10.2 CPU expert engine (§5)
+
+- **Measured fractional miss share** `1/(1+C·t)` — rejected. The floor flipped between startups.
+- **`round(1 + C·t)` divisor** — rejected. The switch lands inside the startup noise.
+- **Divisor that follows the expert hit rate over eight-token windows** — rejected. It measured
+  below the best fixed divisor at every length.
+- **Cost-based CPU/link split chosen per call** while a cost model says it pays — rejected.
+- **Static worker ownership** — rejected. E-cores held P-cores back; dynamic counters measured
+  41 against 52 µs per cold expert at 12+ workers, bits unchanged (i9-13900K).
+- **AVX-VNNI-INT8 kernel variant** — not built.
+- **CPU L2 warming of predicted misses** — rejected. The GPU warms its own L2 during the wait.
+- **Full or fitted rates for the prefill split** — rejected. Full rates overload the CPU; a
+  fitted line starved it (pp256 +13 %, 2026-10-10).
+- **Prefill split width cap above the measured optimum** — rejected (pp2048 +2.4 %).
+
+### 10.3 Decode (§6)
+
+- **Lookahead prefetch of next-layer experts by the router** — not built. The host owns expert
+  movement, and the CPU wait's L2 warming covers the same window.
+- **Victim landing** — rejected. One-off misses push out residents that still earn hits;
+  promoting less gained more.
+- **Per-layer cache quotas** — rejected. They lost 3-34 % in replay (§4.3).
+
+### 10.4 Tier extensions (§9)
+
+- **Expert records striped over several drives** (more segments per record, one read queue per
+  drive) — not built. It is designed in
+  [GLM-5.3-Flash §11](glm5_3-flash-design.md#11-multi-ssd-expert-streaming) for the RTX 5090
+  machine's two drives, and the
+  [DeepSeek-V4.1-Flash proposal](deepseek_v4_1-flash-design.md) needs it. The production machine
+  has one drive.
