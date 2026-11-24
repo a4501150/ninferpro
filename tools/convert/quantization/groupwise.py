@@ -167,7 +167,7 @@ def quantize_matrix_mse(
     max_abs = grouped.abs().amax(dim=2)
     base_scales, base_reciprocal = _canonical_scale_words(max_abs, spec.qmax)
     base_codes = torch.clamp(
-        torch.round(grouped * base_reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
+        torch.round(grouped * base_reciprocal.to(target).unsqueeze(-1)), spec.qmin, spec.qmax
     )
 
     host_values = grouped.detach().cpu().numpy().astype(np.float64)
