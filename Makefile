@@ -25,10 +25,12 @@
 #                                mixed-length traffic, throughput against per-user decode speed
 
 BUILD     ?= build
-# A compile job peaks near 1.75 GiB and a debug-info link several more; MEM caps the whole build
-# (an unbounded one has run the host out of memory). Eight jobs leave half the cores to production.
-JOBS      ?= 8
-MEM       ?= 64G
+# The machine's 16 cores are the job count (SMT threads add little to compiles). MEM scales with
+# it: a compile job peaks near 1.75 GiB and a debug-info link several GiB more (an unbounded nvcc
+# build has run the host out of memory). While production serves, `JOBS=8` leaves half the cores
+# to its host threads.
+JOBS      ?= 16
+MEM       ?= $(shell expr $(JOBS) \* 2 + 16)G
 ARGS      ?=
 R         ?=
 LOCKS     := $(HOME)/.cache/super-quant

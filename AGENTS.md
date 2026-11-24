@@ -341,13 +341,14 @@ The machine: Ubuntu 26.04, kernel 7.0, one RTX PRO 6000 Blackwell (SM120, 96 GB)
   plus tests and benchmarks), holds the production server and the tests. Export
   `CPATH=/usr/local/cuda-13.4/include` for the plain C++ test targets. Build only what the task
   needs (`--target infernix-serve`, or the affected tests). Wrap builds as
-  `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=64G cmake --build
-  build -j8 ...` (the `Makefile` targets do, `JOBS=` and `MEM=` override): an unbounded nvcc build
+  `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=48G cmake --build
+  build -j16 ...` (the `Makefile` targets default to 16 jobs — the machine's 16 cores — and a
+  memory cap that scales with the job count; `JOBS=` and `MEM=` override): an unbounded nvcc build
   has run the host out of memory. Never wrap a `Makefile` target (`make t0`, `make t2`, ...) in an
   outer `flock` of the same lock — the target takes the build and GPU locks itself, and a double
   lock waits on itself forever. A compile job peaks near 1.75 GiB, but linking the debug-info
-  binaries beside eight compiles outgrew a 24G cap (2026-11-14). Eight jobs leave half the 16
-  cores to production's host threads; with production stopped, `JOBS=16` is faster.
+  binaries beside eight compiles outgrew a 24G cap (2026-11-14). While production serves, `JOBS=8`
+  leaves half the cores to production's host threads.
   `build/` links with mold and compiles through ccache (`CMAKE_LINKER_TYPE=MOLD`,
   `CMAKE_{CXX,CUDA}_COMPILER_LAUNCHER=ccache`, set in its cache, not in the presets); a header
   that every CUDA file includes (`core/pdl.cuh`, `ops/common/*.cuh`) still recompiles about 180 of
