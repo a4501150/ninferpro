@@ -14,6 +14,9 @@ struct FrontendResources {
     std::string_view tokenizer_config_json;
     std::string_view chat_template_jinja;
     std::string_view generation_config_json;
+    // The vision component's processor_config.json (image and video processors); empty without
+    // vision.
+    std::string_view processor_config_json;
     std::shared_ptr<const frontend::Tokenizer> tokenizer;
     std::uint32_t public_token_count = 0;
 };

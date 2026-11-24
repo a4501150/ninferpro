@@ -6,6 +6,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "ops/common/mma.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
@@ -33,6 +34,7 @@ constexpr int kMaxSplits   = 65; // automatic splits: (budget tokens + tail) / t
 constexpr int kProjectCols = 32; // projection columns per CTA pass
 
 constexpr std::size_t kChunkBudget = std::size_t{32} << 20; // partials + latent sums per chunk
+constexpr std::size_t kMmaChunkBudget = std::size_t{96} << 20; // the tensor-core route's latent sums
 
 // The registered geometry (heads may be any multiple of 16).
 constexpr int kLatent  = 512;
@@ -283,6 +285,301 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+// The tensor-core prompt route (MlaAttentionExecutionEnvelope::tensor_cores): one CTA per column
+// and all 64 heads, which share the column's selected tokens. A tile of kMmaTokens latent rows is
+// staged as BF16 (INT8 codes are exact in BF16); the scores are BF16 MMAs with FP32 accumulation
+// (an INT8 cache's 64-dimension group dots scaled in FP32, as the split route does), the softmax is
+// online in FP32, and the value MMAs take each probability (times the INT8 group scale) as a BF16
+// high and low pair, about 16 significant bits. Warp w owns latent group w (dimensions 64 w ..
+// 64 w + 63) of every head in the value phase; in the score phase warp w owns heads 16 (w % 4) ..
+// and tokens 8 (w / 4) .. of the tile.
+constexpr int kMmaThreads = 256;
+constexpr int kMmaTokens  = 16;
+constexpr int kMmaHeads   = 64;
+constexpr int kMmaChunks  = kLatent / 8; // 16-byte BF16 chunks per row
+
+struct MmaShared {
+    static constexpr std::size_t kQ      = sizeof(bf16) * kMmaHeads * kLatent;
+    static constexpr std::size_t kK      = kQ + sizeof(bf16) * kMmaTokens * kLatent;
+    static constexpr std::size_t kScales = kK + sizeof(float) * kMmaTokens * kGroups;
+    static constexpr int kScorePitch     = kMmaTokens + 1;
+    static constexpr std::size_t kScores = kScales + sizeof(float) * kMmaHeads * kScorePitch;
+    static constexpr std::size_t kStats  = kScores + sizeof(float) * 3 * kMmaHeads;
+    static constexpr std::size_t kBytes  = kStats + sizeof(std::int64_t) * kMmaTokens;
+};
+
+// Element offset of (row, dimension) in a swizzled BF16 row block: the 16-byte chunks of a row
+// are XORed with the row's low three bits, so ldmatrix's eight rows hit eight banks.
+__device__ __forceinline__ int swizzled(int row, int chunk) {
+    return row * kLatent + ((chunk ^ (row & 7)) << 3);
+}
+
+__device__ __forceinline__ unsigned smem_address(const void* p) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ unsigned pack_bf16(float lo, float hi) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const unsigned*>(&v);
+}
+
+// The BF16 high part of (a, b) and the BF16 rounding of what it leaves.
+__device__ __forceinline__ void split_bf16(float a, float b, unsigned& hi, unsigned& lo) {
+    const __nv_bfloat162 h = __floats2bfloat162_rn(a, b);
+    hi                     = *reinterpret_cast<const unsigned*>(&h);
+    lo = pack_bf16(a - __bfloat162float(h.x), b - __bfloat162float(h.y));
+}
+
+template <bool kInt8>
+__global__ void __launch_bounds__(kMmaThreads, 1)
+    attention_mma_kernel(const bf16* __restrict__ qa, const unsigned char* __restrict__ pages,
+                         const __half* __restrict__ scales, const std::int32_t* __restrict__ tables,
+                         int table_stride, const std::int32_t* __restrict__ table_rows,
+                         const std::int32_t* __restrict__ positions, int width,
+                         const std::int32_t* __restrict__ pools,
+                         const std::int32_t* __restrict__ counts, int top, int pool, float scale,
+                         int column_begin, float* __restrict__ ol) {
+    pdl::enter();
+    const int t = static_cast<int>(blockIdx.x), column = column_begin + t;
+    const int count  = counts == nullptr ? -1 : counts[column];
+    const bool dense = pools == nullptr || counts == nullptr || count < 0;
+    const int n      = positions[column] + 1;
+    const int total  = attended_total(dense ? -1 : count, pool, n);
+    const int tail_base = n - n % pool;
+    const std::int32_t* table =
+        tables + static_cast<std::int64_t>(table_rows[column / width]) * table_stride;
+
+    extern __shared__ __align__(16) unsigned char smem[];
+    auto* q_s     = reinterpret_cast<bf16*>(smem);
+    auto* k_s     = reinterpret_cast<bf16*>(smem + MmaShared::kQ);
+    auto* scale_s = reinterpret_cast<float (*)[kGroups]>(smem + MmaShared::kK);
+    auto* score_s = reinterpret_cast<float (*)[MmaShared::kScorePitch]>(smem + MmaShared::kScales);
+    float* m_s    = reinterpret_cast<float*>(smem + MmaShared::kScores);
+    float* l_s    = m_s + kMmaHeads;
+    float* a_s    = l_s + kMmaHeads;
+    auto* offset  = reinterpret_cast<std::int64_t*>(smem + MmaShared::kStats);
+
+    const int tid = static_cast<int>(threadIdx.x), warp = tid / 32, lane = tid % 32;
+
+    // The column's queries, every head, swizzled.
+    {
+        const bf16* q = qa + static_cast<std::int64_t>(column) * kLatent * kMmaHeads;
+        for (int i = tid; i < kMmaHeads * kMmaChunks; i += kMmaThreads) {
+            const int h = i / kMmaChunks, c = i % kMmaChunks;
+            *reinterpret_cast<uint4*>(q_s + swizzled(h, c)) =
+                *reinterpret_cast<const uint4*>(q + static_cast<std::int64_t>(h) * kLatent + 8 * c);
+        }
+    }
+    if (tid < kMmaHeads) {
+        m_s[tid] = -INFINITY;
+        l_s[tid] = 0.0F;
+    }
+
+    // Score phase tiling, and the value phase's accumulators: heads 16 mt + lane / 4 (+ 8) by
+    // latent dimensions 64 warp + 8 nt + 2 (lane % 4) (+ 1).
+    const int score_mt = warp % 4, score_nt = warp / 4;
+    float acc[4][8][4];
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { acc[mt][nt][i] = 0.0F; }
+        }
+    }
+
+    for (int first = 0; first < total; first += kMmaTokens) {
+        const int n_tok = min(kMmaTokens, total - first);
+        if (tid < kMmaTokens) {
+            const int index = first + tid;
+            std::int64_t at = -1;
+            if (tid < n_tok) {
+                const int position =
+                    dense ? index
+                          : attended_position(index, count, pool, pools, top, column, tail_base);
+                at = (static_cast<std::int64_t>(table[position >> kPagedKVPageShift]) * kPagedKVPageSize +
+                      (position & kPagedKVPageMask)) *
+                     kLatent;
+            }
+            offset[tid] = at;
+        }
+        __syncthreads();
+        // The tile's rows as BF16 (zero past the tile's tokens, so their weights of 0 stay 0).
+        if constexpr (kInt8) {
+            for (int i = tid; i < kMmaTokens * (kLatent / 16); i += kMmaThreads) {
+                const int j = i / (kLatent / 16), ch = i % (kLatent / 16);
+                __align__(16) bf16 v[16];
+                if (offset[j] >= 0) {
+                    const uint4 raw  = *reinterpret_cast<const uint4*>(pages + offset[j] + 16 * ch);
+                    const auto* code = reinterpret_cast<const std::int8_t*>(&raw);
+#pragma unroll
+                    for (int e = 0; e < 16; ++e) { v[e] = __float2bfloat16_rn(static_cast<float>(code[e])); }
+                } else {
+#pragma unroll
+                    for (int e = 0; e < 16; ++e) { v[e] = __float2bfloat16_rn(0.0F); }
+                }
+                *reinterpret_cast<uint4*>(k_s + swizzled(j, 2 * ch))     = reinterpret_cast<const uint4*>(v)[0];
+                *reinterpret_cast<uint4*>(k_s + swizzled(j, 2 * ch + 1)) = reinterpret_cast<const uint4*>(v)[1];
+            }
+            if (tid < kMmaTokens * kGroups) {
+                const int j = tid / kGroups, g = tid % kGroups;
+                scale_s[j][g] = offset[j] >= 0 ? __half2float(scales[offset[j] / kGroup + g]) : 0.0F;
+            }
+        } else {
+            for (int i = tid; i < kMmaTokens * kMmaChunks; i += kMmaThreads) {
+                const int j = i / kMmaChunks, ch = i % kMmaChunks;
+                *reinterpret_cast<uint4*>(k_s + swizzled(j, ch)) =
+                    offset[j] >= 0 ? *reinterpret_cast<const uint4*>(
+                                         pages + sizeof(bf16) * offset[j] + 16 * ch)
+                                   : make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        // Scores: heads 16 score_mt .., tokens 8 score_nt .. of the tile, over every dimension.
+        {
+            const int token0 = 8 * score_nt + 2 * (lane % 4);
+            float s[4]       = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+            for (int g = 0; g < kGroups; ++g) {
+                float part[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+                for (int kp = 0; kp < 2; ++kp) { // two pairs of 16-dimension steps
+                    const int chunk0 = g * 8 + kp * 4;
+                    unsigned b[4];
+                    ldmatrix_x4(b[0], b[1], b[2], b[3],
+                                smem_address(k_s + swizzled(8 * score_nt + lane % 8, chunk0 + lane / 8)));
+#pragma unroll
+                    for (int ks = 0; ks < 2; ++ks) {
+                        unsigned a[4];
+                        ldmatrix_x4(a[0], a[1], a[2], a[3],
+                                    smem_address(q_s + swizzled(16 * score_mt + lane % 16,
+                                                                chunk0 + 2 * ks + lane / 16)));
+                        mma_bf16(part[0], part[1], part[2], part[3], a[0], a[1], a[2], a[3],
+                                 b[2 * ks], b[2 * ks + 1]);
+                    }
+                }
+                if constexpr (kInt8) {
+                    const float s0 = scale_s[token0][g], s1 = scale_s[token0 + 1][g];
+                    s[0] += part[0] * s0;
+                    s[1] += part[1] * s1;
+                    s[2] += part[2] * s0;
+                    s[3] += part[3] * s1;
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) { s[i] += part[i]; }
+                }
+            }
+            const int row = 16 * score_mt + lane / 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int token = token0 + (i & 1);
+                score_s[row + 8 * (i / 2)][token] = token < n_tok ? s[i] * scale : -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        // Online softmax: four threads per head, four tokens each.
+        {
+            const int row = tid / 4, part = tid % 4;
+            float v[4];
+            float tmax = -INFINITY;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                v[e] = score_s[row][4 * part + e];
+                tmax = fmaxf(tmax, v[e]);
+            }
+            tmax              = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFU, tmax, 1));
+            tmax              = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFU, tmax, 2));
+            const float m_old = m_s[row];
+            const float m_new = fmaxf(m_old, tmax);
+            float sum         = 0.0F;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float p = v[e] == -INFINITY ? 0.0F : expf(v[e] - m_new);
+                score_s[row][4 * part + e] = p;
+                sum += p;
+            }
+            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 1);
+            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 2);
+            __syncwarp();
+            if (part == 0) {
+                const float alpha = m_old == -INFINITY ? 0.0F : expf(m_old - m_new);
+                a_s[row]          = alpha;
+                l_s[row]          = l_s[row] * alpha + sum;
+                m_s[row]          = m_new;
+            }
+        }
+        __syncthreads();
+
+        // Values: latent group `warp` of every head.
+        {
+            const int g = warp;
+            unsigned a_hi[4][4], a_lo[4][4];
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt) {
+                const int r0 = 16 * mt + lane / 4, k0 = 2 * (lane % 4);
+                const float alpha0 = a_s[r0], alpha1 = a_s[r0 + 8];
+#pragma unroll
+                for (int nt = 0; nt < 8; ++nt) {
+                    acc[mt][nt][0] *= alpha0;
+                    acc[mt][nt][1] *= alpha0;
+                    acc[mt][nt][2] *= alpha1;
+                    acc[mt][nt][3] *= alpha1;
+                }
+                float w0 = 1.0F, w1 = 1.0F, w8 = 1.0F, w9 = 1.0F;
+                if constexpr (kInt8) {
+                    w0 = scale_s[k0][g];
+                    w1 = scale_s[k0 + 1][g];
+                    w8 = scale_s[k0 + 8][g];
+                    w9 = scale_s[k0 + 9][g];
+                }
+                split_bf16(score_s[r0][k0] * w0, score_s[r0][k0 + 1] * w1, a_hi[mt][0], a_lo[mt][0]);
+                split_bf16(score_s[r0 + 8][k0] * w0, score_s[r0 + 8][k0 + 1] * w1, a_hi[mt][1], a_lo[mt][1]);
+                split_bf16(score_s[r0][k0 + 8] * w8, score_s[r0][k0 + 9] * w9, a_hi[mt][2], a_lo[mt][2]);
+                split_bf16(score_s[r0 + 8][k0 + 8] * w8, score_s[r0 + 8][k0 + 9] * w9, a_hi[mt][3],
+                           a_lo[mt][3]);
+            }
+#pragma unroll
+            for (int np = 0; np < 4; ++np) { // pairs of 8-dimension n-tiles
+                unsigned b[4];
+                ldmatrix_x4_t(b[0], b[1], b[2], b[3],
+                              smem_address(k_s + swizzled(lane % 16, g * 8 + 2 * np + lane / 16)));
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int nt = 2 * np + half;
+#pragma unroll
+                    for (int mt = 0; mt < 4; ++mt) {
+                        mma_bf16(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3],
+                                 a_hi[mt][0], a_hi[mt][1], a_hi[mt][2], a_hi[mt][3], b[2 * half],
+                                 b[2 * half + 1]);
+                        mma_bf16(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3],
+                                 a_lo[mt][0], a_lo[mt][1], a_lo[mt][2], a_lo[mt][3], b[2 * half],
+                                 b[2 * half + 1]);
+                    }
+                }
+            }
+        }
+        __syncthreads(); // the tile's rows, probabilities and offsets are free
+    }
+
+    // The normalized latent sums: ol (d, h, t) FP32.
+    float* out = ol + static_cast<std::size_t>(t) * kLatent * kMmaHeads;
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) {
+        const int r0 = 16 * mt + lane / 4;
+        const float inv0 = 1.0F / l_s[r0], inv1 = 1.0F / l_s[r0 + 8];
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int d = 64 * warp + 8 * nt + 2 * (lane % 4);
+            *reinterpret_cast<float2*>(out + d + static_cast<std::size_t>(r0) * kLatent) =
+                make_float2(acc[mt][nt][0] * inv0, acc[mt][nt][1] * inv0);
+            *reinterpret_cast<float2*>(out + d + static_cast<std::size_t>(r0 + 8) * kLatent) =
+                make_float2(acc[mt][nt][2] * inv1, acc[mt][nt][3] * inv1);
+        }
+    }
+}
+
 // Combines a column's splits into its normalized latent sums: grid (heads, columns).
 __global__ void attention_merge_kernel(const float* __restrict__ partial, int heads,
                                        int splits_grid, int groups,
@@ -494,6 +791,16 @@ struct Carve {
     float* ol         = nullptr; // [latent, heads, chunk] FP32, the merged latent sums
 };
 
+// The tensor-core route keeps only the FP32 latent sums of a chunk of columns.
+Carve carve_mma(void* base, int columns) {
+    Carve out;
+    const std::size_t per_column = sizeof(float) * kMmaHeads * kLatent;
+    out.chunk = std::clamp<std::size_t>(kMmaChunkBudget / per_column, 1, static_cast<std::size_t>(columns));
+    out.bytes = align256(out.chunk * per_column);
+    out.ol    = static_cast<float*>(base);
+    return out;
+}
+
 Carve carve(void* base, const MlaAttentionGeometry& geometry, int columns, int splits) {
     Carve out;
     out.splits = splits;
@@ -623,6 +930,10 @@ std::size_t mla_sparse_attention_workspace_bytes(const MlaAttentionGeometry& geo
                                                  MlaAttentionExecutionEnvelope envelope) {
     require_geometry(geometry);
     require(columns > 0 && max_context > 0 && envelope.splits >= 0, "invalid workspace profile");
+    if (envelope.tensor_cores) {
+        require(geometry.heads == kMmaHeads, "the tensor-core route needs 64 heads");
+        return carve_mma(nullptr, columns).bytes;
+    }
     return carve(nullptr, geometry, columns, resolve_splits(max_context, envelope)).bytes;
 }
 
@@ -655,7 +966,9 @@ void mla_sparse_attention(const Tensor& qa, const Tensor& w_uv, const MlaLatentB
         require(selected.pool > 0 && selected.pool < kPagedKVPageSize, "pool must be in (0, 64)");
     }
     const int splits = resolve_splits(max_context, envelope);
-    Carve ws         = carve(workspace, geometry, columns, splits);
+    if (envelope.tensor_cores) { require(geometry.heads == kMmaHeads, "the tensor-core route needs 64 heads"); }
+    Carve ws = envelope.tensor_cores ? carve_mma(workspace, columns)
+                                     : carve(workspace, geometry, columns, splits);
     require(workspace != nullptr && workspace_bytes >= ws.bytes, "workspace is too small");
     const auto* pages  = static_cast<const unsigned char*>(cache.pages.data);
     const auto* scales = static_cast<const __half*>(cache.scales.data);
@@ -667,6 +980,38 @@ void mla_sparse_attention(const Tensor& qa, const Tensor& w_uv, const MlaLatentB
     const auto* cnt_p  = sparse ? static_cast<const std::int32_t*>(counts->data) : nullptr;
     const int top      = sparse ? pools->ne[0] : 0;
     const int pool     = sparse ? selected.pool : 4;
+    const int row_blocks = ceil_div(static_cast<std::int64_t>(geometry.heads) * kHeadDim, 8);
+    if (envelope.tensor_cores) {
+        static const bool attributes = [] {
+            CUDA_CHECK(cudaFuncSetAttribute(attention_mma_kernel<false>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(MmaShared::kBytes)));
+            CUDA_CHECK(cudaFuncSetAttribute(attention_mma_kernel<true>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(MmaShared::kBytes)));
+            return true;
+        }();
+        (void)attributes;
+        for (int begin = 0; begin < columns; begin += static_cast<int>(ws.chunk)) {
+            const int n = std::min<int>(static_cast<int>(ws.chunk), columns - begin);
+            const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(n)), dim3(kMmaThreads), MmaShared::kBytes, stream};
+            if (int8) {
+                CUDA_CHECK(pdl::launch_consumer(launch, attention_mma_kernel<true>, static_cast<const bf16*>(qa.data),
+                                                pages, scales, tables, stride, rows, pos, batch.width, pool_p, cnt_p,
+                                                top, pool, scale, begin, ws.ol));
+            } else {
+                CUDA_CHECK(pdl::launch_consumer(launch, attention_mma_kernel<false>, static_cast<const bf16*>(qa.data),
+                                                pages, scales, tables, stride, rows, pos, batch.width, pool_p, cnt_p,
+                                                top, pool, scale, begin, ws.ol));
+            }
+            CUDA_CHECK(pdl::launch_consumer(
+                {dim3(static_cast<unsigned>(row_blocks)), dim3(256), 0, stream}, project_kernel<float>,
+                static_cast<const float*>(ws.ol), static_cast<const bf16*>(w_uv.data), geometry.heads, n, begin,
+                static_cast<bf16*>(out.data)));
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     for (int begin = 0; begin < columns; begin += static_cast<int>(ws.chunk)) {
         const int n = std::min<int>(static_cast<int>(ws.chunk), columns - begin);
         const dim3 grid(static_cast<unsigned>(splits), static_cast<unsigned>(ws.groups),
@@ -689,7 +1034,6 @@ void mla_sparse_attention(const Tensor& qa, const Tensor& w_uv, const MlaLatentB
              0, stream},
             attention_merge_kernel, ws.partial, geometry.heads, splits, ws.groups, pos, cnt_p,
             pool_p, top, pool, begin, ws.ol));
-        const int row_blocks = ceil_div(static_cast<std::int64_t>(geometry.heads) * kHeadDim, 8);
         CUDA_CHECK(pdl::launch_consumer(
             {dim3(static_cast<unsigned>(row_blocks)), dim3(256), 0, stream}, project_kernel<float>,
             static_cast<const float*>(ws.ol), static_cast<const bf16*>(w_uv.data), geometry.heads,

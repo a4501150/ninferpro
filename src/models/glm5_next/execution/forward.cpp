@@ -10,6 +10,7 @@
 #include "infernix/ops/projection_fp32.h"
 #include "infernix/ops/rmsnorm.h"
 #include "infernix/ops/rows.h"
+#include "infernix/ops/scatter.h"
 #include "infernix/ops/silu_mul.h"
 
 #include <algorithm>
@@ -42,7 +43,7 @@ constexpr std::size_t kAlign = 256; // the arena's per-allocation alignment
 
 std::size_t aligned(std::size_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; }
 
-// Prefill calls of at least this many columns attend without key splits.
+// Prefill calls of at least this many columns attend on the tensor-core route.
 constexpr std::int32_t kPrefillAttentionWidth = 64;
 
 } // namespace
@@ -105,7 +106,8 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
         aligned(std::max(ops::mla_sparse_attention_workspace_bytes(mg, static_cast<std::int32_t>(t),
                                                                    max_context, {}),
                          ops::mla_sparse_attention_workspace_bytes(mg, static_cast<std::int32_t>(t),
-                                                                   max_context, {.splits = 1})));
+                                                                   max_context,
+                                                                   {.tensor_cores = true})));
 
     const auto mlp_bytes = [&](std::size_t intermediate) { return 3 * aligned(intermediate * t * bf) + y; };
     const std::size_t e = c.moe.experts, k = c.moe.top_k;
@@ -128,57 +130,99 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
 }
 
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
-    const cudaStream_t s = device_.stream;
+    if (logits.dtype != DType::FP32 || logits.ne[0] != dim(config_.vocab_size) ||
+        logits.ne[1] != batch.logit_columns.ne[0]) {
+        throw std::invalid_argument("Glm5Next forward: batch geometry is invalid");
+    }
+    begin_call(batch);
     const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size), S = dim(config_.hc.streams);
-    const bool verify = batch.verify != nullptr;
+    CallColumns columns{.residual = work_.alloc(DType::BF16, {dim(config_.residual_width()), T}),
+                        .x        = work_.alloc(DType::BF16, {H, T}),
+                        .post     = work_.alloc(DType::FP32, {S, T}),
+                        .comb     = work_.alloc(DType::FP32, {S, S, T})};
+    embed(batch, columns);
+    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
+        step(l, batch, columns, {}, tap);
+    }
+    finish(batch, columns, &logits);
+}
+
+void Forward::begin_call(const ForwardBatch& batch) {
+    const std::int32_t T = batch.ids.ne[0];
+    const bool verify    = batch.verify != nullptr;
     if (batch.batch <= 0 || batch.width <= 0 || batch.batch * batch.width != T ||
         (batch.width > 1 && batch.batch != 1 && !verify) || batch.batch > 8 ||
         batch.positions.ne[0] != T || batch.slots.ne[0] != batch.batch ||
         batch.table_rows.ne[0] != batch.batch ||
         (batch.width > 1 && !verify && batch.host_slots.size() != 1) ||
-        (verify && (batch.width > 16 || batch.verify->size() != config_.kda_layers)) ||
-        logits.dtype != DType::FP32 || logits.ne[0] != dim(config_.vocab_size) ||
-        logits.ne[1] != batch.logit_columns.ne[0]) {
+        (verify && (batch.width > 16 || batch.verify->size() != config_.kda_layers))) {
         throw std::invalid_argument("Glm5Next forward: batch geometry is invalid");
     }
     // A verify round runs like a decode round (the expert fork and landing frames).
     eager_ = batch.width > 1 && !verify;
     work_.reset();
-    Tensor residual = work_.alloc(DType::BF16, {dim(config_.residual_width()), T});
-    Tensor x        = work_.alloc(DType::BF16, {H, T});
-    Tensor post     = work_.alloc(DType::FP32, {S, T});
-    Tensor comb     = work_.alloc(DType::FP32, {S, S, T});
+}
+
+void Forward::embed(const ForwardBatch& batch, CallColumns& columns) {
+    const cudaStream_t s = device_.stream;
+    const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size),
+                       S = dim(config_.hc.streams);
     {
         auto scope = work_.scope();
         Tensor x0  = work_.alloc(DType::BF16, {H, T});
         ops::embedding(batch.ids, parameters_.token_embedding, x0, s,
                        DeviceFault{.word = experts_.error, .value = kErrorTokenId});
-        ops::hyper_connection_expand(x0, S, residual, s);
+        if (batch.vision_columns.data != nullptr) {
+            ops::scatter(batch.vision_embeddings, batch.vision_columns, x0, s);
+        }
+        ops::hyper_connection_expand(x0, S, columns.residual, s);
     }
-    mix(parameters_.layers[0].attn_hc, residual, x, post, comb);
-    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
-        try {
-            layer(l, batch, residual, post, comb, x, tap);
-        } catch (const std::exception& error) {
-            throw std::runtime_error("glm5_next/layers/" + std::to_string(l) + ": " + error.what());
-        }
-        if (batch.draft_features.data != nullptr) {
-            const std::int32_t n = batch.draft_features.ne[1];
-            if (n > T) { throw std::invalid_argument("Glm5Next forward: DFlash2 features exceed the call"); }
-            capture_draft_features(l, residual.slice(1, T - n, n), batch.draft_features);
-        }
-        if (tap != nullptr && tap->residuals != nullptr) {
-            CUDA_CHECK(cudaMemcpyAsync(tap->residuals->at(l).data, residual.data, residual.bytes(),
-                                       cudaMemcpyDeviceToDevice, s));
-        }
+    mix(parameters_.layers[0].attn_hc, columns.residual, columns.x, columns.post, columns.comb);
+}
+
+void Forward::step(std::uint32_t l, const ForwardBatch& batch, CallColumns& columns,
+                   StreamUse stream, const ForwardTap* tap) {
+    const std::int32_t T = batch.ids.ne[0];
+    stream_              = stream;
+    try {
+        layer(l, batch, columns.residual, columns.post, columns.comb, columns.x, tap);
+    } catch (const std::exception& error) {
+        throw std::runtime_error("glm5_next/layers/" + std::to_string(l) + ": " + error.what());
     }
+    if (batch.draft_features.data != nullptr) {
+        const std::int32_t n = batch.draft_features.ne[1];
+        if (n > T) {
+            throw std::invalid_argument("Glm5Next forward: DFlash2 features exceed the call");
+        }
+        capture_draft_features(l, columns.residual.slice(1, T - n, n), batch.draft_features);
+    }
+    if (tap != nullptr && tap->residuals != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(tap->residuals->at(l).data, columns.residual.data,
+                                   columns.residual.bytes(), cudaMemcpyDeviceToDevice,
+                                   device_.stream));
+    }
+}
+
+void Forward::finish(const ForwardBatch& batch, const CallColumns& columns, Tensor* logits) {
+    const cudaStream_t s   = device_.stream;
+    const Tensor& residual = columns.residual;
     if (batch.residual_out.data != nullptr) {
         CUDA_CHECK(cudaMemcpyAsync(batch.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
     }
+    if (batch.head_residual_out.data != nullptr) {
+        // The call's last column, as the head reads it (the saved column is BF16 [S*H]).
+        const std::size_t width = static_cast<std::size_t>(dim(config_.residual_width()));
+        CUDA_CHECK(cudaMemcpyAsync(batch.head_residual_out.data,
+                                   static_cast<std::byte*>(residual.data) +
+                                       (static_cast<std::size_t>(residual.ne[1]) - 1U) * width * 2U,
+                                   width * 2U, cudaMemcpyDeviceToDevice, s));
+    }
+    if (logits == nullptr) { return; }
     auto scope     = work_.scope();
-    Tensor columns = work_.alloc(DType::BF16, {dim(config_.residual_width()), batch.logit_columns.ne[0]});
-    ops::gather_columns(residual, batch.logit_columns, columns, s);
-    head(columns, logits);
+    Tensor gathered =
+        work_.alloc(DType::BF16, {dim(config_.residual_width()), batch.logit_columns.ne[0]});
+    ops::gather_columns(residual, batch.logit_columns, gathered, s);
+    head(gathered, *logits);
 }
 
 void Forward::head_logits(const Tensor& residuals, Tensor& logits) {
@@ -430,10 +474,10 @@ Tensor Forward::mla(const MlaParameters& p, const Tensor& x, std::uint32_t index
         Tensor qa = work_.alloc(DType::BF16, {KR, NH, T});
         ops::mla_absorbed_q_projection(q.view({DN, NH, T}), p.key_up, qa, s);
         const ops::MlaSelectedPools selected{.pools = &pools, .counts = &counts, .pool = index_geometry.pool};
-        // A prefill call's columns fill the card without key splits; the automatic splits' partials
-        // would leave the workspace a few columns per launch.
+        // A prefill call's columns fill the card one column per CTA, all heads sharing its tokens;
+        // the split route's partials would leave the workspace a few columns per launch.
         const ops::MlaAttentionExecutionEnvelope envelope{
-            .splits = batch.verify == nullptr && batch.width >= kPrefillAttentionWidth ? 1 : 0};
+            .tensor_cores = batch.verify == nullptr && batch.width >= kPrefillAttentionWidth};
         const std::size_t bytes = ops::mla_sparse_attention_workspace_bytes(geometry, T, max_context_, envelope);
         const DeviceSpan workspace = work_.alloc_bytes(bytes);
         ops::mla_sparse_attention(qa, p.value_up, cache.latent, sparse, selected, geometry,
@@ -537,7 +581,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
             ? experts_.stream
             : nullptr;
     if (streaming != nullptr) {
-        streaming->before_experts(moe_layer, s);
+        if (stream_.first) { streaming->before_experts(moe_layer, s); }
         source.prefetched      = streaming->slots(moe_layer);
         source.prefetch_base   = streaming->base();
         source.prefetch_stride = streaming->pitch(); // the ring's slots: the largest record
@@ -558,7 +602,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
         CUDA_CHECK(cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s));
     }
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/true, planned);
-    if (streaming != nullptr) { streaming->after_experts(moe_layer, s); }
+    if (streaming != nullptr && stream_.last) { streaming->after_experts(moe_layer, s); }
     // The shared expert is ungated: noaux_tc routing sets every shared gate to 1.
     const Tensor shared = mlp(p.shared, x);
     ops::moe_combine(outputs, routing, shared, y, s);

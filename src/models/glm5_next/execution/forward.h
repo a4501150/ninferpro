@@ -112,12 +112,19 @@ struct ForwardBatch {
     std::int32_t width = 0;
     // When set: BF16 [S*H, T] copy of the final residual.
     Tensor residual_out;
+    // When set: BF16 [S*H, 1] copy of the final residual of the call's last column (the prefix
+    // cache's prompt-end capture: the zero-token resume regenerates the first token from it).
+    Tensor head_residual_out;
     // DFlash2 target features (docs/maintainer/dflash.md): when set, BF16 [taps * H, n] receives,
     // for the call's last n columns, the stream mean of each tapped layer's completed residual
     // (tap i at rows [i * H, (i + 1) * H)). n <= T.
     Tensor draft_features;
     // When set, the call verifies (one record per KDA block): width > 1 with any batch.
     const std::vector<KdaVerifyRecord>* verify = nullptr;
+    // Media embeddings (the vision tower's output, BF16 [H, n]) that replace the token embeddings
+    // of the call's columns vision_columns (I32 [n]) before the stream expansion. Empty: none.
+    Tensor vision_embeddings;
+    Tensor vision_columns;
 };
 
 // Optional observation of every block, for reference comparison.
@@ -138,6 +145,36 @@ public:
 
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
+
+    // The steps run() composes, for a prefill layer walk (glm5_3-flash-design.md §17.1): a walk
+    // runs each layer over every chunk of its span before the next layer, so the chunk's residual
+    // stream and its mHC state live in caller memory between steps. Chunk c's layer l reads what
+    // the chunk-major call c reads there (its own columns, the layer's caches and state after
+    // chunks 0..c-1), so every bit equals the chunk-major prefill's.
+    struct CallColumns {
+        Tensor residual; // BF16 [S*H, T]
+        Tensor x;        // BF16 [H, T]: the next half-layer's mHC mix
+        Tensor post;     // FP32 [S, T]
+        Tensor comb;     // FP32 [S, S, T]
+    };
+
+    // The expert stream's layer boundaries a step crosses: a walk's layer waits for the layer's
+    // copies before its first chunk and frees the ring half after its last.
+    struct StreamUse {
+        bool first = true;
+        bool last  = true;
+    };
+
+    // Validates the call, selects its expert route and resets the workspace.
+    void begin_call(const ForwardBatch& batch);
+    // The token embedding, the stream expansion and layer 0's attention mix.
+    void embed(const ForwardBatch& batch, CallColumns& columns);
+    // Layer l (with its DFlash2 feature and tap copies).
+    void step(std::uint32_t l, const ForwardBatch& batch, CallColumns& columns, StreamUse stream,
+              const ForwardTap* tap = nullptr);
+    // The final-residual copies the batch names and, with `logits`, the head over its logit
+    // columns.
+    void finish(const ForwardBatch& batch, const CallColumns& columns, Tensor* logits);
 
     // FP32 logits [V, n] of n final residuals (BF16 [S*H, n], ForwardBatch::residual_out): the
     // stream mean, the final norm and the LM head, as run() applies them to its logit columns.
@@ -179,6 +216,7 @@ private:
     std::int32_t max_context_;
     std::vector<std::uint32_t> draft_taps_; // the DFlash2 drafter's target layers (empty without it)
     bool eager_ = false;                    // the call is a prefill chunk (one sequence, several positions)
+    StreamUse stream_{};                    // the current step's expert stream boundaries
 };
 
 } // namespace infernix::models::glm5_next::execution

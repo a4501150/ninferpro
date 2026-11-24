@@ -1,14 +1,15 @@
 #pragma once
 
-// Streams the Vision tower's weights from their pinned host block through device staging
-// (docs/maintainer/qwen3_8-flash-next-design.md §16.5): a prelude region (patch and position
-// embedding), two layer slots refilled one layer ahead of compute, and a merger region. All
-// synchronization is device-side (events); the host never blocks between layers. Shared by
-// Qwen3.5's overlay window and Qwen4Exp's encode window; Program-free.
+// Streams a vision tower's weights from their pinned host block through device staging: a
+// prelude region, two layer slots
+// refilled one layer ahead of compute, and a merger region. All synchronization is device-side
+// (events); the host never blocks between layers. Program-free; a family rebases its own
+// parameters onto the staging through prelude(), layer() and merger().
 
 #include "core/device.h"
-#include "models/qwen_common/execution/parameters.h"
-#include "models/qwen_common/load/vision_overlay.h"
+#include "core/tensor.h"
+#include "core/weight.h"
+#include "models/common/vision/overlay_layout.h"
 
 #include <cuda_runtime.h>
 
@@ -16,12 +17,7 @@
 #include <cstdint>
 #include <span>
 
-namespace infernix::models::qwen_common::execution {
-
-// Staging regions start on 256-byte boundaries.
-[[nodiscard]] constexpr std::size_t vision_staging_align(std::size_t bytes) noexcept {
-    return (bytes + 255) / 256 * 256;
-}
+namespace infernix::models::common {
 
 class VisionWeightStream {
 public:
@@ -37,12 +33,18 @@ public:
     VisionWeightStream(const VisionWeightStream&)            = delete;
     VisionWeightStream& operator=(const VisionWeightStream&) = delete;
 
-    // Rebased view of the host weights: every layer's tensors point at the slot that will hold the
-    // layer when arrive(layer) admits it.
-    [[nodiscard]] VisionParameters window_weights(const VisionParameters& host) const;
+    // A pinned weight rebased onto the staging that holds it: the prelude's, the merger's, or the
+    // slot that holds `layer` once arrive(layer) admits it. A null pointer stays null; one outside
+    // the group throws std::logic_error.
+    [[nodiscard]] Tensor prelude(const Tensor& host) const;
+    [[nodiscard]] Weight prelude(const Weight& host) const;
+    [[nodiscard]] Tensor layer(std::uint32_t layer, const Tensor& host) const;
+    [[nodiscard]] Weight layer(std::uint32_t layer, const Weight& host) const;
+    [[nodiscard]] Tensor merger(const Tensor& host) const;
+    [[nodiscard]] Weight merger(const Weight& host) const;
 
-    // Starts another pass over the layers (Qwen3.5 encodes one item per pass): uploads of layers 0
-    // and 1 follow everything already submitted on `compute`, which still reads the slots.
+    // Starts another pass over the layers (a family that encodes one item per pass): uploads of
+    // layers 0 and 1 follow everything already submitted on `compute`, which still reads the slots.
     void reset(cudaStream_t compute);
 
     void prelude_ready(cudaStream_t compute);
@@ -78,4 +80,4 @@ private:
     std::size_t upload_bytes_  = 0;
 };
 
-} // namespace infernix::models::qwen_common::execution
+} // namespace infernix::models::common

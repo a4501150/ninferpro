@@ -21,9 +21,10 @@ objects_for(const std::vector<loading::PendingWeight>& pending, WeightId id) {
 
 } // namespace
 
-qwen_common::VisionOverlayLayout compute_vision_overlay_layout(const ModelWeights& weights,
-                                                  const std::vector<loading::PendingWeight>& pending,
-                                                  const artifact::MaterializationPlan& plan) {
+common::VisionOverlayLayout
+compute_vision_overlay_layout(const ModelWeights& weights,
+                              const std::vector<loading::PendingWeight>& pending,
+                              const artifact::MaterializationPlan& plan) {
     if (!weights.vision) { throw std::logic_error("vision overlay layout requires vision weights"); }
     const VisionWeights& vision = *weights.vision;
     const auto handles = [&](std::initializer_list<WeightId> ids) {
@@ -41,10 +42,12 @@ qwen_common::VisionOverlayLayout compute_vision_overlay_layout(const ModelWeight
                                   s.query_bias, s.key_bias, s.value_bias, s.output, s.output_bias, s.fc1, s.fc1_bias,
                                   s.fc2, s.fc2_bias}));
     }
-    return qwen_common::make_vision_overlay_layout(
-        plan, handles({vision.patch_embedding, vision.patch_embedding_bias, vision.position_embedding}), layers,
-        handles({vision.merger_norm.weight, vision.merger_norm.bias, vision.merger_fc1, vision.merger_fc1_bias,
-                 vision.merger_fc2, vision.merger_fc2_bias}));
+    return common::make_vision_overlay_layout(
+        plan,
+        handles({vision.patch_embedding, vision.patch_embedding_bias, vision.position_embedding}),
+        layers,
+        handles({vision.merger_norm.weight, vision.merger_norm.bias, vision.merger_fc1,
+                 vision.merger_fc1_bias, vision.merger_fc2, vision.merger_fc2_bias}));
 }
 
 } // namespace infernix::models::qwen3_5

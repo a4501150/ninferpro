@@ -16,8 +16,12 @@ namespace infernix::models::glm5_next::detail {
 namespace {
 
 // Misses staged per pass of a layer's experts: frame-sized slots, so each costs a cached expert's
-// VRAM (glm5_3-flash-design.md §10.3).
+// VRAM (glm5_3-flash-design.md §10.3). A decode or verify call keeps the fork route of
+// ops::moe_experts (staging beside the resident experts, staged misses landing in the cache) only
+// while its top_k x columns jobs fit the slots, and that route covers calls of at most
+// kForkColumns columns.
 constexpr std::int32_t kStagingSlots = 32;
+constexpr std::int32_t kForkColumns  = 8;
 
 } // namespace
 
@@ -104,6 +108,7 @@ DeviceLayout ProgramImpl::plan_device(const ProgramOptions& o, const Config& con
     d.io.rows      = take(4 * lanes);
     d.io.columns   = take(4 * columns);
     d.io.bytes     = at;
+    d.vision_io    = config.vision ? align(4 * columns) : 0; // a call's media columns
 
     const auto vocab = static_cast<std::size_t>(c.vocab_size);
     const auto round     = lanes * static_cast<std::size_t>(d.width); // a round's logit columns
@@ -169,6 +174,27 @@ DeviceLayout ProgramImpl::plan_device(const ProgramOptions& o, const Config& con
         io.words             = take(0);
     }
     d.work += sampling;
+    if (o.prefix_cache) {
+        if (o.prefill_chunk % kPagedKVPageSize != 0) {
+            throw std::invalid_argument("Glm5Next: the prefix cache snapshots only chunk-grid "
+                                        "state (--prefill-chunk must be a "
+                                        "multiple of 64)");
+        }
+        // The prefix cache's Device staging: the prompt-end captures' fixed slots (the packed state
+        // image, min(lanes, 2) of them) and every lane's saved head residual. The image's layout
+        // (and its size) comes from the state spec alone.
+        prefix::DraftRingGeometry ring;
+        if (d.draft > 0) {
+            const auto lanes32 = static_cast<std::uint32_t>(d.lanes);
+            ring.layers        = static_cast<std::uint32_t>(d.ring_layout.k.size());
+            ring.k_bytes       = d.ring_layout.k.at(0).region.bytes / lanes32;
+            ring.v_bytes       = d.ring_layout.v.at(0).region.bytes / lanes32;
+        }
+        const prefix::StateImageLayout image = prefix::plan_state_image(
+            prefix::state_image_spec(c, ring, dim(c.residual_width()) * 2U));
+        d.prefix_staging = (std::min<std::size_t>(lanes, 2U)) * image.image_bytes;
+        d.head_saved     = align(dim(c.residual_width()) * 2U);
+    }
     if (o.causal_scoring) {
         d.score_residuals = align(2ULL * c.residual_width() * o.max_context);
         d.score_logits    = align(4 * vocab * kScoreTileColumns);
@@ -180,7 +206,11 @@ DeviceLayout ProgramImpl::plan_device(const ProgramOptions& o, const Config& con
     const std::uint64_t shape[] = {c.moe.experts, c.hidden_size, c.moe.intermediate};
     const std::uint64_t record_stride =
         weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16, shape).record_stride;
-    d.staging_slots = kStagingSlots;
+    // The widest decode or verify call: a plain round of every lane, or a one-row verification
+    // (only one-row rounds draft, execution.cpp).
+    const std::int32_t round_columns = std::min(std::max(d.lanes, d.width), kForkColumns);
+    d.staging_slots =
+        std::max(kStagingSlots, static_cast<std::int32_t>(c.moe.top_k) * round_columns);
     d.staging       = static_cast<std::size_t>(d.staging_slots) * record_stride;
 
     auto& b     = d.bytes;
@@ -189,9 +219,11 @@ DeviceLayout ProgramImpl::plan_device(const ProgramOptions& o, const Config& con
     b.staging   = d.staging;
     b.state     = d.kda_bytes + d.index_ring;
     b.draft     = d.features + d.ring + d.records;
-    b.io = d.io.bytes + d.logits32 + d.logits16 + align(4 * lanes) * 2 + 4 * d.dflash_io.words +
-           align(sizeof(ops::SamplingConfig) * lanes) + d.token_counts + d.constraint + d.grammar +
-           d.score_residuals + d.score_logits + d.score_logits16 + d.score_io;
+    b.prefix    = d.prefix_staging + d.head_saved * lanes;
+    b.io = d.io.bytes + d.vision_io + d.logits32 + d.logits16 + align(4 * lanes) * 2 +
+           4 * d.dflash_io.words + align(sizeof(ops::SamplingConfig) * lanes) + d.token_counts +
+           d.constraint + d.grammar + d.score_residuals + d.score_logits + d.score_logits16 +
+           d.score_io;
     b.residency            = offload::ExpertResidency::table_bytes(bank_geometry(c), d.columns);
     b.expert_record_stride = record_stride;
     b.max_frames           = offload::ExpertResidency::max_frames(bank_geometry(c));
@@ -233,8 +265,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
     tables_ = std::make_unique<KVExecutionTablePool>(kv_span, plan_.tables, *pool_);
 
     if (plan_.draft > 0) { allocate_dflash2(allocated); }
+    if (plan_.head_saved != 0) { allocate(head_saved_, plan_.head_saved * lanes, allocated); }
     allocate(io_device_, plan_.io.bytes, allocated);
     io_host_ = PinnedHostBuffer(plan_.io.bytes);
+    allocate(vision_io_device_, plan_.vision_io, allocated);
+    if (plan_.vision_io != 0) { vision_io_host_ = PinnedHostBuffer(plan_.vision_io); }
     allocate(logits32_, plan_.logits32, allocated);
     allocate(logits16_, plan_.logits16, allocated);
     allocate(sampled_, align(4 * lanes), allocated);
@@ -279,16 +314,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
     if (plane != plan_.geometry.planes.size()) {
         throw std::logic_error("Glm5Next: the KV planes do not match the page geometry");
     }
+    kv_geometry_ = prefix::kv_page_geometry(c_, options_.kv_cache);
     work_ = std::make_unique<WorkspaceArena>(plan_.work);
     allocated += plan_.work;
 
     execution::ForwardExperts experts;
     create_experts(experts, allocated);
-    if (allocated != plan_.bytes.fixed_bytes()) {
-        throw std::logic_error("Glm5Next: the Program's device allocations (" + std::to_string(allocated) +
-                               " bytes) differ from its device plan (" + std::to_string(plan_.bytes.fixed_bytes()) +
-                               " bytes)");
-    }
     forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, state, std::move(kv),
                                                     std::move(experts), dim(options_.max_context));
     if (plan_.draft > 0) {
@@ -299,6 +330,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
         drafter_ = std::make_unique<execution::DFlash2>(
             parameters_, device_, *work_, std::move(ring), options_.max_context,
             static_cast<std::uint32_t*>(device_error_.data()));
+    }
+    create_prefix_cache(allocated);
+    if (allocated != plan_.bytes.fixed_bytes()) {
+        throw std::logic_error("Glm5Next: the Program's device allocations (" +
+                               std::to_string(allocated) + " bytes) differ from its device plan (" +
+                               std::to_string(plan_.bytes.fixed_bytes()) + " bytes)");
     }
     device_.synchronize();
 }

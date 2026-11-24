@@ -4,7 +4,10 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "artifact/views.h"
+#include "models/common/vision/overlay_layout.h"
 #include "models/registry.h"
+
+#include "core/device.h"
 
 #include <algorithm>
 #include <cmath>
@@ -229,16 +232,114 @@ DFlash2Weights bind_dflash2(Bindings& b, const DFlash2Config& d, const TextConfi
     return out;
 }
 
+// The vision tower (tools/convert/glm5_next.py _Builder.vision names): on the device, or with
+// vision offload in pinned host memory.
+VisionWeights bind_vision(Bindings& b, const VisionConfig& v, Residency r) {
+    const std::uint64_t h = v.hidden_size, i = v.intermediate_size, o = v.out_hidden_size,
+                        pi = v.projection_intermediate_size, d = v.head_dim(),
+                        m = v.spatial_merge_size;
+    VisionWeights out;
+    out.patch_embedding =
+        b.parameter("vision/patch_embedding", {h, v.patch_width()}, "vision/patch_input", {}, r);
+    out.patch_embedding_bias = b.direct("vision/patch_embedding_bias", {h}, QType::BF16, r);
+    for (std::uint32_t l = 0; l < v.depth; ++l) {
+        const std::string p = "vision/layers/" + std::to_string(l) + "/", a = p + "attention/";
+        VisionBlockWeights layer;
+        layer.norm1       = b.direct(p + "norm1", {h}, QType::BF16, r);
+        layer.norm2       = b.direct(p + "norm2", {h}, QType::BF16, r);
+        layer.query       = b.parameter(a + "query", {h, h}, p + "attention_input", {}, r);
+        layer.key         = b.parameter(a + "key", {h, h}, p + "attention_input", {}, r);
+        layer.value       = b.parameter(a + "value", {h, h}, p + "attention_input", {}, r);
+        layer.query_bias  = b.direct(a + "query_bias", {h}, QType::BF16, r);
+        layer.key_bias    = b.direct(a + "key_bias", {h}, QType::BF16, r);
+        layer.value_bias  = b.direct(a + "value_bias", {h}, QType::BF16, r);
+        layer.query_norm  = b.direct(a + "query_norm", {d}, QType::BF16, r);
+        layer.key_norm    = b.direct(a + "key_norm", {d}, QType::BF16, r);
+        layer.output      = b.parameter(a + "output", {h, h}, p + "attention_output", {}, r);
+        layer.output_bias = b.direct(a + "output_bias", {h}, QType::BF16, r);
+        layer.gate        = b.parameter(p + "mlp/gate", {i, h}, p + "mlp_input", {}, r);
+        layer.gate_bias   = b.direct(p + "mlp/gate_bias", {i}, QType::BF16, r);
+        layer.up          = b.parameter(p + "mlp/up", {i, h}, p + "mlp_input", {}, r);
+        layer.up_bias     = b.direct(p + "mlp/up_bias", {i}, QType::BF16, r);
+        layer.down        = b.parameter(p + "mlp/down", {h, i}, p + "mlp_product", {}, r);
+        layer.down_bias   = b.direct(p + "mlp/down_bias", {h}, QType::BF16, r);
+        out.layers.push_back(layer);
+    }
+    out.post_norm  = b.direct("vision/post_norm", {h}, QType::BF16, r);
+    out.downsample = b.parameter("vision/downsample", {o, h, m, m}, "vision/merged_input", {}, r);
+    out.downsample_bias = b.direct("vision/downsample_bias", {o}, QType::BF16, r);
+    out.merger_projection =
+        b.parameter("vision/merger/projection", {o, o}, "vision/merger/input", {}, r);
+    out.merger_norm      = b.direct("vision/merger/post_projection_norm", {o}, QType::BF16, r);
+    out.merger_norm_bias = b.direct("vision/merger/post_projection_norm_bias", {o}, QType::BF16, r);
+    out.merger_gate = b.parameter("vision/merger/gate", {pi, o}, "vision/merger/activation", {}, r);
+    out.merger_up   = b.parameter("vision/merger/up", {pi, o}, "vision/merger/activation", {}, r);
+    out.merger_down = b.parameter("vision/merger/down", {o, pi}, "vision/merger/product", {}, r);
+    return out;
+}
+
+// The downsample's conv kernel [O, H, m, m] becomes [O, m*m, H] in place: the column of a merged
+// token is its m x m patches' H features one patch after another, so the convolution is one GEMM.
+void permute_downsample(const BoundWeight& weight, const VisionConfig& v) {
+    const WeightRegion region = contiguous_weight_region(weight.view);
+    const std::uint64_t o = v.out_hidden_size, h = v.hidden_size, area = v.merge_area();
+    if (region.parent == nullptr || region.parent->geometry.format != QType::BF16 ||
+        region.end - region.begin != o * h * area) {
+        throw ArtifactError(weight.name + ": the downsample must be one plain BF16 kernel");
+    }
+    auto* data = const_cast<std::byte*>(region.parent->data) + region.begin * sizeof(std::uint16_t);
+    const std::size_t bytes = o * h * area * sizeof(std::uint16_t);
+    std::vector<std::uint16_t> stored(o * h * area), permuted(stored.size());
+    CUDA_CHECK(cudaMemcpy(stored.data(), data, bytes, cudaMemcpyDefault)); // device or pinned
+    for (std::uint64_t row = 0; row < o; ++row) {
+        const std::uint16_t* in = stored.data() + row * h * area;
+        std::uint16_t* out      = permuted.data() + row * h * area;
+        for (std::uint64_t c = 0; c < h; ++c) {
+            for (std::uint64_t j = 0; j < area; ++j) { out[j * h + c] = in[c * area + j]; }
+        }
+    }
+    CUDA_CHECK(cudaMemcpy(data, permuted.data(), bytes, cudaMemcpyDefault));
+}
+
+// The pinned groups the encode streams (vision offload): the patch embedding, each layer, and
+// everything after the last layer.
+common::VisionOverlayLayout vision_overlay_layout(const VisionWeights& vision,
+                                                  const std::vector<PendingWeight>& pending,
+                                                  const artifact::MaterializationPlan& plan) {
+    const auto handles = [&](std::initializer_list<WeightId> ids) {
+        std::vector<artifact::ObjectHandle> out;
+        for (const WeightId id : ids) {
+            for (const auto& part : pending.at(id.index).reference.binding.parts) {
+                out.push_back(part.object);
+            }
+        }
+        return out;
+    };
+    std::vector<std::vector<artifact::ObjectHandle>> layers;
+    for (const VisionBlockWeights& l : vision.layers) {
+        layers.push_back(
+            handles({l.norm1, l.norm2, l.query, l.key, l.value, l.query_bias, l.key_bias,
+                     l.value_bias, l.query_norm, l.key_norm, l.output, l.output_bias, l.gate,
+                     l.gate_bias, l.up, l.up_bias, l.down, l.down_bias}));
+    }
+    return common::make_vision_overlay_layout(
+        plan, handles({vision.patch_embedding, vision.patch_embedding_bias}), layers,
+        handles({vision.post_norm, vision.downsample, vision.downsample_bias,
+                 vision.merger_projection, vision.merger_norm, vision.merger_norm_bias,
+                 vision.merger_gate, vision.merger_up, vision.merger_down}));
+}
+
 FrontendResources bind_resources(artifact::Binder& binder, const Config& config) {
-    const auto resource = [&](std::string_view role) {
-        const auto bytes = binder.host_object(binder.resource("text", role));
+    const auto resource = [&](std::string_view component, std::string_view role) {
+        const auto bytes = binder.host_object(binder.resource(component, role));
         return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     };
     FrontendResources out;
-    out.tokenizer_json         = resource("tokenizer.json");
-    out.tokenizer_config_json  = resource("tokenizer_config.json");
-    out.chat_template_jinja    = resource("chat_template.jinja");
-    out.generation_config_json = resource("generation_config.json");
+    out.tokenizer_json         = resource("text", "tokenizer.json");
+    out.tokenizer_config_json  = resource("text", "tokenizer_config.json");
+    out.chat_template_jinja    = resource("text", "chat_template.jinja");
+    out.generation_config_json = resource("text", "generation_config.json");
+    if (config.vision) { out.processor_config_json = resource("vision", "processor_config.json"); }
     // The frontend validates the token domain against the embedding rows.
     parse_resources(out, {.vocab_size = config.text.vocab_size});
     if (config.dflash2 && config.dflash2->selector_top_k > out.public_token_count) {
@@ -276,6 +377,7 @@ struct LoadPlan::Impl {
     FrontendResources resources;
     InstanceInfo info;
     std::uint64_t embedding_bytes = 0; // the token embedding's stored bytes (pinned)
+    std::optional<common::VisionOverlayLayout> vision_overlay; // vision offload
     // The DFlash2 companion (--draft-model): its Reader, its plan, and the first of its weights in
     // `pending` (the main artifact's come first).
     std::unique_ptr<artifact::Reader> draft_reader;
@@ -294,8 +396,11 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }
 
-// Besides the expert banks: the token embedding (bind_text).
-std::uint64_t LoadPlan::pinned_other_bytes() const { return impl_->embedding_bytes; }
+// Besides the expert banks: the token embedding (bind_text) and, with vision offload, the tower.
+std::uint64_t LoadPlan::pinned_other_bytes() const {
+    return impl_->embedding_bytes +
+           (impl_->vision_overlay ? impl_->vision_overlay->tower_bytes() : 0);
+}
 
 std::uint64_t LoadPlan::device_bytes() const {
     return impl_->materialization.device_capacity_bytes +
@@ -347,6 +452,11 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     Bindings bindings(binder, options.a16_activations);
     out->weights = bind_text(bindings, out->config.text,
                              options.stream_experts ? Residency::Streamed : Residency::HostPinned);
+    if (out->config.vision) {
+        out->weights.vision =
+            bind_vision(bindings, *out->config.vision,
+                        options.overlay_vision() ? Residency::HostPinned : Residency::Device);
+    }
     for (std::size_t i = out->config.text.dense_layers; i < out->weights.layers.size(); ++i) {
         for (const auto& part : bindings.weights.at(moe_of(out->weights.layers[i]).experts.index).reference.binding.parts) {
             const auto& tensor = reader.directory().tensor(part.object);
@@ -379,6 +489,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->draft_materialization = std::move(draft_binder).finish();
     }
     out->materialization = std::move(binder).finish();
+    if (out->weights.vision && options.overlay_vision()) {
+        out->vision_overlay =
+            vision_overlay_layout(*out->weights.vision, out->pending, out->materialization);
+    }
     out->info.name       = reader.directory().metadata.value(
         "name", std::string(architecture_name(Architecture::Glm5Next)));
     out->info.metadata_json   = reader.directory().metadata.dump();
@@ -388,14 +502,18 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     return LoadPlan(std::move(out));
 }
 
-Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
-             std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
-             artifact::MaterializedArtifact backing, std::optional<offload::ExpertStore> expert_store,
+Model::Model(Config config, LoadOptions options, TextWeights weights,
+             std::vector<BoundWeight> bound, std::vector<ExpertBank> banks,
+             FrontendResources resources, InstanceInfo info,
+             std::optional<common::VisionOverlayAssets> overlay_vision,
+             artifact::MaterializedArtifact backing,
+             std::optional<offload::ExpertStore> expert_store,
              std::optional<artifact::MaterializedArtifact> draft_backing)
     : backing_(std::move(backing)), draft_backing_(std::move(draft_backing)),
       expert_store_(std::move(expert_store)), config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
-      resources_(std::move(resources)), info_(std::move(info)) {}
+      resources_(std::move(resources)), info_(std::move(info)),
+      overlay_vision_(std::move(overlay_vision)) {}
 
 Model::~Model() = default;
 
@@ -420,6 +538,9 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         weight.view   = artifact::bind_view(item.reference,
                                             draft_backing && i >= data->draft_first ? *draft_backing : backing);
         bound.push_back(std::move(weight));
+    }
+    if (data->weights.vision) {
+        permute_downsample(bound.at(data->weights.vision->downsample.index), *data->config.vision);
     }
     std::vector<ExpertBank> banks;
     const auto& c = data->config.text;
@@ -461,10 +582,20 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         store.emplace(backing.stream_source(), bank_objects, std::move(bank_strides), c.moe.experts,
                       std::move(multipliers)); // the vectors move, so the planes' pointers stay valid
     }
-    return std::unique_ptr<Model>(new Model(std::move(data->config), data->options, std::move(data->weights),
-                                            std::move(bound), std::move(banks), std::move(data->resources),
-                                            std::move(data->info), std::move(backing), std::move(store),
-                                            std::move(draft_backing)));
+    std::optional<common::VisionOverlayAssets> overlay;
+    if (data->vision_overlay) {
+        const auto pinned = backing.pinned_bytes_range();
+        if (pinned.empty()) {
+            throw ArtifactError("vision offload requires a pinned materialization");
+        }
+        overlay = common::VisionOverlayAssets{.pinned_block = pinned.data(),
+                                              .pinned_bytes = pinned.size(),
+                                              .layout       = std::move(*data->vision_overlay)};
+    }
+    return std::unique_ptr<Model>(new Model(
+        std::move(data->config), data->options, std::move(data->weights), std::move(bound),
+        std::move(banks), std::move(data->resources), std::move(data->info), std::move(overlay),
+        std::move(backing), std::move(store), std::move(draft_backing)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

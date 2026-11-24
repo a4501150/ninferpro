@@ -33,7 +33,7 @@ struct LoadPlan::Impl {
     ModelWeights weights;
     std::vector<loading::PendingWeight> pending;
     artifact::MaterializationPlan materialization;
-    std::optional<qwen_common::VisionOverlayLayout> vision_overlay;
+    std::optional<common::VisionOverlayLayout> vision_overlay;
     qwen_common::FrontendResources resources;
     InstanceInfo info;
 };
@@ -58,7 +58,7 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }
 
-const std::optional<qwen_common::VisionOverlayLayout>& LoadPlan::vision_overlay_layout() const {
+const std::optional<common::VisionOverlayLayout>& LoadPlan::vision_overlay_layout() const {
     return impl_->vision_overlay;
 }
 
@@ -170,7 +170,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto backing = artifact::materialize(*data->materialization.source,
                                          std::move(data->materialization), device, observer,
                                          std::move(pool));
-    std::optional<qwen_common::VisionOverlayAssets> overlay;
+    std::optional<common::VisionOverlayAssets> overlay;
     if (data->options.overlay_vision()) {
         EvictableWeightPool* eviction = backing.eviction_pool();
         if (eviction == nullptr) {
@@ -181,12 +181,11 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         if (pinned.empty()) {
             throw std::logic_error("overlay vision requires a pinned materialization");
         }
-        overlay = qwen_common::VisionOverlayAssets{
-            .pool         = eviction,
-            .pinned_block = pinned.data(),
-            .pinned_bytes = pinned.size(),
-            .ladder_bytes = eviction->evictable_tail_bytes(),
-            .layout       = std::move(*data->vision_overlay)};
+        overlay = common::VisionOverlayAssets{.pool         = eviction,
+                                              .pinned_block = pinned.data(),
+                                              .pinned_bytes = pinned.size(),
+                                              .ladder_bytes = eviction->evictable_tail_bytes(),
+                                              .layout       = std::move(*data->vision_overlay)};
     }
     auto bound = loading::resolve_weights(std::move(data->pending), backing);
     return std::unique_ptr<Model>(new Model(

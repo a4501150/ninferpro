@@ -1,4 +1,4 @@
-#include "models/qwen_common/load/vision_overlay.h"
+#include "models/common/vision/overlay_layout.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace infernix::models::qwen_common {
+namespace infernix::models::common {
 namespace {
 
 // Pinned byte placement (offset, size) for each object, from the materialization plan.
@@ -33,14 +33,9 @@ struct PinnedRangeIndex {
     }
 };
 
-constexpr std::size_t kStagingAlignment = 256;
-
-std::size_t staging_align(std::size_t bytes) {
-    return (bytes + kStagingAlignment - 1) / kStagingAlignment * kStagingAlignment;
-}
-
 // Stage a group's distinct objects in the order listed, recording each object's pinned and
 // staged offsets. Objects shared by several bindings (for example a fused qkv) are staged once.
+// Each object starts on a staging boundary, whatever the sizes of the objects before it.
 VisionOverlayGroup build_group(const PinnedRangeIndex& index,
                                const std::vector<artifact::ObjectHandle>& handles) {
     VisionOverlayGroup group;
@@ -51,14 +46,26 @@ VisionOverlayGroup build_group(const PinnedRangeIndex& index,
         if (std::find(seen.begin(), seen.end(), handle.index) != seen.end()) { continue; }
         seen.push_back(handle.index);
         const auto [pinned, bytes] = index.lookup(handle);
+        staging                    = vision_staging_align(staging);
         group.segments.push_back(VisionOverlaySegment{pinned, staging, bytes});
         staging += bytes;
     }
-    group.bytes = staging;
+    group.bytes = vision_staging_align(staging);
     return group;
 }
 
 } // namespace
+
+std::size_t VisionOverlayLayout::tower_bytes() const noexcept {
+    std::size_t bytes = 0;
+    const auto add    = [&](const VisionOverlayGroup& group) {
+        for (const VisionOverlaySegment& segment : group.segments) { bytes += segment.bytes; }
+    };
+    add(prelude);
+    for (const VisionOverlayGroup& layer : layers) { add(layer); }
+    add(merger);
+    return bytes;
+}
 
 VisionOverlayLayout make_vision_overlay_layout(const artifact::MaterializationPlan& plan,
                                                const std::vector<artifact::ObjectHandle>& prelude,
@@ -74,9 +81,10 @@ VisionOverlayLayout make_vision_overlay_layout(const artifact::MaterializationPl
         out.layers.push_back(std::move(group));
     }
     out.merger        = build_group(index, merger);
-    out.staging_bytes = staging_align(out.prelude.bytes) + staging_align(out.merger.bytes) +
-                        2 * staging_align(out.slot_bytes);
+    out.staging_bytes = vision_staging_align(out.prelude.bytes) +
+                        vision_staging_align(out.merger.bytes) +
+                        2 * vision_staging_align(out.slot_bytes);
     return out;
 }
 
-} // namespace infernix::models::qwen_common
+} // namespace infernix::models::common

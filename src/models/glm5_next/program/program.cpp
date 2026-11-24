@@ -52,9 +52,30 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept { return impl_->feasible(base); }
 
-std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, std::uint32_t) {
-    return impl_->hybrid_sources(base);
+std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base,
+                                                     std::uint32_t maximum_frontier) {
+    return impl_->hybrid_sources(base, maximum_frontier);
 }
+
+bool Program::hybrid_reclaim(runtime::ContextResourceUsage) { return false; }
+
+std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) {
+    return impl_->hybrid_prefetch(base);
+}
+
+std::uint32_t Program::hybrid_prefetch_room() const noexcept {
+    return impl_->hybrid_prefetch_room();
+}
+
+void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
+    impl_->hybrid_hold_queue(queue);
+}
+
+bool Program::hybrid_holds_stale() const noexcept { return false; }
+
+std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
+
+HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 
 BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                           const SourceCandidate& source, ResumeState* resume, ExecutionUnitKind,

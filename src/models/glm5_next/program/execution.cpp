@@ -40,11 +40,14 @@ GenerationTimings ProgramImpl::timings(const Lane& lane) const {
 
 void ProgramImpl::release(std::uint32_t index) noexcept {
     Lane& lane = lanes_[index];
+    if (walk_.active && walk_.lane == index) { walk_abandon(); }
     if (stream_lease_.valid() && !prefilling_besides(index)) {
         try {
             return_stream_lease();
         } catch (...) {}
     }
+    vision_release(lane);
+    prefix_release(lane);
     lane.pages.clear();
     lane.reservation.reset();
     lane.row = KVExecutionRowLease{};
@@ -65,6 +68,10 @@ void ProgramImpl::release(std::uint32_t index) noexcept {
 void ProgramImpl::split_beside_decode(Lane& lane, std::uint32_t index) {
     const std::uint32_t cap = std::min<std::uint32_t>(beside_decode_chunk_, static_cast<std::uint32_t>(chunk_));
     if (cap == 0 || lane.calls[lane.next_call] - lane.state_tokens <= cap) { return; }
+    // A lane that publishes keeps the cold call grid: this family's exactness contract ties a
+    // snapshot's bits to the publishing run's call boundaries (projection routes are chosen by
+    // call width), so its prefill is not split beside another lane's decode.
+    if (lane.prefix.reuse) { return; }
     bool decoding = false;
     for (std::uint32_t other = 0; other < options_.max_concurrency; ++other) {
         decoding = decoding || (other != index && lanes_[other].phase == Phase::Decode);
@@ -133,6 +140,18 @@ void ProgramImpl::forward_call(std::int32_t batch, std::int32_t width, std::int3
     }
     // A scored prompt's calls keep their final residuals for the LM head (causal_score).
     if (scoring_) { fb.residual_out = score_residuals(score_column_, batch * width); }
+    // A prompt's last call keeps its final residual (the zero-token resume's head input).
+    if (head_saved_lane_ >= 0) {
+        fb.head_residual_out =
+            Tensor(static_cast<std::byte*>(head_saved_.p) +
+                       static_cast<std::size_t>(head_saved_lane_) * plan_.head_saved,
+                   DType::BF16, {width_, 1});
+        head_saved_lane_ = -1;
+    }
+    if (vision_call_lane_ >= 0) {
+        vision_batch(lanes_[static_cast<std::size_t>(vision_call_lane_)], vision_call_.first,
+                     vision_call_.second, static_cast<std::byte*>(vision_io_device_.p), fb);
+    }
     Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
     forward_->run(fb, logits);
     round_logits(logit_columns);
@@ -220,7 +239,7 @@ void ProgramImpl::run(std::int32_t batch, std::int32_t width, std::int32_t logit
     before_call(decode_round);
     // A prefill call wide enough streams its non-resident experts by copy-engine DMA two layers
     // ahead of compute (glm5_3-flash-design.md §17.2); decode and verification rounds never do.
-    const bool streamed = !decode_round && stream_chunk(width);
+    const bool streamed = !decode_round && !walk_.active && stream_chunk(width);
     if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s); }
     try {
         if (decode_round) {
@@ -323,8 +342,9 @@ void ProgramImpl::seed_prompt_experts(Lane& lane) {
 }
 
 void ProgramImpl::after_call(std::int32_t columns, std::size_t promotions) {
-    residency_->after_round(device_.stream, columns, promotions);
-    (void)placement_->apply_placement(false);
+    // An active layer walk's stream planned its copies against the frames of its start.
+    residency_->after_round(device_.stream, columns, walk_.active ? 0 : promotions);
+    if (!walk_.active) { (void)placement_->apply_placement(false); }
 }
 
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence, runtime::TokenMaskProvider* masks) {
@@ -333,8 +353,47 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence, runtime::T
     const auto index = lane_of(sequence);
     Lane& lane       = lanes_[index];
     if (lane.phase != Phase::Prefill) { throw std::logic_error("Glm5Next: prefill on a lane that is not prefilling"); }
+    if (walk_.active) {
+        if (walk_.lane != index) {
+            throw std::logic_error("Glm5Next: another lane's prefill holds the layer walk");
+        }
+        return walk_step(lane, index, start);
+    }
+    // The zero-token resume: the lane's state is the prompt's own end snapshot and its head's
+    // saved residual, so the first token regenerates from the residual through the head at the
+    // same width the cold run's last prefill call used (no prefill call at all).
+    if (lane.prefix.head_resume) {
+        lane.prefix.head_resume = false;
+        Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
+        const Tensor residual(static_cast<std::byte*>(head_saved_.p) +
+                                  static_cast<std::size_t>(index) * plan_.head_saved,
+                              DType::BF16, {width_, 1});
+        forward_->head_logits(residual, logits);
+        round_logits(1);
+        const std::uint32_t lanes[]    = {index};
+        const std::int32_t positions[] = {static_cast<std::int32_t>(lane.state_tokens - 1U)};
+        PrefillProgress out;
+        out.summary                 = lane.begin;
+        out.processed_prompt_tokens = 0;
+        out.complete                = true;
+        if (!lane.readout.empty()) { out.readout = read_prompt_frontier(lane); }
+        sample(lanes, positions); // synchronizes
+        const SequenceHandle rows[] = {handle(index)};
+        out.timing.submit_host_ns   = elapsed_ns(start);
+        lane.prefill_ns += out.timing.submit_host_ns;
+        pending_transaction_ = ++next_transaction_;
+        out.pending.emplace(ContractAccess::make_pending(this, pending_transaction_, rows,
+                                                         {pending_tokens_.data(), 1}, out.timing));
+        mark_row_failures(*out.pending);
+        return out;
+    }
     if (lane.next_call >= lane.calls.size() || lane.calls[lane.next_call] <= lane.state_tokens) {
         throw std::logic_error("Glm5Next: the lane's prefill plan does not continue its state");
+    }
+    if (lane.vision && !lane.vision->encoded) { vision_encode(lane); }
+    if (const std::size_t end = walk_span_end(lane); end > lane.next_call) {
+        walk_begin(lane, index, end);
+        return walk_step(lane, index, start);
     }
     split_beside_decode(lane, index);
     const auto begin         = static_cast<std::int32_t>(lane.state_tokens);
@@ -343,17 +402,45 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence, runtime::T
     // A call the size of a decode round promotes at the decode rate; wider prefill calls promote
     // nothing (their routes still count toward the cache's scores).
     const std::size_t promotions = width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
+    // The lane's pending copies (its restore, and the taps' capture of its state) land before the
+    // call reads or writes that state.
+    const auto restore_events = prefix_restore_wait(lane);
+    if (!restore_events.empty()) {
+        CUDA_CHECK(cudaStreamWaitEvent(device_.stream, restore_events.back(), 0));
+    }
+    const auto capture_events = prefix_capture_wait(lane);
+    if (!capture_events.empty()) {
+        CUDA_CHECK(cudaStreamWaitEvent(device_.stream, capture_events.back(), 0));
+    }
     stage_sequence(index, begin, width);
+    vision_call_ =
+        vision_columns(lane, static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(width),
+                       static_cast<std::int32_t*>(vision_io_host_.data()));
+    if (vision_call_.second != 0) {
+        vision_call_lane_ = static_cast<std::int32_t>(index);
+        CUDA_CHECK(cudaMemcpyAsync(vision_io_device_.p, vision_io_host_.data(),
+                                   4ULL * vision_call_.second, cudaMemcpyHostToDevice,
+                                   device_.stream));
+    }
     score_column_ = begin;
+    if (last) { head_saved_lane_ = static_cast<std::int32_t>(index); }
     run(1, width, 1, false);
+    vision_call_lane_ = -1;
     // The stream ring stays lent across the prompt's calls; it returns once the prompt's last is
     // enqueued (its compute has waited for every copy) and no lane is prefilling.
     if (last && !prefilling_besides(index)) { return_stream_lease(); }
     lane.state_tokens += static_cast<std::uint32_t>(width);
+    prefix_after_prefill_call(lane, index, last);
+    return after_prefill(lane, index, begin, width, static_cast<std::uint32_t>(width), last,
+                         promotions, start);
+}
 
+PrefillProgress ProgramImpl::after_prefill(Lane& lane, std::uint32_t index, std::int32_t begin,
+                                           std::int32_t width, std::uint32_t tokens, bool last,
+                                           std::size_t promotions, Clock::time_point start) {
     PrefillProgress out;
     out.summary                 = lane.begin;
-    out.processed_prompt_tokens = static_cast<std::uint32_t>(width);
+    out.processed_prompt_tokens = tokens;
     out.complete                = last;
     if (last) {
         const std::uint32_t lanes[]    = {index};
@@ -361,6 +448,7 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence, runtime::T
         // The readout reads the logits before the sampler's constraints mask them.
         if (!lane.readout.empty()) { out.readout = read_prompt_frontier(lane); }
         sample(lanes, positions); // synchronizes
+        vision_release(lane);     // the prompt's calls have read the handoff
         note_prompt_routes(lane, width);
         after_call(width, promotions);
         seed_prompt_experts(lane);
@@ -558,6 +646,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
         out.speculative       = lanes_[index].speculative;
         out.constrained_draws = std::move(lanes_[index].constraint_trace);
         out.expert_cache      = expert_cache_stats(lanes_[index]);
+        prefix_finish(lanes_[index], index);
         release(index);
         out.status = runtime::ConsumeStatus::Consumed;
     } catch (const std::exception& error) {
@@ -575,6 +664,9 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         const auto index = lane_of(sequence);
         out.timings      = timings(lanes_[index]);
         out.speculative  = lanes_[index].speculative;
+        // A consistent abort publishes the blocks the prompt prefilled (its prefill-computed
+        // prefix stays reusable).
+        prefix_finish(lanes_[index], index);
         release(index);
         out.status = runtime::ConsumeStatus::Consumed;
     } catch (...) {}

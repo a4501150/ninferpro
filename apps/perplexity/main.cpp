@@ -53,6 +53,7 @@ struct Options {
     std::optional<std::filesystem::path> save_top_tokens;
     std::optional<std::filesystem::path> kl_reference;
     std::filesystem::path expert_stripe; // Qwen3.8-Flash-Next's record tails on a second drive
+    std::string experts;                 // the offloaded families' --experts placement
     float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
@@ -81,7 +82,8 @@ std::string usage_text() {
            "        default the Engine's 1024)\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
-           "       [--logits-dtype fp32|bf16] (the head's logits scoring reads; default fp32, bf16\n"
+           "       [--logits-dtype fp32|bf16] (the head's logits scoring reads; default fp32, "
+           "bf16\n"
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
@@ -102,6 +104,8 @@ std::string usage_text() {
            "       [--save-top-tokens <file>] (record each position's 64 most probable tokens)\n"
            "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
            "        same corpus, context and stride, by context length)\n"
+           "       [--experts SPEC] (offloaded MoE families' three-tier placement, as in\n"
+           "        infernix: vram=N%,ram=M%[,ssd=K%] or counts)\n"
            "       [--expert-stripe <file>] (Qwen3.8-Flash-Next's expert record tails on a second\n"
            "        drive, read beside the artifact by the SSD expert tier)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
@@ -207,6 +211,8 @@ Options parse_options(int argc, char** argv) {
             out.save_top_tokens = std::filesystem::path(value("--save-top-tokens"));
         } else if (option == "--kl-reference") {
             out.kl_reference = std::filesystem::path(value("--kl-reference"));
+        } else if (option == "--experts") {
+            out.experts = value("--experts");
         } else if (option == "--expert-stripe") {
             out.expert_stripe = std::filesystem::path(value("--expert-stripe"));
         } else if (option == "--log-level") {
@@ -330,6 +336,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.fast_path_exclusions = options.fast_path_exclusions;
     if (options.ngram_volume) { engine_options.ngram_volume_path = *options.ngram_volume; }
     engine_options.expert_stripe_path   = options.expert_stripe;
+    engine_options.experts_spec         = options.experts;
     engine_options.startup_observer = startup_log.observer();
     engine_options.diagnostic_observer = infernix::product::engine_diagnostic_observer(logger);
     infernix::Engine engine(std::move(engine_options));

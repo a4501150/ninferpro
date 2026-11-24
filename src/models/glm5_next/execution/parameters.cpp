@@ -1,5 +1,6 @@
 #include "models/glm5_next/execution/parameters.h"
 
+#include "core/device.h"
 #include "core/weight_view.h"
 
 #include <array>
@@ -128,7 +129,68 @@ public:
         return out;
     }
 
+    // The vision tower; the blocks' gate/up biases are joined into `biases` ([layers][2I]).
+    VisionParameters vision(const VisionWeights& w, const VisionConfig& v,
+                            DeviceBuffer& biases) const {
+        VisionParameters out;
+        out.patch_embedding      = linear({w.patch_embedding});
+        out.patch_embedding_bias = tensor(w.patch_embedding_bias);
+        const std::size_t joined = 2ULL * v.intermediate_size * sizeof(std::uint16_t);
+        biases                   = DeviceBuffer(joined * w.layers.size());
+        for (std::size_t i = 0; i < w.layers.size(); ++i) {
+            out.layers.push_back(with_context("vision/layers/" + std::to_string(i), [&] {
+                const auto& l = w.layers[i];
+                VisionBlockParameters layer;
+                layer.norm1       = tensor(l.norm1);
+                layer.norm2       = tensor(l.norm2);
+                layer.query       = linear({l.query});
+                layer.key         = linear({l.key});
+                layer.value       = linear({l.value});
+                layer.query_bias  = tensor(l.query_bias);
+                layer.key_bias    = tensor(l.key_bias);
+                layer.value_bias  = tensor(l.value_bias);
+                layer.query_norm  = tensor(l.query_norm);
+                layer.key_norm    = tensor(l.key_norm);
+                layer.output      = linear({l.output});
+                layer.output_bias = tensor(l.output_bias);
+                layer.gate_up     = linear({l.gate, l.up});
+                layer.down        = linear({l.down});
+                layer.down_bias   = tensor(l.down_bias);
+                auto* joined_bias = static_cast<std::byte*>(biases.p) + joined * i;
+                const Tensor gate = tensor(l.gate_bias), up = tensor(l.up_bias);
+                // The biases stay resident with vision offload, so they are not rebased.
+                CUDA_CHECK(cudaMemcpy(joined_bias, gate.data, joined / 2, cudaMemcpyDefault));
+                CUDA_CHECK(
+                    cudaMemcpy(joined_bias + joined / 2, up.data, joined / 2, cudaMemcpyDefault));
+                layer.gate_up_bias =
+                    Tensor(joined_bias, DType::BF16, {dim(2ULL * v.intermediate_size)});
+                return layer;
+            }));
+        }
+        out.post_norm = tensor(w.post_norm);
+        {
+            // The permuted kernel read as the [O, m*m*H] matrix of one GEMM.
+            const auto& bound = model_.weight(w.downsample);
+            WeightView view   = bound.view;
+            view.shape        = {v.out_hidden_size, v.merged_width()};
+            out.downsample    = with_context(bound.name, [&] {
+                const auto single =
+                    ops::prepare_linear_weight(ops::WeightInput{view, bound.policy, std::nullopt});
+                return LinearParameters{single.weight, single.policy};
+            });
+        }
+        out.downsample_bias   = tensor(w.downsample_bias);
+        out.merger_projection = linear({w.merger_projection});
+        out.merger_norm       = tensor(w.merger_norm);
+        out.merger_norm_bias  = tensor(w.merger_norm_bias);
+        out.merger_gate_up    = linear({w.merger_gate, w.merger_up});
+        out.merger_down       = linear({w.merger_down});
+        return out;
+    }
+
 private:
+    static std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
+
     const Model& model_;
 };
 
@@ -186,6 +248,11 @@ Parameters::Parameters(const Model& source) : model(source) {
     }
     if (w.dflash2) {
         dflash2 = with_context("dflash2", [&] { return prepare.dflash2(*w.dflash2, *model.config().dflash2); });
+    }
+    if (w.vision) {
+        vision = with_context("vision", [&] {
+            return prepare.vision(*w.vision, *model.config().vision, vision_biases_);
+        });
     }
 }
 

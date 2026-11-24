@@ -176,7 +176,10 @@ EngineOptions normalize_engine_options(EngineOptions options, const FamilyOption
     if (cache.enabled) {
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
-        cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(kDefaultHybridHostCacheBytes);
+        // A family may default it smaller (its snapshots' size sets the value).
+        cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(
+            family.host_cache_default != 0 ? family.host_cache_default
+                                           : kDefaultHybridHostCacheBytes);
         const bool host_tier             = *cache.host_capacity_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
         // Whether a turn resumes from lossy Host state depends on what eviction left, so the exact

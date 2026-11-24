@@ -1,13 +1,11 @@
 # The shared tier: the frontend, the n-gram archive, and the Vision pieces Qwen3.5 and Qwen4Exp
-# share (the tower's config, parameters, pass, weight stream, control and overlay layout). The
-# same compile owners as before: resource parsing, the shared tokenizer and the shared overlay
-# layout join infernix_model_loading; the frontend, the archive and the Vision execution join
+# share (the tower's config, parameters, pass and control). Resource parsing and the shared
+# tokenizer join infernix_model_loading; the frontend, the archive and the Vision execution join
 # infernix_model_runtime.
 target_sources(infernix_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/vision_config.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/resources.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tokenizer.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/load/vision_overlay.cpp"
 )
 
 target_sources(infernix_model_runtime PRIVATE
@@ -23,5 +21,4 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_control.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/block_keys.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision_tower.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/execution/vision_weight_stream.cpp"
 )

@@ -6,7 +6,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen_common/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load/vision_overlay.h"
-#include "models/qwen_common/execution/vision_weight_stream.h"
+#include "models/common/vision/weight_stream.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 
 #include <cstddef>

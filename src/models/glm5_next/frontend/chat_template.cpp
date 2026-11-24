@@ -505,8 +505,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 if (const auto region = unique_output_region(output, origin.part_tags[part]))
                     return region->end;
             } else if (origin.part_media[part]) {
-                return layout.media_placeholders[*origin.part_media[part]].bytes.end +
-                       std::string_view("<|vision_end|>").size();
+                const auto& placeholder = layout.media_placeholders[*origin.part_media[part]];
+                return placeholder.bytes.end +
+                       std::string_view(placeholder.modality == Modality::Image
+                                            ? "<|end_of_image|>"
+                                            : "<|end_of_video|>")
+                           .size();
             }
         }
         return std::nullopt;

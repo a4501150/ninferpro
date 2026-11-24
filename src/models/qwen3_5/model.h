@@ -55,7 +55,8 @@ public:
 
     // Overlay vision assets (evictable pool + pinned block + layout); present only when the
     // model was loaded with vision offload on.
-    [[nodiscard]] const std::optional<qwen_common::VisionOverlayAssets>& overlay_vision() const noexcept {
+    [[nodiscard]] const std::optional<common::VisionOverlayAssets>&
+    overlay_vision() const noexcept {
         return overlay_vision_;
     }
 
@@ -64,11 +65,11 @@ private:
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           qwen_common::FrontendResources resources, InstanceInfo info,
-          std::optional<qwen_common::VisionOverlayAssets> overlay_vision,
+          std::optional<common::VisionOverlayAssets> overlay_vision,
           artifact::MaterializedArtifact backing);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
-    std::optional<qwen_common::VisionOverlayAssets> overlay_vision_;
+    std::optional<common::VisionOverlayAssets> overlay_vision_;
     artifact::MaterializedArtifact backing_;
     Config config_;
     LoadOptions options_;

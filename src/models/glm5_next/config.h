@@ -122,9 +122,43 @@ struct DFlash2Config {
     }
 };
 
+// The vision tower (docs/maintainer/glm5_3-flash-design.md §21.1): 24 blocks of RMSNorm, Q/K/V
+// with biases, per-head q/k norms, 2-D axial RoPE and a clamped SwiGLU MLP, then a post norm,
+// the m x m downsample and a gated merger into the text width. Patches are 3 x t x p x p pixels.
+struct VisionConfig {
+    std::uint32_t depth                        = 0;
+    std::uint32_t hidden_size                  = 0;
+    std::uint32_t num_heads                    = 0;
+    std::uint32_t intermediate_size            = 0;
+    std::uint32_t out_hidden_size              = 0; // the text width
+    std::uint32_t projection_intermediate_size = 0; // the merger's gate/up rows
+    std::uint32_t patch_size                   = 0;
+    std::uint32_t temporal_patch_size          = 0;
+    std::uint32_t spatial_merge_size           = 0;
+    float rms_norm_eps                         = 0;
+    float swiglu_limit                         = 0;
+    float rope_theta                           = 0;
+    std::uint32_t image_token_id = 0, image_start_token_id = 0, image_end_token_id = 0;
+    std::uint32_t video_token_id = 0, video_start_token_id = 0, video_end_token_id = 0;
+
+    [[nodiscard]] std::uint32_t head_dim() const noexcept { return hidden_size / num_heads; }
+
+    [[nodiscard]] std::uint32_t patch_width() const noexcept {
+        return 3U * temporal_patch_size * patch_size * patch_size;
+    }
+
+    [[nodiscard]] std::uint32_t merge_area() const noexcept {
+        return spatial_merge_size * spatial_merge_size;
+    }
+
+    // The downsample's input: one merged token's m x m patches.
+    [[nodiscard]] std::uint32_t merged_width() const noexcept { return merge_area() * hidden_size; }
+};
+
 struct Config {
     TextConfig text;
     std::optional<DFlash2Config> dflash2; // the DFlash2 drafter is bound (--spec dflash2 --draft-model)
+    std::optional<VisionConfig> vision;   // the tower is bound (--vision)
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);

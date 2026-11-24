@@ -49,7 +49,7 @@
 #include "models/qwen4_exp/program/rope_positions.h"
 #include "models/qwen4_exp/program/vision_window.h"
 #include "models/qwen_common/execution/vision_tower.h"
-#include "models/qwen_common/execution/vision_weight_stream.h"
+#include "models/common/vision/weight_stream.h"
 #include "models/qwen_common/program/vision_control.h"
 #include "models/offload/route_trace.h"
 #include "models/offload/vram_monitor.h"
@@ -190,7 +190,7 @@ struct LaneVision {
     offload::ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
     DeviceBuffer fallback;                     // the same bytes when the residency lends no frame
     Tensor handoff;                            // BF16 [out, V_encoded]
-    std::unique_ptr<qwen_common::execution::VisionWeightStream> stream;
+    std::unique_ptr<common::VisionWeightStream> stream;
     std::optional<qwen_common::execution::VisionParameters> weights; // the stream's rebased view
     std::unique_ptr<qwen_common::execution::VisionPassLayout> layout;
     std::unique_ptr<qwen_common::execution::VisionTowerPass> pass;

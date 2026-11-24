@@ -1,5 +1,6 @@
 #include "models/glm5_next/frontend/encoding.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -7,15 +8,19 @@
 namespace infernix::models::glm5_next::frontend {
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
-                                 std::size_t maximum_tokens) {
-    if (!rendered.media_placeholders.empty() || !rendered.media_token_runs.empty()) {
-        throw std::logic_error("a GLM prompt holds no media");
+                                 std::size_t maximum_tokens, TokenId image_token) {
+    if (!rendered.media_placeholders.empty()) {
+        throw std::logic_error("rendered chat contains unexpanded media placeholders");
+    }
+    if (!rendered.media_token_runs.empty() && image_token < 0) {
+        throw std::logic_error("encoding media runs needs the image token");
     }
     EncodedChat encoded;
     std::vector<std::size_t> byte_boundaries;
     byte_boundaries.reserve((rendered.rewrite_checkpoint ? 2U : 0U) +
                             rendered.rewrite_execution_boundaries.size() +
-                            rendered.message_boundaries.size() + rendered.cache_boundaries.size());
+                            rendered.message_boundaries.size() + rendered.cache_boundaries.size() +
+                            2U * rendered.media_token_runs.size());
     if (rendered.rewrite_checkpoint) {
         byte_boundaries.push_back(rendered.rewrite_checkpoint->offset);
         byte_boundaries.push_back(rendered.rewrite_checkpoint->recovery_offset);
@@ -27,6 +32,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     }
     for (const std::optional<std::size_t> boundary : rendered.cache_boundaries) {
         if (boundary) { byte_boundaries.push_back(*boundary); }
+    }
+    for (const MediaTokenRunByteSpec& run : rendered.media_token_runs) {
+        byte_boundaries.push_back(run.bytes.begin);
+        byte_boundaries.push_back(run.bytes.end);
     }
 
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
@@ -87,6 +96,26 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
                 encoded.cache_boundaries[index] =
                     to_frontier(*boundary.exact_frontier, "cache boundary");
         }
+    }
+    encoded.media_token_runs.reserve(rendered.media_token_runs.size());
+    for (const MediaTokenRunByteSpec& run : rendered.media_token_runs) {
+        const TokenBoundaryResult& begin = tokenized.boundaries.at(boundary_index++);
+        const TokenBoundaryResult& end   = tokenized.boundaries.at(boundary_index++);
+        if (!begin.exact_frontier || !end.exact_frontier ||
+            *begin.exact_frontier >= *end.exact_frontier) {
+            throw std::logic_error("media token run is not an exact nonempty token span");
+        }
+        const std::size_t first = *begin.exact_frontier, last = *end.exact_frontier;
+        if (!std::all_of(encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(first),
+                         encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(last),
+                         [image_token](int token) { return token == image_token; })) {
+            throw std::logic_error("media token run contains a non-media token");
+        }
+        encoded.media_token_runs.push_back(
+            {.tokens      = TokenSpan{.begin = first, .count = last - first},
+             .modality    = run.modality,
+             .item_index  = run.item_index,
+             .frame_index = run.frame_index});
     }
     if (boundary_index != tokenized.boundaries.size()) {
         throw std::logic_error("rendered token boundary result count changed during encoding");

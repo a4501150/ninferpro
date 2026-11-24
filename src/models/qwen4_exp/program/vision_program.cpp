@@ -36,7 +36,8 @@ std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen_commo
     }
     const std::size_t pass_bytes = patches.empty() ? 0 : vx::plan_vision_pass(config, *parameters_.vision, patches).bytes;
     const auto& overlay          = parameters_.model.overlay_vision();
-    const std::size_t staging    = overlay ? vx::vision_staging_align(overlay->layout.staging_bytes) : 0;
+    const std::size_t staging =
+        overlay ? common::vision_staging_align(overlay->layout.staging_bytes) : 0;
     out->window = plan_vision_window(items, reused, pass_bytes, staging, work_capacity_, residency_->lend_pitch(),
                                      static_cast<std::uint32_t>(parameters_.vision->merger_fc2.weight.n),
                                      config.hidden_size, config.depth);
@@ -119,9 +120,10 @@ void ProgramImpl::vision_step(Lane& lane) {
         const vx::VisionParameters* weights = &*parameters_.vision;
         std::size_t staging                 = 0;
         if (const auto& overlay = parameters_.model.overlay_vision()) {
-            staging   = vx::vision_staging_align(overlay->layout.staging_bytes);
-            v.stream  = std::make_unique<vx::VisionWeightStream>(device_, *overlay, static_cast<std::byte*>(memory.data));
-            v.weights = v.stream->window_weights(*parameters_.vision);
+            staging  = common::vision_staging_align(overlay->layout.staging_bytes);
+            v.stream = std::make_unique<common::VisionWeightStream>(
+                device_, *overlay, static_cast<std::byte*>(memory.data));
+            v.weights = vx::vision_window_weights(*v.stream, *parameters_.vision);
             weights   = &*v.weights;
         }
         const DeviceSpan arena{static_cast<std::byte*>(memory.data) + staging, memory.bytes - staging};

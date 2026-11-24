@@ -6,6 +6,7 @@
 #include "core/startup.h"
 #include "core/vram_budget.h"
 #include "models/glm5_next/load.h"
+#include "models/glm5_next/options.h"
 #include "models/glm5_next/sampling_defaults.h"
 #include "models/load_options.h"
 #include "models/offload/expert_placement_report.h"
@@ -79,9 +80,6 @@ void validate(const EngineOptions& options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
-    if (options.enable_vision) {
-        throw std::invalid_argument("GLM-5.3-Flash has no vision tower yet: drop --enable-vision");
-    }
     if (options.kv_cache != KvCacheStorage::BFloat16 &&
         options.kv_cache != KvCacheStorage::Int8Group64) {
         throw std::invalid_argument(
@@ -116,6 +114,10 @@ offload::HostMemoryDemand host_demand(const EngineOptions& options, const glm::L
     demand.expert_cap     = options.expert_ram_bytes;
     demand.pin_room       = offload::pin_room(vram.query());
     demand.expert_pin_cap = options.expert_pin_bytes;
+    // The prefix cache pins its whole Host tier at startup, beside the experts.
+    if (options.context_cache.enabled) {
+        demand.prefix_cache = options.context_cache.host_capacity_bytes.value_or(0U);
+    }
     return demand;
 }
 
@@ -123,11 +125,16 @@ offload::HostMemoryDemand host_demand(const EngineOptions& options, const glm::L
 
 Glm5NextInstance::Glm5NextInstance(std::unique_ptr<glm::Model> source, const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
-      frontend(glm::make_frontend(model->resources(), {.chat_template_path      = options.chat_template_path,
-                                                       .sampling                = glm::default_sampling(),
-                                                       .vision_enabled          = false,
-                                                       .max_context             = options.max_context,
-                                                       .thinking_budget_message = options.thinking_budget_message})),
+      frontend(glm::make_frontend(model->resources(),
+                                  {.chat_template_path       = options.chat_template_path,
+                                   .sampling                 = glm::default_sampling(),
+                                   .vision_enabled           = options.enable_vision,
+                                   .max_context              = options.max_context,
+                                   .media_cache_bytes        = options.media_cache_bytes,
+                                   .media_live_bytes         = options.media_live_bytes,
+                                   .media_preprocess_threads = options.media_preprocess_threads,
+                                   .vision_max_merged_tokens = options.vision_max_merged_tokens,
+                                   .thinking_budget_message  = options.thinking_budget_message})),
       capacity(options.max_context) {}
 
 Glm5NextInstance::~Glm5NextInstance() = default;
@@ -147,7 +154,7 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
     const artifact::Reader reader(options.artifact_path);
     if (!glm::is_glm5_next(reader)) { throw std::invalid_argument("artifact is not Glm5NextForCausalLM"); }
     inspect.complete();
-    models::LoadOptions load = models::load_options(options, false);
+    models::LoadOptions load = models::load_options(options, glm::kVisionOffloadAuto);
     auto plan                = glm::plan_load(reader, load);
     auto vram                = open_vram_budget_source(device.device, options.vram_past_budget);
     offload::HostMemoryDemand demand = host_demand(options, plan, *vram);
@@ -166,6 +173,26 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
                                        ? options.speculative.draft_tokens
                                        : 0;
     program_options.diagnostics                 = options.diagnostic_observer;
+    // The hybrid prefix cache (design §18). Snapshots are born in the pinned Host slab pool; the
+    // cost constants rate a resume's restore against a re-prefill of the same tokens, at the
+    // measured prefill and link rates of this family.
+    if (options.context_cache.enabled) {
+        const ContextCacheOptions& cache           = options.context_cache;
+        program_options.prefix_cache               = true;
+        program_options.prefix_host_bytes          = cache.host_capacity_bytes.value();
+        program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value();
+        program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value();
+        program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value();
+        const std::uint32_t chunk                  = options.prefill_chunk;
+        program_options.prefix_cost.chunk_seconds  = 0.1645 * (static_cast<double>(chunk) / 4096.0);
+        program_options.prefix_cost.chunk_tokens   = chunk;
+        program_options.prefix_cost.token_seconds  = 2.23e-5;
+        program_options.prefix_cost.attention_pair_seconds = 1.06e-9;
+        program_options.prefix_cost.call_route_fraction    = 10.0 / 512.0;
+        program_options.prefix_cost.h2d_bytes_per_second =
+            27.5e9; // the reference link, until measured
+        program_options.prefix_cost.transfer_batch_seconds = 20.0e-6;
+    }
     // A binding reserves its request's whole extent, so the automatic capacity holds every lane
     // at max_context and admission never waits for pages.
     program_options.kv_capacity_tokens = options.kv_capacity.mode == KvCapacityMode::Explicit
@@ -404,6 +431,11 @@ ConstructedBackend construct_glm5_next_backend(EngineOptions& options, DeviceCon
     out.backend = make_engine_backend(std::move(constructed.instance), device, options);
     finalize_phase.complete();
     return out;
+}
+
+std::unique_ptr<Glm5NextInstance> construct_glm5_next_instance(const EngineOptions& options,
+                                                               DeviceContext& device) {
+    return construct_glm5_next(options, device).instance;
 }
 
 } // namespace infernix::runtime

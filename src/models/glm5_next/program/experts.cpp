@@ -63,6 +63,7 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
     hooks.diagnostic      = [this](const std::string& text, DiagnosticLevel level) { diagnostic(text, level); };
     hooks.on_tier_changed = [this](offload::HostExpertTier* tier, bool rebuilt) {
         tier_ = tier;
+        if (cpu_service_ != nullptr) { cpu_service_->set_record_provider(tier); }
         // The stream's callbacks captured the tier a rebuild replaced: retarget them to this one.
         if (rebuilt && expert_stream_ != nullptr) {
             StreamBindings bindings = stream_bindings();
@@ -121,8 +122,36 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
                std::to_string((static_cast<std::uint64_t>(sizing_.frames) * residency_->frame_bytes()) >> 20) + " MiB)");
     diagnostic("device address map: " + residency_->address_map(), DiagnosticLevel::Debug);
 
+    // Decode and verification calls hand part of their host-memory misses to the CPU team, which
+    // computes them from the records in place while the link stages the rest.
+    if (options_.cpu_expert_workers > 0 && options_.cpu_expert_jobs > 0) {
+        std::vector<ops::offloaded_moe::CpuMissService::Layer> layers;
+        for (const auto& bank : banks) {
+            layers.push_back({.records = reinterpret_cast<const std::uint8_t*>(bank.planes.records),
+                              .record_stride = bank.planes.record_stride,
+                              .scales        = bank.scales.data()});
+        }
+        const int decode_columns =
+            std::max(ops::offloaded_moe::kMaxCpuColumns,
+                     static_cast<int>(options_.max_concurrency * (options_.draft_tokens + 1)));
+        cpu_service_ = std::make_unique<ops::offloaded_moe::CpuMissService>(
+            std::move(layers),
+            ops::offloaded_moe::CpuMissService::Options{
+                .workers     = static_cast<int>(options_.cpu_expert_workers),
+                .max_jobs    = static_cast<int>(std::min<std::uint32_t>(
+                    options_.cpu_expert_jobs, ops::offloaded_moe::kMaxCpuJobs)),
+                .max_columns = decode_columns,
+                .pcie_share  = options_.cpu_link_share256,
+                .activation  = ops::offloaded_moe::ExpertActivation::kA16,
+                .geometry    = {.hidden       = static_cast<int>(c_.hidden_size),
+                                .intermediate = static_cast<int>(c_.moe.intermediate),
+                                .swiglu_limit = c_.swiglu_limit},
+                .records     = tier_});
+    }
+
     const offload::ExpertBankGeometry geometry = bank_geometry(c_);
     for (std::uint32_t l = 0; l < geometry.banks; ++l) {
+        if (cpu_service_) { experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l))); }
         experts.frame_bases.push_back(residency_->frame_base(l));
         experts.frame_pitches.push_back(residency_->frame_pitch(l));
         experts.frames.push_back(residency_->table(l));
@@ -144,7 +173,13 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
 }
 
 void ProgramImpl::before_call(bool decode_round) {
-    residency_->before_round(device_.stream, /*landing=*/decode_round && !residency_->resident());
+    // Beside an active layer walk nothing lands: the walk's stream planned against its start's
+    // frames.
+    residency_->before_round(device_.stream,
+                             /*landing=*/decode_round && !residency_->resident() && !walk_.active,
+                             /*walking=*/walk_.active);
+    // The CPU lane's first request comes within this round.
+    if (cpu_service_ && decode_round) { cpu_service_->wake(); }
     if (fetch_channel_ && tier_ && !tier_->round_open()) {
         throw std::logic_error("Glm5Next: a call reading SSD-only experts was enqueued outside the tier's round");
     }
@@ -161,6 +196,11 @@ void ProgramImpl::check_device_error() {
     const std::uint32_t value = *word;
     if (value == 0) { return; }
     *word = 0;
+    if (cpu_service_) {
+        if (const std::string why = cpu_service_->failure(); !why.empty()) {
+            throw std::runtime_error("GLM-5.3-Flash: the CPU expert service stopped (" + why + ")");
+        }
+    }
     if (const std::string why = placement_->tier_failure(); !why.empty()) {
         throw std::runtime_error("GLM-5.3-Flash: the SSD expert tier's read agent stopped (" + why + ")");
     }
@@ -234,8 +274,10 @@ ProgramImpl::StreamBindings ProgramImpl::stream_bindings() const {
 }
 
 void ProgramImpl::maintain() {
-    (void)placement_->apply_placement(true);
+    if (!walk_.active) { (void)placement_->apply_placement(true); }
     placement_->maintain_expert_state();
+    // The prefix cache's copies publish while the engine is idle (its captures and writes land).
+    if (prefix_) { prefix_->poll(); }
 }
 
 } // namespace infernix::models::glm5_next::detail

@@ -5,6 +5,8 @@
 
 #include "models/glm5_next/frontend/chat_template.h"
 #include "models/glm5_next/frontend/encoding.h"
+#include "models/glm5_next/frontend/media_cache.h"
+#include "models/glm5_next/frontend/processor.h"
 #include "models/glm5_next/frontend/test_access.h"
 #include "models/glm5_next/frontend/tokenizer.h"
 #include "models/glm5_next/frontend/tool_call_parser.h"
@@ -31,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -117,6 +120,77 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     }
 }
 
+// processor_config.json's two processors, checked against the compiled pixel pipeline.
+fi::ProcessorOptions processor_options(const FrontendResources& resources) {
+    const Json config =
+        parse_resource_json(resources.processor_config_json, "processor_config.json");
+    const auto check = [](const Json& processor, std::string_view name) {
+        const std::string resource = "processor_config.json." + std::string(name);
+        for (const char* flag : {"do_resize", "do_rescale", "do_normalize", "do_convert_rgb"}) {
+            if (processor.contains(flag) &&
+                (!processor[flag].is_boolean() || !processor[flag].get<bool>())) {
+                throw std::invalid_argument(resource + "." + flag +
+                                            " must be enabled for the compiled pixel pipeline");
+            }
+        }
+        if (require_integer(processor, "patch_size", resource) != 14 ||
+            require_integer(processor, "temporal_patch_size", resource) != 2 ||
+            require_integer(processor, "merge_size", resource) != 2 ||
+            integer_or_default(processor, "patch_expand_factor", resource, 1) != 1 ||
+            number_or_default(processor, "rescale_factor", resource, 1.0 / 255.0) != 1.0 / 255.0) {
+            throw std::invalid_argument(resource +
+                                        " does not match the compiled Vision patch geometry");
+        }
+        constexpr std::array<double, 3> kMean{0.48145466, 0.4578275, 0.40821073};
+        constexpr std::array<double, 3> kStd{0.26862954, 0.26130258, 0.27577711};
+        for (const auto& [field, expected] :
+             {std::pair{"image_mean", kMean}, std::pair{"image_std", kStd}}) {
+            if (!processor.contains(field) || !processor.at(field).is_array() ||
+                processor.at(field).size() != 3) {
+                throw std::invalid_argument(resource + "." + field + " must hold three values");
+            }
+            for (std::size_t c = 0; c < 3; ++c) {
+                const Json& value = processor.at(field)[c];
+                if (!value.is_number() || value.get<double>() != expected[c]) {
+                    throw std::invalid_argument(resource + "." + field +
+                                                " does not match the compiled normalization");
+                }
+            }
+        }
+        return std::pair{positive_u64(require_integer(processor, "min_image_tokens", resource),
+                                      resource + ".min_image_tokens"),
+                         positive_u64(require_integer(processor, "max_image_tokens", resource),
+                                      resource + ".max_image_tokens")};
+    };
+    const Json& image = require_object(config, "image_processor", "processor_config.json");
+    const Json& video = require_object(config, "video_processor", "processor_config.json");
+    fi::ProcessorOptions options;
+    std::tie(options.image_min_tokens, options.image_max_tokens) = check(image, "image_processor");
+    std::tie(options.video_min_tokens, options.video_max_tokens) = check(video, "video_processor");
+    options.video_fps =
+        number_or_default(video, "fps", "processor_config.json.video_processor", 2.0);
+    options.video_max_frames = static_cast<int>(std::clamp<std::int64_t>(
+        integer_or_default(video, "max_frames", "processor_config.json.video_processor", 2048), 1,
+        options.max_video_source_frames));
+    if (!(options.video_fps > 0.0)) {
+        throw std::invalid_argument("processor_config.json.video_processor.fps must be positive");
+    }
+    return options;
+}
+
+[[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {
+    switch (error.kind()) {
+    case fi::ProcessorErrorKind::BudgetExceeded:
+        throw RequestError(RequestErrorKind::MediaBudgetExceeded, error.what());
+    case fi::ProcessorErrorKind::ContextLengthExceeded:
+        if (error.context_length()) { throw RequestError(*error.context_length()); }
+        throw RequestError(RequestErrorKind::ContextLengthExceeded, error.what());
+    case fi::ProcessorErrorKind::InvalidMedia:
+        throw RequestError(RequestErrorKind::InvalidMedia, error.what());
+    }
+    throw std::logic_error("unknown GLM processor error kind");
+}
+
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
                                                const std::filesystem::path& override_path) {
     validate_tokenizer_config(resources);
@@ -174,12 +248,34 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
         }
         target.parts.reserve(source.parts.size());
         for (MessagePart& part : source.parts) {
-            if (part.kind != MessagePartKind::Text) {
-                throw std::invalid_argument(
-                    "GLM-5.3-Flash is a text-only model: image, video and audio inputs are not "
-                    "supported");
+            switch (part.kind) {
+            case MessagePartKind::Text:
+                target.parts.push_back(fi::ChatPart::text_part(std::move(part.text)));
+                break;
+            case MessagePartKind::Media: {
+                if (part.media.bytes.empty()) {
+                    throw std::invalid_argument("frontend media input contains no owning bytes");
+                }
+                fi::MediaData media;
+                media.source_name         = std::move(part.media.source_name);
+                media.media_type          = std::move(part.media.media_type);
+                media.bytes               = std::move(part.media.bytes);
+                media.image_resize_policy = part.media.image_resize_policy;
+                switch (part.media.kind) {
+                case MediaKind::Image:
+                    target.parts.push_back(fi::ChatPart::image(std::move(media)));
+                    break;
+                case MediaKind::Video:
+                    target.parts.push_back(fi::ChatPart::video(std::move(media)));
+                    break;
+                default:
+                    throw std::invalid_argument("GLM-5.3-Flash takes image and video media only");
+                }
+                break;
             }
-            target.parts.push_back(fi::ChatPart::text_part(std::move(part.text)));
+            default:
+                throw std::invalid_argument("frontend message-part kind is invalid");
+            }
         }
         result.push_back(std::move(target));
     }
@@ -209,9 +305,10 @@ std::uint32_t checked_token_count(std::size_t count) {
     return static_cast<std::uint32_t>(count);
 }
 
+// GLM's positions are the token indices on every axis, media tokens included.
 void assign_text_positions(PreparedPromptData& prompt) {
     const std::size_t count = prompt.token_ids.size();
-    prompt.token_types.assign(count, 0);
+    if (prompt.token_types.size() != count) { prompt.token_types.assign(count, 0); }
     prompt.positions.resize(count * 3);
     for (std::size_t axis = 0; axis < 3; ++axis) {
         for (std::size_t index = 0; index < count; ++index) {
@@ -402,9 +499,39 @@ class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, FrontendOptions options)
         : chat_template(compile_chat_template(resources, options.chat_template_path)),
-          tokenizer(resources.tokenizer), max_context(options.max_context) {
+          tokenizer(resources.tokenizer),
+          processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
+          vision_enabled(options.vision_enabled), max_context(options.max_context) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
+        }
+        const std::uint64_t vision_tokens =
+            std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
+        processor.max_vision_tokens = vision_tokens;
+        processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        // A video larger than the prompt can hold resizes to fit it, like one past
+        // vision_max_merged_tokens.
+        processor.video_max_tokens = std::min(processor.video_max_tokens, vision_tokens);
+        if (options.vision_max_merged_tokens != 0) {
+            processor.image_max_tokens = std::min<std::uint64_t>(processor.image_max_tokens,
+                                                                 options.vision_max_merged_tokens);
+            processor.video_max_tokens = std::min<std::uint64_t>(processor.video_max_tokens,
+                                                                 options.vision_max_merged_tokens);
+        }
+        processor.image_min_tokens =
+            std::min(processor.image_min_tokens, processor.image_max_tokens);
+        processor.video_min_tokens =
+            std::min(processor.video_min_tokens, processor.video_max_tokens);
+        if (vision_enabled) {
+            const std::uint64_t minimum_live =
+                processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);
+            if (minimum_live > options.media_live_bytes) {
+                throw std::invalid_argument(
+                    "media live-byte capacity cannot hold the maximum supported Vision prompt");
+            }
+            media_cache = std::make_shared<fi::MediaPreprocessCache>(
+                options.media_cache_bytes, options.media_live_bytes,
+                options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
         }
         if (!tokenizer || resources.public_token_count != tokenizer->vocab_size()) {
             throw std::invalid_argument(
@@ -459,6 +586,9 @@ public:
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
+    fi::ProcessorOptions processor;
+    std::shared_ptr<fi::MediaPreprocessCache> media_cache;
+    bool vision_enabled = false;
     StopPolicy defaults;
     fi::OutputMarkerTokens markers; // the reasoning-end exclusion's tokens (reasoning_ban)
     ModelSamplingDefaults sampling;
@@ -502,9 +632,12 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
     if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.starts_in_reasoning = data_->starts_in_reasoning,
-                         .prompt_tokens       = checked_token_count(data_->token_ids.size()),
-                         .has_media           = false};
+    PromptSummary summary{.starts_in_reasoning = data_->starts_in_reasoning,
+                          .prompt_tokens       = checked_token_count(data_->token_ids.size()),
+                          .has_media           = data_->has_media()};
+    summary.media.reserve(data_->vision_items.size());
+    for (const VisionItem& item : data_->vision_items) { summary.media.push_back(item.source); }
+    return summary;
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
@@ -594,28 +727,58 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     result.tool_call_output    = tool_call_output;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
-    const fi::RenderedChat rendered =
-        impl_->chat_template.render(messages, render_options(options, rendered_markers), control);
-    result.starts_in_reasoning  = rendered.starts_in_reasoning;
-    result.continuation_content = rendered.continuation_content;
-    const auto tokenize_started = Clock::now();
-    fi::EncodedChat encoded     = fi::encode_rendered_chat(
-        *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
-    result.prepare.tokenize_seconds =
-        std::chrono::duration<double>(Clock::now() - tokenize_started).count();
-    fi::check_preparation_control(control, "tokenization");
-    if (encoded.input_ids.size() > impl_->max_context) {
-        throw_context_length_exceeded(
-            fi::encode_rendered_chat(*impl_->tokenizer, rendered,
-                                     fi::context_recount_limit(impl_->max_context))
-                .input_ids.size(),
-            impl_->max_context);
+    const bool has_media =
+        std::any_of(messages.begin(), messages.end(),
+                    [](const fi::ChatMessage& message) { return message.has_media(); });
+    if (has_media && !impl_->vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
     }
-    result.token_ids                   = std::move(encoded.input_ids);
-    result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
-    result.identity.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
-    message_boundaries                          = std::move(encoded.message_boundaries);
-    cache_boundaries                            = std::move(encoded.cache_boundaries);
+    if (has_media) {
+        const fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
+                                      impl_->media_cache);
+        fi::ProcessedInput processed;
+        try {
+            processed =
+                processor.process(std::move(messages), render_options(options, rendered_markers),
+                                  control, impl_->max_context);
+        } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+        result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
+        result.starts_in_reasoning         = processed.starts_in_reasoning;
+        result.continuation_content        = std::move(processed.continuation_content);
+        result.token_types                 = std::move(processed.token_types);
+        result.media_payloads              = std::move(processed.media_payloads);
+        result.vision_items                = std::move(processed.vision_items);
+        result.prepare                     = processed.stats;
+        result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
+        result.identity.rewrite_execution_frontiers =
+            std::move(processed.rewrite_execution_frontiers);
+        message_boundaries = std::move(processed.message_boundaries);
+        cache_boundaries   = std::move(processed.cache_boundaries);
+    } else {
+        const fi::RenderedChat rendered = impl_->chat_template.render(
+            messages, render_options(options, rendered_markers), control);
+        result.starts_in_reasoning  = rendered.starts_in_reasoning;
+        result.continuation_content = rendered.continuation_content;
+        const auto tokenize_started = Clock::now();
+        fi::EncodedChat encoded     = fi::encode_rendered_chat(
+            *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
+        result.prepare.tokenize_seconds =
+            std::chrono::duration<double>(Clock::now() - tokenize_started).count();
+        fi::check_preparation_control(control, "tokenization");
+        if (encoded.input_ids.size() > impl_->max_context) {
+            throw_context_length_exceeded(
+                fi::encode_rendered_chat(*impl_->tokenizer, rendered,
+                                         fi::context_recount_limit(impl_->max_context))
+                    .input_ids.size(),
+                impl_->max_context);
+        }
+        result.token_ids                   = std::move(encoded.input_ids);
+        result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
+        result.identity.rewrite_execution_frontiers =
+            std::move(encoded.rewrite_execution_frontiers);
+        message_boundaries = std::move(encoded.message_boundaries);
+        cache_boundaries   = std::move(encoded.cache_boundaries);
+    }
     assign_text_positions(result);
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable = true;
@@ -632,6 +795,20 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     fi::check_preparation_control(control);
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    const bool has_media =
+        std::any_of(messages.begin(), messages.end(),
+                    [](const fi::ChatMessage& message) { return message.has_media(); });
+    if (has_media && !impl_->vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
+    if (has_media) {
+        const fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
+                                      impl_->media_cache);
+        try {
+            return checked_token_count(
+                processor.count_tokens(std::move(messages), render_options(options), control));
+        } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+    }
     const fi::RenderedChat rendered =
         impl_->chat_template.render(messages, render_options(options), control);
     const std::uint32_t count = checked_token_count(
@@ -640,7 +817,26 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     return count;
 }
 
-MediaCacheSummary Frontend::media_cache_summary() const { return {}; }
+MediaCacheSummary Frontend::media_cache_summary() const {
+    if (impl_ == nullptr || !impl_->media_cache) { return {}; }
+    const fi::MediaCacheStats stats = impl_->media_cache->stats();
+    return MediaCacheSummary{
+        .capacity_bytes      = stats.capacity_bytes,
+        .live_capacity_bytes = stats.live_capacity_bytes,
+        .retained_bytes      = stats.retained_bytes,
+        .live_bytes          = stats.live_bytes,
+        .entries             = stats.entries,
+        .inflight            = stats.inflight,
+        .queued_tasks        = stats.queued_tasks,
+        .active_tasks        = stats.active_tasks,
+        .preprocess_threads  = stats.preprocess_threads,
+        .hits                = stats.hits,
+        .misses              = stats.misses,
+        .singleflight_waits  = stats.singleflight_waits,
+        .evictions           = stats.evictions,
+        .oversize_bypasses   = stats.oversize_bypasses,
+    };
+}
 
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
                                         bool allow_prefix_identity) const {

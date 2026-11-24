@@ -5,7 +5,7 @@
 #include "artifact/reader.h"
 #include "core/ggml_format.h"
 #include "artifact/views.h"
-#include "models/qwen_common/load/vision_overlay.h"
+#include "models/common/vision/overlay_layout.h"
 #include "models/registry.h"
 
 #include <cmath>
@@ -307,8 +307,9 @@ VisionWeights bind_vision(Bindings& b, const qwen_common::VisionConfig& config, 
 }
 
 // The pinned groups the encode window streams (vision offload): prelude, each layer, the merger.
-qwen_common::VisionOverlayLayout vision_overlay_layout(const VisionWeights& vision, const std::vector<PendingWeight>& pending,
-                                                   const artifact::MaterializationPlan& plan) {
+common::VisionOverlayLayout vision_overlay_layout(const VisionWeights& vision,
+                                                  const std::vector<PendingWeight>& pending,
+                                                  const artifact::MaterializationPlan& plan) {
     const auto handles = [&](std::initializer_list<WeightId> ids) {
         std::vector<artifact::ObjectHandle> out;
         for (const WeightId id : ids) {
@@ -322,10 +323,12 @@ qwen_common::VisionOverlayLayout vision_overlay_layout(const VisionWeights& visi
                                   s.query_bias, s.key_bias, s.value_bias, s.output, s.output_bias, s.fc1, s.fc1_bias,
                                   s.fc2, s.fc2_bias}));
     }
-    return qwen_common::make_vision_overlay_layout(
-        plan, handles({vision.patch_embedding, vision.patch_embedding_bias, vision.position_embedding}), layers,
-        handles({vision.merger_norm.weight, vision.merger_norm.bias, vision.merger_fc1, vision.merger_fc1_bias,
-                 vision.merger_fc2, vision.merger_fc2_bias}));
+    return common::make_vision_overlay_layout(
+        plan,
+        handles({vision.patch_embedding, vision.patch_embedding_bias, vision.position_embedding}),
+        layers,
+        handles({vision.merger_norm.weight, vision.merger_norm.bias, vision.merger_fc1,
+                 vision.merger_fc1_bias, vision.merger_fc2, vision.merger_fc2_bias}));
 }
 
 FrontendResources bind_resources(artifact::Binder& binder, const Config& config) {
@@ -400,7 +403,7 @@ struct LoadPlan::Impl {
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
     InstanceInfo info;
-    std::optional<qwen_common::VisionOverlayLayout> vision_overlay; // vision offload
+    std::optional<common::VisionOverlayLayout> vision_overlay; // vision offload
     std::uint64_t embedding_bytes = 0; // the token embedding's stored bytes (pinned)
     // The DFlash2 companion (--draft-model): its Reader, its plan, and the first of its weights in
     // `pending` (the main artifact's come first).
@@ -423,11 +426,7 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
 std::uint64_t LoadPlan::pinned_other_bytes() const {
     // Besides the expert banks: the token embedding (bind_text) and, with vision offload, the tower.
     std::uint64_t bytes = impl_->embedding_bytes;
-    if (impl_->vision_overlay) {
-        const auto& v = *impl_->vision_overlay;
-        bytes += v.prelude.bytes + v.merger.bytes;
-        for (const auto& layer : v.layers) { bytes += layer.bytes; }
-    }
+    if (impl_->vision_overlay) { bytes += impl_->vision_overlay->tower_bytes(); }
     return bytes;
 }
 
@@ -606,14 +605,18 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     return LoadPlan(std::move(out));
 }
 
-Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
-             std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
-             std::optional<qwen_common::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
-             std::optional<offload::ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing)
-    : backing_(std::move(backing)), draft_backing_(std::move(draft_backing)), expert_store_(std::move(expert_store)),
-      config_(std::move(config)), options_(options),
+Model::Model(Config config, LoadOptions options, TextWeights weights,
+             std::vector<BoundWeight> bound, std::vector<ExpertBank> banks,
+             FrontendResources resources, InstanceInfo info,
+             std::optional<common::VisionOverlayAssets> overlay_vision,
+             artifact::MaterializedArtifact backing,
+             std::optional<offload::ExpertStore> expert_store,
+             std::optional<artifact::MaterializedArtifact> draft_backing)
+    : backing_(std::move(backing)), draft_backing_(std::move(draft_backing)),
+      expert_store_(std::move(expert_store)), config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
-      resources_(std::move(resources)), info_(std::move(info)), overlay_vision_(std::move(overlay_vision)) {}
+      resources_(std::move(resources)), info_(std::move(info)),
+      overlay_vision_(std::move(overlay_vision)) {}
 
 Model::~Model() = default;
 
@@ -703,15 +706,15 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         store.emplace(backing.stream_source(), bank_objects, std::move(bank_strides), c.moe.experts,
                       std::move(multipliers)); // the vectors move, so the planes' pointers stay valid
     }
-    std::optional<qwen_common::VisionOverlayAssets> overlay;
+    std::optional<common::VisionOverlayAssets> overlay;
     if (data->vision_overlay) {
         const auto pinned = backing.pinned_bytes_range();
         if (pinned.empty()) { throw ArtifactError("vision offload requires a pinned materialization"); }
-        overlay = qwen_common::VisionOverlayAssets{.pool         = nullptr,
-                                                  .pinned_block = pinned.data(),
-                                                  .pinned_bytes = pinned.size(),
-                                                  .ladder_bytes = 0,
-                                                  .layout       = std::move(*data->vision_overlay)};
+        overlay = common::VisionOverlayAssets{.pool         = nullptr,
+                                              .pinned_block = pinned.data(),
+                                              .pinned_bytes = pinned.size(),
+                                              .ladder_bytes = 0,
+                                              .layout       = std::move(*data->vision_overlay)};
     }
     return std::unique_ptr<Model>(new Model(std::move(data->config), data->options,
                                             std::move(data->weights), std::move(bound),

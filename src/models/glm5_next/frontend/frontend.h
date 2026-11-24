@@ -20,7 +20,7 @@ struct FrontendOptions {
     std::size_t grammar_cache_bytes        = 256ULL * 1024 * 1024;
     // The family's recommended sampling presets (a request's omitted fields take them).
     ModelSamplingDefaults sampling;
-    bool vision_enabled                    = true;
+    bool vision_enabled                    = false;
     std::uint32_t max_context              = 2'048;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;

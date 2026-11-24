@@ -89,6 +89,34 @@ struct DFlash2Parameters {
     Tensor predecessor_codebook, successor_codebook; // BF16 [rank, vocab]
 };
 
+// One vision block (VisionBlockWeights): the MLP's gate/up parent with its biases joined.
+struct VisionBlockParameters {
+    Tensor norm1, norm2;                     // BF16 [H]
+    LinearParameters query, key, value;      // [H, H] each
+    Tensor query_bias, key_bias, value_bias; // BF16 [H]
+    Tensor query_norm, key_norm;             // BF16 [head_dim]
+    LinearParameters output;                 // [H, H]
+    Tensor output_bias;                      // BF16 [H]
+    LinearParameters gate_up;                // [2I, H]: gate rows, then up rows
+    Tensor gate_up_bias;                     // BF16 [2I]
+    LinearParameters down;                   // [H, I]
+    Tensor down_bias;                        // BF16 [H]
+};
+
+// The vision tower (execution/vision.h).
+struct VisionParameters {
+    LinearParameters patch_embedding; // [H, patch_width]
+    Tensor patch_embedding_bias;      // BF16 [H]
+    std::vector<VisionBlockParameters> layers;
+    Tensor post_norm;                     // BF16 [H]
+    LinearParameters downsample;          // [O, m*m*H]: patch-major (the loader's permutation)
+    Tensor downsample_bias;               // BF16 [O]
+    LinearParameters merger_projection;   // [O, O]
+    Tensor merger_norm, merger_norm_bias; // BF16 [O]: LayerNorm
+    LinearParameters merger_gate_up;      // [2PI, O]
+    LinearParameters merger_down;         // [O, PI]
+};
+
 struct BlockParameters {
     HyperConnectionParameters attn_hc, ffn_hc;
     Tensor input_norm, post_attention_norm; // BF16 [H]
@@ -109,10 +137,13 @@ public:
     Tensor output_head;     // BF16 [H, V]: one vocabulary row per column (FP32 logits)
     std::vector<BlockParameters> layers;
     std::optional<DFlash2Parameters> dflash2;
+    std::optional<VisionParameters> vision;
 
 private:
     // Device copy of every MoE layer's ExpertScales, [MoE layers][E].
     DeviceBuffer scales_;
+    // The vision blocks' joined gate/up biases, [layers][2I].
+    DeviceBuffer vision_biases_;
 };
 
 } // namespace infernix::models::glm5_next::execution

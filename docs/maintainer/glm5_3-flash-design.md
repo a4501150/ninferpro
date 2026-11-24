@@ -2,9 +2,10 @@
 
 **Status: in progress.** M4 and M6 are built: the Engine, CLI, server and causal scoring on the
 shared VRAM, RAM and SSD expert tiers, the INT8-G64 latent cache, and DFlash2 speculation for
-one-request rounds (§16). Prefill streams its experts by DMA per call (§17); the layer walk is not
-built, and a fresh prompt prefills at ≈ 1,600 tok/s on the production machine, far below §5.4's
-model. The prefix cache and vision are not built yet; a request for one is refused at startup. This document designs
+one-request rounds (§16). Prefill streams its experts by DMA and runs layer-major walk spans
+(§17.1), ≈ 2,400 tok/s on a fresh prompt on the production machine, compute-bound. The prefix
+cache (§18) is built (M7, 2026-11-24; the walk captures its taps in place), and so are image and
+video prompts (M9, §21.1, `--vision`). This document designs
 `Glm5NextForConditionalGeneration` (GLM-5.3-Flash, model type `glm5_next`) on the shared offload
 tier, which is built and in production for Qwen3.8-Flash-Next. The shared machinery — expert banks,
 residency, tiers, placement, the CPU expert engine, decode and prefill on an offloaded MoE — is
@@ -120,9 +121,10 @@ checkpoint.
 **Vision is in scope** (owner, 2026-11-23). The checkpoint holds the 24-block tower in BF16
 (347 tensors, 1.13 GB, unquantized; the FP8 source would only be less precise). The converter
 stores it as the `vision` component, every tensor BF16 as the checkpoint keeps it, beside its
-`processor_config.json` resource. The binder refuses `--vision` until milestone M9 (§23) loads
-the tower, held in pinned host memory as Qwen3.8-Flash-Next's `--vision-offload` does, and adds
-the image and video prompts after the text engine works.
+`processor_config.json` resource. `--vision` loads the tower and the frontend takes image and
+video prompts (M9, §21.1); `--vision-offload` (auto: on) keeps the tower in pinned host memory and
+streams it through lent expert frames while it encodes, the mechanism Qwen3.8-Flash-Next uses
+(`src/models/common/vision/`).
 
 ### 1.2 Baselines
 
@@ -1361,12 +1363,37 @@ up to 24 of the hottest RAM experts per token instead of the steady-state pace).
 always stay on the link: with every miss on the CPU nothing is promoted, and Maya's hit rate fell
 to 60 %. No promotions after a walked prefill (MoE §7.3).
 
+**As built (2026-11-24).** One promotion per layer every 32 decode tokens
+(`kDecodePromotionInterval`), and CPU-served misses from 8 workers with half of a call's
+host-memory misses kept on the link (`cpu_expert_workers`, `cpu_link_share256`). Plain decode on
+the production machine, vram=42 %, ram=58 %, INT8 KV, 256-token answers, two runs each:
+
+| Configuration | C = 1, tok/s | C = 4, aggregate tok/s | Decode hits |
+|---|---:|---:|---:|
+| A promotion every token, no CPU lane (the first build) | 30.7-31.7 | ≈ 45 | 86 % |
+| No promotions, no CPU lane | 42.2-42.3 | | 88.9 % |
+| A promotion every 8 / 32 tokens, no CPU lane | 37.9-39.2 / 41.2-41.3 | | 87 / 88.5 % |
+| No promotions, CPU lane 8 workers, link share 1/2 | 47.1-47.5 | 75.4 | 88.9 / 80.1 % |
+| Same, 12 workers | 47.8-47.9 | 78.7 | 88.9 / 80.9 % |
+| Same, 8 workers, link share 1/3 | 46.5-48.0 | 75.0 | 88.9 / 80.8 % |
+
+A promotion of a 13.5 MiB record also demotes one (every expert lives in one tier), so a
+promotion every token copied ≈ 15 records each way per token across the link the misses need, and
+did not raise the hit rate. Twelve workers measured 1-4 % faster, inside the spread their higher
+hit rate explains; eight leave the host cores to other work. At C = 1 the profile now spends
+8.1 ms of 21.3 ms per token in the BF16 dense GEMVs (at the read rate), 4.3 ms in hit experts
+(≈ 54 % of the read rate), 4.2 ms staging misses beside them and 2.7 ms waiting for the CPU
+lane; the GPU idles 0.5 ms.
+
 ### 10.3 Staging, landing and leases
 
 Staging slots, landing frames and their adoption, frame retirement and leases are the shared
-machinery (MoE §4.4-§4.5). Staging slots are frames with a staging role, at most 32 (0.42 GiB at
-13.5 MiB),
-since a staging slot costs as much VRAM as a cached expert. The prefill stream's ring and staging
+machinery (MoE §4.4-§4.5). Staging slots are frames with a staging role: top_k × the widest
+decode or verify call's columns (at most 8), and at least 32 (0.42 GiB at 13.5 MiB), since a
+staging slot costs as much VRAM as a cached expert. A call keeps the fork route of the expert Op
+(staging beside the resident experts, staged misses landing in the cache) only while its
+top_k × columns jobs fit the slots: production's widest call (four lanes, or one row of K = 3)
+is 4 columns, 32 slots; one row of K = 7 takes 64 (0.85 GiB). The prefill stream's ring and staging
 areas (§17) and the vision encode window of a later track borrow frames through leases.
 
 ### 10.4 RAM tier
@@ -1716,6 +1743,21 @@ Every step follows the reference (§2.2) at its precision:
   (model). Query tiles of 64 share their tails and most recent pools; the kernel processes the tile
   against the union of its selected pools with a per-query mask, as Flash-Next's QSA prompt kernel
   does (FN §14.2).
+- **As built (2026-11-24):** one route for both regimes, the absorbed form throughout. Prompt calls
+  of 64 or more columns take `mla_sparse_attention`'s tensor-core envelope: one CTA per column with
+  all 64 heads sharing its tokens, 16-token tiles of latent rows staged as BF16 (INT8 codes exactly),
+  scores and value sums on BF16 MMAs with FP32 accumulation, each probability entering the value
+  MMA as a BF16 high and low pair. Against the FP64 oracle it stays within the split route's
+  criterion (worst 0.735 of the limit, the split route 0.699). On a 10,092-token prompt
+  (`vram=42%,ram=58%`, INT8 KV) attention went from 2.17 s to 0.27 s, TTFT from 7.6 s to 6.3 s. On
+  an 18,842-token perplexity run (context 8192, stride 4096) it differs from the split route by
+  KL 0.0125 (PPL 7.035 against 7.041); two FP32 orders of the split route itself differ by KL
+  0.0128, so the difference is the model's own rounding sensitivity (expert routing flips).
+- A score-kernel indexing bug (fixed 2026-11-24) left every 64-column select pass after a call's
+  first without scores, so prompt calls wider than 64 columns attended wrong pools beyond position
+  2,048 (PPL 7.65-7.99 by prefill chunk, against 7.035 fixed; the fixed prefill is bit-identical
+  across chunks of 1,024, 4,096 and 8,192). Measurements recorded before that date with prompts
+  past 2,048 tokens carry it.
 
 ### 13.5 KV formats
 
@@ -1741,9 +1783,16 @@ qualifies them. Order of work: `bf16`, then `int8` (built), then `fp8` and `nvfp
 
 Default `--max-context 131072`; up to 1,048,576 is supported. At 1M a `bf16` cache is ≈ 12.5 GB
 with its pooled keys (§13.5; `int8` 6.8 GB): the expert cache would lose ~880 (`int8` ~480)
-frames per sequence. Above 128K the design uses a live
-KV host tier — planned
-for Flash-Next and never built there (FN §14.4), so it is new work here: the pooled-key plane stays
+frames per sequence. Above 128K the design proposed a live KV host tier (below). **It is not built
+(2026-11-24):** on the 96 GB card the device cache holds every context this family is served at,
+so the tier would trade expert frames for RAM-tier slots and a PCIe read per selected token
+without a workload that needs it. At 262,144 tokens the INT8 cache is 1.59 GiB, and one
+255,771-token prompt prefilled at 2.09k tok/s (TTFT 2 min 2 s) and decoded 256 tokens at 33.3
+tok/s; a 3,964-token prompt on the same boot decoded at 30.7 tok/s (RTX PRO 6000, INT8 KV,
+`vram=42%,ram=58%`: 5,080 / 7,016 / 0 experts in VRAM / RAM / SSD; model 15.44 GiB, KV 1.59 GiB,
+experts 67.0 GiB). The tier stays the design for a smaller card or contexts past what the device
+holds. The proposed tier — planned
+for Flash-Next and never built there (FN §14.4): the pooled-key plane stays
 on the device, latent pages live in pinned RAM with a device CLOCK cache of hot pools, and only the
 selected ≤ 2,051 tokens per query are read. The host copy costs RAM-tier slots (9.0 GB of `fp8`
 latents and pooled keys at 1M ≈ 640 slots), which the ledger shows. The indexer's per-token scan
@@ -1866,6 +1915,32 @@ are no slower than plain (their tail rounds, once one request is left, draft) an
 So a round of several rows decodes plainly, and only one-row rounds draft; the drafter adds 1.6 GiB
 of VRAM (weights, context ring, verify records). The cost model below replaces this rule.
 
+**Profiled and re-measured (2026-11-24, same machine and placement: 5,080 / 7,016 / 0 experts in
+VRAM / RAM / SSD; model 15.44 GiB, experts 67.0 GiB; one request, 512-token essays, four sets
+after a warm-up, `infernix_glm5_next_engine_bench --draft-tokens K`; speeds climb over an
+Engine's first sets as the cache warms, so sets 3-4 compare):**
+
+| K | Median tok/s | Sets 3-4 | Accepted | ms a round |
+|---|---|---|---|---|
+| 0 (plain) | 35.0 | 35.0, 35.3 | – | 28 |
+| 1 | 40.9 | 40.9, 42.1 | 74-82 % | 42 |
+| 2 | 44.4 | 44.4, 44.5 | 56-65 % | 50 |
+| 3 | **47.8** | 47.8, 48.1 | 50-57 % | 55 |
+| 4 | 43.2 (28.9 before the fix below) | 43.0, 46.5 | 41-52 % | 64 (90) |
+| 5 | 37.7 | 35.3, 41.6 | 35-43 % | 75 |
+
+Under Nsight (`make t2-bench FAMILY=glm5_next PROFILE=1`), a one-row round is GPU-bound (≥ 98 %
+busy) and the drafter's own kernels are ≤ 2 ms of it; the round is the target's verification,
+and 80-84 % of that is expert service: at K = 3, of 58.6 ms, the miss staging 27.9, the CPU
+team's wait 13.9 and the GPU experts 11.7; the dense BF16 weights 8.4 (the plain round: 27.7 ms,
+of which staging 5.6, CPU 9.2, dense 8.1). Each verify column routes its own experts, so a
+column costs 14, 8, 5 and 9 ms for the second to fifth. The fifth column first cost 35 ms: the
+staging held 32 slots, so a five-column call's 40 jobs left the fork route and staged in two
+serial passes without landing its misses (174 ms of staging a round, and an expert cache that
+warmed slowly); the slots now follow the widest call (§10.3), as Qwen3.8-Flash-Next's do. K = 3 is
+production's length. Rounds of several rows still decode plainly: with drafting, two rows of
+K = 3 already reach 8 columns, the fork route's limit.
+
 Flash-Next's policy shape (FN §11.4): maximize E[tokens(K)] / E[t_round(K)] with
 t_round(K) = t_gpu(K+1) + t_host(U_{K+1}, current tier shares) + t_ssd + t_draft(K); every input an
 online EWMA; K = 0 always a candidate; experts used only by rejected columns are not credited to
@@ -1897,6 +1972,45 @@ the arena lent from frames. Every non-VRAM expert crosses the link once per span
 without a host copy is streamed too, through the tier's lent stream slots reading the volumes
 (MoE §4.7, §7.1).
 
+**Built (2026-11-24), `program/prefill_walk.cpp`:** consecutive streamed calls (at least 256
+columns each) of one prompt form a span of up to 32,768 tokens; chunk c's layer l runs what the
+chunk-major call c runs there, so the bits equal the chunk-major prefill's (the Program test
+compares a 1,100-token prompt's greedy tokens both ways). The span's residual stream, mHC mix,
+post/comb weights, ids, positions and per-chunk DFlash2 features live in a second frame lease
+beside the ring; the Forward exposes `begin_call`/`embed`/`step`/`finish`, which `run()` composes.
+Each `advance_prefill` enqueues about one call's work of layers over every chunk (a beside-decode
+call's width while another lane decodes) and synchronizes; other prefilling lanes wait
+(`context_blocks`), and other lanes' rounds land and promote nothing while a span is active.
+Prefix taps due at an inner chunk end on the block grid are captured in place: the span opens a
+staged capture for each (`PrefixCache::open_staged`, Host slabs reserved up front), copies each
+layer group of the tap's chunk once that chunk has run the layer (the next chunk's step of the
+layer waits on the copy's event; the drafter group follows the chunk's context ring), and commits
+them after the span, publishing the blocks up to each first. Only a due tap off the block grid ends
+the span (it needs the partial tail page, which later chunks overwrite).
+`ProgramOptions::prefill_walk` turns it off. The walk first ran the stream's SSD read path,
+which the port had left without the ring-half guard and without returning a layer's slots once its
+copies landed (heap corruption on the real artifact); both now follow the Flash-Next stream.
+Measured (RTX PRO 6000, `vram=42%,ram=58%`: 5,080 / 7,016 / 0 experts in VRAM / RAM / SSD, model
+15.44 GiB + KV 0.40 GiB + experts 67.0 GiB; INT8 KV, `--no-prefix-reuse`, chunk 4,096, with the
+tensor-core attention of §13.4 in both columns):
+
+| Prompt tokens | Chunk-major | Walk |
+|---|---|---|
+| 10,092 | 6.3 s TTFT (1.61k tok/s) | 4.3 s (2.35k tok/s) |
+| 12,644 | 8.0 s (1.59k tok/s) | 5.2 s (2.43k tok/s) |
+| 37,805 | 18.5 s (2.04k tok/s) | 15.7 s (2.41k tok/s) |
+
+The flat rate says prefill is now compute-bound (§17.3).
+
+With prefix reuse on (measured 2026-11-24, same placement, chunk 1,024,
+`tests/models/glm5_next/test_prefix_real.cpp`): a 7,741-token prompt is one 8-call span with its
+seven inner taps captured in place, 5.4-6.4 s; a prompt sharing its first 7,168 tokens resumes
+from the last tap in 2.2 s (573 computed); an exact repeat computes nothing. The tokens equal the
+cold runs', with and without DFlash2. Under a small RAM tier the walk is no faster than
+chunk-major: the stream's read slots are an eighth of the tier's (`tier.stream`), so a layer's
+SSD-only experts beyond that share go to the fetch channel once per chunk (`--expert-ram-mib
+24576`: about 74 s for the same prompt). Production's split leaves no SSD-only expert there.
+
 ### 17.2 Expert supply within a layer: the streamed ring
 
 **Built (M9, 2026-11-24):** a prefill chunk of at least 256 columns streams its non-resident
@@ -1904,7 +2018,7 @@ experts by copy-engine DMA two layers ahead of compute — the Flash-Next varian
 §7.1), not the expert-group pipelining this section first described. `ExpertStream`
 (`src/models/glm5_next/execution/expert_stream.{h,cpp}`, specialized from Qwen3.8-Flash-Next's:
 no gated CPU split, ggml banks or host record strides, which GLM does not use; the SSD stream
-slots and the unpinned-record bounce stay, so a layer walk can be added later) copies each MoE
+slots and the unpinned-record bounce stay, for the layer walk of §17.1) copies each MoE
 layer's non-resident experts with a pinned host record, in ascending id, into half l % 2 of a ring
 of frames the expert cache lends for the prompt (`lend`/`give_back`, returned after the prompt's
 last call once no lane is prefilling); runs of adjacent records of one bank coalesce into one
@@ -2005,6 +2119,24 @@ family owns its prefix index, spec §17.1):
   route-invariant (§9.5).
 - **Host tier default 2 GiB** (`--host-context-mib`). Each GiB costs ≈ 78 RAM expert slots
   (≈ 0.6 % of the bank); the ledger line names the trade, and agentic users may raise it.
+
+As built (M7, 2026-11-24). The family owns its prefix index (a fork of Qwen4Exp's,
+`program/prefix/prefix_index.*`) and its physical binding (`prefix_cache.*`, `state_image.*`):
+KV blocks of MLA latents (BF16, or INT8-G64 with their scales) and pooled indexer keys; state
+snapshots of the KDA recurrence and convolutions, the indexer's raw key/gate rings and the
+DFlash2 drafter's context ring (about 141 MiB each at the default artifact). The Disk tier is
+refused: the Host tier is the only snapshot residency. The endpoints of the shared spec are not
+published — GLM's projection routes are chosen by call width, so a resume is exact only when its
+calls repeat the publishing run's call boundaries. Instead every tap lands on the chunk grid (a
+multiple of the prefill chunk, which must be a multiple of 64): a tap splits nothing, a resume
+from any tap replays the publishing run's call widths over the same restored state, and the
+prompt-end captures of the zero-token resume hold the prefill transition's own state with the
+target head's saved residual, so an exact repeat regenerates its first token with no prefill
+(exact under DFlash2: the drafter's ring is in the image and its proposal reads only the ring).
+Mixed rounds (`--prefill-chunk-beside-decode`) are refused for a lane that publishes, for the
+same call-grid reason; they remain available with the cache off. Eviction, supersession, queue
+holds and the blocked-head prefetch follow the spec (§9, §6.6, §9.6). Persistence across
+restarts is refused (no save file, no Disk tier).
 
 ---
 
@@ -2214,6 +2346,71 @@ above stay defined against the BF16 reference forward on the same checkpoint.
 - **Serving.** `infernix-serve` serves the family; the expert-placement admin endpoint
   (`GET`/`POST /admin/expert-placement`, MoE §4.8) and the prefix cache apply unchanged.
 
+### 21.1 Vision
+
+Built (M9, 2026-11-24) behind `--vision`.
+
+- **Processor** (`frontend/processor.cpp`). Glm5NextImageProcessor and Glm5NextVideoProcessor:
+  the smart resize to whole 28-pixel merge blocks within `min_image_tokens` and
+  `max_image_tokens` merged tokens (an image: 16 to 8,000; a whole video: 16 to 240,000, capped
+  by `--vision-max-merged-tokens` and the prompt's vision budget), the content resized into that
+  canvas without upscaling once the source alone holds the minimum, then zero padding right and
+  bottom; torchvision's antialiased uint8 bicubic (ATen's int16 weights and their precision); the
+  fused CLIP normalization in FP32 rounded to BF16; 14-pixel patches of 1,176 features in
+  merge-block order, an image's frame duplicated. Video frames are sampled by GLM's own rule
+  (`sample_frames`: 2 fps, at most 2,048 frames, an odd count's last frame repeated), and each
+  frame pair's tokens follow `<|begin_of_image|>` and precede `<|end_of_image|>` and the pair's
+  time (`metadata.timestamps[::2]`, `"%.1f seconds"`). An image's `<|image|>` repeats once per
+  merged token; video frames use the same token id inside `<|begin_of_video|>` …
+  `<|end_of_video|>`, and token types are 1 for an image's tokens and 2 for a video's. Positions
+  stay the token indices: GLM-5.3 has no multimodal rope. Media decoding is the shared decoder's,
+  with the frame selection passed in.
+- **Tower** (`execution/vision.cpp`): patch embedding, 24 blocks (RMSNorm, separate Q/K/V GEMMs
+  with biases, per-head q/k RMSNorm, 2-D rope over (row, column) at head dimension 64, packed
+  attention within one item, clamped SwiGLU MLP in 4,096-column tiles), the post norm, the 2 × 2
+  downsample (its weight permuted at load to the merged column order) and the gated merger into
+  the text width. One pass runs every item of a prompt layer-major; each image, and each frame
+  pair of a video, is its own item, so an item's embeddings are the same alone or beside others.
+- **Offload** (`--vision-offload auto|on|off`, auto on). The tower binds `HostPinned`, and the
+  encode lends the weight staging with the handoff and the pass (`src/models/common/vision/`: the
+  pinned layout in groups, and the weight stream, which uploads the patch embedding, then each
+  layer one layer ahead of compute into two slots, then everything after the last layer). The
+  pass reads a copy of its parameters rebased onto the staging (`vision_window_weights`); the
+  blocks' joined gate/up biases (0.4 MB) stay in device memory.
+- **Program** (`program/vision.cpp`). Binding plans the items whose tokens end past the reused
+  prefix; the lane's first prefill call runs the whole pass into one token-ordered handoff (BF16
+  [hidden, tokens]) in lent expert frames, or an allocation when the residency lends none, and
+  gives the pass's frames (and the weight staging) back; every call, chunk-major or in a walk span, scatters its columns of
+  the handoff over the token embeddings before the stream expansion (`ForwardBatch::
+  vision_embeddings`). The handoff returns after the prompt's last call. A resume inside an item
+  (a tap at a call boundary there) encodes the item again and scatters only its remaining
+  columns. Block keys carry each item's identity (content digest, grid, timing, placement), so
+  the prefix cache shares a prefix only with the same media at the same place.
+- **Qualification.** The processor equals the Hugging Face processor exactly on prompts, token
+  types, grids and BF16 patches for PNG images (downscaled, upscaled, padded only, a 28 × 1,000
+  strip, three images at once) and H.264 videos (8 to 30 fps, 1 to 7 s, an odd sampled count),
+  through `tools/glm5_next/processor_reference.py` and the frontend real test; JPEG pixels differ
+  by up to 3 levels in about 5 % of values, because FFmpeg's IDCT is not libjpeg's (shared
+  decoder, not fixed). The tower is qualified stage by stage against a binary64 reference
+  (`tools/glm5_next/vision_reference.py`): it amplifies BF16 rounding chaotically in its middle
+  blocks (two BF16 implementations land 7–25 % apart end to end), so each block and the merger,
+  given the reference's own BF16 state, must stay within 1.25 × Transformers' BF16 error on the
+  same input (measured 1.03–1.16 ×), and end to end within 2 × Transformers' error (0.10–0.23
+  against Transformers' 0.07–0.26). Through the Engine
+  (`tests/models/glm5_next/test_vision_engine_real.cpp`): the examples' chart title, the
+  image-and-video case `NIFER-9`, concurrent media requests equal alone, a resumed repeat and a
+  resume inside an image equal their cold runs. With the tower streamed, the pass gives the
+  resident tower's bits, and an Engine with the tower in device memory gives the streamed
+  Engine's tokens.
+- **Cost.** Resident (`--vision-offload off`), the tower's weights take 1.13 GB of VRAM (about
+  80 expert frames of the cache). Streamed (the default), they take 1.13 GB of pinned RAM, and an
+  encode lends 370 MiB of staging (two layer slots and the 320 MiB merger) beside its handoff and
+  pass. An encode of 320–530 merged tokens took 96–149 ms on the GPU and 20 tokens 22 ms
+  (resident, measured 2026-11-24, after warm-up). The pass over the four reference images took
+  411.0 ms streamed against 408.5 ms resident: the 1,075 MiB upload hides behind compute. Other
+  lanes wait for an encode, as for one prefill call. Not built: stepping a large encode between
+  other lanes' rounds, and fused Q/K/V GEMMs or a D64 specialization of the 2-D rope.
+
 ---
 
 ## 22. Configuration surface
@@ -2231,7 +2428,7 @@ shared and already served by `src/serve/serve_options.cpp`. This family adds:
 | `--cpu-experts auto\|off\|N`, `--cpu-expert-cores p\|pe` | auto (calibrated), auto | CPU team size; whether E-cores join it (§12.3) |
 | `--spec dflash2 --draft-model FILE`, `--draft-tokens` | off | DFlash2 speculation (§16.2), the only drafter; the drafter is a companion artifact (FN §11.3's binding) |
 | `--kv-dtype bf16\|fp8\|int8\|nvfp4` | `bf16` | **Changes output** |
-| `--max-context N` | 131072 | Up to 1,048,576; the KV host tier above 128K (§13.6) |
+| `--max-context N` | 131072 | Up to 1,048,576, from the device cache (the KV host tier is not built, §13.6) |
 | `--prefill-chunk N`, `--prefill-group N` | auto, 48 | Chunking; experts per prefill group (§17.2) |
 | `--host-context-mib N` | 2048 | Prefix Host tier |
 | `--reasoning-effort low\|high\|max` | max | Template default; requests may override |
@@ -2258,9 +2455,50 @@ probe suite (the shape of `tools/flash_next_probe/`).
 | **M7** | Frontend and serving | Tokenizer, chat template, GLM tool-call and reasoning parsing, protocol schema tests | Tokenizer oracle exact; serving schema tests |
 | **M6** | DFlash2 speculation | The drafter at hidden 4096 (companion artifact, target features by `ops::hyper_connection_stream_mean`), acceptance measured, the §16.3 cost model | Default chosen by measurement; never slower than plain beyond noise |
 | **M7** | Prefix cache, lanes, decode performance | Prefix cache, multiple lanes, mixed rounds; `make t1`/`make t2` for `FAMILY=glm5_next` ([Decode profiling tiers](round-bench.md)); placement re-measurement including the owner's 50/20/30 observation (§3.1); route traces recorded on NRS and a broad corpus, then the policy replay of §10.2 and §10.4 against them | 128K decode ≥ 85 % of 4K; §9.3's budgets hold or get ncu; placement and policy defaults set by measurement |
-| **M8** | Prefill and long context | Indexer prompt kernels and attention prompt route at speed, KV formats (`int8` next), the KV host tier beyond 128K | Prefill measured against §5.4; 128K prefill stable |
-| **M9** | Vision | The `vision` component in the converter (BF16, as stored) and a re-conversion; the GLM tower (patch 14, temporal patch 2, merge 2, q/k norms, clamped SwiGLU, downsample and gated merger) with an FP64 reference; image and video prompts in the frontend | The tower against its reference; the frontend's image prompts against the Hugging Face processor |
+| **M8** | Prefill and long context | Indexer prompt kernels and attention prompt route at speed, KV formats (`int8` next), the KV host tier beyond 128K | Prefill measured against §5.4; 128K prefill stable. The KV host tier is not built (§13.6); 262K runs from the device cache |
+| **M9** | Vision | Built (§21.1). The `vision` component in the converter (BF16, as stored) and a re-conversion; the GLM tower (patch 14, temporal patch 2, merge 2, q/k norms, clamped SwiGLU, downsample and gated merger) with an FP64 reference; image and video prompts in the frontend | The tower against its reference; the frontend's image prompts against the Hugging Face processor |
 | **Later options** | Behind their gates | The approximate expert mode (§9.8); 8-bit dense recipes (O9, §25.3); the 5090 machine and striped expert volumes (§11.6); EXL3 imports (O7, §25.4) | Each behind its own §25.3 gate |
+
+**M7 status (measured 2026-11-24, RTX PRO 6000, INT8 KV, `vram=42%,ram=58%`: 5,080 / 7,016 / 0
+experts in VRAM / RAM / SSD; model 15.44 GiB, experts 67.0 GiB):**
+
+- Prefix cache and lanes: built (§18, §17.1).
+- `make t1|t1-record|t2|t2-record|t2-bench FAMILY=glm5_next`: built (round-bench.md lists how this
+  family differs). T1 at 1,024 tokens of context, median round over 64 after 16 warm: 1x1 34.4 ms
+  (29.1 tok/s, 49.5 % VRAM hits, the first shape on a cold cache), 2x1 30.5 ms (65.7 tok/s in
+  aggregate), 4x1 43.0 ms (92.9 tok/s), 1x3 (two drafts) 39.6 ms (75.7 tok/s; the bench's
+  numbered text accepts every draft). Five replays per shape gave identical tokens; T2's golden
+  tokens reproduce across boots, with four in flight, after a tap resume and after a placement
+  switch.
+- 128K decode ≥ 85 % of 4K: met. One lane, 256 tokens after prompts of 3,964 and 130,164 tokens
+  (prefill 2.35k tok/s at 130K, 55 s): 38.1 and 36.8 tok/s at 83.1 % and 83.0 % decode hit rates
+  (97 %); a later 4K prompt at 84.8 % reached 41.0 (90 %).
+- Mixed rounds: not built, by measurement. A 30,614-token prompt beside a decoding lane prefilled
+  at 2.53k tok/s while that lane's 1,500 tokens took 55.6 s against 42.3 s alone: the lane gets one
+  round per walk step either way. A mixed round would save one decode round (about 27 ms) per
+  1,024-token step of about 430 ms (≈ 6 % of the prompt's prefill), give the decoding lane no more
+  rounds, and could not run for a lane that publishes to the prefix cache (the default), since
+  this family's routes are chosen by call width and a mixed call's bits differ from its own call's.
+- A RAM-tier switch on this family first refused any RAM count (the new tier had to fit beside the
+  old 113 GiB one); `ensure_tier` now releases the old tier first when both do not fit, and the
+  fill reads the records again.
+- Placement (one boot each, `--no-prefix-reuse`, 4 lanes, 65,536 context, 256 greedy tokens:
+  two single requests, then four at once; VRAM fixed at 42 %, 5,080 experts, model 15.44 GiB, KV
+  0.40 GiB, experts 67.0 GiB):
+
+  | RAM / SSD | RAM slots (residents + 1,536 stream slots) | C1 decode tok/s | C4 decode tok/s each | decode hits |
+  |---|---|---|---|---|
+  | 58 % / 0 % | 8,552 | 41.6, 41.9 | 19.4 | ≈ 82 % |
+  | 38 % / 20 % | 6,132 | 42.4, 44.1 | 20.1 | 83–86 % |
+  | 28 % / 30 % | 4,922 | 34.9, 38.2 | 16.9 | 81–86 % |
+
+  Twenty percent on the SSD decodes as fast as all-RAM (the 1,536 stream slots keep the hot part of
+  the SSD share in RAM, and the hit rate is the VRAM's), thirty percent is 12–16 % slower. The
+  owner's 50 % VRAM split does not fit beside the model and KV under the 95 % cap on this family
+  (80 GiB of experts), so it was not run; the observation's lesson (some SSD share costs nothing)
+  holds here up to about 20 %. Two and four requests per point: differences under about 5 % are
+  within run-to-run spread.
+- Open: route traces and the policy replay of §10.2 and §10.4, and §9.3's per-kernel budgets.
 
 Critical path: M0 → M1 → M2 → M3 → M4 → M6 → M7 → M8, with M5 parallel from the moment the
 tokenizer files are read (they are available now) and M3 able to start beside M2 once M1's record

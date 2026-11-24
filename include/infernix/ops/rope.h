@@ -19,20 +19,22 @@ namespace infernix::ops {
  *   full-head domain head_dim=rotary_dim=128; phi=positions[t]*theta^(-2*i/rotary_dim).
  * - Text MRoPE: positions I32 [T,3], head_dim=256, rotary_dim=64; pair i uses axis i%3 with
  *   the same frequency as Text 1-D.
- * - Vision 2-D: positions I32 [T,2], head_dim=rotary_dim=72; pairs 0..17 use axis 0 and pairs
- *   18..35 use axis 1, each with local frequency theta^(-2*(i%18)/36).
+ * - Vision 2-D: positions I32 [T,2], head_dim=rotary_dim=D in {72, 64}; with Q=D/4, pairs
+ *   0..Q-1 use axis 0 and pairs Q..2Q-1 use axis 1, each with local frequency
+ *   theta^(-2*(i%Q)/(2Q)).
  *
  * positions is contiguous and theta is positive and finite. Q/K tensors are BF16
  * [head_dim,heads,T] with positive head counts, contiguous head features and heads, and an optional
  * padded token stride. The registered optimized domains are D256/R64 Text Q/K head geometries
- * 24/4 and 16/2, D128/R128 1-D Text geometry 32/8, plus Vision geometry 16/16. q and k must not
- * overlap one another or positions. The Op mutates only dimensions [0,rotary_dim) of the supplied
- * Q/K tensor storage. The oracle evaluates the rotated dimensions naively in FP64 from the
- * represented inputs. The updated BF16 values are promoted and compared directly with that result;
- * output storage rounding belongs to the Op's numerical criterion, not the oracle. Unrotated
- * dimensions remain bit-exact. Private kernel arithmetic is implementation-defined. The Op uses no
- * workspace or persistent state. `execution` supplies the stream and the selected device's
- * positive physical SM count; the count selects launch geometry, not the transformation.
+ * 24/4 and 16/2, D128/R128 1-D Text geometry 32/8, plus Vision geometry 16/16 at D72 (D64 runs
+ * the generic kernel). q and k must not overlap one another or positions. The Op mutates only
+ * dimensions [0,rotary_dim) of the supplied Q/K tensor storage. The oracle evaluates the rotated
+ * dimensions naively in FP64 from the represented inputs. The updated BF16 values are promoted and
+ * compared directly with that result; output storage rounding belongs to the Op's numerical
+ * criterion, not the oracle. Unrotated dimensions remain bit-exact. Private kernel arithmetic is
+ * implementation-defined. The Op uses no workspace or persistent state. `execution` supplies the
+ * stream and the selected device's positive physical SM count; the count selects launch geometry,
+ * not the transformation.
  */
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
           DeviceExecutionView execution);

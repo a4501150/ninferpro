@@ -20,7 +20,7 @@ struct ToolCallOutputContract;
 
 namespace infernix::models::glm5_next {
 
-inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
+inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 14ULL * 14ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
 // Aggregate prompt capacity and one-item execution capacity are intentionally distinct. Multiple
 // media items are retained by one prepared prompt but pass through the Vision tower sequentially.

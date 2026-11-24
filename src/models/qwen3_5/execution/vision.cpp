@@ -300,7 +300,8 @@ Tensor VisionContext::bind_output(DeviceSpan backing, const VisionWorkspacePlan&
 }
 
 void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
-                           const VisionWorkspacePlan& plan, qwen_common::execution::VisionWeightStream* weight_stream) const {
+                           const VisionWorkspacePlan& plan,
+                           common::VisionWeightStream* weight_stream) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
     const qwen_common::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;

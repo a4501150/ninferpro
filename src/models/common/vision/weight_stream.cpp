@@ -1,8 +1,8 @@
-#include "models/qwen_common/execution/vision_weight_stream.h"
+#include "models/common/vision/weight_stream.h"
 
 #include <stdexcept>
 
-namespace infernix::models::qwen_common::execution {
+namespace infernix::models::common {
 namespace {
 
 // Rebases a pointer inside a group's pinned bytes into the group's staged slot, through the
@@ -77,42 +77,30 @@ VisionWeightStream::~VisionWeightStream() {
     }
 }
 
-VisionParameters VisionWeightStream::window_weights(const VisionParameters& host) const {
-    const VisionOverlayLayout& layout = assets_.layout;
-    const std::byte* block            = assets_.pinned_block;
-    const VisionOverlayGroup& prelude = layout.prelude;
-    const VisionOverlayGroup& merger  = layout.merger;
+Tensor VisionWeightStream::prelude(const Tensor& host) const {
+    return stage_tensor(assets_.layout.prelude, prelude_, assets_.pinned_block, host);
+}
 
-    VisionParameters out       = host;
-    out.patch_embedding.weight = stage_weight(prelude, prelude_, block, host.patch_embedding.weight);
-    out.patch_embedding_bias   = stage_tensor(prelude, prelude_, block, host.patch_embedding_bias);
-    out.position_embedding     = stage_tensor(prelude, prelude_, block, host.position_embedding);
-    for (std::size_t layer = 0; layer < host.layers.size(); ++layer) {
-        const VisionOverlayGroup& group  = layout.layers[layer];
-        std::byte* staging               = slot_[layer % 2];
-        const VisionBlockParameters& src = host.layers[layer];
-        VisionBlockParameters dst        = src;
-        dst.norm1.weight  = stage_tensor(group, staging, block, src.norm1.weight);
-        dst.norm1.bias    = stage_tensor(group, staging, block, src.norm1.bias);
-        dst.norm2.weight  = stage_tensor(group, staging, block, src.norm2.weight);
-        dst.norm2.bias    = stage_tensor(group, staging, block, src.norm2.bias);
-        dst.qkv.weight    = stage_weight(group, staging, block, src.qkv.weight);
-        dst.qkv_bias      = stage_tensor(group, staging, block, src.qkv_bias);
-        dst.output.weight = stage_weight(group, staging, block, src.output.weight);
-        dst.output_bias   = stage_tensor(group, staging, block, src.output_bias);
-        dst.fc1.weight    = stage_weight(group, staging, block, src.fc1.weight);
-        dst.fc1_bias      = stage_tensor(group, staging, block, src.fc1_bias);
-        dst.fc2.weight    = stage_weight(group, staging, block, src.fc2.weight);
-        dst.fc2_bias      = stage_tensor(group, staging, block, src.fc2_bias);
-        out.layers[layer] = dst;
-    }
-    out.merger_norm.weight = stage_tensor(merger, merger_, block, host.merger_norm.weight);
-    out.merger_norm.bias   = stage_tensor(merger, merger_, block, host.merger_norm.bias);
-    out.merger_fc1.weight  = stage_weight(merger, merger_, block, host.merger_fc1.weight);
-    out.merger_fc1_bias    = stage_tensor(merger, merger_, block, host.merger_fc1_bias);
-    out.merger_fc2.weight  = stage_weight(merger, merger_, block, host.merger_fc2.weight);
-    out.merger_fc2_bias    = stage_tensor(merger, merger_, block, host.merger_fc2_bias);
-    return out;
+Weight VisionWeightStream::prelude(const Weight& host) const {
+    return stage_weight(assets_.layout.prelude, prelude_, assets_.pinned_block, host);
+}
+
+Tensor VisionWeightStream::layer(std::uint32_t layer, const Tensor& host) const {
+    return stage_tensor(assets_.layout.layers.at(layer), slot_[layer % 2], assets_.pinned_block,
+                        host);
+}
+
+Weight VisionWeightStream::layer(std::uint32_t layer, const Weight& host) const {
+    return stage_weight(assets_.layout.layers.at(layer), slot_[layer % 2], assets_.pinned_block,
+                        host);
+}
+
+Tensor VisionWeightStream::merger(const Tensor& host) const {
+    return stage_tensor(assets_.layout.merger, merger_, assets_.pinned_block, host);
+}
+
+Weight VisionWeightStream::merger(const Weight& host) const {
+    return stage_weight(assets_.layout.merger, merger_, assets_.pinned_block, host);
 }
 
 void VisionWeightStream::reset(cudaStream_t compute) {
@@ -165,4 +153,4 @@ void VisionWeightStream::upload_next_layer() {
     }
 }
 
-} // namespace infernix::models::qwen_common::execution
+} // namespace infernix::models::common

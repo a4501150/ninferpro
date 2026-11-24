@@ -30,17 +30,28 @@ namespace infernix::models::glm5_next::frontend {
 }
 
 // A rendered chat's token ids, with its byte boundaries mapped to the token frontiers that fall
-// exactly on them.
+// exactly on them, and each expanded media run's tokens.
 struct EncodedChat {
     std::vector<int> input_ids;
+
+    struct MediaTokenRun {
+        TokenSpan tokens;
+        Modality modality       = Modality::Image;
+        std::size_t item_index  = 0;
+        std::size_t frame_index = 0;
+    };
+
+    std::vector<MediaTokenRun> media_token_runs;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
 };
 
+// Every media run must be expanded (media_placeholders empty) and encode to image_token only.
 EncodedChat
 encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
-                     std::size_t maximum_tokens = std::numeric_limits<std::size_t>::max());
+                     std::size_t maximum_tokens = std::numeric_limits<std::size_t>::max(),
+                     TokenId image_token        = -1);
 
 } // namespace infernix::models::glm5_next::frontend

@@ -39,7 +39,7 @@ gate's default role against a width-routed fast route, and its second reference.
 scores only each stream's first N windows, a spot check of a saved run (it excludes
 `--save-top-tokens` and `--kl-reference`). [Model-level numerical quality](maintainer/model-quality.md)
 has the method and the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
-`--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` as there too). Its windows
+`--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` and `--experts SPEC` as there too). Its windows
 prefill through the generation path, the SSD expert tier included, keeping each position's final
 residual; the LM head then runs over them in tiles of 64 positions with FP32 logits. The available Main
 KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; unlike `infernix` and

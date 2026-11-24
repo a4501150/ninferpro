@@ -126,6 +126,61 @@ TextConfig text(const Json& value) {
     return out;
 }
 
+VisionConfig vision(const Json& value, const TextConfig& text) {
+    require_members(value, {"model_type",           "in_channels",
+                            "temporal_patch_size",  "depth",
+                            "hidden_size",          "num_heads",
+                            "image_size",           "patch_size",
+                            "spatial_merge_size",   "intermediate_size",
+                            "out_hidden_size",      "projection_intermediate_size",
+                            "rms_norm_eps",         "swiglu_limit",
+                            "rope_parameters",      "image_token_id",
+                            "image_start_token_id", "image_end_token_id",
+                            "video_token_id",       "video_start_token_id",
+                            "video_end_token_id"},
+                    {}, "vision config");
+    if (value.at("model_type") != "glm5_next_vision" || dimension(value, "in_channels") != 3) {
+        throw ArtifactError("the vision component is not a three-channel glm5_next_vision tower");
+    }
+    VisionConfig out;
+    out.depth                        = dimension(value, "depth");
+    out.hidden_size                  = dimension(value, "hidden_size");
+    out.num_heads                    = dimension(value, "num_heads");
+    out.intermediate_size            = dimension(value, "intermediate_size");
+    out.out_hidden_size              = dimension(value, "out_hidden_size");
+    out.projection_intermediate_size = dimension(value, "projection_intermediate_size");
+    out.patch_size                   = dimension(value, "patch_size");
+    out.temporal_patch_size          = dimension(value, "temporal_patch_size");
+    out.spatial_merge_size           = dimension(value, "spatial_merge_size");
+    out.rms_norm_eps                 = positive_float(value, "rms_norm_eps");
+    out.swiglu_limit                 = positive_float(value, "swiglu_limit");
+    const Json& rope                 = value.at("rope_parameters");
+    if (!rope.is_object() || rope.value("rope_type", std::string()) != "axial") {
+        throw ArtifactError("the vision tower's RoPE must be axial");
+    }
+    out.rope_theta = rope.contains("rope_theta") ? positive_float(rope, "rope_theta") : 10'000.0F;
+    // The tower's Ops: 16 heads of 64 (packed attention, 2-D RoPE), 2 x 2 merges, two-frame
+    // patches.
+    if (out.num_heads != 16 || out.hidden_size != 16 * 64 || out.spatial_merge_size != 2 ||
+        out.temporal_patch_size != 2 || out.out_hidden_size != text.hidden_size) {
+        throw ArtifactError("the vision tower's geometry is not the one this family runs");
+    }
+    const auto token = [&](const char* name) {
+        const std::uint32_t id = integer(value.at(name), name, false);
+        if (id >= text.vocab_size) {
+            throw ArtifactError(std::string(name) + " lies outside the vocabulary");
+        }
+        return id;
+    };
+    out.image_token_id       = token("image_token_id");
+    out.image_start_token_id = token("image_start_token_id");
+    out.image_end_token_id   = token("image_end_token_id");
+    out.video_token_id       = token("video_token_id");
+    out.video_start_token_id = token("video_start_token_id");
+    out.video_end_token_id   = token("video_end_token_id");
+    return out;
+}
+
 } // namespace
 
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
@@ -144,7 +199,6 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (!options.dflash2() && !options.draft_model.empty()) {
             throw ArtifactError("--draft-model is the DFlash2 drafter: it needs --spec dflash2");
         }
-        if (options.vision) { throw ArtifactError("Glm5Next has no vision tower yet"); }
         if (options.rope_yarn_factor != 1.0F) {
             throw ArtifactError("Glm5Next attention has no RoPE to scale (rope_yarn_factor)");
         }
@@ -153,6 +207,12 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         }
         Config out;
         out.text = text(directory.component("text").config);
+        if (options.vision) {
+            if (!directory.components.contains("vision")) {
+                throw ArtifactError("--vision needs an artifact with the vision component");
+            }
+            out.vision = vision(directory.component("vision").config, out.text);
+        }
         return out;
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("Glm5Next config: ") + error.what());

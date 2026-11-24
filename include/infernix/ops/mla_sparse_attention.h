@@ -147,8 +147,14 @@ struct MlaSelectedPools {
 /// model's per-call choice, e.g. 1 for prefill); a column's bits then also depend on that host
 /// value, and stay independent of the batch within it. The workspace query and the execution
 /// must use the same envelope value.
+///
+/// tensor_cores selects the tensor-core route (heads 64 only; splits is then ignored): one pass
+/// per column over all of its attended tokens in 16-token tiles, scores and value sums on BF16
+/// MMAs with FP32 accumulation (see the Op's Numeric). Meant for wide prompt calls; a column's
+/// bits depend only on its own inputs and its sequence's cache.
 struct MlaAttentionExecutionEnvelope {
     std::int32_t splits = 0;
+    bool tensor_cores   = false;
 };
 
 /// Caller-owned transient capacity for every legal call of up to `columns` columns at
@@ -191,6 +197,11 @@ mla_sparse_attention_workspace_bytes(const MlaAttentionGeometry& geometry, std::
  *   FP32 scores and online softmax (exact per-tile maxima, exponentials and in-order value fold
  *   per 32-token tile), FP32 split merge (max, weight exp, weighted sums in split order), FP32
  *   projection accumulation, one BF16 rounding of out. Selection belongs to the indexer Op.
+ *   The tensor-core route: the cached latents enter the MMAs exactly (BF16 as stored, INT8 codes
+ *   with each 64-dimension group's dot scaled in FP32), qa as stored; FP32 online softmax per
+ *   16-token tile; each probability (times the INT8 group scale) enters the value MMA as a BF16
+ *   high part plus the BF16 rounding of its remainder (about 16 significant bits); MMA
+ *   accumulation order is the hardware's.
  *
  * Effects:
  *   Writes out completely; reads the cache; nothing else changes. Inputs, cache and out pairwise

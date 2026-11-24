@@ -51,4 +51,9 @@ struct Glm5NextInstance {
 // resolved values.
 [[nodiscard]] ConstructedBackend construct_glm5_next_backend(EngineOptions& options, DeviceContext& device);
 
+// The family's instance alone, without the Engine's backend (the T1 round bench drives its
+// Program); `options` as normalize_engine_options leaves them for this family.
+[[nodiscard]] std::unique_ptr<Glm5NextInstance> construct_glm5_next_instance(const EngineOptions& options,
+                                                                            DeviceContext& device);
+
 } // namespace infernix::runtime

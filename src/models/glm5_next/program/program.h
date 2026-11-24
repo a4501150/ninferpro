@@ -23,6 +23,8 @@
 #include "runtime/contract/request.h"
 #include "runtime/contract/resources.h"
 #include "runtime/contract/timing.h"
+#include "runtime/prefix_cache/cost.h"
+#include "runtime/prefix_cache/tap_planner.h"
 
 #include <array>
 #include <chrono>
@@ -313,13 +315,14 @@ struct ProgramDevicePlan {
     std::uint64_t state     = 0; // KDA convolution and recurrent state of every lane
     std::uint64_t io        = 0; // per-call inputs, logits, sampling, constraint and scoring arrays
     std::uint64_t draft     = 0; // the DFlash2 context ring, target features and KDA verify records
+    std::uint64_t prefix    = 0; // the prefix cache's staging slots and saved head residuals
     std::uint64_t residency = 0; // the expert frame tables and route log
     std::uint64_t expert_record_stride = 0; // one expert record (staging slots and frames)
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
-        return kv + workspace + staging + state + io + draft + residency;
+        return kv + workspace + staging + state + io + draft + prefix + residency;
     }
 };
 
@@ -337,6 +340,15 @@ struct ProgramOptions {
     // (glm5_3-flash-design.md §17.2); off, the MoE stages them with its SM kernel as before. The
     // records a chunk copies are the same bytes either way, so the outputs do not change.
     bool prefill_stream = true;
+    // Consecutive streamed calls of a prompt run layer-major (prefill_walk.cpp): each expert
+    // crosses the link once per span instead of once per call, with the same bits.
+    bool prefill_walk = true;
+    // CPU-served misses of decode and verification calls: host expert-engine workers (0
+    // disables), the most of a layer call's misses they take, and the link's share of a call's
+    // host-memory misses in 256ths (the rest go to the CPU).
+    std::uint32_t cpu_expert_workers = 8;
+    std::uint32_t cpu_expert_jobs    = 4;
+    std::int32_t cpu_link_share256   = 128;
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
     // The MLA latent's storage: BF16 (1024 B a token and layer) or Int8Group64 (528 B; the
@@ -354,6 +366,16 @@ struct ProgramOptions {
     // with the instance's placement, warm start, VRAM headroom and RAM tier sizing; the Program
     // fills the family's own fields (label, geometry, staging, chunk, tier floor, stripe identity).
     offload::ExpertPlacementRuntime::Options placement;
+    // The prefix cache (glm5_3-flash-design.md §18): requests resume from and publish to a shared
+    // block tree with state snapshots in a pinned Host slab pool of prefix_host_bytes (the family's
+    // only snapshot residency; there is no Disk tier). GLM resumes only from prefill-computed state
+    // on the chunk grid — its projection routes are chosen by call width, so a snapshot's frontier
+    // is always a call boundary of the publishing run — plus the prompt-end captures of the
+    // zero-token resume, whose state is the prefill transition itself.
+    bool prefix_cache               = false;
+    std::uint64_t prefix_host_bytes = 0;
+    runtime::prefix_cache::TapPlannerConfig prefix_taps;
+    runtime::prefix_cache::CacheCostModel prefix_cost;
     DiagnosticObserver diagnostics;
 };
 
@@ -391,7 +413,7 @@ public:
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
-    // ---- admission: a root source, start_binding reserves, poll_context activates ----
+    // ---- admission: sources over the prefix cache, start_binding reserves, poll_context activates
     [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
                                                               std::uint32_t maximum_frontier);
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane,
@@ -402,17 +424,21 @@ public:
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
-    // No cached blocks to evict, prefetch or hold.
-    [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage) { return false; }
-    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&) { return std::nullopt; }
-    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept { return 0; }
-    void hybrid_hold_queue(std::span<const RequestBasePlan* const>) {}
+    // Reclaims cached Device pages for a shortage (evicting unpinned cached blocks).
+    [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
+    // The blocked FIFO head's Host-only blocks are copied into spare Device cache while it waits
+    // (hybrid-prefix-cache-spec §6.6).
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    // Holds the snapshots queued requests would resume from, admission order first (§9.6).
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
     void hybrid_hold_continuation(std::chrono::steady_clock::time_point) {
-        throw std::logic_error("Glm5Next: there is no prefix cache to hold");
+        throw std::logic_error("Glm5Next: its prefix cache has no tool-call holds");
     }
-    [[nodiscard]] bool hybrid_holds_stale() const noexcept { return false; }
-    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept { return 0; }
-    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept { return {}; }
+
+    [[nodiscard]] bool hybrid_holds_stale() const noexcept;
+    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
 
     // ---- execution units: a binding reserves the request's whole extent ----
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);

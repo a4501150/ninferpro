@@ -5,6 +5,7 @@
 #include "models/glm5_next/config.h"
 #include "models/glm5_next/frontend/resources.h"
 #include "models/glm5_next/weights.h"
+#include "models/common/vision/overlay_layout.h"
 #include "models/offload/expert_store.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
@@ -58,11 +59,19 @@ public:
         return backing_.stats();
     }
 
+    // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
+    // lends its staging from the expert cache).
+    [[nodiscard]] const std::optional<common::VisionOverlayAssets>&
+    overlay_vision() const noexcept {
+        return overlay_vision_;
+    }
+
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
           std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
+          std::optional<common::VisionOverlayAssets> overlay_vision,
           artifact::MaterializedArtifact backing, std::optional<offload::ExpertStore> expert_store,
           std::optional<artifact::MaterializedArtifact> draft_backing);
 
@@ -77,6 +86,7 @@ private:
     std::vector<ExpertBank> banks_;
     FrontendResources resources_;
     InstanceInfo info_;
+    std::optional<common::VisionOverlayAssets> overlay_vision_;
 };
 
 } // namespace infernix::models::glm5_next

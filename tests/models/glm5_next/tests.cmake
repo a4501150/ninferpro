@@ -52,3 +52,29 @@ infernix_add_test(infernix_glm5_next_program_real_test
 infernix_add_test(infernix_glm5_next_engine_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_real.cpp"
   LIBRARIES infernix_engine)
+
+# The prefix cache through the public Engine on the real artifact (INFERNIX_GLM_ARTIFACT): a
+# shared-prefix resume and an exact repeat against cold runs, with the layer walk's in-place taps.
+infernix_add_test(infernix_glm5_next_prefix_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_real.cpp"
+  LIBRARIES infernix_engine)
+
+# The T2 start-up and correctness smoke test (AGENTS.md "Iteration tiers"): the Engine with
+# production's options on the real artifacts, then the default route against golden tokens.
+infernix_add_test(infernix_glm5_next_smoke_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_smoke_real.cpp"
+  LIBRARIES infernix_engine)
+
+# The vision tower on the real artifact (INFERNIX_GLM_ARTIFACT) against the binary64 reference
+# tower (INFERNIX_GLM_VISION_REFERENCE: tools/glm5_next/vision_reference.py --no-bf16-boundaries
+# --hf-check --one-step), stage by stage and end to end, on the Hugging Face processor's pixels.
+infernix_add_test(infernix_glm5_next_vision_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_real.cpp"
+  LIBRARIES infernix_model_runtime infernix_model_loading infernix::json)
+
+# Media prompts through the public Engine on the real artifact (INFERNIX_GLM_ARTIFACT) with the
+# examples' media: an image, an image and a video, concurrent media requests and prefix reuse.
+infernix_add_test(infernix_glm5_next_vision_engine_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_engine_real.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES infernix_engine)

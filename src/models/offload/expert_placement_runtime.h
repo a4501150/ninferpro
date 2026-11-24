@@ -328,9 +328,16 @@ private:
 
     // Builds or rebuilds the tier to hold `residents` resident records beside its lists (the
     // read ring, prefetch and demotion -- the boot derivation's). Engine thread, at a maintenance
-    // boundary. An existing tier's records seed the new one best-first; the rest fill by the tier
+    // boundary. An existing tier's records seed the new one best-first when the new one fits in
+    // the host's free memory beside it, else the old releases first; the rest fill by the tier
     // fill and demand below. The old tier's pinned chunks release with it.
     void ensure_tier(std::uint32_t residents);
+
+    // The host memory a tier of `residents` resident records and its lists takes (an estimate
+    // in frame sizes).
+    [[nodiscard]] std::uint64_t tier_bytes(std::uint32_t residents) const noexcept {
+        return (static_cast<std::uint64_t>(residents) + 1536) * residency_->frame_bytes();
+    }
 
     // The resident placement still leaves one key without a frame (the pools hold one key fewer
     // than the set), and artifact reads stage through the tier's lists: keep only those lists and

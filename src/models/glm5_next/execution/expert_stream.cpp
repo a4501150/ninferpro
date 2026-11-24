@@ -111,10 +111,16 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
         for (std::uint32_t e = 0; e < experts_; ++e) {
             row[e] = -1;
             if (frames[e] >= 0) { continue; }
+            if (taken >= half_) {
+                complete = false;
+                continue;
+            }
             if (takes(l, e, taken, staged)) { // a pinned record, or an unpinned one while staging has room
                 row[e] = static_cast<std::int32_t>((l % 2) * half_ + taken++);
                 if (hold_) { hold_(l, e); }
-            } else if (ssd_planned_[l].size() < ssd_cap) { // SSD-only: a stream read
+            } else if (record_of_(l, e) == nullptr &&
+                       (!staging_.unpinned || staging_.unpinned(l, e) == nullptr) &&
+                       ssd_planned_[l].size() < ssd_cap) { // SSD-only: a stream read
                 row[e] = static_cast<std::int32_t>((l % 2) * half_ + taken++);
                 ssd_planned_[l].emplace_back(e, row[e]);
             } else {
@@ -246,6 +252,9 @@ void ExpertStream::enqueue(std::uint32_t layer) {
         bounce_used_[h] = true;
     }
     CUDA_CHECK(cudaEventRecord(landed_[layer], stream_));
+    if (!ssd_planned_[layer].empty()) {
+        ssd_held_.push_back(layer);
+    } // its slots return once landed
 }
 
 void ExpertStream::end() noexcept {

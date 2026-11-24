@@ -92,12 +92,32 @@ struct DFlash2Weights {
     WeightId predecessor_codebook, successor_codebook; // BF16 [vocab, rank]
 };
 
+// One vision block: RMSNorms without bias, Q/K/V (one packing group) with biases, the per-head
+// q/k norms [head_dim], the output projection, and the clamped SwiGLU MLP with biases.
+struct VisionBlockWeights {
+    WeightId norm1, norm2;
+    WeightId query, key, value, query_bias, key_bias, value_bias, query_norm, key_norm;
+    WeightId output, output_bias;
+    WeightId gate, gate_bias, up, up_bias, down, down_bias;
+};
+
+// The vision tower (tools/convert/glm5_next.py _Builder.vision). downsample is the stored conv
+// kernel [O, H, m, m]; the loader permutes it in place to [O, m*m*H] (patch-major), the order of
+// one merged token's m x m patch columns.
+struct VisionWeights {
+    WeightId patch_embedding, patch_embedding_bias;
+    std::vector<VisionBlockWeights> layers;
+    WeightId post_norm, downsample, downsample_bias;
+    WeightId merger_projection, merger_norm, merger_norm_bias, merger_gate, merger_up, merger_down;
+};
+
 struct TextWeights {
     WeightId token_embedding; // BF16, pinned host memory
     WeightId final_norm;      // over the stream mean
     WeightId output_head;
     std::vector<BlockWeights> layers;
     std::optional<DFlash2Weights> dflash2; // bound from the companion artifact
+    std::optional<VisionWeights> vision;   // the vision component (--vision)
 };
 
 } // namespace infernix::models::glm5_next

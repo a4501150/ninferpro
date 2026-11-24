@@ -23,9 +23,12 @@
 #include "models/glm5_next/execution/dflash2.h"
 #include "models/glm5_next/execution/forward.h"
 #include "models/glm5_next/execution/parameters.h"
+#include "models/glm5_next/program/prefix/call_plan.h"
+#include "models/glm5_next/program/prefix/prefix_cache.h"
 #include "models/offload/expert_residency.h"
 #include "models/offload/host_expert_tier.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
+#include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "runtime/diagnostics.h"
 
 #include <cuda_runtime.h>
@@ -38,6 +41,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace infernix::models::glm5_next::detail {
@@ -66,13 +70,83 @@ struct BasePlanImpl {
     ops::SamplingConfig sampling;
     std::vector<TokenId> readout_tokens;              // read at the prompt's frontier (/v1/decide)
     std::shared_ptr<const ConstraintPlan> constraint; // null: unconstrained
+    bool reuse              = false; // the prefix cache may resume and publish this request
     std::uint32_t pages     = 0; // KV page groups of the extent
     std::uint32_t positions = 0; // the extent: prompt + effective output, at most max_context
     std::shared_ptr<const PreparedPrompt> prompt; // the request's prompt, moved in by plan_request
 };
 
+// One admission's prefix-cache source: the snapshot it resumes from, the blocks it maps, the
+// copy-on-write tail it takes, and the suffix's prefill calls.
+struct PrefixSelection {
+    std::optional<prefix::cache_index::SnapshotRef> snapshot;
+    std::uint32_t frontier = 0;
+    // The full blocks below the frontier (the anchor included).
+    std::vector<prefix::cache_index::NodeRef> path;
+    std::uint32_t shared = 0;     // leading blocks mapped from the cache
+    bool cow_tail        = false; // a non-block-aligned frontier: the snapshot's tail is copied
+    std::uint32_t need   = 0;     // pages the admission newly takes (private + restored)
+    bool image_restore   = false;
+    std::vector<std::uint32_t> existing; // frontiers of every matched snapshot (tap spacing)
+    std::uint32_t cached_tokens = 0;     // the prompt prefix held as cached blocks (diagnostics)
+    prefix::CallPlan plan;               // the suffix's prefill calls and taps from `frontier`
+};
+
 struct QuoteImpl {
     std::uint32_t pages = 0;
+    // The prefix cache's selection (absent: a root start).
+    std::optional<PrefixSelection> prefix;
+};
+
+// One lane's prefix-cache state.
+struct LanePrefix {
+    bool reuse = false;
+    std::vector<prefix::cache_index::NodeRef>
+        path;                    // pinned once each: mapped, then published blocks
+    std::uint32_t page_base = 0; // logical block of lane.pages[0]
+    std::uint32_t deepest   = 0; // frontier of the lineage's deepest snapshot
+    std::uint32_t reused    = 0;
+    // The zero-token resume: the lane's state is the prompt's own end snapshot, whose head
+    // residual is saved (the first token regenerates from it without prefill).
+    bool head_resume = false;
+    std::optional<prefix::cache_index::SnapshotRef> resume;
+    std::optional<prefix::RestoreTicket> restore; // the first call waits on it
+    std::uint64_t capture = 0;                    // its copy-out gates the next call
+    // The current request has captured (its first capture superseded the resume snapshot).
+    bool captured = false;
+    std::uint64_t resident_capture =
+        0; // the capture whose image the lane's staging slot still holds
+    std::vector<runtime::prefix_cache::PlannedTap> taps;
+    std::vector<runtime::prefix_cache::TapHint> hints; // the prompt's (the generation opener)
+    // Block lookup hashes: the prompt's, extended by publication over the generated blocks.
+    std::vector<std::uint64_t> hashes;
+    std::uint64_t trailing_extra = 0;
+    // The admission's diagnostics: the prompt prefix held as cached blocks, and the bytes its
+    // restore copied back from the Host tier.
+    std::uint32_t cached_tokens  = 0;
+    std::uint64_t restored_bytes = 0;
+};
+
+// A media prompt's vision encode (vision.cpp): the tower items past the reused prefix (an image,
+// or one frame pair of a video), encoded at the lane's first prefill call into one token-ordered
+// handoff BF16 [H, V] whose columns the prompt's calls scatter over their token embeddings. The
+// handoff lives in lent expert frames (or, when the residency lends none, an allocation) until the
+// prompt's last call has completed.
+struct LaneVision {
+    struct Segment {
+        std::span<const std::uint16_t> patches; // BF16 [patch_width, P] of a payload
+        std::vector<std::int32_t> positions;    // I32 [2, P]
+        std::uint32_t token_begin = 0, tokens = 0;
+    };
+
+    std::vector<std::shared_ptr<const PreparedMediaPayload>> payloads; // the segments' patches
+    std::vector<Segment> segments;
+    // The encoded tokens' positions, ascending: handoff column c is token visual[c].
+    std::vector<std::uint32_t> visual;
+    bool encoded = false;
+    offload::ExpertResidency::FrameLease lease;
+    DeviceBuffer fallback;
+    Tensor handoff;
 };
 
 struct ResumeStateImpl {
@@ -149,6 +223,7 @@ struct DFlash2Io {
 // Expert promotions one layer's routes may start per decode token (the shared admission budget,
 // moe-offload-design.md §4.3).
 inline constexpr std::size_t kDecodePromotionsPerLayer = 1;
+inline constexpr std::uint64_t kDecodePromotionInterval = 32;
 
 // Causal scoring's logits tile: 64 columns of FP32 logits.
 inline constexpr std::int32_t kScoreTileColumns = 64;
@@ -171,6 +246,7 @@ struct DeviceLayout {
     KVExecutionTableLayout tables;
     std::size_t kv = 0;
     IoLayout io;
+    std::size_t vision_io = 0;
     std::size_t logits32 = 0, logits16 = 0, token_counts = 0, constraint = 0, grammar = 0, work = 0;
     std::int32_t staging_slots = 0;
     std::size_t staging        = 0;
@@ -182,6 +258,9 @@ struct DeviceLayout {
     std::size_t features = 0, ring = 0, records = 0;
     CyclicKVCacheLayout ring_layout;
     DFlash2Io dflash_io;
+    // The prefix cache (ProgramOptions::prefix_cache): the prompt-end captures' staging slots
+    // (min(lanes, 2) state images) and every lane's saved head residual.
+    std::size_t prefix_staging = 0, head_saved = 0;
     ProgramDevicePlan bytes;
 };
 
@@ -210,6 +289,7 @@ public:
         std::optional<DeviceKVPageReservation> reservation;
         std::vector<DeviceKVPageLease> pages;
         KVExecutionRowLease row;
+        LanePrefix prefix;
         std::uint64_t prefill_ns      = 0;
         std::uint64_t decode_ns       = 0;
         std::uint64_t decode_share_ns = 0;
@@ -219,6 +299,7 @@ public:
         std::vector<std::uint32_t> prompt_uses;
         std::uint32_t prompt_counted = 0;
         SpeculativeStats speculative;
+        std::unique_ptr<LaneVision> vision; // a media prompt's encode, until its prefill ends
     };
 
     struct DecodeGraph {
@@ -240,7 +321,8 @@ public:
     // ---------------------------------------------------------------- admission (binding.cpp)
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] bool feasible(const RequestBasePlan& base) const noexcept;
-    [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base);
+    [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
+                                                              std::uint32_t maximum_frontier);
     [[nodiscard]] runtime::ResourceReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                                              const SourceCandidate& source, ResumeState* resume);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
@@ -249,6 +331,15 @@ public:
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
     [[nodiscard]] bool start_pause(SequenceHandle sequence);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence);
+
+    // The blocked FIFO head's Host-only blocks are copied into spare Device cache while it waits
+    // (hybrid-prefix-cache-spec §6.6).
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    // The snapshots queued requests would resume from, held in admission order (§9.6).
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept;
 
     // ---------------------------------------------------------------- execution (execution.cpp)
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence, runtime::TokenMaskProvider* masks);
@@ -318,6 +409,68 @@ private:
     // held. Decode and verification rounds never stream.
     bool stream_chunk(std::int32_t width);
 
+    // ---- prefill layer walk (prefill_walk.cpp; glm5_3-flash-design.md §17.1)
+    // A span of consecutive streamed calls of one prompt, run layer-major: chunk c's layer l runs
+    // after chunk c - 1's, and every chunk's layer l before any chunk's layer l + 1. Each step
+    // (advance_prefill call) enqueues a few layers of every chunk and synchronizes, so other lanes'
+    // rounds run between steps; the span's residual stream and mHC state live in the walk lease.
+    struct LayerWalk {
+        bool active            = false;
+        std::uint32_t lane     = 0;
+        std::int32_t host_slot = 0;
+        std::size_t first_call = 0, end_call = 0;
+        std::vector<std::int32_t> begins, widths, offsets; // per chunk; offsets in span columns
+        std::int32_t columns = 0;                          // the span's tokens
+        // Area offsets (bytes): the residual stream, mix, post and comb of every column, the ids
+        // and positions, each chunk's {slot, row, logit column} and DFlash2 features.
+        std::size_t residual = 0, x = 0, post = 0, comb = 0, ids = 0, positions = 0, vision = 0,
+                    meta = 0, features = 0, feature_stride = 0, bytes = 0;
+        // Per chunk: its media columns' first handoff column and count (vision.cpp).
+        std::vector<std::uint32_t> vision_first, vision_count;
+        std::uint32_t next_layer = 0, steps = 0;
+
+        // A prefix tap due at an inner chunk's end (block-aligned): its image is copied layer by
+        // layer in place and committed after the span.
+        struct Tap {
+            std::uint32_t frontier = 0;
+            prefix::cache_index::SnapshotKind kind{};
+            std::uint64_t staged = 0; // 0: none at this chunk's end
+        };
+
+        std::vector<Tap> taps; // per chunk
+    };
+
+    // Spans end at kWalkMaxTokens and at a call whose end an unaligned prefix tap is due at
+    // (captured after the span, at the state the chunk-major run has there); aligned taps at inner
+    // chunk ends are captured in place.
+    static constexpr std::uint32_t kWalkMaxTokens = 32768;
+    [[nodiscard]] LayerWalk walk_layout(const Lane& lane, std::size_t end) const;
+    // The exclusive end of the span starting at lane.next_call (lane.next_call: chunk-major),
+    // lending the ring and the walk area.
+    [[nodiscard]] std::size_t walk_span_end(Lane& lane);
+    [[nodiscard]] bool tap_due(const Lane& lane, std::uint32_t B,
+                               std::size_t next_call) const noexcept;
+    void walk_begin(Lane& lane, std::uint32_t index, std::size_t end);
+    // The span's io, the lane's pending copies and the residency round its stream begins in.
+    void walk_stage(Lane& lane, std::uint32_t index);
+    [[nodiscard]] PrefillProgress walk_step(Lane& lane, std::uint32_t index,
+                                            Clock::time_point start);
+    [[nodiscard]] execution::ForwardBatch walk_batch(std::size_t c) const;
+    [[nodiscard]] execution::Forward::CallColumns walk_columns(std::size_t c) const;
+    void walk_abandon() noexcept;
+    // The taps due at the span's inner chunk ends, as the chunk-major calls would take them.
+    void walk_plan_taps(Lane& lane);
+    void walk_commit_taps(Lane& lane);
+
+    [[nodiscard]] std::byte* walk_area() const noexcept {
+        return static_cast<std::byte*>(walk_lease_.memory.data);
+    }
+
+    // The prompt's last call is enqueued (by a call or a walk): sample, or settle and report.
+    [[nodiscard]] PrefillProgress after_prefill(Lane& lane, std::uint32_t index, std::int32_t begin,
+                                                std::int32_t width, std::uint32_t tokens, bool last,
+                                                std::size_t promotions, Clock::time_point start);
+
     // The ring (the stream lease).
     [[nodiscard]] DeviceSpan ring_span() const noexcept {
         return DeviceSpan{stream_lease_.memory.data, stream_ring_bytes_};
@@ -337,10 +490,18 @@ private:
     void seed_prompt_experts(Lane& lane);
     // After a call completed (the stream was synchronized): the expert cache's round boundary.
     void after_call(std::int32_t columns, std::size_t promotions);
-    // The promotions a served call of `tokens` columns may make at its round boundary.
-    [[nodiscard]] static std::size_t decode_budget(std::uint32_t tokens) noexcept {
-        return kDecodePromotionsPerLayer * tokens;
+
+    // The promotions a served call of `tokens` columns may make at its round boundary: one per
+    // layer every promotion_interval_ tokens.
+    [[nodiscard]] std::size_t decode_budget(std::uint32_t tokens) noexcept {
+        budget_tokens_ += tokens;
+        const std::uint64_t due = budget_tokens_ / promotion_interval_;
+        budget_tokens_ %= promotion_interval_;
+        return static_cast<std::size_t>(due) * kDecodePromotionsPerLayer;
     }
+
+    std::uint64_t budget_tokens_      = 0;
+    std::uint64_t promotion_interval_ = kDecodePromotionInterval;
 
     // ---- constraints (constraint.cpp)
     [[nodiscard]] std::shared_ptr<const ConstraintPlan> compile_constraint(const TokenConstraint& constraint);
@@ -405,8 +566,80 @@ private:
                       static_cast<std::size_t>(width - 2)];
     }
 
+    // ---- vision (vision.cpp)
+    // At binding: the segments of `prompt` ending past `reused` tokens (none: no encode).
+    void vision_plan(Lane& lane, const PreparedPromptData& prompt, std::uint32_t reused);
+    // Before the lane's first prefill call: the tower's pass into the handoff.
+    void vision_encode(Lane& lane);
+    // The handoff columns of the call [begin, begin + width) and, into `columns`, their columns
+    // relative to begin: {first, count}.
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
+    vision_columns(const Lane& lane, std::uint32_t begin, std::uint32_t width,
+                   std::int32_t* columns) const;
+    // The handoff columns [first, first + count) and their device columns as the batch's media.
+    void vision_batch(const Lane& lane, std::uint32_t first, std::uint32_t count,
+                      std::byte* columns, execution::ForwardBatch& batch) const;
+    // After the prompt's last call has completed (or at release).
+    void vision_release(Lane& lane) noexcept;
+
     // ---- scoring (score.cpp)
     [[nodiscard]] Tensor score_residuals(std::int32_t begin, std::int32_t columns) const;
+
+    // ---------------------------------------------------------------- prefix cache
+    // (prefix_program.cpp)
+    void create_prefix_cache(std::uint64_t& allocated);
+    void pc_make_room(std::uint32_t pages);
+    // Chooses the resume source for `prompt` in lane `lane` (kNoLane while quoting): the deepest
+    // affordable chunk-grid snapshot, else the root, or nothing when even the root does not fit
+    // now.
+    std::optional<PrefixSelection> prefix_select(const PreparedPromptData& prompt,
+                                                 const BasePlanImpl& base, std::uint32_t lane);
+    // The root start of a request with a prefix cache: every page reserved, the cold call grid.
+    PrefixSelection prefix_root(const PreparedPromptData& prompt, const BasePlanImpl& base);
+    // The prompt's prefill calls from `frontier`, and with `taps` the prefix taps they realize: a
+    // tap lands on the chunk grid, so every snapshot a resume takes keeps the publishing run's call
+    // boundaries (the phase-aligned chunking of the exactness contract).
+    [[nodiscard]] prefix::CallPlan plan_prefill(const PreparedPromptData& prompt,
+                                                std::uint32_t frontier,
+                                                std::span<const std::uint32_t> existing, bool taps,
+                                                std::uint32_t branch = 0) const;
+    // What a call costs beyond its tokens, for the call planner's tap admission.
+    [[nodiscard]] prefix::CallCost call_cost() const;
+    // Pins what a selection reads before room is made for it, so making room cannot evict it.
+    void prefix_pin(const PrefixSelection& selection);
+    void prefix_unpin(const PrefixSelection& selection) noexcept;
+    // Activates a pinned selection in a lane whose pages are reserved: maps shared pages, stages
+    // restores and copy-on-write sources, and sets the lane's frontier.
+    void prefix_activate(Lane& lane, std::uint32_t index, const PrefixSelection& selection,
+                         DeviceKVPageReservation& reservation, std::uint32_t pages);
+    // After a prefill call ending at the lane's frontier: publish its blocks and realize the taps
+    // due at this call boundary; after the last one, the prompt-end capture.
+    void prefix_after_prefill_call(Lane& lane, std::uint32_t index, bool last);
+    void prefix_publish(Lane& lane, std::uint32_t frontier);
+    void prefix_capture(Lane& lane, std::uint32_t index, prefix::cache_index::SnapshotKind kind);
+    [[nodiscard]] prefix::PrefixCache::Capture
+    prefix_capture_at(Lane& lane, std::uint32_t F, prefix::cache_index::SnapshotKind kind,
+                      bool hand_over_tail, DeviceKVPageLease* fresh_tail = nullptr);
+    void prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F);
+    bool prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary);
+    // The zero-token resume's prompt-end capture (design §18): a snapshot at the prompt's own
+    // frontier n whose image carries the head's saved residual, that an exact repeat resumes from
+    // with no prefill at all.
+    void prefix_prompt_end_capture(Lane& lane, std::uint32_t index);
+    // Finish or a consistent abort: the remaining blocks, then write-through.
+    void prefix_finish(Lane& lane, std::uint32_t index);
+    void prefix_release(Lane& lane) noexcept;
+    // The lane's pending capture and restore copies, as one event each (empty when none): the
+    // lane's next call waits on them before it runs.
+    [[nodiscard]] std::span<const cudaEvent_t> prefix_capture_wait(const Lane& lane) const noexcept;
+    [[nodiscard]] std::span<const cudaEvent_t> prefix_restore_wait(const Lane& lane) const noexcept;
+    [[nodiscard]] std::optional<prefix::cache_index::SnapshotRef>
+    prefix_resident(const Lane& lane) const;
+    // Credits what needs no transfer, then leaves only sources restorable now.
+    void prefix_credit(std::vector<prefix::cache_index::MatchCandidate>& candidates,
+                       std::optional<prefix::cache_index::SnapshotRef> resident) const;
+
+    static constexpr std::uint32_t kNoLane = UINT32_MAX;
 
     // ---- experts (experts.cpp)
     // Builds the frame cache and the RAM/SSD tier and fills `experts` with what the MoE reads.
@@ -459,6 +692,13 @@ private:
     DeviceBuffer kda_backing_, index_ring_, kv_backing_, io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_,
         token_counts_, constraint_, grammar_masks_, staging_, score_residuals_, score_logits_, score_logits16_, score_io_;
     PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1}, grammar_host_{1}, score_host_{1};
+    // A chunk-major call's media columns (I32 [chunk]), uploaded only with media.
+    DeviceBuffer vision_io_device_;
+    PinnedHostBuffer vision_io_host_{1};
+    // The chunk-major call being run carries lane vision_call_lane_'s handoff columns
+    // [first, first + count) (-1: none).
+    std::int32_t vision_call_lane_ = -1;
+    std::pair<std::uint32_t, std::uint32_t> vision_call_{};
     PinnedHostBuffer nonfinite_flags_{sizeof(std::int32_t) * kMaximumConcurrency};
     PinnedHostBuffer device_error_{64};
     [[nodiscard]] std::int32_t* nonfinite_flag(std::uint32_t lane) const noexcept {
@@ -481,8 +721,21 @@ private:
     std::vector<execution::KdaVerifyRecord> records_;
     std::vector<DecodeGraph> propose_graphs_, verify_graphs_, context_graphs_;
     std::array<std::array<TokenId, 16>, kMaximumConcurrency> drafts_{};
+
+    // The prefix cache: the index and its physical binding, the packed state image of a lane, the
+    // prompt-end captures' staging slots and every lane's saved head residual.
+    std::unique_ptr<prefix::PrefixCache> prefix_;
+    std::optional<prefix::RestoreTicket> prefetch_ticket_;
+    std::uint64_t next_capture_ = 0;
+    std::unique_ptr<prefix::StateImageLayout> image_layout_;
+    std::unique_ptr<prefix::LaneStateImage> lane_image_;
+    std::vector<DeviceBuffer> prompt_end_staging_;
+    DeviceBuffer head_saved_;
+    prefix::KvPageGeometry kv_geometry_;
     bool scoring_              = false;
     std::int32_t score_column_ = 0;
+    // The lane whose call keeps its final residual (the zero-token resume's head input); -1 none.
+    std::int32_t head_saved_lane_ = -1;
 
     // Constraints and grammar masks.
     runtime::TokenMaskProvider* grammar_ = nullptr;
@@ -516,12 +769,18 @@ private:
     offload::ExpertResidency::FrameLease stream_lease_;
     std::size_t stream_ring_bytes_ = 0;
     execution::ExpertStream::Stats stream_at_lease_;
+    LayerWalk walk_;
+    offload::ExpertResidency::FrameLease walk_lease_; // the active span's area
+    PinnedHostBuffer walk_host_{1};                   // the span's ids, positions and chunk words
     std::unique_ptr<VramBudgetSource> vram_;
     std::unique_ptr<offload::ExpertPlacementRuntime> placement_;
     offload::ExpertResidency* residency_                = nullptr;
     offload::HostExpertTier* tier_                      = nullptr;
     ops::offloaded_moe::FetchChannel* fetch_channel_    = nullptr;
     offload::VramSizing sizing_;
+    // CPU-served misses of decode and verification calls (moe-offload-design.md §5): declared after
+    // the placement runtime, whose tier its jobs read through, so it stops first.
+    std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
 };
 
 } // namespace infernix::models::glm5_next::detail

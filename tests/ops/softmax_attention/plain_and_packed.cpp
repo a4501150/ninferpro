@@ -19,10 +19,18 @@ using namespace infernix::test;
 
 namespace {
 
-constexpr int kDim     = 72;
-constexpr int kHeads   = 16;
-constexpr float kScale = 0.11785113019775792073F;
-constexpr ops::AttentionHeadGeometry kGeometry{kDim, kHeads, kHeads};
+constexpr int kHeads = 16;
+
+// The registered head dimension under test (72 or 64).
+int g_dim     = 72;
+float g_scale = 0.11785113019775792073F;
+ops::AttentionHeadGeometry g_geometry{72, kHeads, kHeads};
+
+void select_head_dim(int dim) {
+    g_dim      = dim;
+    g_scale    = static_cast<float>(1.0 / std::sqrt(static_cast<double>(dim)));
+    g_geometry = {dim, kHeads, kHeads};
+}
 
 constexpr ReductionCriterion kPackedAttentionBf16Criterion{
     .relative_l2                     = 2.5e-3,
@@ -31,7 +39,7 @@ constexpr ReductionCriterion kPackedAttentionBf16Criterion{
 };
 
 std::size_t index_of(int token, int head, int d) {
-    return (static_cast<std::size_t>(token) * kHeads + static_cast<std::size_t>(head)) * kDim +
+    return (static_cast<std::size_t>(token) * kHeads + static_cast<std::size_t>(head)) * g_dim +
            static_cast<std::size_t>(d);
 }
 
@@ -44,14 +52,14 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
 void packed_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
                              const std::vector<float>& v, const std::vector<int>& cu_seqlens,
                              std::vector<double>& out, int workers = 1) {
-    const double scale = 1.0 / std::sqrt(72.0);
+    const double scale = 1.0 / std::sqrt(static_cast<double>(g_dim));
     out.assign(q.size(), 0.0);
 
     for (std::size_t segment = 0; segment + 1 < cu_seqlens.size(); ++segment) {
         const int begin = cu_seqlens[segment];
         const int end   = cu_seqlens[segment + 1];
         naive_dense_softmax_attention(
-            kGeometry, end - begin, end - begin, scale,
+            g_geometry, end - begin, end - begin, scale,
             [&](int d, int head, int token) {
                 return static_cast<double>(q[index_of(begin + token, head, d)]);
             },
@@ -64,7 +72,8 @@ void packed_attention_oracle(const std::vector<float>& q, const std::vector<floa
             [](int, int) { return true; },
             [&](int d, int head, int token, double value) {
                 out[index_of(begin + token, head, d)] = value;
-            }, workers);
+            },
+            workers);
     }
 }
 
@@ -114,7 +123,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
              PublicEntry entry, InputProfile input_profile = InputProfile::Random,
              int oracle_workers = 1) {
     const int tokens              = cu_seqlens.back();
-    const std::size_t token_plane = static_cast<std::size_t>(kHeads) * kDim;
+    const std::size_t token_plane = static_cast<std::size_t>(kHeads) * g_dim;
     const std::size_t value_count = static_cast<std::size_t>(tokens) * token_plane;
     std::vector<float> q(value_count);
     std::vector<float> k(value_count);
@@ -166,9 +175,9 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
         q_storage = to_device(q_expected);
         k_storage = to_device(k_expected);
         v_storage = to_device(v_expected);
-        q_tensor  = Tensor(q_storage.p, DType::BF16, {kDim, kHeads, tokens});
-        k_tensor  = Tensor(k_storage.p, DType::BF16, {kDim, kHeads, tokens});
-        v_tensor  = Tensor(v_storage.p, DType::BF16, {kDim, kHeads, tokens});
+        q_tensor  = Tensor(q_storage.p, DType::BF16, {g_dim, kHeads, tokens});
+        k_tensor  = Tensor(k_storage.p, DType::BF16, {g_dim, kHeads, tokens});
+        v_tensor  = Tensor(v_storage.p, DType::BF16, {g_dim, kHeads, tokens});
     } else {
         interleaved_expected.resize(value_count * 3);
         for (int token = 0; token < tokens; ++token) {
@@ -182,7 +191,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                         interleaved_expected.data() + target + token_plane * 2);
         }
         interleaved_storage = to_device(interleaved_expected);
-        q_tensor            = Tensor(interleaved_storage.p, DType::BF16, {kDim, kHeads, tokens});
+        q_tensor            = Tensor(interleaved_storage.p, DType::BF16, {g_dim, kHeads, tokens});
         q_tensor.nb[2]      = static_cast<std::int64_t>(token_plane * 3 * sizeof(std::uint16_t));
         k_tensor            = q_tensor;
         v_tensor            = q_tensor;
@@ -196,21 +205,21 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     Tensor cu_tensor(d_cu_seqlens.p, DType::I32, {static_cast<std::int32_t>(cu_seqlens.size())});
     GuardedDeviceBuffer d_out(value_count * sizeof(std::uint16_t));
     d_out.fill(0x7f);
-    Tensor out_tensor(d_out.data(), DType::BF16, {kDim, kHeads, tokens});
+    Tensor out_tensor(d_out.data(), DType::BF16, {g_dim, kHeads, tokens});
 
     const std::int32_t segments       = static_cast<std::int32_t>(cu_seqlens.size()) - 1;
     const std::size_t workspace_bytes = ops::packed_softmax_attention_workspace_capacity_bytes(
-        kGeometry, tokens, tokens, segments, segments);
+        g_geometry, tokens, tokens, segments, segments);
     DeviceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (entry == PublicEntry::Plain) {
         if (cu_seqlens.size() != 2) {
             throw std::logic_error("plain case requires exactly one segment");
         }
-        ops::softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale, workspace,
+        ops::softmax_attention(q_tensor, k_tensor, v_tensor, g_geometry, g_scale, workspace,
                                out_tensor, nullptr);
     } else if (entry == PublicEntry::CuSeqlensArena) {
-        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale, cu_tensor,
+        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, g_geometry, g_scale, cu_tensor,
                                       workspace, out_tensor, nullptr);
     } else {
         const int segment_length = cu_seqlens[1] - cu_seqlens[0];
@@ -219,12 +228,13 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                 throw std::logic_error("uniform case requires equal segments");
             }
         }
-        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale,
+        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, g_geometry, g_scale,
                                       segment_length, out_tensor, nullptr);
     }
     cuda_synchronize();
 
-    const std::string label = "packed_softmax_attention T=" + std::to_string(tokens) +
+    const std::string label = "packed_softmax_attention D=" + std::to_string(g_dim) +
+                              " T=" + std::to_string(tokens) +
                               " S=" + std::to_string(cu_seqlens.size() - 1) + " " +
                               storage_name(storage_profile) + " " + entry_name(entry);
     const std::string qualified_label =
@@ -268,15 +278,16 @@ int run_softmax_attention_plain_and_packed_tests() {
     }
 
     int failures = 0;
-    if (ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 4, 194, 1, 1) != 0 ||
-        ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 4, 194, 1, 3) !=
-            ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 194, 194, 3, 3)) {
+    select_head_dim(72);
+    if (ops::packed_softmax_attention_workspace_capacity_bytes(g_geometry, 4, 194, 1, 1) != 0 ||
+        ops::packed_softmax_attention_workspace_capacity_bytes(g_geometry, 4, 194, 1, 3) !=
+            ops::packed_softmax_attention_workspace_capacity_bytes(g_geometry, 194, 194, 3, 3)) {
         std::cerr
             << "packed_softmax_attention rectangular capacity missed its maximal legal pair\n";
         ++failures;
     }
     try {
-        (void)ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 1, 2, 3, 4);
+        (void)ops::packed_softmax_attention_workspace_capacity_bytes(g_geometry, 1, 2, 3, 4);
         std::cerr << "packed_softmax_attention accepted an envelope without a legal segment pair\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
@@ -296,6 +307,18 @@ int run_softmax_attention_plain_and_packed_tests() {
     // BF16 criterion by an order of magnitude.
     failures += run_case({0, 4096}, 2027u, StorageProfile::InterleavedQkv,
                          PublicEntry::UniformSegments, InputProfile::FlatScores, 16);
+
+    // D64: separate Q/K/V planes as well as the interleaved form.
+    select_head_dim(64);
+    failures += run_case({0, 4}, 103u, StorageProfile::Contiguous, PublicEntry::Plain);
+    failures += run_case({0, 4, 11}, 7u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena,
+                         InputProfile::SegmentIsolation);
+    failures += run_case({0, 64, 129, 194}, 31u, StorageProfile::InterleavedQkv,
+                         PublicEntry::CuSeqlensArena);
+    failures +=
+        run_case({0, 68, 136}, 103u, StorageProfile::Contiguous, PublicEntry::UniformSegments);
+    failures += run_case({0, 4096}, 2028u, StorageProfile::Contiguous, PublicEntry::UniformSegments,
+                         InputProfile::Random, 16);
 
     if (failures != 0) {
         std::cerr << "packed_softmax_attention failures=" << failures << '\n';

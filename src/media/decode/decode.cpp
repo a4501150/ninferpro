@@ -698,7 +698,7 @@ struct VideoPlan {
 };
 
 VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& policy,
-                          double target_fps, int min_frames, int max_frames) {
+                          const FrameSampler& sampler, int min_frames) {
     Decoder probe(bytes, policy.max_decoded_pixels);
     VideoPlan plan;
     plan.fps          = fps_of(probe.stream());
@@ -718,7 +718,13 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
     if (plan.total_frames > policy.max_video_source_frames) {
         throw Error(ErrorKind::BudgetExceeded, "video source frame count exceeds processor limit");
     }
-    plan.indices = sample_indices(plan.total_frames, plan.fps, target_fps, min_frames, max_frames);
+    plan.indices = sampler(plan.total_frames, plan.fps, plan.duration);
+    if (plan.indices.empty() || plan.indices.front() < 0 ||
+        plan.indices.back() >= plan.total_frames ||
+        std::adjacent_find(plan.indices.begin(), plan.indices.end(),
+                           [](int a, int b) { return a >= b; }) != plan.indices.end()) {
+        throw std::logic_error("video frame sampler returned invalid indices");
+    }
     const std::uint64_t coded_pixels =
         static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->width, 0)) *
         static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->height, 0));
@@ -726,7 +732,7 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
         throw Error(ErrorKind::BudgetExceeded,
                     "sampled source video pixels exceed processor limit");
     }
-    plan.minimum_frames = std::min(min_frames, plan.total_frames);
+    plan.minimum_frames = std::min(min_frames, static_cast<int>(plan.indices.size()));
     plan.orientation    = orientation_from_rotation(rotation_of(probe.stream()));
     return plan;
 }
@@ -884,11 +890,27 @@ ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& polic
     return result;
 }
 
+namespace {
+
+FrameSampler uniform_sampler(double target_fps, int min_frames, int max_frames) {
+    return [=](int total, double fps, double) {
+        return sample_indices(total, fps, target_fps, min_frames, max_frames);
+    };
+}
+
+} // namespace
+
 VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
                         double target_fps, int min_frames, int max_frames) {
+    return inspect_video(bytes, policy, uniform_sampler(target_fps, min_frames, max_frames),
+                         min_frames);
+}
+
+VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                        const FrameSampler& sampler, int min_frames) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-    VideoPlan plan       = make_video_plan(bytes, policy, target_fps, min_frames, max_frames);
+    VideoPlan plan       = make_video_plan(bytes, policy, sampler, min_frames);
     const VideoScan scan = scan_video(bytes, policy, plan, [](Decoder&, const AVFrame*, int) {});
     VideoInfo out;
     out.width          = scan.first_frame.width;
@@ -932,9 +954,15 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
 
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
                    int min_frames, int max_frames) {
+    return decode_video(bytes, policy, uniform_sampler(target_fps, min_frames, max_frames),
+                        min_frames);
+}
+
+Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                   const FrameSampler& sampler, int min_frames) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-    VideoPlan plan = make_video_plan(bytes, policy, target_fps, min_frames, max_frames);
+    VideoPlan plan = make_video_plan(bytes, policy, sampler, min_frames);
     Video out;
     out.total_frames = plan.total_frames;
     out.fps          = plan.fps;

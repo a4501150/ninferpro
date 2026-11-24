@@ -76,14 +76,16 @@ else
 	$(GPU) $(ROUND) $(ROUND_ARGS) --shape $(T1_SHAPE) --check $(HASHES) $(ARGS)
 endif
 
+# A family without an exact route leaves T1_EXACT empty.
 t1-exact:
+	$(if $(T1_EXACT),,$(error FAMILY=$(FAMILY) has no exact route))
 	$(BUILD_CMD) --target $(ROUND_TARGET)
 	$(GPU) $(ROUND) $(ROUND_ARGS) --shape $(T1_EXACT) --exact --check $(HASHES) $(ARGS)
 
 t1-record:
 	$(BUILD_CMD) --target $(ROUND_TARGET)
 	$(GPU) $(ROUND) $(ROUND_ARGS) --shape $(T1_FAST) --replays 5 --record $(HASHES)
-	$(GPU) $(ROUND) $(ROUND_ARGS) --shape $(T1_EXACT) --replays 5 --exact --record $(HASHES)
+	$(if $(T1_EXACT),$(GPU) $(ROUND) $(ROUND_ARGS) --shape $(T1_EXACT) --replays 5 --exact --record $(HASHES))
 
 t2:
 	$(BUILD_CMD) --target $(SMOKE_TARGET)

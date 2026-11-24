@@ -19,9 +19,16 @@
 #include <span>
 #include <vector>
 
+namespace infernix::models::common {
+class VisionWeightStream;
+}
+
 namespace infernix::models::qwen_common::execution {
 
-class VisionWeightStream;
+// The tower's parameters rebased onto a weight stream's staging (vision offload): every layer's
+// tensors point at the slot that holds the layer once the stream admits it.
+[[nodiscard]] VisionParameters vision_window_weights(const common::VisionWeightStream& stream,
+                                                     const VisionParameters& host);
 
 // Buffers of one item's patch and position embedding (P patches).
 struct VisionEmbedBuffers {
@@ -51,9 +58,10 @@ struct VisionMergerBuffers {
 // Uploads the item's (pageable) patches and control arrays on `stream`, then x = patch projection
 // + bias + bilinear position embedding. x: BF16 [H, P]. With a weight stream, the projection waits
 // for the streamed prelude weights (the uploads overlap it).
-void vision_embed(cudaStream_t stream, const VisionConfig& config, const VisionParameters& parameters,
-                  const VisionItemControl& control, std::span<const std::uint16_t> patches,
-                  const VisionEmbedBuffers& buffers, Tensor& x, VisionWeightStream* weight_stream = nullptr);
+void vision_embed(cudaStream_t stream, const VisionConfig& config,
+                  const VisionParameters& parameters, const VisionItemControl& control,
+                  std::span<const std::uint16_t> patches, const VisionEmbedBuffers& buffers,
+                  Tensor& x, common::VisionWeightStream* weight_stream = nullptr);
 
 // One encoder layer in place on x: LN, fused QKV + bias, 2-D RoPE, non-causal attention per
 // segment (equal-length form), output projection + bias + residual, LN, fc1 + bias, tanh-GELU,
@@ -101,9 +109,10 @@ struct VisionPassLayout {
 // stream, each stage waits for its weights' upload.
 class VisionTowerPass {
 public:
-    VisionTowerPass(DeviceContext& device, const VisionConfig& config, const VisionParameters& parameters,
-                    std::vector<VisionTowerItem> items, DeviceSpan arena, const VisionPassLayout& layout,
-                    VisionWeightStream* weight_stream);
+    VisionTowerPass(DeviceContext& device, const VisionConfig& config,
+                    const VisionParameters& parameters, std::vector<VisionTowerItem> items,
+                    DeviceSpan arena, const VisionPassLayout& layout,
+                    common::VisionWeightStream* weight_stream);
 
     [[nodiscard]] static std::uint32_t stages(std::uint32_t depth) noexcept { return depth + 2; }
     [[nodiscard]] std::uint32_t next_stage() const noexcept { return next_; }
@@ -118,7 +127,7 @@ private:
     std::vector<VisionTowerItem> items_;
     DeviceSpan arena_;
     const VisionPassLayout& layout_;
-    VisionWeightStream* stream_;
+    common::VisionWeightStream* stream_;
     std::uint32_t next_ = 0;
 };
 

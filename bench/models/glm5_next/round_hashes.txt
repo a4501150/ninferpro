@@ -1,0 +1,5 @@
+# T1 golden token hashes (infernix_glm5_next_round_bench --record): FNV-1a of every row's greedy tokens.
+GLM-5.3-Flash-Uncensored-NVFP4-Infernix.infernix shape=1x1 context=1024 chunk=4096 kv=int8 experts=vram=42%,ram=58% rounds=16+64 = bae48c33fbc490b7
+GLM-5.3-Flash-Uncensored-NVFP4-Infernix.infernix shape=1x4 context=1024 chunk=4096 kv=int8 experts=vram=42%,ram=58% rounds=16+64 = 9e35d32dac0e0ce7
+GLM-5.3-Flash-Uncensored-NVFP4-Infernix.infernix shape=2x1 context=1024 chunk=4096 kv=int8 experts=vram=42%,ram=58% rounds=16+64 = 0afebb0e39919baa
+GLM-5.3-Flash-Uncensored-NVFP4-Infernix.infernix shape=4x1 context=1024 chunk=4096 kv=int8 experts=vram=42%,ram=58% rounds=16+64 = 3a6ae00ac339abb9

@@ -18,7 +18,9 @@
 #include <span>
 #include <vector>
 
-namespace infernix::models::qwen_common::execution { class VisionWeightStream; }
+namespace infernix::models::common {
+class VisionWeightStream;
+}
 
 namespace infernix::models::qwen3_5::execution {
 
@@ -65,7 +67,8 @@ public:
     // weight_stream, when set, gates each stage on the streamed uploads of an overlay window;
     // resident execution passes nullptr.
     void encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
-                const VisionWorkspacePlan& plan, qwen_common::execution::VisionWeightStream* weight_stream = nullptr) const;
+                const VisionWorkspacePlan& plan,
+                common::VisionWeightStream* weight_stream = nullptr) const;
 
 private:
     DeviceContext& ctx_;

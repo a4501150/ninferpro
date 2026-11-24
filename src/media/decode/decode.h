@@ -68,6 +68,10 @@ struct VideoInfo {
     std::vector<int> indices;
 };
 
+// The source frame indices to keep (ascending, unique) of a video of total_frames frames at fps
+// lasting duration seconds (0 when the container does not say).
+using FrameSampler = std::function<std::vector<int>(int total_frames, double fps, double duration)>;
+
 // Exact display geometry without RGB conversion. Image probing decodes the first displayed frame
 // so codec crop and orientation match decode_image(). Video probing walks the selected frame
 // sequence so frame-count, truncation, pixel-budget, crop, and sampling semantics match
@@ -79,6 +83,12 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
                    int min_frames, int max_frames);
+
+// The same with the caller's frame selection; at least min_frames of its indices must decode.
+VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                        const FrameSampler& sampler, int min_frames);
+Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                   const FrameSampler& sampler, int min_frames);
 
 enum class LibraryLogSeverity {
     Error,

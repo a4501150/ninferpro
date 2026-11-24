@@ -13,22 +13,38 @@ std::int64_t stride_elements(const Tensor& tensor, int dim) {
     return tensor.nb[dim] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
 }
 
-template <int Br, int Bc>
-void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
+template <int D, int Br, int Bc>
+void launch_flash_dim(const Tensor& q, const Tensor& k, const Tensor& v,
                   const PackedAttentionTile* tiles, std::int32_t uniform_segment_length,
                   std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
     constexpr int kThreads = Br * 2;
     constexpr int kSmemBytes =
-        (Br + 2 * Bc) * kPackedAttentionPaddedD * static_cast<int>(sizeof(__nv_bfloat16));
+        (Br + 2 * Bc) * PackedAttentionDim<D>::padded * static_cast<int>(sizeof(__nv_bfloat16));
     const dim3 grid(static_cast<unsigned>(query_tiles),
                     static_cast<unsigned>(kPackedAttentionHeads), 1u);
-    packed_attention_flash_kernel<Br, Bc><<<grid, kThreads, kSmemBytes, stream>>>(
+    packed_attention_flash_kernel<D, Br, Bc><<<grid, kThreads, kSmemBytes, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), tiles, q.ne[2], uniform_segment_length,
         static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
         stride_elements(q, 2), stride_elements(k, 0), stride_elements(k, 1), stride_elements(k, 2),
         stride_elements(v, 0), stride_elements(v, 1), stride_elements(v, 2));
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <int Br, int Bc>
+void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
+                  const PackedAttentionTile* tiles, std::int32_t uniform_segment_length,
+                  std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
+    switch (q.ne[0]) {
+    case 72:
+        launch_flash_dim<72, Br, Bc>(q, k, v, tiles, uniform_segment_length, query_tiles, out, stream);
+        return;
+    case 64:
+        launch_flash_dim<64, Br, Bc>(q, k, v, tiles, uniform_segment_length, query_tiles, out, stream);
+        return;
+    default:
+        throw std::invalid_argument("packed_softmax_attention: unregistered head dimension");
+    }
 }
 
 } // namespace

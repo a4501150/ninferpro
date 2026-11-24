@@ -1,5 +1,6 @@
 #include "models/glm5_next/frontend/prompt_layout.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
@@ -18,6 +19,14 @@ constexpr std::array kRoleMarkers{
     RoleMarker{"<|observation|>", ChatRole::Tool},
 };
 constexpr std::string_view kThinkOpen = "<think>";
+
+// The template's media wrappers; the processor expands the middle token.
+struct MediaWrapper {
+    std::string_view open, token, close;
+};
+
+constexpr MediaWrapper kImageWrapper{"<|begin_of_image|>", "<|image|>", "<|end_of_image|>"};
+constexpr MediaWrapper kVideoWrapper{"<|begin_of_video|>", "<|video|>", "<|end_of_video|>"};
 
 bool template_bytes(const text::TemplateOutput& output, std::size_t begin, std::size_t end) {
     return !text::overlaps(output.literal_spans, begin, end);
@@ -78,7 +87,6 @@ std::optional<std::size_t> source_boundary(const text::TemplateOutput& output, s
 
 PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
                                    std::span<const Modality> media) {
-    if (!media.empty()) throw std::invalid_argument("this model accepts text input only");
     PromptLayout result;
     const std::string_view source = output.text;
     for (auto role = next_role(output, 0); role;) {
@@ -108,6 +116,34 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
             if (!closed) result.starts_in_reasoning = opens && close == std::string::npos;
         }
         role = next;
+    }
+
+    // Each media input contributes one complete wrapper in input order. The next token of each
+    // kind is searched again only once it is consumed, so the scan stays linear in the prompt.
+    std::size_t image = find_marker(output, kImageWrapper.token, 0);
+    std::size_t video = find_marker(output, kVideoWrapper.token, 0);
+    for (;;) {
+        const auto at = std::min(image, video);
+        if (at == std::string::npos) break;
+        const auto modality         = at == image ? Modality::Image : Modality::Video;
+        const MediaWrapper& wrapper = modality == Modality::Image ? kImageWrapper : kVideoWrapper;
+        const auto end              = at + wrapper.token.size();
+        if (at < wrapper.open.size() ||
+            source.substr(at - wrapper.open.size(), wrapper.open.size()) != wrapper.open ||
+            source.substr(end, wrapper.close.size()) != wrapper.close ||
+            !template_bytes(output, at - wrapper.open.size(), end + wrapper.close.size())) {
+            throw std::invalid_argument("chat template media token requires its complete wrapper");
+        }
+        const auto index = result.media_placeholders.size();
+        if (index >= media.size() || media[index] != modality) {
+            throw std::invalid_argument(
+                "chat template media placeholders must match input count, type and order");
+        }
+        result.media_placeholders.push_back({{at, end}, modality, index});
+        (modality == Modality::Image ? image : video) = find_marker(output, wrapper.token, end);
+    }
+    if (result.media_placeholders.size() != media.size()) {
+        throw std::invalid_argument("chat template omitted an input media placeholder");
     }
     return result;
 }

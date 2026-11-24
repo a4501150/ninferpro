@@ -19,6 +19,9 @@ struct FamilyOptionRules {
     std::uint32_t prefill_chunk_beside_decode = 0;
     // --draft-tokens auto's ceiling when none is given.
     std::uint32_t draft_tokens_auto = 0;
+    // The prefix cache Host tier's default when --host-context-mib is not given; 0: the common
+    // default (kDefaultHybridHostCacheBytes).
+    std::uint64_t host_cache_default = 0;
     // An explicit KV capacity.
     void (*validate_explicit_kv_capacity)(const EngineOptions&) = nullptr;
     void (*validate_logits_dtype)(const EngineOptions&)         = nullptr;

@@ -293,7 +293,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter (Qwen3.8-Flash-Next: also alone, `1..15`), `1..63`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
 | `--ngram-min-match N` | minimum matched tokens for an n-gram proposal, `4..64` | `12` |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
-| `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; takes effect only with `--vision`. `auto` is on for Qwen3.8-Flash-Next (the expert cache lends the encode memory) and off for Qwen3.5 | `auto` |
+| `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; takes effect only with `--vision`. `auto` is on for Qwen3.8-Flash-Next and GLM-5.3-Flash (the expert cache lends the encode memory) and off for Qwen3.5 | `auto` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768`; larger media is downscaled during preprocessing | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--expert-state FILE\|off` | Qwen3.8-Flash-Next: the expert cache's saved state, seeded from at startup and rewritten at stop and every 10 minutes between requests; `off` starts with an empty cache and saves nothing (cold benchmarks). The full contract is [serving](serving.md#server-options)'s | `<artifact>.expert-state` |

@@ -205,8 +205,10 @@ struct Fixture {
                from_fp16(scales_host[row * kGroups + d / kGroup]);
     }
 
+    // sharp: cache latents in [-4, 4], so scores spread over several units and the softmax is
+    // far from uniform.
     Fixture(int batch_, int width_, const std::vector<int>& contexts_, bool with_selection,
-            std::uint32_t seed, bool int8_ = false) {
+            std::uint32_t seed, bool int8_ = false, bool sharp = false) {
         batch             = batch_;
         width             = width_;
         int8              = int8_;
@@ -221,7 +223,7 @@ struct Fixture {
         latents_buf = upload(latents_host);
         // The cache plane: fixture latents in [0.002, 0.01] (finite, well-scaled), scattered pages.
         pages_host = bf16_inputs(static_cast<std::size_t>(kLatent) * kPage * pages_per_row,
-                                 seed + 1, 0.002F, 0.01F);
+                                 seed + 1, sharp ? -4.0F : 0.002F, sharp ? 4.0F : 0.01F);
         if (int8) {
             const std::size_t rows = static_cast<std::size_t>(kPage) * pages_per_row;
             codes_host.resize(rows * kLatent);
@@ -761,6 +763,61 @@ void test_attention_int8() {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+// The tensor-core route: dense and sparse, BF16 and INT8 caches, a near-uniform and a sharp
+// softmax, a prompt-shaped call wider than one chunk of columns, and column invariance.
+void test_attention_tensor_cores() {
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const ops::MlaAttentionExecutionEnvelope tc{.tensor_cores = true};
+    for (const bool int8 : {false, true}) {
+        const std::string kind = int8 ? "tensor cores int8" : "tensor cores bf16";
+        {
+            // Tile edges: 1, 15, 16, 17 and 63 attended tokens beside longer lanes.
+            Fixture f(6, 1, {1, 15, 16, 17, 63, 300}, false, 401, int8);
+            const auto qa_bits = prepare_qa(f, stream);
+            verify_attention(f, qa_bits, run_attention(f, tc, stream),
+                             (kind + " dense lanes").c_str());
+        }
+        {
+            Fixture f(1, 3, {2053}, false, 402, int8, true);
+            const auto qa_bits = prepare_qa(f, stream);
+            verify_attention(f, qa_bits, run_attention(f, tc, stream),
+                             (kind + " dense sharp").c_str());
+        }
+        {
+            Fixture f(2, 2, {6000, 2052}, true, 403, int8);
+            const auto qa_bits = prepare_qa(f, stream);
+            verify_attention(f, qa_bits, run_attention(f, tc, stream),
+                             (kind + " sparse lanes").c_str());
+        }
+        {
+            Fixture f(1, 4, {6003}, true, 404, int8, true);
+            const auto qa_bits = prepare_qa(f, stream);
+            verify_attention(f, qa_bits, run_attention(f, tc, stream),
+                             (kind + " sparse sharp").c_str());
+        }
+    }
+    {
+        // A prompt call of 800 columns spans two chunks of the route's latent sums.
+        Fixture f(1, 800, {2100}, false, 405, false, true);
+        const auto qa_bits = prepare_qa(f, stream);
+        verify_attention(f, qa_bits, run_attention(f, tc, stream), "tensor cores prompt 800");
+    }
+    {
+        Fixture one(1, 1, {6000}, true, 406, true);
+        (void)prepare_qa(one, stream);
+        const auto got_one = run_attention(one, tc, stream);
+        expect(got_one == run_attention(one, tc, stream),
+               "tensor cores: the same call twice gives the same bits");
+        Fixture lanes(2, 1, {6000, 4000}, true, 406, true);
+        (void)prepare_qa(lanes, stream);
+        const auto got_lanes = run_attention(lanes, tc, stream);
+        expect(std::equal(got_one.begin(), got_one.end(), got_lanes.begin()),
+               "tensor cores: a column's bits do not depend on the call's other lanes");
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 } // namespace
 
 int main() {
@@ -775,6 +832,7 @@ int main() {
         test_attention_dense();
         test_attention_sparse();
         test_attention_int8();
+        test_attention_tensor_cores();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "infernix_mla_sparse_attention_test: %s\n", error.what());
         return 1;

@@ -12,6 +12,8 @@
 //   rounded reference sets.
 // - Teacher forcing: scoring the prompt with the generated tokens gives each generated token as the
 //   argmax wherever the top two are not a near-tie, so decode and prefill agree on the state.
+// - The prefill layer walk: a prompt of streamed calls prefills layer-major in one span and
+//   generates the same greedy tokens as its chunk-major prefill.
 
 #include "artifact/reader.h"
 #include "core/device.h"
@@ -185,6 +187,60 @@ int main() {
             for (std::size_t i = 0; i < kGenerated; ++i) { same += row_a[i] == generated[i]; }
             std::printf("batched decode: rows equal %s; %zu of %u tokens equal the one-lane run\n",
                         row_a == row_b ? "yes" : "no", same, kGenerated);
+        }
+
+        // The layer walk: 1,100 tokens in calls of 256 (four streamed calls walk in one span, the
+        // remainder runs alone), against the same prompt prefilled chunk-major.
+        {
+            std::vector<std::int32_t> long_prompt;
+            while (long_prompt.size() < 1100) {
+                long_prompt.insert(long_prompt.end(), prompt.begin(), prompt.end());
+            }
+            long_prompt.resize(1100);
+            constexpr std::uint32_t kWalkTokens = 24;
+            std::vector<std::int32_t> tokens[2];
+            int spans[2] = {0, 0};
+            for (int walk = 0; walk < 2; ++walk) {
+                glm::ProgramOptions options;
+                options.max_concurrency               = 1;
+                options.max_context                   = 2048;
+                options.kv_capacity_tokens            = 2048;
+                options.prefill_chunk                 = 256;
+                options.prefill_walk                  = walk == 1;
+                options.placement.expert_frame_target = 2000;
+                options.placement.expert_ram_bytes    = 24ULL << 30;
+                options.diagnostics.callback          = [&spans, walk](const Diagnostic& d) {
+                    if (d.message.rfind("prefill layer walk:", 0) == 0) {
+                        ++spans[walk];
+                        std::printf("  [program] %s\n", d.message.c_str());
+                    }
+                };
+                glm::Program program(parameters, device, options);
+                std::int32_t first  = 0;
+                std::uint32_t calls = 0;
+                const glm::SequenceHandle seq =
+                    start(program, frontend, long_prompt, 0, kWalkTokens, first, calls);
+                tokens[walk].push_back(first);
+                for (std::uint32_t step = 1; step < kWalkTokens; ++step) {
+                    const glm::SequenceHandle rows[]    = {seq};
+                    const runtime::RoundBudget budget[] = {{kWalkTokens - step}};
+                    glm::PendingBatch pending           = program.decode(rows, budget);
+                    tokens[walk].push_back(pending.tokens()[0]);
+                    const runtime::CommitDecision commit[] = {
+                        {.accepted_tokens = 1, .terminal = step + 1 == kWalkTokens}};
+                    (void)program.commit(std::move(pending), commit);
+                }
+                (void)program.finish(seq);
+            }
+            std::size_t same = 0;
+            for (std::size_t i = 0; i < kWalkTokens; ++i) { same += tokens[0][i] == tokens[1][i]; }
+            std::printf(
+                "layer walk: %d span(s); %zu of %u greedy tokens equal the chunk-major prefill's\n",
+                spans[1], same, kWalkTokens);
+            expect(spans[0] == 0 && spans[1] == 1,
+                   "the long prompt did not prefill in exactly one walk span");
+            expect(tokens[0] == tokens[1],
+                   "the walked prefill's greedy tokens differ from the chunk-major prefill's");
         }
 
         // Causal scoring: the prompt against the oracle, then the prompt with the generated tokens.

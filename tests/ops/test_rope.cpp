@@ -89,8 +89,9 @@ std::vector<double> rope_oracle(const std::vector<float>& input, const std::vect
                 int axis        = 0;
                 double exponent = 0.0;
                 if (geometry.axes == 2) {
-                    axis     = pair / 18;
-                    exponent = -2.0 * static_cast<double>(pair % 18) / 36.0;
+                    const int quarter = geometry.rotary_dim / 4;
+                    axis              = pair / quarter;
+                    exponent = -2.0 * static_cast<double>(pair % quarter) / (2.0 * quarter);
                 } else {
                     axis     = geometry.axes == 3 ? pair % 3 : 0;
                     exponent = -2.0 * static_cast<double>(pair) / geometry.rotary_dim;
@@ -611,6 +612,12 @@ int main() {
         run_single_case(execution, {"35b mtp k text", 256, 64, 1, 5, kTextTheta}, 2, 16384, 8);
 
     failures += run_vision_packed_case(execution);
+    // The D64 Vision geometry (generic kernel), and an unaligned token count with padded strides.
+    failures += run_pair_case(execution, {"vision d64", 64, 64, 2, 256, kVisionTheta}, 16, 16, 0);
+    failures += run_pair_case(execution, {"vision d64 padded", 64, 64, 2, 37, kVisionTheta}, 16, 16,
+                              0, 64, 128);
+    failures +=
+        run_single_case(execution, {"vision d64 single", 64, 64, 2, 37, kVisionTheta}, 16, 0);
 
     // DFlash proposal consumes 2..16 tokens; context append uses the single-K form.
     failures += run_pair_case(execution, {"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32,

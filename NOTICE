@@ -54,7 +54,10 @@ Modifications made in this product (summary; see README.md for details):
   the shared expert placement runtime (lifted out of Qwen3.8-Flash-Next into
   src/models/offload/), DFlash2 drafting and streamed prefill, with new Ops for
   Kimi delta attention, sparse MLA over a BF16 or INT8-G64 latent cache, the pooled
-  DSA indexer and a second NVFP4 expert geometry.
+  DSA indexer and a second NVFP4 expert geometry; its prefix cache, the layer-major
+  prefill walk, CPU-served decode misses, and image and video prompts (its processor
+  and vision tower), whose tower streams from pinned RAM through the vision weight
+  stream now shared with Qwen3.8-Flash-Next (src/models/common/vision/).
 - The fast-path quality gate runs its default role on the fast run's kernel set (the
   exact route on the width-routed kernels, EngineOptions::width_routed_kernels, where
   it would run column-invariant ones), decides that kernel switch by a control against

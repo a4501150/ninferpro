@@ -4,7 +4,7 @@
 // binding into the shared overlay layout (qwen_common/load/vision_overlay.h).
 
 #include "models/qwen3_5/weights.h"
-#include "models/qwen_common/load/vision_overlay.h"
+#include "models/common/vision/overlay_layout.h"
 
 #include <vector>
 
@@ -16,8 +16,9 @@ struct PendingWeight;
 
 // Resolve each vision group's contiguous byte range in the pinned block. Throws when a
 // group's objects are not all pinned or are not packed contiguously (gap beyond alignment).
-[[nodiscard]] qwen_common::VisionOverlayLayout compute_vision_overlay_layout(
-    const ModelWeights& weights, const std::vector<loading::PendingWeight>& pending,
-    const artifact::MaterializationPlan& plan);
+[[nodiscard]] common::VisionOverlayLayout
+compute_vision_overlay_layout(const ModelWeights& weights,
+                              const std::vector<loading::PendingWeight>& pending,
+                              const artifact::MaterializationPlan& plan);
 
 } // namespace infernix::models::qwen3_5

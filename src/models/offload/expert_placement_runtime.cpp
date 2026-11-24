@@ -468,6 +468,11 @@ void ExpertPlacementRuntime::ensure_tier(std::uint32_t residents) {
     if (tier_ != nullptr && tier_->resident_capacity() == residents) { return; }
     // The old tier's records seed the new one: no demotion may still be landing in its slots.
     residency_->quiesce_tier(device_.stream);
+    // A new tier that does not fit beside the old one (a tier holding most of the host's RAM)
+    // replaces it empty: the old releases first and the fill reads the records again.
+    if (tier_ != nullptr && tier_bytes(residents) > host_memory_snapshot().available_physical) {
+        release_tier("its rebuild does not fit beside it");
+    }
     HostExpertTier::Options options = tier_options_;
     const std::uint32_t lists       = options.ring + options.prefetch + options.demotion;
     // ram=0 below full VRAM still stages SSD reads through the tier's lists; the tier needs
@@ -614,17 +619,22 @@ bool ExpertPlacementRuntime::request_placement(const ExpertPlacementRequest& req
     if (request.has_ram_target && request.ram_target > 0 &&
         tier_capacity_.load(std::memory_order_relaxed) != request.ram_target) {
         // The records the rebuilt RAM tier would pin, plus its lists: they must fit the host's
-        // free memory beside the current tier, which the rebuild copies from before releasing
-        // (the mechanism's numbers; whether to spend them is client policy). A tier that already
-        // has the named capacity is kept as it is.
+        // free memory and what the current tier gives back (the rebuild copies from it beside the
+        // new tier when both fit, else releases it first; ensure_tier). The mechanism's numbers;
+        // whether to spend them is client policy. A tier that already has the named capacity is
+        // kept as it is.
         const HostMemorySnapshot host = host_memory_snapshot();
-        const std::uint64_t bytes = (static_cast<std::uint64_t>(request.ram_target) + 1536) *
-                                    residency_->frame_bytes();
-        if (bytes > host.available_physical) {
+        const std::uint64_t bytes     = tier_bytes(request.ram_target);
+        const std::uint32_t current   = tier_capacity_.load(std::memory_order_relaxed);
+        const std::uint64_t room =
+            host.available_physical + (current != 0 ? tier_bytes(current) : 0);
+        if (bytes > room) {
             if (error != nullptr) {
-                *error = "the RAM tier's " + std::to_string(request.ram_target) +
-                         " records need " + std::to_string(bytes >> 20) + " MiB of host memory; " +
-                         std::to_string(host.available_physical >> 20) + " MiB is free";
+                *error = "the RAM tier's " + std::to_string(request.ram_target) + " records need " +
+                         std::to_string(bytes >> 20) + " MiB of host memory; " +
+                         std::to_string(host.available_physical >> 20) +
+                         " MiB is free beside the current tier's " +
+                         std::to_string((room - host.available_physical) >> 20);
             }
             return false;
         }

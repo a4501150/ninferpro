@@ -21,6 +21,17 @@ order to use the tiers in when bringing up or tuning a family's decode.
 drive the Program rather than the Forward and implement none of the options below, so the tier
 targets do not run for `qwen3_5`.
 
+`glm5_next` provides every piece with these differences. Its routed experts (159.5 GiB) do not fit
+in VRAM, so its round bench builds the family's instance with production's placement
+(`--experts`, default `vram=42%,ram=58%`) and times whole rounds through the Program (the Forward
+graph, CPU-served misses, sampling and commit) after warm rounds, reporting the expert hit rate
+instead of a speed of light; its hash covers every row's greedy tokens, and `--replays` (or
+`--determinism`) repeats a shape from a fresh binding. A shape `1xW` with W >= 2 is a one-row
+DFlash2 round drafting W - 1 tokens. The family has no exact route, so `T1_EXACT` is empty
+(`make t1-exact` refuses) and the smoke test's golden tokens are the default route's, taken
+without the drafter; `make t1 SWEEP=1` and `PROFILE=1` do not apply (no speed-of-light fields,
+no `--sections`).
+
 ## The round bench
 
 One generation round of each requested shape through the production Forward and its CUDA Graph,

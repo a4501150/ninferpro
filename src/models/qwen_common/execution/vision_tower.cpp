@@ -2,7 +2,7 @@
 
 #include "core/layout.h"
 #include "core/nvtx.h"
-#include "models/qwen_common/execution/vision_weight_stream.h"
+#include "models/common/vision/weight_stream.h"
 #include "infernix/ops/add_bias.h"
 #include "infernix/ops/gelu.h"
 #include "infernix/ops/layer_norm.h"
@@ -50,9 +50,10 @@ Tensor columns_of(const Tensor& storage, std::int32_t columns) {
 
 } // namespace
 
-void vision_embed(cudaStream_t stream, const VisionConfig& config, const VisionParameters& parameters,
-                  const VisionItemControl& control, std::span<const std::uint16_t> patches,
-                  const VisionEmbedBuffers& buffers, Tensor& x, VisionWeightStream* weight_stream) {
+void vision_embed(cudaStream_t stream, const VisionConfig& config,
+                  const VisionParameters& parameters, const VisionItemControl& control,
+                  std::span<const std::uint16_t> patches, const VisionEmbedBuffers& buffers,
+                  Tensor& x, common::VisionWeightStream* weight_stream) {
     nvtx::ScopedRange patch_range(nvtx::Name::VisionPatchEmbedding, nvtx::Category::Vision,
                                   static_cast<std::uint64_t>(control.patch_count));
     Tensor position_ids = buffers.position_ids;
@@ -209,11 +210,45 @@ VisionPassLayout plan_vision_pass(const VisionConfig& config, const VisionParame
     return out;
 }
 
-VisionTowerPass::VisionTowerPass(DeviceContext& device, const VisionConfig& config, const VisionParameters& parameters,
-                                 std::vector<VisionTowerItem> items, DeviceSpan arena, const VisionPassLayout& layout,
-                                 VisionWeightStream* weight_stream)
-    : device_(device), config_(config), parameters_(parameters), items_(std::move(items)), arena_(arena),
-      layout_(layout), stream_(weight_stream) {
+VisionParameters vision_window_weights(const common::VisionWeightStream& stream,
+                                       const VisionParameters& host) {
+    VisionParameters out       = host;
+    out.patch_embedding.weight = stream.prelude(host.patch_embedding.weight);
+    out.patch_embedding_bias   = stream.prelude(host.patch_embedding_bias);
+    out.position_embedding     = stream.prelude(host.position_embedding);
+    for (std::size_t i = 0; i < host.layers.size(); ++i) {
+        const auto layer                 = static_cast<std::uint32_t>(i);
+        const VisionBlockParameters& src = host.layers[i];
+        VisionBlockParameters& dst       = out.layers[i];
+        dst.norm1.weight                 = stream.layer(layer, src.norm1.weight);
+        dst.norm1.bias                   = stream.layer(layer, src.norm1.bias);
+        dst.norm2.weight                 = stream.layer(layer, src.norm2.weight);
+        dst.norm2.bias                   = stream.layer(layer, src.norm2.bias);
+        dst.qkv.weight                   = stream.layer(layer, src.qkv.weight);
+        dst.qkv_bias                     = stream.layer(layer, src.qkv_bias);
+        dst.output.weight                = stream.layer(layer, src.output.weight);
+        dst.output_bias                  = stream.layer(layer, src.output_bias);
+        dst.fc1.weight                   = stream.layer(layer, src.fc1.weight);
+        dst.fc1_bias                     = stream.layer(layer, src.fc1_bias);
+        dst.fc2.weight                   = stream.layer(layer, src.fc2.weight);
+        dst.fc2_bias                     = stream.layer(layer, src.fc2_bias);
+    }
+    out.merger_norm.weight = stream.merger(host.merger_norm.weight);
+    out.merger_norm.bias   = stream.merger(host.merger_norm.bias);
+    out.merger_fc1.weight  = stream.merger(host.merger_fc1.weight);
+    out.merger_fc1_bias    = stream.merger(host.merger_fc1_bias);
+    out.merger_fc2.weight  = stream.merger(host.merger_fc2.weight);
+    out.merger_fc2_bias    = stream.merger(host.merger_fc2_bias);
+    return out;
+}
+
+VisionTowerPass::VisionTowerPass(DeviceContext& device, const VisionConfig& config,
+                                 const VisionParameters& parameters,
+                                 std::vector<VisionTowerItem> items, DeviceSpan arena,
+                                 const VisionPassLayout& layout,
+                                 common::VisionWeightStream* weight_stream)
+    : device_(device), config_(config), parameters_(parameters), items_(std::move(items)),
+      arena_(arena), layout_(layout), stream_(weight_stream) {
     if (items_.size() != layout_.items.size() || arena_.data == nullptr || arena_.bytes < layout_.bytes) {
         throw std::invalid_argument("Vision pass items or arena disagree with the layout");
     }
