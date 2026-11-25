@@ -45,6 +45,7 @@ const std::size_t q6_linear_shape_set_count = std::size(q6_linear_shape_sets);
 const LinearShapeSet<Q8ShapeEntry> q8_linear_shape_sets[] = {
     {models::qwen3_5::q8_shapes, &models::qwen3_5::q8_shapes_count},
     {models::qwen4_exp::q8_shapes, &models::qwen4_exp::q8_shapes_count},
+    {models::glm5_next::q8_shapes, &models::glm5_next::q8_shapes_count},
 };
 const std::size_t q8_linear_shape_set_count = std::size(q8_linear_shape_sets);
 

@@ -497,6 +497,18 @@ def qwen3_8_flash_next_dflash2(model, recipe, sources):
 
 
 
+# The dense text projections the Q8-dense GLM-5.3-Flash recipe stores in Q8
+# (docs/maintainer/glm5_3-flash-design.md §17.2): KDA's q/k/v and output, MLA's query down/latent,
+# query up and output, the dense MLPs and the shared experts — the bulk of the bytes a decode token
+# reads besides the routed experts.
+_GLM_Q8_DENSE = (
+    "/kda/query", "/kda/key", "/kda/value", "/kda/output",
+    "/attention/query_down", "/attention/latent", "/attention/query_up", "/attention/output",
+    "/mlp/gate", "/mlp/up", "/mlp/down",
+    "/moe/shared/gate", "/moe/shared/up", "/moe/shared/down",
+)
+
+
 def glm5_3_flash_nvfp4_orcarouter(model, recipe, sources):
     """GLM-5.3-Flash from orcarouter/GLM-5.3-Flash-Uncensored-NVFP4 (docs/maintainer/glm5_3-flash-design.md
     §3), a weight-only compressed-tensors export served with BF16 activations. The routed experts of
@@ -518,6 +530,19 @@ def glm5_3_flash_nvfp4_orcarouter(model, recipe, sources):
         recipe.assign(name, format="nvfp4_mul", layout="nvfp4_expert_rg16_v1", method=import_expert_bank,
                       activation_policy="A16Only")
         recipe.group(name, shape=model.parameters[name].shape)
+
+
+def glm5_3_flash_nvfp4_orcarouter_q8dense(model, recipe, sources):
+    """glm5_3_flash_nvfp4_orcarouter with the dense text projections of ``_GLM_Q8_DENSE`` quantized
+    from their stored BF16 to Q8 (``grouped_mse``); the token embedding and ``lm_head``, the routers,
+    the KDA control projections, MLA's absorbed ``key_up``/``value_up`` and the indexer stay BF16.
+    Not served: it misses the KL gate against the BF16-dense artifact
+    (docs/maintainer/glm5_3-flash-design.md §17.2)."""
+
+    glm5_3_flash_nvfp4_orcarouter(model, recipe, sources)
+    for name in model.parameters:
+        if name.startswith("text/layers/") and name.endswith(_GLM_Q8_DENSE):
+            _assign(recipe, name, Q8, method=grouped_mse)
 
 
 def glm5_3_flash_dflash2(model, recipe, sources):
@@ -547,5 +572,6 @@ RECIPES = {
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
     "glm5_3_flash_nvfp4_orcarouter": glm5_3_flash_nvfp4_orcarouter,
+    "glm5_3_flash_nvfp4_orcarouter_q8dense": glm5_3_flash_nvfp4_orcarouter_q8dense,
     "glm5_3_flash_dflash2": glm5_3_flash_dflash2,
 }

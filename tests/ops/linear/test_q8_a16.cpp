@@ -36,8 +36,26 @@ constexpr std::array kGeometries{
     Geometry{2560, 2560, 359U},
     // Shapes NInfer tunes for its own 2560-wide groupings (not Flash-Next recipe B packings).
     Geometry{6144, 2560, 367U},  Geometry{10240, 2560, 373U}, Geometry{12288, 2560, 379U},
+    // GLM-5.3-Flash's dense Q8 problems (src/models/glm5_next/shapes/q8): KDA qkv and the dense
+    // MLP's gate and up, KDA output, MLA query up and output, dense MLP down, shared expert gate and
+    // up, shared expert down.
+    Geometry{24576, 4096, 383U}, Geometry{4096, 8192, 389U}, Geometry{16384, 1536, 397U},
+    Geometry{4096, 16384, 401U}, Geometry{4096, 12288, 409U}, Geometry{4096, 4096, 419U},
+    Geometry{4096, 2048, 421U},
     // An unregistered geometry on the runtime-shape route (predicated SIMT, then MMA tiles).
     Geometry{2560, 4096, 331U}};
+
+// The last T of each route of a GLM-5.3-Flash selector (the `tokens <= N` seams).
+std::vector<int> glm_seams(std::int32_t n, std::int32_t k) {
+    if (n == 24576 && k == 4096) return {8, 16, 24, 32, 64, 79, 80, 96, 128, 192};
+    if (n == 4096 && k == 8192) return {16, 24, 32, 40, 64, 80, 96, 117, 128, 256, 384, 512, 768};
+    if (n == 16384 && k == 1536) return {8, 16, 24, 32, 48, 63, 64, 96, 128, 192};
+    if (n == 4096 && k == 16384) return {16, 24, 32, 40, 64, 80, 109, 128, 256, 384, 512, 768};
+    if (n == 4096 && k == 12288) return {2, 16, 24, 32, 40, 64, 80, 106, 128, 256, 384, 512, 768};
+    if (n == 4096 && k == 4096) return {9, 16, 24, 32, 40, 52, 64, 80, 102, 128, 256, 384, 512, 768};
+    if (n == 4096 && k == 2048) return {5, 7, 8, 22, 32, 40, 51, 64, 80, 102, 128, 256, 384, 512, 768};
+    return {};
+}
 
 int q8_a16_conformance() {
     int failures = 0;
@@ -63,6 +81,13 @@ int q8_a16_conformance() {
             if (shape.n == 4608) {
                 for (int t : {255, 257}) calls.push_back({t});
             }
+        }
+        if (const auto seams = glm_seams(shape.n, shape.k); !seams.empty()) {
+            for (int t : seams) {
+                calls.push_back({t});
+                calls.push_back({t + 1});
+            }
+            calls.push_back({4096});
         }
         if (shape.n == 9216 && shape.k == 2048) {
             for (int t : {12, 13, 14}) calls.push_back({t});

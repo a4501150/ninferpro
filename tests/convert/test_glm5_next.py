@@ -239,6 +239,22 @@ def test_build_model_binds_every_block_and_the_recipe_imports_the_banks(tmp_path
         selection = recipe.selections["text/layers/1/moe/experts"][0]
         assert (selection.format, selection.method) == ("nvfp4_mul", import_expert_bank)
         assert "mtp" not in model.components
+        bulk = ("0/kda/query", "0/kda/key", "0/kda/value", "0/kda/output", "0/mlp/gate", "0/mlp/up",
+                "0/mlp/down", "1/attention/query_down", "1/attention/latent", "1/attention/query_up",
+                "1/attention/output", "1/moe/shared/gate", "1/moe/shared/up", "1/moe/shared/down")
+        for name in bulk:
+            assert recipe.selections[f"text/layers/{name}"][0].format == "bf16", name
+        # The Q8-dense recipe stores the bulk dense projections in Q8; the routers, KDA control
+        # projections, absorbed MLA operands, indexer, embedding and head stay BF16.
+        q8 = Recipe(model)
+        RECIPES["glm5_3_flash_nvfp4_orcarouter_q8dense"](model, q8, {"base": store})
+        assert q8.selections["text/layers/1/moe/experts"][0].format == "nvfp4_mul"
+        for name in bulk:
+            assert q8.selections[f"text/layers/{name}"][0].format == "q8_g32_fp16", name
+        for name in ("layers/0/kda/forget_down", "layers/0/kda/gate_up", "layers/0/kda/beta",
+                     "layers/1/attention/key_up", "layers/1/attention/index_query", "layers/1/attention/index_key",
+                     "layers/1/moe/router", "token_embedding", "output_head"):
+            assert q8.selections[f"text/{name}"][0].format == "bf16", name
 
 
 def test_a_checkpoint_mtp_layer_is_stored_as_bf16(tmp_path) -> None:

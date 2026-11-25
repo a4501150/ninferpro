@@ -51,13 +51,41 @@ Every measurement ran on the production machine — one RTX PRO 6000 Blackwell (
 
 ## 1. Status and measured performance
 
-**Serving configuration** (`configs/GLM-5.3-Flash/model.env`): `--experts vram=40%,ram=60%`,
-INT8 latents, `--max-context 262144`, four lanes, plain decode by default (the DFlash2 drafter at
-three draft tokens is opt-in, §10.2), the prefix cache with a 2 GiB Host tier, and `--vision` with
+**Serving configuration** (`configs/GLM-5.3-Flash/model.env`): the BF16-dense artifact,
+`--experts vram=40%,ram=60%`,
+INT8 latents, `--max-context 262144`, four lanes, DFlash2 at two draft tokens on one-row rounds
+(§10.2), the prefix cache with a 2 GiB Host tier, and `--vision` with
 the tower streamed from pinned RAM. The placement puts
 4,838 experts in VRAM, 7,258 in RAM and none on the SSD. The whole process stays under the 95 %
 VRAM cap (92,993 MiB). KV is allocated for every lane at the full context at startup, and with the
 prefix cache on, its KV holds every lane's full context (6.36 GiB INT8 at 4 × 262,144).
+
+The serving build (2026-11-24: the shared expert and L2 warming inside the CPU wait, §6.3),
+`infernix_glm5_next_engine_bench --tokens 512 --repeat 4` at the serving split (model 15.44 GiB,
+16.70 with the drafter; KV 1.59 GiB at one lane, 6.36 at four; experts 63.8 GiB), median and range:
+
+| Requests | Plain | DFlash2 K = 2 | DFlash2 K = 3 |
+|---|---|---|---|
+| 1 | 36.9 (33.2-38.0) | 44.4 (40.8-46.4) | 45.8 (34.6-45.8) |
+| 4 | 69.5 (60.2-70.8) | | 64.8 (60.0-65.5) |
+
+With the drafter loaded, four requests measured 7 % below plain although several-row rounds
+decode plainly (the ranges overlap; §10.3 found them equal on an earlier build).
+
+The Q8-dense artifact (§17.2; not served: it misses the KL gate) against the BF16-dense one at the same split (`vram=40%,ram=60%`, 4,838 / 7,258 / 0
+experts, plain decode, `infernix_glm5_next_engine_bench` 512 tokens, median and range of four sets;
+fresh prompts on `infernix-serve`, 2026-11-24):
+
+| Measurement | BF16 dense (model 15.44 GiB) | Q8 dense (model 9.17 GiB) |
+|---|---|---|
+| Decode, one request | 35.4 (30.9-36.5) tok/s | 38.6 (36.1-41.2) tok/s |
+| Decode, four requests, aggregate | 64.6 (58.6-67.5) tok/s | 67.6 (64.1-69.9) tok/s |
+| Prefill, 10K and 40K-token prompts | 2.51-2.58k tok/s | 2.42-2.46k tok/s (≈ 4 % slower: the MMA routes dequantize in the loop) |
+| Serving process at `vram=44%` with the drafter, the 9.4K-prompt load below | — | peak 92,516 MiB (model 10.43 GiB with the drafter) |
+| Teacher-forced KL against BF16 dense, quick corpus, context 8192, stride 4096, INT8 KV | — | mean 0.0058, p99 0.066, top-1 97.3 %, PPL 3.1515 against 3.1489 |
+
+The tuned Q8 shapes (`src/models/glm5_next/shapes/q8/`) did not move one-request decode against
+the generic routes (38.7 tok/s). The rows below are the BF16-dense artifact's.
 
 | Measurement (serving split unless named) | Result |
 |---|---|
@@ -362,9 +390,10 @@ routed keys of the default artifact (42 × 288).
 
 ### 6.1 Placement
 
-The serving split is `vram=40%,ram=60%` (§1). It is the largest VRAM share that keeps the process
-under the 95 % cap with the prefix cache on at 4 × 262,144 tokens, and it puts no expert on the
-SSD, which measured faster than any SSD share at production's settings:
+The serving split is `vram=40%,ram=60%` (§1); the Q8-dense artifact would fit `vram=44%`. Each is
+the largest VRAM share that keeps the process under the 95 % cap with the prefix cache on at
+4 × 262,144 tokens, and puts no expert on the SSD, which measured faster than any SSD share at
+production's settings:
 
 | Split | VRAM / RAM / SSD experts | One request, K = 3, tok/s | Four requests, aggregate tok/s |
 |---|---|---|---|
@@ -404,7 +433,11 @@ need, and did not raise the hit rate (§6.3). No promotions follow a walked pref
 CPU-served misses run on 8 workers (`cpu_expert_workers`), and half of every decode call's
 host-memory misses stay on the link (`cpu_link_share256` = 128/256; MoE §5.6 states the shared
 share forms). The CPU computes any column count without changing a bit, since every W4A16 route is
-exact. Measured plain decode, `vram=42%,ram=58%`, INT8 KV, 256-token answers, two runs each:
+exact. While the host computes a call's misses the device runs the shared expert and warms the next
+layer's attention mix and first input projections into L2 (40 MiB at one column, 16 MiB wider: FN
+§8.6's budgets); the bits are unchanged and the one-row round median fell 21.6 → 20.3 ms
+(`vram=44%`, Q8-dense artifact). Measured plain decode, `vram=42%,ram=58%`, INT8 KV, 256-token
+answers, two runs each:
 
 | Configuration | One request, tok/s | Four requests, aggregate tok/s | Decode hits |
 |---|---:|---:|---:|
@@ -580,14 +613,29 @@ BF16 and resident; it never touches the expert tiers.
 
 The draft length is fixed: `--spec dflash2 --draft-tokens N` with N in 1-7 (no automatic length,
 no trees, no `--spec-min-p`). Only one-row rounds draft; a round of several rows decodes plainly,
-since since two rows of K = 3 already reach 8 columns, the fork route's limit (§6.4).
+since two rows of K = 3 already reach 8 columns, the fork route's limit (§6.4).
 
-Serving (`configs/GLM-5.3-Flash/model.env`) decodes plainly by default and opts in with
-`INFERNIX_SPEC=dflash2`: the drafter lifts a single stream by about 37 % (§10.3), it never runs
-beside several streams, and the speed headroom is in plain decode itself — close that gap first
-(the §17.2 8-bit dense recipe is the largest lever), then re-enable the drafter on top.
+Serving (`configs/GLM-5.3-Flash/model.env`) drafts three tokens a one-row round (§10.3;
+`INFERNIX_SPEC=` serves plain decode).
 
 ### 10.3 Measurements
+
+Draft length at one request on the Q8-dense artifact (not served, §17.2), `vram=44%,ram=56%`
+(5,322 / 6,774 / 0 experts; model 10.43 GiB with the drafter, KV 1.59 GiB, experts 70.2 GiB),
+`infernix_glm5_next_engine_bench --concurrency 1 --tokens 512 --repeat 4`, 2026-11-24:
+
+| K | Median tok/s | Range | Accepted, last two sets |
+|---|---|---|---|
+| 0 (plain) | 40.7 | 38.1-41.9 | – |
+| 2 | **52.1** | 43.9-52.8 | 62 %, 64 % |
+| 3 | 47.1 | 44.7-56.0 | 51 %, 60 % |
+| 4 | 46.9 | 42.6-48.6 | 50 %, 43 % |
+
+K = 2 has the best median; K = 3's acceptance varies more between sets (its best set, 56.0, is
+the fastest single set). On these essays acceptance sits below DFlash2's published 80-85 % a
+position for Qwen3.8-27B (no GLM numbers are published), while a greedy chat continuation accepts
+5.27 of 7 (below); the drafter was trained against the official checkpoint, not the uncensored
+edit served here. The BF16-dense measurements below set serving's K = 3.
 
 Rounds of several rows, `vram=45%,ram=55%` (5,443 / 6,621 / 32 experts), INT8 KV, 600-token essay
 continuations, two runs a level, aggregate output tok/s:
@@ -947,7 +995,7 @@ decided the shared machinery are in
 
 | Option | State and reason |
 |---|---|
-| **8-bit dense recipe** (dense text and `lm_head` quantized to 8 bits at conversion) | The largest single lever: dense bytes per token 16.7 → ≈ 9.6 GB (model), ≈ 6.6 GiB less VRAM. strata-glm measured int8-per-32 dense at 0.0105 mean KL against 0.0066 for BF16 dense after a 2,600-token prompt (§18.4). It needs its own teacher-forced KL gate against the BF16 artifact |
+| **8-bit dense recipe** | Built: the orcarouter recipe stores KDA q/k/v/o, MLA query down/latent/up/output, the dense MLP and the shared expert as `q8_g32_fp16` (grouped MSE scales) from the source's BF16; the embedding, `lm_head`, routers, KDA control projections, key_up/value_up and the indexer stay BF16. Model 15.44 → 9.17 GiB, +9 % one-request decode (§1). strata-glm measured int8-per-32 dense at 0.0105 mean KL against 0.0066 for BF16 dense after a 2,600-token prompt (§18.4). Not served: against the BF16-dense artifact (`infernix-perplexity` quick corpus, context 8192, stride 4096, INT8 KV, 252,823 positions) it measured mean KL 0.0058, p99 0.066, top-1 97.3 % (PPL 3.1515 against 3.1489), against the gate's 0.002 / 0.05 / 99 %; the BF16 artifact's own chunk-order floor is 0.00012 and 99.9 %. The error is spread over every context bucket (0.005-0.007). Untried: which projections carry it (a KDA-BF16 variant keeps most of the bytes) |
 | **A teacher-forced KL gate on frozen texts** (≥ 2,500 positions in the GLM template, with a block past 8K tokens; against the BF16 reference forward: mean KL ≤ 0.002 nats, p99 ≤ 0.05, top-1 ≥ 99 %) | Defined but not run. The current qualification is §14 |
 | **An opt-in approximate expert mode** (Maya's per-layer keep map, strata-glm's weight threshold, `ssd` or `vram` scope, a static reproducible rule) | Not built: it changes the model's outputs and would need its own labelling and KL gates. Maya measured +23 % decode at KL 0.018 to its own model; strata-glm +30 % at KL 0.022 for SSD-only experts below ≈ 3 % weight (§18) |
 | **Expert volumes on several drives: 12-way striped records, per-volume read queues, landed-unit masks** | Designed for the RTX 5090 machine with four NVMe drives, where two drives measured additive on 14.16 MB records (2 × 5.8 → 11.7 GB/s; 12.7 GB/s for a 990 PRO beside an Optane P5800X, 2026-10-10) and a striped record would land in ≈ 1.1-1.3 ms against ≈ 2.3 ms whole (model). The production machine has one drive and serves with no SSD share |

@@ -56,6 +56,13 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n17408_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n34816_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n248320_k5120(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n4096_k2048(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n4096_k4096(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n4096_k8192(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n4096_k12288(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n4096_k16384(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n16384_k1536(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n24576_k4096(std::int32_t tokens);
 // A16ColumnInvariant for the output head: one 8-K-warp sliced-K family for every T.
 [[nodiscard]] Q8Launch select_q8_n248320_k5120_invariant(std::int32_t tokens);
 // A16ColumnInvariant for Qwen3.8-Flash-Next's hyper-connection and PLE problems: the MMA tiles at every T.
