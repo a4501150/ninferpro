@@ -823,8 +823,17 @@ Each entry names the option and the reason or measurement that decided it.
 
 ### 10.3 Decode (§6)
 
-- **Lookahead prefetch of next-layer experts by the router** — not built. The host owns expert
-  movement, and the CPU wait's L2 warming covers the same window.
+- **Lookahead prefetch of next-layer experts by the router** — rejected (GLM-5.3-Flash, Q8-dense
+  artifact, `vram=44%,ram=56%`, RTX PRO 6000, 2026-11-24). The next layer's router on this layer's
+  MoE input caught 46 % of the next layer's misses with its top 8, copying 2.9 records per caught
+  miss (57 % at 3.9 with its top 12); the previous token's experts caught 8 %. A prototype copied
+  the best-ranked non-resident predictions into slots on a side stream after the call's staging,
+  read them in place at the next layer (same bits) and made that layer wait for the copies: the
+  one-row round median went 21.3 → 25.5 / 32.1 / 43.3 ms at 1 / 2 / 4 records a layer (four rows
+  38.8 → 40.6 / 47.7 / 62.1 ms), and the hit rate fell (75.6 → 63.1 % at 4), since a copied record
+  never lands in a frame. A layer leaves the link idle for well under one 13.5 MiB record between
+  its staging and the next layer's routing, so the copies are not hidden, and two of three move an
+  expert no column uses.
 - **Victim landing** — rejected. One-off misses push out residents that still earn hits;
   promoting less gained more.
 - **Per-layer cache quotas** — rejected. They lost 3-34 % in replay (§4.3).
