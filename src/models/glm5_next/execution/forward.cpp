@@ -573,6 +573,44 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
             source.landing_slots = experts_.landing_slots;
         }
     }
+    // While the host computes this call's misses, the CPU wait warms the next layer's weights into
+    // L2 in the order it reads them: its attention mix, then its mixer's input projections. A
+    // one-column call warms up to 40 MiB, a wider call 16 MiB of the first projection
+    // (Qwen3.8-Flash-Next's measured budgets, its design §8.6).
+    const std::uint32_t layer = moe_layer + config_.dense_layers;
+    if (source.cpu.max_jobs > 0 && layer + 1 < config_.num_hidden_layers) {
+        const auto& next = parameters_.layers[layer + 1];
+        const bool whole_chain = T == 1;
+        std::size_t left       = whole_chain ? 40ULL << 20 : 16ULL << 20;
+        int spans              = 0;
+        const auto add         = [&](const void* data, std::size_t bytes) {
+            if (spans == ops::MoeL2Warm::kSpans || left < 16 || data == nullptr ||
+                reinterpret_cast<std::uintptr_t>(data) % 16 != 0 || bytes < 16) {
+                return;
+            }
+            const std::size_t take       = std::min(bytes, left);
+            source.l2_warm.ptr[spans]   = data;
+            source.l2_warm.bytes[spans] = take;
+            left -= take;
+            ++spans;
+        };
+        const auto add_linear = [&](const LinearParameters& linear) {
+            add(linear.weight.payload, linear.weight.payload_bytes);
+        };
+        if (whole_chain) { add(next.attn_hc.fn.data, next.attn_hc.fn.bytes()); }
+        if (config_.layer_types[layer + 1] == MixerKind::Kda) {
+            const auto& kda = std::get<KdaParameters>(next.mixer);
+            add_linear(kda.qkv);
+            if (whole_chain) { add_linear(kda.control); }
+        } else {
+            const auto& mla = std::get<MlaParameters>(next.mixer);
+            add_linear(mla.query_latent);
+            if (whole_chain) {
+                add_linear(mla.index_inputs);
+                add_linear(mla.query_up);
+            }
+        }
+    }
 
     // A streamed prefill chunk (expert_stream.h): the layer's copied-ahead experts are read from
     // the ring like resident ones. An expert not in the ring stages or fetches as before.
@@ -601,10 +639,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
     if (route_tap != nullptr) {
         CUDA_CHECK(cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s));
     }
-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/true, planned);
+    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned);
     if (streaming != nullptr && stream_.last) { streaming->after_experts(moe_layer, s); }
-    // The shared expert is ungated: noaux_tc routing sets every shared gate to 1.
+    // The shared expert runs while the host computes the CPU-served misses. It is ungated:
+    // noaux_tc routing sets every shared gate to 1.
     const Tensor shared = mlp(p.shared, x);
+    ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
     ops::moe_combine(outputs, routing, shared, y, s);
     return y;
 }
