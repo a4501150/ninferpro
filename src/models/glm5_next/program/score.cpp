@@ -7,6 +7,7 @@
 #include "models/glm5_next/program/program_impl.h"
 
 #include "infernix/ops/cast.h"
+#include "infernix/ops/hyper_connection.h"
 #include "infernix/ops/target_logprobs.h"
 #include "infernix/ops/top_logprobs.h"
 
@@ -74,6 +75,13 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
         }
         scoring_ = false;
         check_device_error();
+        if (capture_rows_ > 0) {
+            // The final norm's input of every position, beside the taps the calls wrote.
+            Tensor final(capture_final_.p, DType::BF16, {dim(c_.hidden_size), static_cast<std::int32_t>(n)});
+            ops::hyper_connection_stream_mean(score_residuals(0, static_cast<std::int32_t>(n)),
+                                              dim(c_.hc.streams), final, device_.stream);
+            captured_ = n;
+        }
 
         // Position p's logits (p in [first_target - 1, n - 2]) predict token p + 1.
         const cudaStream_t s = device_.stream;
@@ -146,6 +154,32 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
         (void)abort(sequence);
     }
     return output;
+}
+
+void ProgramImpl::enable_feature_capture(std::vector<std::uint32_t> layers) {
+    if (!options_.causal_scoring || drafter_ || layers.empty()) {
+        throw std::logic_error("Glm5Next: feature capture needs a causal-scoring Program without a drafter");
+    }
+    for (const std::uint32_t l : layers) {
+        if (l >= c_.num_hidden_layers) { throw std::invalid_argument("Glm5Next: capture layer out of range"); }
+    }
+    const std::size_t H = c_.hidden_size, T = options_.max_context;
+    capture_rows_       = static_cast<std::int32_t>(layers.size() * H);
+    capture_features_   = DeviceBuffer(2ULL * static_cast<std::size_t>(capture_rows_) * T);
+    capture_final_      = DeviceBuffer(2ULL * H * T);
+    forward_->set_feature_taps(std::move(layers));
+}
+
+void ProgramImpl::take_features(std::vector<std::uint16_t>& features, std::vector<std::uint16_t>& final) {
+    if (capture_rows_ == 0 || captured_ == 0) { throw std::logic_error("Glm5Next: nothing captured"); }
+    features.resize(static_cast<std::size_t>(capture_rows_) * captured_);
+    final.resize(c_.hidden_size * captured_);
+    CUDA_CHECK(cudaMemcpyAsync(features.data(), capture_features_.p, 2 * features.size(), cudaMemcpyDeviceToHost,
+                               device_.stream));
+    CUDA_CHECK(cudaMemcpyAsync(final.data(), capture_final_.p, 2 * final.size(), cudaMemcpyDeviceToHost,
+                               device_.stream));
+    device_.synchronize();
+    captured_ = 0;
 }
 
 Tensor ProgramImpl::score_residuals(std::int32_t begin, std::int32_t columns) const {

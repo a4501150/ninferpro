@@ -365,6 +365,8 @@ public:
     // ---------------------------------------------------------------- causal scoring (score.cpp)
     [[nodiscard]] ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
                                            const ScoreOptions& options);
+    void enable_feature_capture(std::vector<std::uint32_t> layers);
+    void take_features(std::vector<std::uint16_t>& features, std::vector<std::uint16_t>& final);
 
     // ---------------------------------------------------------------- experts (experts.cpp)
     void set_maintenance_waker(std::function<void()> waker) { placement_->set_maintenance_waker(std::move(waker)); }
@@ -747,6 +749,11 @@ private:
     DeviceBuffer head_saved_;
     prefix::KvPageGeometry kv_geometry_;
     bool scoring_              = false;
+    // Drafter-training capture (enable_feature_capture): the tap features [rows, max_context] and
+    // final stream means [H, max_context] of the last scored prompt, its length.
+    DeviceBuffer capture_features_, capture_final_;
+    std::int32_t capture_rows_ = 0;
+    std::size_t captured_      = 0;
     std::int32_t score_column_ = 0;
     // The lane whose call keeps its final residual (the zero-token resume's head input); -1 none.
     std::int32_t head_saved_lane_ = -1;

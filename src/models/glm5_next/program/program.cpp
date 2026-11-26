@@ -146,6 +146,14 @@ ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_t
     return impl_->causal_score(std::move(prompt), first_target, options);
 }
 
+void Program::enable_feature_capture(std::vector<std::uint32_t> layers) {
+    impl_->enable_feature_capture(std::move(layers));
+}
+
+void Program::take_features(std::vector<std::uint16_t>& features, std::vector<std::uint16_t>& final) {
+    impl_->take_features(features, final);
+}
+
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->usage(); }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory(); }

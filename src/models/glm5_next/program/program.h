@@ -486,6 +486,14 @@ public:
     // Teacher-forced scoring of a text prompt (ProgramOptions::causal_scoring; an idle Program).
     [[nodiscard]] ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
                                            const ScoreOptions& options);
+    // Drafter-training capture (bench/models/glm5_next/drafter_capture.cpp): after this, every
+    // causal_score also keeps each position's stream-mean residual after `layers` and its final
+    // stream mean (the final norm's input), read with take_features. Allocates
+    // (layers + 1) x hidden x max_context BF16 on the device.
+    void enable_feature_capture(std::vector<std::uint32_t> layers);
+    // The last causal_score's capture, position-major: features [n][layers x hidden] and final
+    // [n][hidden], BF16 bits.
+    void take_features(std::vector<std::uint16_t>& features, std::vector<std::uint16_t>& final);
 
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;

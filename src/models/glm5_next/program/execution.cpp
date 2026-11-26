@@ -140,6 +140,12 @@ void ProgramImpl::forward_call(std::int32_t batch, std::int32_t width, std::int3
     }
     // A scored prompt's calls keep their final residuals for the LM head (causal_score).
     if (scoring_) { fb.residual_out = score_residuals(score_column_, batch * width); }
+    if (scoring_ && capture_rows_ > 0) {
+        fb.draft_features = Tensor(static_cast<std::byte*>(capture_features_.p) +
+                                       2ULL * static_cast<std::size_t>(capture_rows_) *
+                                           static_cast<std::size_t>(score_column_),
+                                   DType::BF16, {capture_rows_, batch * width});
+    }
     // A prompt's last call keeps its final residual (the zero-token resume's head input).
     if (head_saved_lane_ >= 0) {
         fb.head_residual_out =

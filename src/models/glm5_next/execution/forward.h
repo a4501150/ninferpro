@@ -190,6 +190,10 @@ public:
                          std::int32_t width, std::span<const std::int32_t> slots,
                          std::span<const std::int32_t> columns);
 
+    // Drafter-training capture without a bound drafter: the layers whose stream-mean residuals
+    // ForwardBatch::draft_features receives (a bound drafter's target layers otherwise).
+    void set_feature_taps(std::vector<std::uint32_t> layers) { draft_taps_ = std::move(layers); }
+
     [[nodiscard]] bool experts_resident() const noexcept { return experts_.resident; }
     void set_experts_resident(bool resident) noexcept { experts_.resident = resident; }
 

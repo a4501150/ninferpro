@@ -11,3 +11,14 @@ add_executable(infernix_glm5_next_engine_bench
   "${CMAKE_CURRENT_LIST_DIR}/engine_bench.cpp")
 infernix_internal_includes(infernix_glm5_next_engine_bench)
 target_link_libraries(infernix_glm5_next_engine_bench PRIVATE infernix_engine)
+
+# The DFlash2 drafter-training corpus (tools/drafter/README.md): the target's own answers through
+# the public Engine, then their teacher-forced features through the causal-scoring Program.
+add_executable(infernix_glm5_next_drafter_generate
+  "${CMAKE_CURRENT_LIST_DIR}/drafter_generate.cpp")
+infernix_internal_includes(infernix_glm5_next_drafter_generate)
+target_link_libraries(infernix_glm5_next_drafter_generate PRIVATE infernix_engine infernix::json)
+add_executable(infernix_glm5_next_drafter_capture
+  "${CMAKE_CURRENT_LIST_DIR}/drafter_capture.cpp")
+infernix_internal_includes(infernix_glm5_next_drafter_capture)
+target_link_libraries(infernix_glm5_next_drafter_capture PRIVATE infernix_engine infernix::json)
