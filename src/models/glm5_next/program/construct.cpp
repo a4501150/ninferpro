@@ -157,6 +157,7 @@ DeviceLayout ProgramImpl::plan_device(const ProgramOptions& o, const Config& con
         io.ids               = take(R);
         io.positions         = take(R);
         io.drafts            = take(K * L);
+        io.confidence        = take(K * L); // beside the drafts: one read-back copy
         io.candidates        = take(C * K * L);
         io.q                 = take(C * K * L);
         io.context_positions = take(f.window + 2); // then the call's count and lane

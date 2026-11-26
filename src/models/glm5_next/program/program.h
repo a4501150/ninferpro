@@ -359,9 +359,17 @@ struct ProgramOptions {
     // Decode rounds replay a CUDA graph per batch size (off: every round runs eagerly).
     bool decode_graphs = true;
     // DFlash2 drafts per round, 1..15 (the bound companion drafter's; 0: no speculation). A
-    // one-row round drafts this many, fewer only near its request's extent; a round of several
-    // rows or of a token-constrained row decodes plainly.
+    // one-row round proposes this many, fewer only near its request's extent, and verifies them
+    // all unless draft_min_p or auto_draft_length cuts them; a round of several rows or of a
+    // token-constrained row decodes plainly.
     std::uint32_t draft_tokens = 0;
+    // --draft-tokens auto (glm5_3-flash-design.md §10.2): a one-row round verifies the prefix of
+    // its drafts that maximizes the expected tokens per round time, from each draft's selector
+    // probability calibrated per request; none decodes the round plainly.
+    bool auto_draft_length = false;
+    // --spec-min-p: a one-row round verifies its drafts up to the first whose selector probability
+    // (temperature 1) is below this value; 0 verifies every draft.
+    double draft_min_p = 0.0;
     // Expert placement: the shared runtime's options (models/offload/expert_placement_runtime.h),
     // with the instance's placement, warm start, VRAM headroom and RAM tier sizing; the Program
     // fills the family's own fields (label, geometry, staging, chunk, tier floor, stripe identity).

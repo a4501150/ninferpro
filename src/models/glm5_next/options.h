@@ -19,19 +19,15 @@ constexpr std::uint32_t kPrefillChunkBesideDecode = 1024U;
 // --vision-offload auto: on; the expert cache lends the encode's staging (design §15.2).
 constexpr bool kVisionOffloadAuto = true;
 
-// The DFlash2 drafter's block less its anchor (FamilyOptionRules::draft_tokens_auto; unused while
-// --draft-tokens auto is refused).
-constexpr std::uint32_t kDraftTokensAuto = 7U;
+// The most drafts a round of --draft-tokens auto verifies (FamilyOptionRules::draft_tokens_auto).
+// Not the drafter's 7: a verify column's routes cost a fifth to a half of a plain round, the
+// calibrated length rarely pays past five (glm5_3-flash-design.md §10.2), and every column more
+// costs eight staging slots (§6.4).
+constexpr std::uint32_t kDraftTokensAuto = 5U;
 
 // The prefix cache Host tier's default (glm5_3-flash-design.md §12): about 26 snapshots beside
 // the expert bank, each GiB costing about 78 RAM expert slots.
 inline constexpr std::uint64_t kDefaultPrefixHostBytes = 2ULL << 30;
-
-// Every round drafts --draft-tokens: --draft-tokens auto is refused.
-void validate_draft_backend(const EngineOptions& options);
-
-// Every draft is verified: --spec-min-p is refused.
-void validate_draft_min_p(const EngineOptions& options);
 
 // The family's prefix-cache tier rules: snapshots are born in the Host tier (its default is the
 // design's 2 GiB); the Disk tier, a save file, Device snapshot slots, lossy Host state and

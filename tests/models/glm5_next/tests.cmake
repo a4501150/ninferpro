@@ -16,6 +16,11 @@ infernix_add_test(infernix_glm5_next_chat_template_test
   LIBRARIES infernix_model_runtime)
 
 
+# The DFlash2 draft-length policy (--draft-tokens auto): the calibrated length and its calibration.
+infernix_add_test(infernix_glm5_next_draft_length_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_length.cpp"
+  LIBRARIES infernix_engine)
+
 infernix_add_test(infernix_glm5_next_tool_calls_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tool_calls.cpp"
   NEEDS_SOURCE_DIR

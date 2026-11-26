@@ -137,16 +137,35 @@ void ProgramImpl::propose(std::span<const std::uint32_t> lanes, std::int32_t wid
         .positions     = Tensor(dflash_device(io.positions), DType::I32, {width, batch}),
         .drafts        = Tensor(dflash_device(io.drafts), DType::I32, {K, batch}),
         .candidates    = Tensor(dflash_device(io.candidates), DType::I32, {C, K, batch}),
-        .proposal_q    = Tensor(dflash_device(io.q), DType::FP32, {C, K, batch})};
+        .proposal_q    = Tensor(dflash_device(io.q), DType::FP32, {C, K, batch}),
+        .confidence    = Tensor(dflash_device(io.confidence), DType::FP32, {K, batch})};
     replay(graph(propose_graphs_, batch, width), [&] { drafter_->propose(call); });
-    CUDA_CHECK(cudaMemcpyAsync(dflash_host(io.drafts), dflash_device(io.drafts), 4ULL * K * batch,
+    // The drafts and their probabilities (adjacent regions) in one copy.
+    CUDA_CHECK(cudaMemcpyAsync(dflash_host(io.drafts), dflash_device(io.drafts),
+                               4ULL * (io.confidence - io.drafts + static_cast<std::size_t>(K) * batch),
                                cudaMemcpyDeviceToHost, s));
     device_.synchronize();
+    const auto* confidence = reinterpret_cast<const float*>(dflash_host(io.confidence));
     for (std::int32_t b = 0; b < batch; ++b) {
         for (std::int32_t j = 0; j < K; ++j) {
-            drafts_[b][static_cast<std::size_t>(j)] = dflash_host(io.drafts)[b * K + j];
+            drafts_[b][static_cast<std::size_t>(j)]     = dflash_host(io.drafts)[b * K + j];
+            confidence_[b][static_cast<std::size_t>(j)] = confidence[b * K + j];
         }
     }
+}
+
+std::int32_t ProgramImpl::verify_length(Lane& lane, std::int32_t room) {
+    const auto& confidence = confidence_[0];
+    std::int32_t k         = 0;
+    while (k < room && static_cast<double>(confidence[static_cast<std::size_t>(k)]) >= options_.draft_min_p) {
+        ++k;
+    }
+    if (!options_.auto_draft_length || k == 0) { return k; }
+    std::int32_t best =
+        calibrated_draft_length(lane.calibration, std::span<const float>(confidence.data(), static_cast<std::size_t>(k)), k);
+    // A probe keeps the longer drafts' deciles measured.
+    if (++lane.policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, k); }
+    return best;
 }
 
 PendingBatch ProgramImpl::speculate(std::span<const SequenceHandle> sequences,
@@ -157,7 +176,8 @@ PendingBatch ProgramImpl::speculate(std::span<const SequenceHandle> sequences,
     const auto& io       = plan_.dflash_io;
     const auto batch     = static_cast<std::int32_t>(lanes.size());
     const std::int32_t W = width, K = width - 1;
-    propose(lanes, W);
+    // One row: its first K drafts, candidates and laws are a prefix of the proposal's planes.
+    if (batch != 1) { throw std::logic_error("Glm5Next: only a one-row round speculates"); }
 
     auto* ids     = reinterpret_cast<std::int32_t*>(host_io() + plan_.io.ids);
     auto* pos     = reinterpret_cast<std::int32_t*>(host_io() + plan_.io.positions);
@@ -261,6 +281,9 @@ PendingBatch ProgramImpl::speculate(std::span<const SequenceHandle> sequences,
         for (std::int32_t j = 0; j < A; ++j) {
             ++stats.accepted_per_position[static_cast<std::size_t>(j)];
         }
+        lane.calibration.observe(
+            std::span<const float>(confidence_[b].data(), static_cast<std::size_t>(K)),
+            static_cast<std::uint32_t>(K), static_cast<std::uint32_t>(A), kCalibrationWeight);
     }
     after_call(batch * W, decode_budget(static_cast<std::uint32_t>(advanced)));
     round_width_ = W;

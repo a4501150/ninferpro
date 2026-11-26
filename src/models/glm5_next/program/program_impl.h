@@ -23,6 +23,7 @@
 #include "models/glm5_next/execution/dflash2.h"
 #include "models/glm5_next/execution/forward.h"
 #include "models/glm5_next/execution/parameters.h"
+#include "models/glm5_next/program/draft_length.h"
 #include "models/glm5_next/program/prefix/call_plan.h"
 #include "models/glm5_next/program/prefix/prefix_cache.h"
 #include "models/offload/expert_residency.h"
@@ -215,7 +216,8 @@ struct IoLayout {
 // copy) and the commit's counts; L lanes, W = K + 1.
 struct DFlash2Io {
     std::size_t anchors = 0, frontiers = 0, valid = 0, slots = 0, ids = 0, positions = 0,
-                drafts = 0, candidates = 0, q = 0, context_positions = 0, context_count = 0,
+                drafts = 0, confidence = 0, candidates = 0, q = 0, context_positions = 0,
+                context_count = 0,
                 context_slot = 0, ones = 0, target = 0, extents = 0, lengths = 0, round_anchors = 0,
                 licensed = 0, counts = 0, accepted = 0, commit = 0, words = 0;
 };
@@ -299,6 +301,10 @@ public:
         std::vector<std::uint32_t> prompt_uses;
         std::uint32_t prompt_counted = 0;
         SpeculativeStats speculative;
+        // --draft-tokens auto: the request's selector calibration and its speculating rounds (every
+        // kProbeInterval-th verifies one draft more than its choice).
+        SelectorCalibration calibration;
+        std::uint64_t policy_rounds = 0;
         std::unique_ptr<LaneVision> vision; // a media prompt's encode, until its prefill ends
     };
 
@@ -549,7 +555,11 @@ private:
     void call_context(std::uint32_t lane, std::int32_t begin, std::int32_t width);
     // A plain decode round's columns into its rows' rings (inside the round's graph).
     void round_context(std::int32_t batch);
-    // A round of `width` columns a row: proposes, verifies and accepts.
+    // A one-row round's drafts to verify after its proposal: the room, cut at the first draft below
+    // draft_min_p, then with auto_draft_length the calibrated length (0: the round decodes plainly).
+    [[nodiscard]] std::int32_t verify_length(Lane& lane, std::int32_t room);
+    // A one-row round of `width` columns after its proposal: verifies the proposal's first
+    // width - 1 drafts and accepts.
     [[nodiscard]] PendingBatch speculate(std::span<const SequenceHandle> sequences,
                                          std::span<const std::uint32_t> lanes,
                                          std::span<const std::int32_t> positions,
@@ -721,6 +731,10 @@ private:
     std::vector<execution::KdaVerifyRecord> records_;
     std::vector<DecodeGraph> propose_graphs_, verify_graphs_, context_graphs_;
     std::array<std::array<TokenId, 16>, kMaximumConcurrency> drafts_{};
+    // Each draft's selector probability (temperature 1), read back with the drafts.
+    std::array<std::array<float, 16>, kMaximumConcurrency> confidence_{};
+    static constexpr std::uint64_t kProbeInterval = 8;
+    static constexpr double kCalibrationWeight    = 0.1;
 
     // The prefix cache: the index and its physical binding, the packed state image of a lane, the
     // prompt-end captures' staging slots and every lane's saved head residual.

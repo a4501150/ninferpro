@@ -494,7 +494,8 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
     const std::span<const std::uint32_t> round_lanes(lanes.data(), static_cast<std::size_t>(batch));
     const std::span<const std::int32_t> round_positions(positions.data(), static_cast<std::size_t>(batch));
     if (drafter_) {
-        // A one-row round drafts what its row has room for. A round of several rows, or of a
+        // A one-row round proposes what its row has room for and verifies the drafts
+        // verify_length keeps (none: it decodes plainly). A round of several rows, or of a
         // token-constrained row, decodes plainly: with experts beyond VRAM a verify column's routes
         // cost more than its accepted tokens save (glm5_3-flash-design.md §10.3).
         std::int32_t room = plan_.draft;
@@ -505,7 +506,9 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
             room = std::min(room, draft_room(lane, budgets[static_cast<std::size_t>(b)]));
         }
         if (!plain && room > 0) {
-            return speculate(sequences, round_lanes, round_positions, room + 1, start);
+            propose(round_lanes, room + 1);
+            const std::int32_t k = verify_length(lanes_[lanes[0]], room);
+            if (k > 0) { return speculate(sequences, round_lanes, round_positions, k + 1, start); }
         }
         for (std::int32_t b = 0; b < batch; ++b) {
             ++lanes_[lanes[static_cast<std::size_t>(b)]].speculative.fallback_steps;

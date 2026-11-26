@@ -46,6 +46,7 @@ struct DFlash2ProposalCall {
     Tensor drafts;                                // I32 [K, B]
     Tensor candidates; // I32 [16, K, B]: each draft position's candidates
     Tensor proposal_q; // FP32 [16, K, B]: the law each draft was drawn from
+    Tensor confidence; // FP32 [K, B]: each draft's selector probability (temperature 1)
 };
 
 class DFlash2 {

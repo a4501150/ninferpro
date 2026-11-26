@@ -216,12 +216,14 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
     }
     Tensor projected = work_.alloc(DType::BF16, {dim(config_.selector_rank), K * B});
     project(hidden, p_.selector_hidden, projected, work_, s);
-    Tensor drafts = call.drafts;
-    Tensor q      = call.proposal_q;
+    Tensor drafts     = call.drafts;
+    Tensor q          = call.proposal_q;
+    Tensor confidence = call.confidence;
     ops::candidate_selector_path(candidates, scores.view({kCandidates, K, B}),
                                  projected.view({dim(config_.selector_rank), K, B}), call.anchors,
                                  p_.predecessor_codebook, p_.successor_codebook, call.frontiers,
-                                 call.configs, drafts, q, nullptr, work_, s);
+                                 call.configs, drafts, q,
+                                 confidence.data != nullptr ? &confidence : nullptr, work_, s);
 }
 
 std::size_t DFlash2::workspace_bytes(const TextConfig& text, const DFlash2Config& config,

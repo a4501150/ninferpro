@@ -53,7 +53,7 @@ Every measurement ran on the production machine — one RTX PRO 6000 Blackwell (
 
 **Serving configuration** (`configs/GLM-5.3-Flash/model.env`): the BF16-dense artifact,
 `--experts vram=40%,ram=60%`,
-INT8 latents, `--max-context 262144`, four lanes, DFlash2 at two draft tokens on one-row rounds
+INT8 latents, `--max-context 262144`, four lanes, DFlash2 `--draft-tokens auto` on one-row rounds
 (§10.2), the prefix cache with a 2 GiB Host tier, and `--vision` with
 the tower streamed from pinned RAM. The placement puts
 4,838 experts in VRAM, 7,258 in RAM and none on the SSD. The whole process stays under the 95 %
@@ -93,6 +93,7 @@ the generic routes (38.7 tok/s). The rows below are the BF16-dense artifact's.
 | Decode, four requests of 256 tokens (rounds of several rows decode plainly) | median 59.9 tok/s aggregate, sets 56.5-62.0 |
 | Same bench at `vram=42%,ram=58%` (5,080 / 7,016 / 0 experts), one request, by draft length | K = 0 35.0, K = 1 40.9, K = 2 44.4, K = 3 47.8, K = 4 43.2, K = 5 37.7 tok/s (§10.3) |
 | Process VRAM while serving: four 1,024-token decodes beside a 9.4K prompt and its cached repeat | peak 92,412 MiB; at vram=42 % it sat at 95,672 MiB |
+| Same with `--draft-tokens auto` (48 staging slots against 32): three 1,024-token decodes beside a 15.7K prompt and its cached repeat, 2026-11-26 | peak 92,680 MiB (cap 92,993) |
 | Same with `--vision`: two decodes, the 9.4K prompt and an image (551-token prompt), then a video (1,544 tokens) | peak 92,412 MiB; the image answer reads the chart's title |
 | Prefill, fresh prompts of 10K-38K tokens, walk spans, `vram=42%,ram=58%` | 2.35-2.43k tok/s, compute-bound (§11.1) |
 | One 255,771-token prompt, INT8 KV, `vram=42%,ram=58%` | prefill 2.09k tok/s (TTFT 2 min 2 s), then 256 tokens at 33.3 tok/s |
@@ -451,6 +452,22 @@ answers, two runs each:
 Twelve workers measured 1-4 % faster, inside the spread their higher hit rate explains; eight leave
 the host cores to other work.
 
+The one-row verify round spends more on staging than on the CPU wait (27.9 against 13.9 ms at
+K = 3, §10.3), so calls of two or more columns were given their own link share (the shared
+`wide_share` / `wide_share_from` mechanism). It did not pay: serving split, DFlash2 `auto`,
+temperature 1.0, one request, 1,024-token essays, four sets, 2026-11-26:
+
+| Calls of ≥ 2 columns | Median tok/s (range) |
+|---|---:|
+| link 1/2, 4 CPU jobs, 8 workers (served) | 49.2 (44.6-51.0) |
+| link 1/3 | 48.4 (45.9-48.7) |
+| link 1/4 | 47.2 (41.8-47.3) |
+| link 2/3 | 46.3 (42.6-47.0) |
+| link 1/3, 8 CPU jobs | 46.9 (43.6-48.2) |
+| link 1/2, 12 workers | 47.5 (46.6-52.3) |
+
+Moving misses either way made the round slower, so the single half share stays.
+
 ### 6.4 Staging slots
 
 Staging slots are frames with a staging role: top_k × the widest decode or verify call's columns
@@ -611,12 +628,27 @@ BF16 and resident; it never touches the expert tiers.
 
 ### 10.2 Draft policy
 
-The draft length is fixed: `--spec dflash2 --draft-tokens N` with N in 1-7 (no automatic length,
-no trees, no `--spec-min-p`). Only one-row rounds draft; a round of several rows decodes plainly,
-since two rows of K = 3 already reach 8 columns, the fork route's limit (§6.4).
+Only one-row rounds draft; a round of several rows decodes plainly, since two rows of K = 3
+already reach 8 columns, the fork route's limit (§6.4). No trees. A one-row round proposes its
+block, then chooses how many of the drafts to verify:
 
-Serving (`configs/GLM-5.3-Flash/model.env`) drafts three tokens a one-row round (§10.3;
-`INFERNIX_SPEC=` serves plain decode).
+- `--draft-tokens N` (1-7) verifies all N, or with `--spec-min-p P` those before the first whose
+  selector probability (the candidate selector's temperature-1 softmax at the drafted rank) is
+  below P.
+- `--draft-tokens auto` proposes 5 (`kDraftTokensAuto`) and verifies the k in 0..5 that maximizes
+  (1 + sum over j ≤ k of the product of the first j drafts' calibrated acceptances) / T(k), where a
+  draft's acceptance is read from its probability's decile, learned per request (EWMA 0.1, one
+  draft more every 8 rounds keeps the longer deciles measured), and T(k) is the measured one-row
+  round time in plain rounds (`program/draft_length.h`: 1.07 for a plain round after a spent
+  proposal, then 1.50 / 1.79 / 1.96 / 2.29 / 2.68 for k = 1-5, §10.3). k = 0 decodes the round
+  plainly. Not 7: a verify column's routes miss on their own, so the length rarely pays past five,
+  and each column more costs eight staging slots.
+
+Greedy output equals plain decoding either way; a sampled row's verification is the same sparse
+rejection sampling against the selector's laws on a prefix of its drafts.
+
+Serving (`configs/GLM-5.3-Flash/model.env`) drafts `auto` (§10.3; `INFERNIX_SPEC=` serves plain
+decode).
 
 ### 10.3 Measurements
 
@@ -674,6 +706,49 @@ drafter's own kernels are ≤ 2 ms of it; 80-84 % of the round is the target's e
 K = 3, of 58.6 ms: miss staging 27.9, the CPU team's wait 13.9, GPU experts 11.7, dense BF16
 weights 8.4 (the plain round: 27.7 ms, of which staging 5.6, CPU 9.2, dense 8.1). The second to
 fifth verify columns cost 14, 8, 5 and 9 ms each, as every column routes its own experts.
+
+The calibrated length against K = 3, serving split (`vram=40%,ram=60%`, 4,838 / 7,258 / 0 experts;
+model 15.44 GiB, 16.70 with the drafter), one request, 512-token essays, four sets after a warm-up,
+`infernix_glm5_next_engine_bench --concurrency 1 --tokens 512 --repeat 4`, 2026-11-26:
+
+| Sampling | K = 3 | `auto` | `auto`: drafts verified a drafting round, accepted, plain rounds |
+|---|---|---|---|
+| greedy | 46.0 (39.1-48.5) | 45.9 (44.2-49.5) | 3.0, 58-63 %, 9-17 % |
+| temperature 1.0, top-p 0.95 | 43.0 (41.9-43.2) | 48.2 (41.2-50.1) | 3.4, 63-69 %, 17-20 % |
+
+On greedy essays the calibrated length commits 2.88 tokens a round against K = 3's 2.65, but its
+rounds took ≈ 63 ms against ≈ 57.5, more than T(k) predicts for its mix of lengths; the two are
+equal within the sets' spread. Sampled, where the selector's probabilities separate good drafts from
+bad ones, it is 12 % faster at the median.
+
+### 10.4 Fine-tuning the drafter on the served target
+
+The incoai drafter was trained against the official checkpoint. `tools/drafter/` (README.md) fine-tunes
+it on this engine's features of the served uncensored target: the target's own answers through the
+public Engine (`infernix_glm5_next_drafter_generate`), each record's teacher-forced tap features and
+final stream mean through the causal-scoring Program (`infernix_glm5_next_drafter_capture`,
+`Program::enable_feature_capture`), then speculators' `DFlash2DraftModel` objective warm-started from
+the incoai body. The capture is checked by the target head's agreement with the next token on the
+target's own sampled answers (94-98 %), and an untrained round trip reproduces the incoai tensors
+bit for bit.
+
+The first run, 2026-11-26: 210 answers (298k tokens, temperature 1.0; generation ran at 39 tok/s
+with eight requests, the corpus's limit) and 400 UltraChat conversations (458k tokens), weights 3 : 1,
+lr 3e-5, 8,192-token rows of 512 anchors, four rows a step. The held-out sum of the selector's
+teacher-forced accuracy at draft positions 1-5 rose 2.415 → 2.468 by step 400 and then fell (2.343
+at step 3,993): the answers overfit. The step-400 drafter
+(`GLM-5.3-Flash-DFlash2-FT-Infernix.infernix`, not served) against incoai, `auto`, one request,
+512-token essays, four sets:
+
+| Sampling | incoai | fine-tuned |
+|---|---|---|
+| temperature 1.0 | 47.7 (41.1-48.7) tok/s, 2.88 tokens a round | 48.2 (41.5-50.8), 2.87 |
+| greedy | 45.9 (44.2-49.5), 2.88 (§10.3's run) | 49.3 (44.5-50.4), 2.85 |
+
+Tokens a round did not change, so serving keeps the incoai drafter. A gain needs far more of the
+target's own text than the generation rate gave overnight (the Apache-2.0 GLM-5.3-Flash DFlash2
+trainer github.com/Enntity/glm-flash-drafter fine-tuned on ≈ 119M stored tokens of its own traffic
+and reports 115-122 % of the incoai drafter's speed there, 87-95 % on public prompts).
 
 ## 11. Prefill
 
@@ -984,7 +1059,7 @@ decided the shared machinery are in
 | Zero-copy SM reads of host experts | 10-14 GB/s against 24-27.6 staged (Flash-Next, MoE §5.2) |
 | Expert deferral, dynamic top-k, low-bit miss copies, expert skipping in the default configuration | They change the model; top-k 6 was rejected on quality by ox-boost (§18.1). The family refuses `--expert-tail-skip`; an opt-in approximate mode is not built (§17.2) |
 | A promotion every decode token | 30.7-31.7 against 41.2-41.3 tok/s at one per 32 tokens, with no hit-rate gain (§6.3) |
-| Drafting every round, or K ≥ 4 | Every-round drafting is slower than plain at two and four requests; K = 4-5 are slower than K = 3 at one request (§10.3) |
+| Drafting every round, or a fixed K ≥ 4 | Every-round drafting is slower than plain at two and four requests; fixed K = 4-5 are slower than K = 3 at one request (§10.3); the calibrated length reaches 4-5 only where the drafts' probabilities are high (§10.2) |
 | MTP drafting with the checkpoint's MTP layer | Both public GLM-5.3-Flash MTP experiments measured slower over PCIe-transferred misses, and Project Maya traced why on one GPU: consecutive tokens share ~1 of 8 experts per layer and none of their RAM pulls (§18.2). The layer stays in the artifact, not loaded |
 | A BF16 KDA state | Saves ≈ 0.1 ms of a ~25 ms token for a numerical change |
 | Folding W_uk into W_qb or W_uv into W_o offline | Changes the stored weights and reads more bytes per token (50 M and 134 M parameters against 33 M and 75 M) |
@@ -1001,7 +1076,7 @@ decided the shared machinery are in
 | **Expert volumes on several drives: 12-way striped records, per-volume read queues, landed-unit masks** | Designed for the RTX 5090 machine with four NVMe drives, where two drives measured additive on 14.16 MB records (2 × 5.8 → 11.7 GB/s; 12.7 GB/s for a 990 PRO beside an Optane P5800X, 2026-10-10) and a striped record would land in ≈ 1.1-1.3 ms against ≈ 2.3 ms whole (model). The production machine has one drive and serves with no SSD share |
 | **SSD lookahead reads of predicted experts** | Project Maya found only ~40-45 % of disk misses predictable 1-4 layers ahead, and its lookahead was exact but slower on one NVMe (§18.2). No SSD share is served |
 | **Draft-informed SSD prefetch** (SP-MoE, MoE-SpeQ) | Needs measured recall first; no SSD share is served |
-| **A draft-length cost model** (Flash-Next's E[tokens(K)] / E[t_round(K)] with K = 0 a candidate) | The fixed K = 3 on one-row rounds measured fastest (§10.3) |
+| **An online round-time fit for the calibrated length** | T(k) is a constant table measured at one placement (§10.2); on greedy essays the chosen mix of lengths ran ≈ 10 % slower a round than the table predicts (§10.3). Flash-Next's MTP fit measured 6 % slower than its constant model on code (dflash.md) |
 | **Mixed rounds** (a prefill call inside the decode round's Forward) | A 30,614-token prompt beside a decoding lane prefilled at 2.53k tok/s while that lane's 1,500 tokens took 55.6 s against 42.3 s alone: the lane gets one round per walk step either way. A mixed round would save one decode round (≈ 27 ms) per 1,024-token step of ≈ 430 ms (≈ 6 % of the prefill), give the decoding lane no more rounds, and could not run for a lane that publishes to the prefix cache, since a mixed call's bits differ from its own call's |
 | **The KV host tier** (pooled keys on the device, latent pages in pinned RAM with a device cache of hot pools) | The device cache holds every served context on this card; the tier would trade expert frames for RAM-tier slots and a PCIe read per selected token without a workload that needs it. It stays the design for a smaller card or contexts past the device |
 | **`fp8` and `nvfp4` latents; Hadamard-domain latent profiles** | Refused until qualified; INT8 measured within the BF16 rounding floor (§7.4). Orthogonal rotations commute with the absorbed product, so rotated profiles would apply |

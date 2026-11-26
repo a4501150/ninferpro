@@ -172,6 +172,8 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
     program_options.draft_tokens = options.speculative.backend == SpeculativeBackend::DFlash2
                                        ? options.speculative.draft_tokens
                                        : 0;
+    program_options.auto_draft_length = options.speculative.draft_tokens_auto;
+    program_options.draft_min_p       = options.speculative.draft_min_p.value_or(0.0F);
     program_options.diagnostics                 = options.diagnostic_observer;
     // The hybrid prefix cache (design §12). Snapshots are born in the pinned Host slab pool; the
     // cost constants rate a resume's restore against a re-prefill of the same tokens, at the

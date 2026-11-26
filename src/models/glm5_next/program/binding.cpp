@@ -227,6 +227,8 @@ runtime::ResourceReservation ProgramImpl::start_binding(const RequestBasePlan& b
         lane.speculative.backend      = SpeculativeBackend::DFlash2;
         lane.speculative.draft_window = static_cast<std::uint32_t>(plan_.draft);
         lane.speculative.accepted_per_position.assign(static_cast<std::size_t>(plan_.draft), 0);
+        lane.calibration.reset();
+        lane.policy_rounds = 0;
     }
     lane.cache_at_admission = residency_->stats();
     lane.begin              = runtime::BeginSummary{

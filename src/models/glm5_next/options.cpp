@@ -4,15 +4,6 @@
 
 namespace infernix::models::glm5_next {
 
-void validate_draft_backend(const EngineOptions&) {
-    throw std::invalid_argument(
-        "GLM-5.3-Flash drafts a fixed length: --spec dflash2 --draft-tokens N (1-7)");
-}
-
-void validate_draft_min_p(const EngineOptions&) {
-    throw std::invalid_argument("GLM-5.3-Flash verifies every draft: --spec-min-p does not apply");
-}
-
 void resolve_cache(ContextCacheOptions& cache, const EngineOptions& options,
                    std::uint32_t concurrency, bool host_tier) {
     (void)options;
@@ -58,8 +49,6 @@ const runtime::FamilyOptionRules& option_rules() {
         .prefill_chunk_beside_decode = kPrefillChunkBesideDecode,
         .draft_tokens_auto           = kDraftTokensAuto,
         .host_cache_default          = kDefaultPrefixHostBytes,
-        .validate_draft_backend      = validate_draft_backend,
-        .validate_draft_min_p        = validate_draft_min_p,
         .resolve_cache               = resolve_cache,
     };
     return rules;

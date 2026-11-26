@@ -2,7 +2,7 @@
 // the public Engine on the real artifacts with production's options
 // (~/src/super-quant/configs/GLM-5.3-Flash/model.env: INT8 KV, 4 x 262,144 tokens, DFlash2 with
 // three draft tokens, vram=40%,ram=60%), and bench_infernix.py's concurrent phase: C chat requests
-// at once (default 4) of N output tokens (default 256), greedy, thinking off, each prompt with a
+// at once (default 4) of N output tokens (default 256), greedy unless --temperature, thinking off, each prompt with a
 // unique prefix so the prefix cache serves none of it. One warm-up set, then --repeat sets
 // (default 3). Each set reports its aggregate speed as bench_infernix.py's C6_agg does (output
 // tokens over the time from the first submission to the last completion) and the DFlash2
@@ -10,10 +10,11 @@
 // INFERNIX_GLM_DRAFT (`make t2-bench FAMILY=glm5_next`).
 //
 //   infernix_glm5_next_engine_bench [--concurrency C] [--tokens N] [--repeat R] [--experts SPEC]
-//       [--draft-tokens K] [--profile]
+//       [--draft-tokens K|auto] [--temperature T] [--profile]
 //
 // --draft-tokens sets the DFlash2 draft length (default production's 3; 0 decodes without the
-// drafter).
+// drafter; auto verifies the calibrated length of up to the family's most). --temperature samples
+// at T with the checkpoint's top-p 0.95 and a fixed seed per request.
 //
 // --profile brackets the measured sets (not the start-up or the warm-up) with
 // cudaProfilerStart/Stop for tools/tiers/step.py.
@@ -39,7 +40,7 @@ constexpr std::size_t kMaxConcurrency = 8;
 
 infernix::EngineOptions production_options(const char* artifact, const char* drafter,
                                            std::uint32_t lanes, const std::string& experts,
-                                           std::uint32_t draft_tokens) {
+                                           std::uint32_t draft_tokens, bool draft_auto) {
     infernix::EngineOptions options;
     options.artifact_path            = artifact;
     options.kv_cache                 = infernix::KvCacheStorage::Int8Group64;
@@ -48,10 +49,11 @@ infernix::EngineOptions production_options(const char* artifact, const char* dra
     options.max_concurrency          = lanes;
     options.max_pending_requests     = 2 * lanes;
     options.experts_spec             = experts;
-    if (draft_tokens != 0) {
-        options.speculative.backend      = infernix::SpeculativeBackend::DFlash2;
-        options.speculative.draft_model  = drafter;
-        options.speculative.draft_tokens = draft_tokens;
+    if (draft_tokens != 0 || draft_auto) {
+        options.speculative.backend           = infernix::SpeculativeBackend::DFlash2;
+        options.speculative.draft_model       = drafter;
+        options.speculative.draft_tokens      = draft_auto ? 0 : draft_tokens;
+        options.speculative.draft_tokens_auto = draft_auto;
     }
     return options;
 }
@@ -66,10 +68,14 @@ infernix::PreparedPrompt chat_prompt(infernix::Engine& engine, const std::string
     return engine.prepare(std::move(input));
 }
 
-infernix::RequestOptions greedy(std::uint32_t tokens) {
+infernix::RequestOptions request(std::uint32_t tokens, float temperature, std::uint64_t seed) {
     infernix::RequestOptions options;
     options.execution.requested_output_tokens = tokens;
-    options.execution.sampling.temperature    = 0.0F;
+    options.execution.sampling.temperature    = temperature;
+    if (temperature > 0.0F) {
+        options.execution.sampling.top_p = 0.95F;
+        options.execution.sampling.seed  = seed;
+    }
     return options;
 }
 
@@ -79,7 +85,7 @@ struct SetResult {
 };
 
 SetResult run_set(infernix::Engine& engine, std::uint32_t concurrency, std::uint32_t tokens,
-                  std::mt19937_64& rng, const char* tag) {
+                  float temperature, std::mt19937_64& rng, const char* tag) {
     std::vector<infernix::PreparedPrompt> prompts;
     for (std::uint32_t i = 0; i < concurrency; ++i) {
         char nonce[17];
@@ -96,7 +102,7 @@ SetResult run_set(infernix::Engine& engine, std::uint32_t concurrency, std::uint
     const auto start = std::chrono::steady_clock::now();
     std::vector<infernix::GenerationHandle> handles;
     for (auto& prompt : prompts) {
-        handles.push_back(engine.submit(std::move(prompt), greedy(tokens)));
+        handles.push_back(engine.submit(std::move(prompt), request(tokens, temperature, rng())));
     }
     SetResult out;
     for (auto& handle : handles) {
@@ -132,6 +138,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::uint32_t concurrency = 4, tokens = 256, repeat = 3, draft_tokens = 3;
+    bool draft_auto     = false;
+    float temperature   = 0.0F;
     std::string experts = "vram=40%,ram=60%";
     bool profile        = false;
     for (int i = 1; i < argc; ++i) {
@@ -146,6 +154,15 @@ int main(int argc, char** argv) {
         }
         if (arg == "--experts") {
             experts = argv[++i];
+            continue;
+        }
+        if (arg == "--temperature") {
+            temperature = std::stof(argv[++i]);
+            continue;
+        }
+        if (arg == "--draft-tokens" && std::string(argv[i + 1]) == "auto") {
+            draft_auto = true;
+            ++i;
             continue;
         }
         const auto value = static_cast<std::uint32_t>(std::stoul(argv[++i]));
@@ -169,19 +186,21 @@ int main(int argc, char** argv) {
     try {
         const auto t0 = std::chrono::steady_clock::now();
         infernix::Engine engine(
-            production_options(artifact, drafter, concurrency, experts, draft_tokens));
+            production_options(artifact, drafter, concurrency, experts, draft_tokens, draft_auto));
         std::printf("engine started in %.1f s; %u concurrent requests of %u tokens; experts %s; "
-                    "%u draft tokens\n",
+                    "draft tokens %s; temperature %g\n",
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-                    concurrency, tokens, experts.c_str(), draft_tokens);
+                    concurrency, tokens, experts.c_str(),
+                    draft_auto ? "auto" : std::to_string(draft_tokens).c_str(),
+                    static_cast<double>(temperature));
         std::mt19937_64 rng(std::random_device{}());
-        print_set("warm-up", run_set(engine, concurrency, tokens, rng, "warm"));
+        print_set("warm-up", run_set(engine, concurrency, tokens, temperature, rng, "warm"));
         std::vector<double> speeds;
         if (profile && cudaProfilerStart() != cudaSuccess) {
             throw std::runtime_error("cudaProfilerStart failed");
         }
         for (std::uint32_t r = 0; r < repeat; ++r) {
-            const SetResult set = run_set(engine, concurrency, tokens, rng, "set");
+            const SetResult set = run_set(engine, concurrency, tokens, temperature, rng, "set");
             print_set(("set " + std::to_string(r + 1)).c_str(), set);
             speeds.push_back(set.tokens_per_second);
         }
