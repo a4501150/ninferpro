@@ -457,6 +457,24 @@ void test_rebuild_pins() {
     tier.check();
 }
 
+// ---- the tier fill's lent slots: a slot lent while its read runs holds no key; adopt makes it the
+// key's resident unless the key gained a host copy meanwhile; give_back returns only the named slots.
+void test_fill_adopt() {
+    HostTier tier(small_config());
+    const std::size_t free0 = tier.free_residents();
+    const std::vector<std::uint32_t> slots = tier.lend(3);
+    check(slots.size() == 3 && tier.free_residents() == free0 - 3 && !tier.host_copy(10), "lent slots hold no key");
+    tier.check();
+    std::int32_t other = -1;
+    check(tier.prefill(11, other), "key 11 gains a copy while its fill read runs");
+    check(tier.adopt(slots[0], 10) && tier.slot_of(10) == static_cast<std::int32_t>(slots[0]), "adopt places key 10");
+    check(!tier.adopt(slots[1], 11) && tier.slot_of(11) == other, "adopt of a key with a copy frees the slot");
+    check(tier.lent() == 1, "one slot still lent");
+    tier.give_back(std::span(&slots[2], 1));
+    check(tier.lent() == 0 && tier.free_residents() == free0 - 2, "give_back returns the named slot");
+    tier.check();
+}
+
 // ---- the warm start's fill (seeded ranking, released shadows)
 void test_warm_fill() {
     // Without seeds every pre-filled key scores 0 and the lowest slot, which the pre-fill gave the
@@ -583,6 +601,7 @@ int main() {
         test_held();
         test_stream_pins();
         test_rebuild_pins();
+        test_fill_adopt();
         test_random();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';

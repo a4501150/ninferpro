@@ -14,6 +14,7 @@
 #include <psapi.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <fstream>
 #include <sstream>
@@ -36,6 +37,21 @@ std::optional<std::uint64_t> proc_kib_field(const char* path, const std::string&
         }
     }
     return std::nullopt;
+}
+
+// The CMA area's size: the zones' "cma" page counts in /proc/zoneinfo (meminfo's CmaTotal reads 0
+// on some kernels while CmaFree does not).
+std::uint64_t cma_area_bytes() {
+    std::ifstream file("/proc/zoneinfo");
+    std::string line;
+    std::uint64_t pages = 0;
+    while (std::getline(file, line)) {
+        std::istringstream fields(line);
+        std::string name;
+        std::uint64_t count = 0;
+        if (fields >> name && name == "cma" && fields >> count) { pages += count; }
+    }
+    return pages * static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
 }
 
 // A cgroup v2 memory file holding one byte count ("max" means unlimited).
@@ -62,9 +78,11 @@ std::uint64_t available_host_memory_bytes() {
 #else
     const auto available = proc_kib_field("/proc/meminfo", "MemAvailable:");
     if (!available) { throw std::runtime_error("/proc/meminfo has no MemAvailable"); }
-    // MemAvailable counts free CMA pages, which only movable allocations may take: a page-locked
-    // block migrates out of them. A 2026-11-26 OOM kill hit with 18 GB "free", all of it CMA.
-    const std::uint64_t cma = proc_kib_field("/proc/meminfo", "CmaFree:").value_or(0);
+    // MemAvailable counts the CMA area's free pages and the reclaimable cache in it, but only
+    // movable allocations may use CMA pages: a page-locked block migrates out of them. Two OOM kills
+    // on 2026-11-26 hit with 17-18 GB "free", all of it CMA, the second after subtracting CmaFree
+    // (reclaiming the cache in CMA pages only frees more CMA pages). The whole area is subtracted.
+    const std::uint64_t cma = cma_area_bytes();
     return *available > cma ? *available - cma : 0;
 #endif
 }

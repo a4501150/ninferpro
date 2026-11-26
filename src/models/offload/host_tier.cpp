@@ -292,12 +292,26 @@ std::vector<std::uint32_t> HostTier::lend(std::uint32_t n) {
     return out;
 }
 
-void HostTier::give_back() {
-    for (const std::uint32_t s : lent_) {
+void HostTier::give_back(std::span<const std::uint32_t> slots) {
+    for (const std::uint32_t s : slots) {
+        const auto it = std::find(lent_.begin(), lent_.end(), s);
+        if (it == lent_.end()) { throw std::logic_error("HostTier: give_back of a slot that is not lent"); }
+        lent_.erase(it);
         slots_[s].list = SlotList::kNone;
         free_resident_.push_back(s);
     }
-    lent_.clear();
+}
+
+bool HostTier::adopt(std::uint32_t slot, std::uint32_t key) {
+    if (host_copy(key) || held(key)) {
+        give_back(std::span(&slot, 1));
+        return false;
+    }
+    const auto it = std::find(lent_.begin(), lent_.end(), slot);
+    if (it == lent_.end()) { throw std::logic_error("HostTier: adopt of a slot that is not lent"); }
+    lent_.erase(it);
+    set_resident(slot, key, SlotState::kResident);
+    return true;
 }
 
 void HostTier::mark_used(std::uint32_t slot) {

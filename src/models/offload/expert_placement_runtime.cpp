@@ -29,6 +29,8 @@ ExpertPlacementRuntime::~ExpertPlacementRuntime() {
     // Both hold tiers that read the stores and the fetch channel destroyed after this body.
     try {
         cancel_tier_rebuild();
+        // A fill's landing calls back into this object from the tier's agent.
+        if (tier_ != nullptr) { (void)tier_->finish_fill([](std::uint32_t) { return false; }); }
     } catch (...) {}
     if (tier_reaper_.joinable()) { tier_reaper_.join(); }
 }
@@ -502,6 +504,7 @@ std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> ExpertPlacementRuntim
 }
 
 std::unique_ptr<HostExpertTier> ExpertPlacementRuntime::swap_tier(std::unique_ptr<HostExpertTier> next) {
+    (void)finish_tier_fill(); // no read may still be landing in the replaced tier's lent slots
     residency_->retier(next.get(), device_.stream);
     device_.synchronize();
     std::unique_ptr<HostExpertTier> old = std::move(tier_);
@@ -682,6 +685,7 @@ void ExpertPlacementRuntime::shrink_tier_to_reader(const char* why) {
 void ExpertPlacementRuntime::release_tier(const char* why) {
     cancel_tier_rebuild();
     if (tier_ == nullptr) { return; }
+    (void)finish_tier_fill();
     tier_backfill_.active = false;
     residency_->retier(nullptr, device_.stream);
     device_.synchronize();
@@ -704,29 +708,42 @@ void ExpertPlacementRuntime::start_tier_fill() {
 
 void ExpertPlacementRuntime::advance_tier_fill() {
     if (!tier_backfill_.active || tier_ == nullptr || residency_ == nullptr) { return; }
+    // A batch's reads run on the tier's agent beside the rounds; their slots join the tier at the
+    // first boundary after they land.
+    if (tier_->fill_in_flight()) {
+        if (!tier_->fill_landed()) { return; }
+        tier_backfill_.landed += finish_tier_fill();
+    }
     const std::uint32_t total = keys();
     const std::int32_t* table = residency_->host_table();
+    const auto batch          = static_cast<std::uint32_t>(std::max<std::uint64_t>(1, kFillBatchBytes / residency_->frame_bytes()));
     std::vector<std::uint32_t> want;
-    for (std::size_t i = tier_backfill_.at; i < tier_backfill_.order.size() && want.size() < kRefillBatch; ++i) {
+    for (std::size_t i = tier_backfill_.at; i < tier_backfill_.order.size() && want.size() < batch; ++i) {
         const std::uint32_t key = tier_backfill_.order[i];
         tier_backfill_.at            = i + 1;
         if (key < total && table[key] < 0 && tier_->record(key) == nullptr) { want.push_back(key); }
-        if (want.size() >= kRefillBatch) { break; }
     }
-    const std::uint32_t landed = want.empty() ? 0 : tier_->prefill(want);
-    if (!tier_->controller().has_free_resident() || tier_backfill_.at >= tier_backfill_.order.size()) {
+    const std::uint32_t started = want.empty() ? 0 : tier_->start_fill(want, batch, [this] { wake_maintenance(); });
+    if (started == 0 && (!tier_->controller().has_free_resident() || tier_backfill_.at >= tier_backfill_.order.size())) {
         tier_backfill_.active = false;
-        diagnostic("expert placement: RAM tier fill read " + std::to_string(landed) + " more records; "
+        diagnostic("expert placement: RAM tier fill read " + std::to_string(tier_backfill_.landed) + " records; "
                    "the tier is full or the order is exhausted", DiagnosticLevel::Info);
         return;
     }
-    if (landed > 0) {
+    if (started > 0) {
         tier_backfill_.stall = 0;
     } else if (++tier_backfill_.stall >= 2) {
         tier_backfill_.active = false;
         return;
     }
     wake_maintenance();
+}
+
+std::uint32_t ExpertPlacementRuntime::finish_tier_fill() {
+    if (tier_ == nullptr || !tier_->fill_in_flight()) { return 0; }
+    const std::int32_t* table = residency_->host_table();
+    // A key promoted into VRAM while its read ran keeps no RAM copy (the tiers are exclusive).
+    return tier_->finish_fill([table](std::uint32_t key) { return table[key] < 0; });
 }
 
 bool ExpertPlacementRuntime::request_placement(const ExpertPlacementRequest& request, std::string* error) {

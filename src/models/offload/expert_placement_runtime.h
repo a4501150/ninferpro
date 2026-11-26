@@ -401,20 +401,25 @@ private:
     void release_tier(const char* why);
 
     // The tier fill: a rebuild or a demotion-dropping shrink leaves free resident slots; the
-    // ranking's keys that are neither in VRAM nor held read into them in bounded batches between
-    // rounds (the placement refill's cadence), so the tier converges on its named capacity.
+    // ranking's keys that are neither in VRAM nor held read into them in batches of
+    // kFillBatchBytes, so the tier converges on its named capacity. The reads run on the tier's
+    // agent beside the rounds (a synchronous 512-record batch held the engine thread 0.4 s per
+    // boundary on 10.5 MB records).
     struct TierBackfill {
         std::vector<std::uint32_t> order; // keys in read order (the ranking, VRAM keys skipped)
         std::size_t at  = 0;              // cursor into `order`
         std::uint32_t stall = 0;          // consecutive ticks without a read
+        std::uint32_t landed = 0;         // records the fill has added
         bool active = false;
     } tier_backfill_;
 
     void start_tier_fill();
+    // Waits for the fill's reads in flight and adopts their records; returns how many.
+    std::uint32_t finish_tier_fill();
 
-    // One bounded slice of the tier fill, at a maintenance boundary: read the next keys of the
-    // order that hold neither a frame nor a host copy. Ends when the tier is full or two ticks
-    // pass without a read.
+    // One slice of the tier fill, at a maintenance boundary: adopts a landed batch, then starts
+    // reading the next keys of the order that hold neither a frame nor a host copy. Ends when the
+    // tier is full or two ticks pass without a read.
     void advance_tier_fill();
 
     // A placement grow's resident refill: the switch backs new frames but does not fill them --
@@ -439,6 +444,8 @@ private:
         bool after_switch = false; // a placement switch's grow (else frames a lease left empty)
     } placement_fill_;
     static constexpr std::uint32_t kRefillBatch = 512; // keys read per tick (~0.1 s of artifacts)
+    // The tier fill's batch: about 40 ms of a Gen5 drive, so a miss read queues behind little.
+    static constexpr std::uint64_t kFillBatchBytes = 512ULL << 20;
     // The last applied switch's outcome for the status (placement_mutex_).
     bool placement_last_ok_ = true;
     std::string placement_last_message_;

@@ -143,6 +143,17 @@ public:
     // Reads the keys of `ranked` (best first) that have no host copy into free resident slots until
     // none is left; returns how many.
     std::uint32_t prefill(std::span<const std::uint32_t> ranked);
+    // The tier fill beside serving rounds: start_fill lends free resident slots to the keys of
+    // `ranked` (best first) that have no host copy, at most `most` of them, and queues their reads
+    // without waiting (one fill at a time); the slots hold no key while the reads run. Once
+    // fill_landed, finish_fill makes each slot its key's resident unless `keep` rejects the key or
+    // it gained a host copy meanwhile (those slots return free); it waits for the reads first when
+    // called early (a tier about to be replaced). Both return how many.
+    // `landed` runs on the agent thread when the batch's last read completes.
+    std::uint32_t start_fill(std::span<const std::uint32_t> ranked, std::uint32_t most, std::function<void()> landed);
+    [[nodiscard]] bool fill_in_flight() const noexcept { return !fill_.empty(); }
+    [[nodiscard]] bool fill_landed();
+    std::uint32_t finish_fill(const std::function<bool(std::uint32_t)>& keep);
     // Reads the keys of `ranked` (best first) that have no host copy and that `skip` rejects into
     // unpinned records until none is left; they keep them for good. Returns how many.
     std::uint32_t fill_unpinned(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip);
@@ -301,6 +312,8 @@ private:
     void submit_run(std::span<const std::pair<std::uint32_t, std::uint8_t*>> run, std::uint64_t tag);
     // Reads (key, destination) records before the first round (prefill, fill_unpinned).
     void read_at_startup(const std::vector<std::pair<std::uint32_t, std::uint8_t*>>& jobs);
+    // Queues (key, destination) reads on the agent beside prefill_jobs_ (read_at_startup, start_fill).
+    void queue_prefill(const std::vector<std::pair<std::uint32_t, std::uint8_t*>>& jobs);
     // A new ticket of this round for `key` (kNoTicket when the round has run out); resident when the
     // key is in RAM, else pending a read.
     std::uint32_t new_ticket(std::uint32_t key, std::int32_t fetch);
@@ -337,6 +350,8 @@ private:
     bool open_           = false;            // a round is open: the agent spins
     std::vector<std::pair<std::uint32_t, std::uint8_t*>> prefill_jobs_; // (key, destination)
     std::uint32_t prefill_pending_ = 0;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> fill_; // start_fill's (key, lent slot) in flight
+    std::function<void()> fill_landed_;                          // start_fill's callback (mutex_)
     std::condition_variable prefill_done_;
     std::atomic<std::uint32_t> in_flight_{0}; // demands and prefill reads not yet completed
     // Ticket + 1 of a key demanded this round, 0 none. CPU expert jobs (demand) and the agent (a

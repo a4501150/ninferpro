@@ -141,8 +141,12 @@ public:
     // Lends up to `n` resident slots (free ones first, then the lowest-ranked unpinned residents,
     // shadows before residents, which leave RAM): they hold no key until give_back. Returns them.
     std::vector<std::uint32_t> lend(std::uint32_t n);
-    // Every lent slot becomes a free resident slot again.
-    void give_back();
+    // These lent slots become free resident slots again.
+    void give_back(std::span<const std::uint32_t> slots);
+    // A lent slot whose bytes now hold `key`'s record becomes its resident slot; false (the slot
+    // freed) when the key has gained a host copy or a hold meanwhile.
+    bool adopt(std::uint32_t slot, std::uint32_t key);
+    [[nodiscard]] std::size_t free_residents() const { return free_resident_.size(); }
     [[nodiscard]] std::size_t lent() const { return lent_.size(); }
 
     // ---- round boundaries (engine thread, no round in flight)

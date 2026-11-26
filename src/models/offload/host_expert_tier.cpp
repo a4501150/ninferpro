@@ -261,13 +261,18 @@ void HostExpertTier::submit_run(std::span<const std::pair<std::uint32_t, std::ui
     agent_run_records_.fetch_add(run.size(), std::memory_order_relaxed);
 }
 
+void HostExpertTier::queue_prefill(const std::vector<std::pair<std::uint32_t, std::uint8_t*>>& jobs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!agent_failure_.empty()) { throw std::runtime_error("SSD tier: the read agent stopped: " + agent_failure_); }
+    prefill_jobs_.insert(prefill_jobs_.end(), jobs.begin(), jobs.end());
+    prefill_pending_ += static_cast<std::uint32_t>(jobs.size());
+    wake_.notify_all();
+}
+
 void HostExpertTier::read_at_startup(const std::vector<std::pair<std::uint32_t, std::uint8_t*>>& jobs) {
+    queue_prefill(jobs);
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (!agent_failure_.empty()) { throw std::runtime_error("SSD tier: the read agent stopped: " + agent_failure_); }
-        prefill_jobs_.insert(prefill_jobs_.end(), jobs.begin(), jobs.end());
-        prefill_pending_ += static_cast<std::uint32_t>(jobs.size());
-        wake_.notify_all();
         prefill_done_.wait(lock, [&] { return prefill_pending_ == 0; });
     }
     if (prefill_failures_ != 0) {
@@ -290,6 +295,58 @@ std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
     if (jobs.empty()) { return 0; }
     read_at_startup(jobs);
     return static_cast<std::uint32_t>(jobs.size());
+}
+
+std::uint32_t HostExpertTier::start_fill(std::span<const std::uint32_t> ranked, std::uint32_t most,
+                                         std::function<void()> landed) {
+    if (!fill_.empty()) { throw std::logic_error("SSD tier: a fill is already in flight"); }
+    std::vector<std::uint32_t> keys;
+    for (const std::uint32_t key : ranked) {
+        if (keys.size() >= std::min<std::size_t>(most, tier_.free_residents())) { break; }
+        if (!tier_.host_copy(key) && !tier_.held(key)) { keys.push_back(key); }
+    }
+    if (keys.empty()) { return 0; }
+    const std::vector<std::uint32_t> slots = tier_.lend(static_cast<std::uint32_t>(keys.size())); // free slots only
+    std::vector<std::pair<std::uint32_t, std::uint8_t*>> jobs;
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        fill_.emplace_back(keys[i], slots[i]);
+        jobs.emplace_back(keys[i], const_cast<std::uint8_t*>(slot_bytes(slots[i])));
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fill_landed_ = std::move(landed);
+    }
+    queue_prefill(jobs);
+    return static_cast<std::uint32_t>(fill_.size());
+}
+
+bool HostExpertTier::fill_landed() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return prefill_pending_ == 0;
+}
+
+std::uint32_t HostExpertTier::finish_fill(const std::function<bool(std::uint32_t)>& keep) {
+    if (fill_.empty()) { return 0; }
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        prefill_done_.wait(lock, [&] { return prefill_pending_ == 0; });
+    }
+    const bool failed = prefill_failures_ != 0;
+    std::uint32_t adopted = 0;
+    for (const auto& [key, slot] : fill_) {
+        if (!failed && keep(key)) {
+            adopted += tier_.adopt(slot, key) ? 1 : 0;
+        } else {
+            tier_.give_back(std::span(&slot, 1));
+        }
+    }
+    stats_.prefill_reads += fill_.size();
+    fill_.clear();
+    if (failed) {
+        throw std::runtime_error("SSD tier: " + std::to_string(prefill_failures_) +
+                                 " expert records could not be read from the artifact");
+    }
+    return adopted;
 }
 
 std::uint32_t HostExpertTier::fill_unpinned(std::span<const std::uint32_t> ranked,
@@ -408,14 +465,16 @@ std::uint32_t HostExpertTier::lend_stream(std::uint32_t n) {
 }
 
 void HostExpertTier::return_stream() {
+    std::vector<std::uint32_t> slots;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stream_slot_.empty()) { return; }
         if (stream_free_.size() != stream_slot_.size()) { throw std::logic_error("SSD tier: a stream slot is still in use"); }
+        slots = std::move(stream_slot_);
         stream_slot_.clear();
         stream_free_.clear();
     }
-    tier_.give_back();
+    tier_.give_back(slots);
 }
 
 std::int32_t HostExpertTier::stream_read(std::uint32_t key) {
@@ -881,8 +940,9 @@ void HostExpertTier::agent_loop() {
             last_work = Clock::now();
         }
         if (!prefills.empty()) {
-            // The startup fill lands whole before the first request, so its order is free: by file
-            // offset, records that follow each other are read as one run.
+            // Fill reads land whole before their slots are used (the startup fill, or start_fill's lent
+            // slots), so their order is free: by file offset, records that follow each other are read
+            // as one run.
             const auto offset_of = [&](std::uint32_t key) {
                 const auto s = store_.segments(key / store_.experts(), key % store_.experts())[0];
                 return std::pair<std::uint32_t, std::uint64_t>(s.file, s.offset);
@@ -979,9 +1039,14 @@ void HostExpertTier::agent_loop() {
                 if (entry.failed) { ++prefill_failures_; }
                 if (--prefill_left == 0) {
                     prefill_entries.clear();
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    prefill_pending_ = 0;
-                    prefill_done_.notify_all();
+                    std::function<void()> landed;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        prefill_pending_ = 0;
+                        prefill_done_.notify_all();
+                        landed.swap(fill_landed_);
+                    }
+                    if (landed) { landed(); }
                 }
             }
         };
