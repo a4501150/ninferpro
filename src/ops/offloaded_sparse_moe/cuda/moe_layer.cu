@@ -2500,7 +2500,7 @@ bool needs_prepare(const Tensor& x, const MoeExpertSource& source, std::int32_t 
 void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
                const moe::wide::ExpertsWorkspace& layout, cudaStream_t stream) {
     if (ggml_bank(source)) {
-        launch_encode_x_ggml(x, layout, stream);
+        launch_encode_x_ggml(x, source, layout, stream);
     } else if (x.ne[1] <= static_cast<std::int64_t>(kA16RowsMaxColumns)) {
         with_geometry(source.geometry, [&](auto geometry) {
             launch_encode_x_acts<decltype(geometry)::kHidden, decltype(geometry)::kIntermediate>(
@@ -2687,9 +2687,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             "experts geometry differs from the nvfp4_expert_rg16_v1 record (see "
             "offloaded_moe::kGeometries)");
     require(geometry.hidden == moe::kDefaultGeometry.hidden ||
-                (source.activation == moe::ExpertActivation::kA16 && !ggml_bank(source) &&
-                 source.wide_a16 == moe::WideA16::kExact),
-            "a non-default record geometry serves exact NVFP4 A16 routes only");
+                (source.activation == moe::ExpertActivation::kA16 && source.wide_a16 == moe::WideA16::kExact &&
+                 source.ggml.gate_up_format != QType::FP8_E4M3FN_B128),
+            "a non-default record geometry serves exact NVFP4 or GGUF A16 routes only");
     require(x.ne[0] == geometry.hidden && outputs.ne[0] == geometry.hidden &&
                 outputs.ne[1] == x.ne[1] * top_k,
             "experts geometry differs from the x and outputs' hidden size");
@@ -2749,7 +2749,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         prepare_x(x, source, max_jobs, layout, stream);
     }
     // A ggml bank's wide jobs' work tiles, planned once the dispatch is known.
-    if (ggml && x.ne[1] > moe::kMaxColumns) { launch_plan_ggml(dispatch, max_jobs, layout, stream); }
+    if (ggml && x.ne[1] > moe::kMaxColumns && geometry.hidden == moe::kDefaultGeometry.hidden) {
+        launch_plan_ggml(dispatch, max_jobs, layout, stream);
+    }
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     const int half      = source.staging_slots / 2;

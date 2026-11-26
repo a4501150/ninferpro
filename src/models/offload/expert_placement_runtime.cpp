@@ -703,9 +703,11 @@ void ExpertPlacementRuntime::apply_pending_placement() {
         const std::uint32_t before = residency_->frames();
         if (target != before) {
             const auto resized = residency_->resize(target, device_.stream, vram_);
-            if (resized.frames != target) {
+            // Several pools back whole per-layer shares: the target rounds down to them.
+            const std::uint32_t reachable = residency_->reachable_frames(target);
+            if (resized.frames != reachable) {
                 record_switch(false, "the expert cache reached " + std::to_string(resized.frames) + " of " +
-                                         std::to_string(target) + " frames: VRAM ran out" +
+                                         std::to_string(reachable) + " frames: VRAM ran out" +
                                          (resized.refused ? "" : " or a lease held frames"));
             } else {
                 record_switch(true, "expert cache " + std::to_string(before) + " -> " +

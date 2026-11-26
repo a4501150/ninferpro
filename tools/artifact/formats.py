@@ -103,6 +103,8 @@ GGML_IQ3_XXS = GgmlFormat("ggml_iq3_xxs", 256, 98)
 GGML_IQ3_S = GgmlFormat("ggml_iq3_s", 256, 110)
 GGML_IQ4_XS = GgmlFormat("ggml_iq4_xs", 256, 136)
 GGML_IQ4_NL = GgmlFormat("ggml_iq4_nl", 32, 18)
+GGML_Q2_K = GgmlFormat("ggml_q2_k", 256, 84)
+GGML_Q3_K = GgmlFormat("ggml_q3_k", 256, 110)
 FP8_E4M3FN_B128 = Fp8BlockFormat("fp8_e4m3fn_b128", 128)
 
 
@@ -118,7 +120,7 @@ GGML_FORMATS = MappingProxyType(
         item.name: item
         for item in (
             GGML_Q2_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_IQ2_S, GGML_IQ3_XXS, GGML_IQ3_S,
-            GGML_IQ4_XS, GGML_IQ4_NL,
+            GGML_IQ4_XS, GGML_IQ4_NL, GGML_Q2_K, GGML_Q3_K,
         )
     }
 )

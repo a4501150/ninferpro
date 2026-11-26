@@ -47,6 +47,8 @@ The GGUF (ggml) block formats store llama.cpp's blocks verbatim (Section 3.6):
 | Canonical name | ggml type | Block elements | Block bytes | Bits/weight |
 |---|---|---:|---:|---:|
 | `ggml_q2_0` | `Q2_0` (42) | 64 | 18 | 2.25 |
+| `ggml_q2_k` | `Q2_K` (10) | 256 | 84 | 2.625 |
+| `ggml_q3_k` | `Q3_K` (11) | 256 | 110 | 3.4375 |
 | `ggml_q4_k` | `Q4_K` (12) | 256 | 144 | 4.50 |
 | `ggml_q5_k` | `Q5_K` (13) | 256 | 176 | 5.50 |
 | `ggml_q6_k` | `Q6_K` (14) | 256 | 210 | 6.5625 |
@@ -347,8 +349,9 @@ W = kappa * (d * sub * code - dmin * min_sub)
 ```
 
 with an integer code (|code| <= 127; IQ2_S/IQ3_* codes come from the grid tables with their sign
-bits), an integer sub-scale, the block's binary16 `d` (and `dmin` with an integer `min_sub` for
-`Q4_K`/`Q5_K`; zero otherwise) and the power-of-two constant kappa: 1/8 for `IQ2_S`, 1/4 for
+bits; `Q3_K` codes are the 2-bit value less 4 where the high-mask bit is clear), an integer
+sub-scale (`Q3_K`'s 6-bit sub-scale less 32), the block's binary16 `d` (and `dmin` with an integer
+`min_sub` for `Q4_K`/`Q5_K`, one per 32 elements, and `Q2_K`, one per 16; zero otherwise) and the power-of-two constant kappa: 1/8 for `IQ2_S`, 1/4 for
 `IQ3_XXS`, 1 for every other type. The products are exact in binary64.
 [`tools/artifact/codecs/ggml.py`](../../tools/artifact/codecs/ggml.py) holds the exact decoders
 (equal to gguf-py's dequantization for every type). Its grid tables are generated from
@@ -357,8 +360,10 @@ writes the C++ and CUDA copies under `src/ops/ggml/`.
 
 The only producers are `import_ggml_rows`, which copies the GGUF rows, and
 `import_ggml_expert_bank`. The layouts are `ggml_rows_v1` (verbatim rows), its tiled form
-`ggml_tiles16_v1`, and the expert-bank records `ggml_expert_iq4_nl_v1` and `ggml_expert_q2_0_v1`
-([storage layouts §7, §8](storage-layouts.md#7-ggml_rows_v1)).
+`ggml_tiles16_v1`, and the expert-bank records `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1`,
+`ggml_expert_q3_k_v1` and `ggml_expert_q2_k_v1`
+([storage layouts §7, §8](storage-layouts.md#7-ggml_rows_v1)). `ggml_q2_k` and `ggml_q3_k` are
+expert-bank formats only (no dense matrix kernel reads them).
 In these records the format names the gate/up type and the layout names the down type.
 Consumers compute with BF16 activations in the exact arithmetic of
 [`src/ops/ggml/ggml_exact.h`](../../src/ops/ggml/ggml_exact.h) (A16 activations, an exact int128

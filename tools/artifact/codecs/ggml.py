@@ -32,6 +32,8 @@ class GgmlType:
 
 
 Q2_0 = GgmlType("ggml_q2_0", 42, 64, 18, 1.0)
+Q2_K = GgmlType("ggml_q2_k", 10, 256, 84, 1.0, has_min=True)
+Q3_K = GgmlType("ggml_q3_k", 11, 256, 110, 1.0)
 Q4_K = GgmlType("ggml_q4_k", 12, 256, 144, 1.0, has_min=True)
 Q5_K = GgmlType("ggml_q5_k", 13, 256, 176, 1.0, has_min=True)
 Q6_K = GgmlType("ggml_q6_k", 14, 256, 210, 1.0)
@@ -41,7 +43,8 @@ IQ3_S = GgmlType("ggml_iq3_s", 21, 256, 110, 1.0)
 IQ2_S = GgmlType("ggml_iq2_s", 22, 256, 82, 0.125)
 IQ4_XS = GgmlType("ggml_iq4_xs", 23, 256, 136, 1.0)
 
-GGML_TYPES = MappingProxyType({t.name: t for t in (Q2_0, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS)})
+GGML_TYPES = MappingProxyType(
+    {t.name: t for t in (Q2_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS)})
 BY_GGML_ID = MappingProxyType({t.ggml_id: t for t in GGML_TYPES.values()})
 
 # Plain GGUF types the converter reads as values (not stored as ggml blocks).
@@ -110,10 +113,16 @@ def _blocks(fmt: GgmlType, raw: np.ndarray, n: int, k: int) -> np.ndarray:
     return data.reshape(n * nb, fmt.block_bytes)
 
 
-def _scale_offsets(fmt: GgmlType) -> tuple[int, ...]:
-    """Byte offsets of a block's binary16 scale words (d, and dmin for Q4_K/Q5_K)."""
+def scale_offsets(fmt: GgmlType) -> tuple[int, ...]:
+    """Byte offsets of a block's binary16 scale words (d, and dmin for Q2_K/Q4_K/Q5_K)."""
 
-    return (208,) if fmt is Q6_K else (0, 2) if fmt.has_min else (0,)
+    if fmt is Q6_K:
+        return (208,)
+    if fmt is Q2_K:
+        return (80, 82)
+    if fmt is Q3_K:
+        return (108,)
+    return (0, 2) if fmt.has_min else (0,)
 
 
 def require_finite_scales(fmt: GgmlType, raw, n: int, k: int, label: str) -> None:
@@ -121,7 +130,7 @@ def require_finite_scales(fmt: GgmlType, raw, n: int, k: int, label: str) -> Non
     scale as mantissa * 2^(e - 25) and is defined for finite words only (tensor-formats §3.6)."""
 
     b = _blocks(fmt, raw, n, k)
-    for offset in _scale_offsets(fmt):
+    for offset in scale_offsets(fmt):
         words = np.ascontiguousarray(b[:, offset:offset + 2]).view("<u2")[:, 0]
         bad = np.flatnonzero((words & 0x7C00) == 0x7C00)
         if bad.size:
@@ -175,6 +184,36 @@ def decode_terms(fmt: GgmlType, raw, n: int, k: int) -> Terms:
             code[:, 32 * ib : 32 * ib + 16] = _KVALUES[q & 0xF]
             code[:, 32 * ib + 16 : 32 * ib + 32] = _KVALUES[q >> 4]
             sub[:, 32 * ib : 32 * ib + 32] = (ls - 32)[:, None]
+    elif fmt is Q2_K:  # scales[16] (sub | min << 4 per 16), qs[64] (four 2-bit planes per 128), d, dmin
+        d = _f16(b[:, 80:82])
+        dmin_b = _f16(b[:, 82:84])
+        scales = b[:, 0:16].astype(np.int32)
+        qs = b[:, 16:80].astype(np.int32)
+        min_sub = np.empty((nb, e), np.int32)
+        for half in range(2):
+            for plane in range(4):
+                base = 128 * half + 32 * plane
+                code[:, base : base + 32] = (qs[:, 32 * half : 32 * half + 32] >> (2 * plane)) & 3
+                for part in range(2):
+                    sc = scales[:, 8 * half + 2 * plane + part]
+                    sub[:, base + 16 * part : base + 16 * part + 16] = (sc & 0xF)[:, None]
+                    min_sub[:, base + 16 * part : base + 16 * part + 16] = (sc >> 4)[:, None]
+        dmin = np.repeat(dmin_b[:, None], e, axis=1)
+    elif fmt is Q3_K:  # hmask[32], qs[64], scales[12] (sixteen 6-bit sub-scales less 32), d
+        d = _f16(b[:, 108:110])
+        hm = b[:, 0:32].astype(np.int32)
+        qs = b[:, 32:96].astype(np.int32)
+        packed = b[:, 96:108].astype(np.int32)
+        for half in range(2):
+            for plane in range(4):
+                base = 128 * half + 32 * plane
+                low = (qs[:, 32 * half : 32 * half + 32] >> (2 * plane)) & 3
+                high = (hm >> (4 * half + plane)) & 1
+                code[:, base : base + 32] = low - np.where(high != 0, 0, 4)
+                for part in range(2):
+                    i = 8 * half + 2 * plane + part
+                    sc = ((packed[:, i % 8] >> (4 * (i // 8))) & 0xF) | (((packed[:, 8 + i % 4] >> (2 * (i // 4))) & 3) << 4)
+                    sub[:, base + 16 * part : base + 16 * part + 16] = (sc - 32)[:, None]
     elif fmt is Q4_K or fmt is Q5_K:
         dmin_b = _f16(b[:, 2:4])
         sc, mn = _k_scale_min(b[:, 4:16])

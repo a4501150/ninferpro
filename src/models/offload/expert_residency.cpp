@@ -191,6 +191,12 @@ std::vector<std::uint32_t> ExpertResidency::split_frames(std::uint32_t frames) c
     return out;
 }
 
+std::uint32_t ExpertResidency::reachable_frames(std::uint32_t frames) const {
+    std::uint32_t n = 0;
+    for (const std::uint32_t f : split_frames(std::min(frames, frame_limit()))) { n += f; }
+    return n;
+}
+
 ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram) {
     Resize out;
     for (const auto& pool : pools_) {

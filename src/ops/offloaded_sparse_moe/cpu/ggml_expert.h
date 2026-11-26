@@ -11,11 +11,13 @@
 // times its sub-scales fit 16 bits (|code * sub| <= 4064), so 16-bit multiply-adds (vpmaddwd,
 // vpdpwssd) give the exact sums sum sub * code * X = 2^11 sum w * hi + sum w * lo.
 //
-// The expert formats are IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS (gate/up) and IQ4_NL and Q2_0 (down);
-// none has a min term.
+// The expert formats are IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS (gate/up) and IQ4_NL and Q2_0 (down) at
+// the default geometry, and GLM-5.3-Flash's K-quants at its own (Q4_K, Q3_K, Q2_K gate/up; Q3_K,
+// Q2_K down). The min terms of Q4_K and Q2_K come from each column's 16-element X sums.
 
 #include "core/weight.h"
 #include "ops/ggml/ggml_exact.h"
+#include "ops/offloaded_sparse_moe/expert_layout.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
 #include <cstdint>
@@ -36,13 +38,15 @@ struct GgmlExpertFormat {
 struct CpuLimbSlice {
     alignas(32) std::int16_t lo[32]; // X & 2047
     std::int16_t hi[32];             // X >> 11
+    std::int32_t sum[2];             // sum of X over elements 0-15, 16-31
 };
 
 inline constexpr int kGgmlXSlices = kHidden / 32;       // 80
 inline constexpr int kGgmlHSlices = kIntermediate / 32; // 20
 
-// Whether this CPU route computes a format pair (the GPU's launch_pass_ggml pairs).
-[[nodiscard]] bool ggml_cpu_supported(const GgmlExpertFormat& format) noexcept;
+// Whether this CPU route computes a format pair (the GPU's launch_pass_ggml pairs) at `geometry`.
+[[nodiscard]] bool ggml_cpu_supported(const GgmlExpertFormat& format,
+                                      const Geometry& geometry = kDefaultGeometry) noexcept;
 
 // Encodes BF16 v[0..n) (n a multiple of 32) under its column exponent, which it returns
 // (canon::kA16NonFinite for a non-finite column: its X are zero and its outputs NaN).
@@ -54,16 +58,19 @@ void ggml_row_sums(CpuIsa isa, QType format, const std::uint8_t* matrix, int row
                    int row_end, const CpuLimbSlice* const* columns, int ncols, ggml::I128* r);
 
 // Phase A for intermediates [i_begin, i_end): gate and up rows, SwiGLU; writes h[col][i] in BF16.
+// (SwiGLU clamped at the geometry's limit.)
 void ggml_gate_up(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format,
                   const CpuLimbSlice* const* x, const int* x_emax, int ncols, int i_begin, int i_end,
-                  std::uint16_t* const* h);
+                  std::uint16_t* const* h, const Geometry& geometry = kDefaultGeometry);
 
 // Phase B for down rows [row_begin, row_end): writes y[col][row] in BF16.
 void ggml_down(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format, const CpuLimbSlice* const* h,
-               const int* h_emax, int ncols, int row_begin, int row_end, std::uint16_t* const* y);
+               const int* h_emax, int ncols, int row_begin, int row_end, std::uint16_t* const* y,
+               const Geometry& geometry = kDefaultGeometry);
 
-// Whole expert on one thread: y[col][0..kHidden) from BF16 x[col][0..kHidden), ncols <= kMaxColumns.
+// Whole expert on one thread: y[col][0..hidden) from BF16 x[col][0..hidden), ncols <= kMaxColumns.
 void ggml_expert_forward(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format, int ncols,
-                         const std::uint16_t* const* x, std::uint16_t* const* y);
+                         const std::uint16_t* const* x, std::uint16_t* const* y,
+                         const Geometry& geometry = kDefaultGeometry);
 
 } // namespace infernix::ops::offloaded_moe

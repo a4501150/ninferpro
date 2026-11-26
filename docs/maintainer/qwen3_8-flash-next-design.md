@@ -514,7 +514,7 @@ Notes:
   E4M3FN codes row-major, then the BF16 tile-scale words, verbatim; 4.69 MiB per expert, 112.6 GiB
   for 24,576 experts. A16 only; the exact W8A16 arithmetic is §17's.
 - **GGUF banks `ggml_expert_iq4_nl_v1` / `ggml_expert_q2_0_v1`** ([storage
-  layouts](storage-layouts.md#8-gguf-expert-banks-ggml_expert_iq4_nl_v1-ggml_expert_q2_0_v1)): gate
+  layouts](storage-layouts.md#8-gguf-expert-banks-ggml_expert_iq4_nl_v1-ggml_expert_q2_0_v1-ggml_expert_q3_k_v1-ggml_expert_q2_k_v1)): gate
   and up share one format (IQ2_S, IQ3_XXS, IQ3_S or IQ4_XS), the down format is IQ4_NL or Q2_0 and
   names the layout. One record per expert: gate rows, up rows, down rows, zero padding to 4 KiB.
   Record sizes vary by layer.

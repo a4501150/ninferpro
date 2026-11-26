@@ -16,9 +16,11 @@ The storage registry contains exactly these identities:
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `nvfp4_expert_rg16_v1` | tensor layout | `nvfp4_mul` | rank 3 `[E,H,I]`, `H % 16 == 0`, `I % 16 == 0` | 4096 bytes |
-| `ggml_rows_v1` | tensor layout | every `ggml_*` format | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
+| `ggml_rows_v1` | tensor layout | every `ggml_*` format but `ggml_q2_k`, `ggml_q3_k` | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
 | `ggml_tiles16_v1` | tensor layout | `ggml_q4_k`, `ggml_q5_k`, `ggml_q6_k`, `ggml_iq4_xs` | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
 | `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1` | tensor layout | `ggml_iq2_s`, `ggml_iq3_xxs`, `ggml_iq3_s`, `ggml_iq4_xs` | rank 3 `[E,H,I]`, whole blocks | 4096 bytes |
+| `ggml_expert_q3_k_v1` | tensor layout | `ggml_q4_k`, `ggml_q3_k` | rank 3 `[E,H,I]`, whole blocks | 4096 bytes |
+| `ggml_expert_q2_k_v1` | tensor layout | `ggml_q3_k`, `ggml_q2_k` | rank 3 `[E,H,I]`, whole blocks | 4096 bytes |
 | `fp8_expert_b128_v1` | tensor layout | `fp8_e4m3fn_b128` | rank 3 `[E,H,I]`, `H % 128 == 0`, `I % 128 == 0` | 4096 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
@@ -406,10 +408,11 @@ row `16 i` begins in `ggml_rows_v1`, so a whole-row view or slice must start at 
 rows and end at one or at `N`. Untiling (the inverse permutation) returns the `ggml_rows_v1` bytes
 exactly; the token embedding (a row gather) is never tiled.
 
-## 8. GGUF expert banks: `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1`
+## 8. GGUF expert banks: `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1`, `ggml_expert_q3_k_v1`, `ggml_expert_q2_k_v1`
 
 These store one MoE layer's routed experts `[E,H,I]` of a GGUF import. The object's format is the
-gate/up matrices' ggml type; the layout names the down matrices' (`ggml_iq4_nl` or `ggml_q2_0`).
+gate/up matrices' ggml type; the layout names the down matrices' (`ggml_iq4_nl`, `ggml_q2_0`,
+`ggml_q3_k` or `ggml_q2_k`).
 Each expert is one record of its gate rows, its up rows (`[I,H]` each, rows of `H / block_elems`
 blocks of the gate/up type) and its down rows (`[H,I]`, blocks of the down type), every row
 verbatim GGUF blocks:

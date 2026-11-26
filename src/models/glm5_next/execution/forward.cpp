@@ -553,6 +553,16 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
     source.error        = experts_.error;
     source.geometry     = geometry;
     source.frame_stride = pitch;
+    if (planes.gate_up_format != QType::NVFP4_MUL) {
+        // A GGUF import's bank: its own record size in frames of its pool's pitch, the exact A16
+        // kernels at every width and the exact CPU route for misses. Stages copy the record
+        // rounded up to 16 bytes (the stride's zero padding).
+        source.ggml = ops::MoeGgmlBank{.gate_up_format = planes.gate_up_format,
+                                       .down_format    = planes.down_format,
+                                       .gate_row_bytes = static_cast<std::uint32_t>(planes.gate_row_bytes),
+                                       .down_row_bytes = static_cast<std::uint32_t>(planes.down_row_bytes),
+                                       .record_bytes   = (planes.record_bytes + 15) / 16 * 16};
+    }
     // Every expert holds a frame: no call can miss, so it runs as one pass over every job with no
     // staging, fork, landing, CPU or fetch channel (the same arithmetic per expert, the same bits).
     if (experts_.resident) {

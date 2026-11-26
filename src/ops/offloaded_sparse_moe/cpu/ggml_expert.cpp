@@ -7,6 +7,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "ops/offloaded_sparse_moe/cpu/x86_mad.h"
 
@@ -59,6 +60,10 @@ struct Decoded {
     int sub0, sub1; // elements 0-15, 16-31
     std::uint16_t d;
 };
+
+// Formats whose two slice halves can have different sub-scales.
+template <QType F>
+inline constexpr bool kHalfSubs = F == QType::GGML_IQ2_S || F == QType::GGML_Q2_K || F == QType::GGML_Q3_K;
 
 inline std::uint16_t u16(const std::uint8_t* p) {
     std::uint16_t v;
@@ -158,6 +163,37 @@ inline Decoded decode(const std::uint8_t* row, int s) {
                                     static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[(aux >> 14) & 127]) << 16 |
                                     static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[(aux >> 21) & 127]) << 24;
         o.q = apply_signs(g, signs);
+    } else if constexpr (F == QType::GGML_Q4_K) {
+        const std::uint8_t* b = row + static_cast<std::size_t>(s / 8) * 144;
+        const int sb          = s % 8;
+        o.d                   = u16(b);
+        int m;
+        ggml::scale_min_k4(sb, b + 4, o.sub0, m);
+        o.sub1          = o.sub0;
+        const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 16 + 32 * (sb / 2)));
+        o.q = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(4 * (sb % 2))), _mm256_set1_epi8(0x0F));
+    } else if constexpr (F == QType::GGML_Q2_K) {
+        const std::uint8_t* b = row + static_cast<std::size_t>(s / 8) * 84;
+        const int sb = s % 8, half = sb / 4, plane = sb % 4;
+        o.d             = u16(b + 80);
+        o.sub0          = b[8 * half + 2 * plane] & 0xF;
+        o.sub1          = b[8 * half + 2 * plane + 1] & 0xF;
+        const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 16 + 32 * half));
+        o.q = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(2 * plane)), _mm256_set1_epi8(3));
+    } else if constexpr (F == QType::GGML_Q3_K) {
+        const std::uint8_t* b = row + static_cast<std::size_t>(s / 8) * 110;
+        const int sb = s % 8, half = sb / 4, plane = sb % 4;
+        o.d            = u16(b + 108);
+        const auto sub = [&](int i) {
+            return (((b[96 + i % 8] >> (4 * (i / 8))) & 0xF) | (((b[104 + i % 4] >> (2 * (i / 4))) & 3) << 4)) - 32;
+        };
+        o.sub0           = sub(8 * half + 2 * plane);
+        o.sub1           = sub(8 * half + 2 * plane + 1);
+        const __m256i q  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 32 + 32 * half));
+        const __m256i hm = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
+        const __m256i lo = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(2 * plane)), _mm256_set1_epi8(3));
+        const __m256i hi = _mm256_and_si256(_mm256_srl_epi16(hm, _mm_cvtsi32_si128(4 * half + plane)), _mm256_set1_epi8(1));
+        o.q = _mm256_sub_epi8(_mm256_or_si256(lo, _mm256_slli_epi16(hi, 2)), _mm256_set1_epi8(4));
     } else if constexpr (F == QType::GGML_IQ2_S) {
         const std::uint8_t* b = row + static_cast<std::size_t>(s / 8) * 82;
         const int ib          = s % 8;
@@ -200,6 +236,43 @@ using x86::hsum8;
 // Slices per unit (one int32 accumulation), and units per block.
 template <QType F>
 inline constexpr int kUnitSlices = F == QType::GGML_IQ4_NL ? 1 : F == QType::GGML_Q2_0 ? 2 : 4;
+
+// The min terms of a row's blocks (Q4_K, Q2_K): - mant(dmin) * sum(min * X sum) per block from the
+// columns' 16-element X sums, the integers of ggml_exact.h's chunk terms (|min * sum| < 2^31 per
+// half, a block's sum < 2^36).
+template <QType F>
+inline constexpr bool kMinTerms = F == QType::GGML_Q4_K || F == QType::GGML_Q2_K;
+
+template <QType F, int NC>
+inline void add_min_terms(const std::uint8_t* w, int slices, const CpuLimbSlice* const* columns, int c0, ggml::I128* out) {
+    constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
+    for (int blk = 0; blk < slices / 8; ++blk) {
+        const std::uint8_t* b = w + static_cast<std::size_t>(blk) * kBlockBytes;
+        int mins[16]; // per 16 elements
+        std::uint16_t dmin;
+        if constexpr (F == QType::GGML_Q4_K) {
+            dmin = u16(b + 2);
+            for (int j = 0; j < 8; ++j) {
+                int sc;
+                ggml::scale_min_k4(j, b + 4, sc, mins[2 * j]);
+                mins[2 * j + 1] = mins[2 * j];
+            }
+        } else {
+            dmin = u16(b + 82);
+            for (int j = 0; j < 16; ++j) { mins[j] = b[j] >> 4; }
+        }
+        std::int64_t mant;
+        int shift;
+        bool negative;
+        ggml::f16_parts(dmin, mant, shift, negative);
+        for (int k = 0; k < NC; ++k) {
+            const CpuLimbSlice* col = columns[c0 + k] + 8 * blk;
+            std::int64_t m          = 0;
+            for (int j = 0; j < 16; ++j) { m += static_cast<std::int64_t>(mins[j]) * col[j / 2].sum[j % 2]; }
+            ggml::add_shifted(out[k], (negative ? mant : -mant) * m, shift);
+        }
+    }
+}
 
 // Rows [row_begin, row_end) against NC columns. Each unit's lane vectors are kept in a batch of
 // eight, reduced together, and each block's exact P = 2048 sum(w * hi) + sum(w * lo) (int64,
@@ -262,6 +335,7 @@ inline constexpr int kUnitSlices = F == QType::GGML_IQ4_NL ? 1 : F == QType::GGM
                     n = 0;                                                                                             \
                 }                                                                                                      \
             }                                                                                                          \
+            if constexpr (kMinTerms<F>) { add_min_terms<F, NC>(w, slices, columns, c0, out); }                         \
             for (int k = 0; k < NC; ++k) { r[static_cast<std::size_t>(row - row_begin) * ncols + c0 + k] = out[k]; }  \
         }                                                                                                              \
     }                                                                                                                  \
@@ -315,7 +389,7 @@ void row_sums_avx512_n(const std::uint8_t* matrix, int row_bytes, int slices, in
                 const int s      = u * kUnit + j;
                 const Decoded dw = decode<F>(w, s);
                 __m512i sub;
-                if constexpr (F == QType::GGML_IQ2_S) { // elements 0-15 and 16-31 have their own sub-scales
+                if constexpr (kHalfSubs<F>) { // elements 0-15 and 16-31 have their own sub-scales
                     sub = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16(static_cast<short>(dw.sub0))),
                                              _mm256_set1_epi16(static_cast<short>(dw.sub1)), 1);
                 } else {
@@ -353,6 +427,7 @@ void row_sums_avx512_n(const std::uint8_t* matrix, int row_bytes, int slices, in
                 n = 0;
             }
         }
+        if constexpr (kMinTerms<F>) { add_min_terms<F, NC>(w, slices, columns, 0, out); }
         for (int k = 0; k < NC; ++k) { r[static_cast<std::size_t>(row - row_begin) * ncols + k] = out[k]; }
     }
 }
@@ -401,17 +476,28 @@ void require(bool condition, const char* message) {
 
 } // namespace
 
-bool ggml_cpu_supported(const GgmlExpertFormat& format) noexcept {
+bool ggml_cpu_supported(const GgmlExpertFormat& format, const Geometry& geometry) noexcept {
+    const bool default_geometry = geometry.hidden == kDefaultGeometry.hidden &&
+                                  geometry.intermediate == kDefaultGeometry.intermediate &&
+                                  geometry.swiglu_limit == kDefaultGeometry.swiglu_limit;
     if (format.gate_up == QType::FP8_E4M3FN_B128) { // fp8_expert.cpp
-        return format.down == QType::FP8_E4M3FN_B128 && format.gate_row_bytes == kHidden &&
+        return default_geometry && format.down == QType::FP8_E4M3FN_B128 && format.gate_row_bytes == kHidden &&
                format.down_row_bytes == kIntermediate;
     }
-    const bool gate_up = format.gate_up == QType::GGML_IQ2_S || format.gate_up == QType::GGML_IQ3_XXS ||
-                         format.gate_up == QType::GGML_IQ3_S || format.gate_up == QType::GGML_IQ4_XS;
-    const bool down    = format.down == QType::GGML_IQ4_NL || format.down == QType::GGML_Q2_0;
-    return gate_up && down &&
-           format.gate_row_bytes == kHidden / ggml_block_elems(format.gate_up) * ggml_block_bytes(format.gate_up) &&
-           format.down_row_bytes == kIntermediate / ggml_block_elems(format.down) * ggml_block_bytes(format.down);
+    bool pair = false;
+    if (default_geometry) {
+        pair = (format.gate_up == QType::GGML_IQ2_S || format.gate_up == QType::GGML_IQ3_XXS ||
+                format.gate_up == QType::GGML_IQ3_S || format.gate_up == QType::GGML_IQ4_XS) &&
+               (format.down == QType::GGML_IQ4_NL || format.down == QType::GGML_Q2_0);
+    } else if (registered_geometry(geometry.hidden, geometry.intermediate, geometry.swiglu_limit) != nullptr) {
+        // The GPU's pairs at GLM-5.3-Flash's geometry.
+        pair = (format.gate_up == QType::GGML_Q4_K && format.down == QType::GGML_Q3_K) ||
+               (format.gate_up == QType::GGML_Q3_K && (format.down == QType::GGML_Q3_K || format.down == QType::GGML_Q2_K)) ||
+               (format.gate_up == QType::GGML_Q2_K && format.down == QType::GGML_Q2_K);
+    }
+    const auto hidden = static_cast<std::uint32_t>(geometry.hidden), inter = static_cast<std::uint32_t>(geometry.intermediate);
+    return pair && format.gate_row_bytes == hidden / ggml_block_elems(format.gate_up) * ggml_block_bytes(format.gate_up) &&
+           format.down_row_bytes == inter / ggml_block_elems(format.down) * ggml_block_bytes(format.down);
 }
 
 int ggml_encode_column(const std::uint16_t* v, int n, CpuLimbSlice* out) {
@@ -422,6 +508,8 @@ int ggml_encode_column(const std::uint16_t* v, int n, CpuLimbSlice* out) {
         CpuLimbSlice& l      = out[j / 32];
         l.lo[j % 32] = static_cast<std::int16_t>(x & 2047);
         l.hi[j % 32] = static_cast<std::int16_t>(x >> 11);
+        if (j % 16 == 0) { l.sum[j % 32 / 16] = 0; }
+        l.sum[j % 32 / 16] += x;
     }
     return emax;
 }
@@ -441,6 +529,9 @@ void ggml_row_sums(CpuIsa isa, QType format, const std::uint8_t* matrix, int row
         INFERNIX_GGML_FORMAT(QType::GGML_IQ4_XS)
         INFERNIX_GGML_FORMAT(QType::GGML_IQ4_NL)
         INFERNIX_GGML_FORMAT(QType::GGML_Q2_0)
+        INFERNIX_GGML_FORMAT(QType::GGML_Q4_K)
+        INFERNIX_GGML_FORMAT(QType::GGML_Q3_K)
+        INFERNIX_GGML_FORMAT(QType::GGML_Q2_K)
     default:
         throw std::invalid_argument("offloaded_moe ggml: not an expert format of the CPU route");
     }
@@ -449,7 +540,7 @@ void ggml_row_sums(CpuIsa isa, QType format, const std::uint8_t* matrix, int row
 
 void ggml_gate_up(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format,
                   const CpuLimbSlice* const* x, const int* x_emax, int ncols, int i_begin, int i_end,
-                  std::uint16_t* const* h) {
+                  std::uint16_t* const* h, const Geometry& geometry) {
     if (format.gate_up == QType::FP8_E4M3FN_B128) {
         fp8_gate_up(isa, record, x, x_emax, ncols, i_begin, i_end, h);
         return;
@@ -457,33 +548,37 @@ void ggml_gate_up(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat
     constexpr int kUnit = 16;
     ggml::I128 g[kUnit * kMaxColumns], u[kUnit * kMaxColumns];
     const int row_bytes = static_cast<int>(format.gate_row_bytes);
-    const std::uint8_t* up = record + static_cast<std::size_t>(kIntermediate) * row_bytes;
+    const std::uint8_t* up = record + static_cast<std::size_t>(geometry.intermediate) * row_bytes;
+    const float limit      = geometry.swiglu_limit;
     for (int i0 = i_begin; i0 < i_end; i0 += kUnit) {
         const int i1 = std::min(i_end, i0 + kUnit);
-        ggml_row_sums(isa, format.gate_up, record, row_bytes, kGgmlXSlices, i0, i1, x, ncols, g);
-        ggml_row_sums(isa, format.gate_up, up, row_bytes, kGgmlXSlices, i0, i1, x, ncols, u);
+        ggml_row_sums(isa, format.gate_up, record, row_bytes, geometry.hidden / 32, i0, i1, x, ncols, g);
+        ggml_row_sums(isa, format.gate_up, up, row_bytes, geometry.hidden / 32, i0, i1, x, ncols, u);
         for (int i = i0; i < i1; ++i) {
             for (int c = 0; c < ncols; ++c) {
-                const std::size_t at = static_cast<std::size_t>(i - i0) * ncols + c;
-                h[c][i] = canon::swiglu_bf16(ggml::output_bf16(g[at], x_emax[c], format.gate_up),
-                                             ggml::output_bf16(u[at], x_emax[c], format.gate_up));
+                const std::size_t at   = static_cast<std::size_t>(i - i0) * ncols + c;
+                const std::uint16_t gv = ggml::output_bf16(g[at], x_emax[c], format.gate_up);
+                const std::uint16_t uv = ggml::output_bf16(u[at], x_emax[c], format.gate_up);
+                h[c][i] = limit > 0.0F ? canon::swiglu_bf16_clamped(gv, uv, limit) : canon::swiglu_bf16(gv, uv);
             }
         }
     }
 }
 
 void ggml_down(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format, const CpuLimbSlice* const* h,
-               const int* h_emax, int ncols, int row_begin, int row_end, std::uint16_t* const* y) {
+               const int* h_emax, int ncols, int row_begin, int row_end, std::uint16_t* const* y,
+               const Geometry& geometry) {
     if (format.down == QType::FP8_E4M3FN_B128) {
         fp8_down(isa, record, h, h_emax, ncols, row_begin, row_end, y);
         return;
     }
     constexpr int kRows = 32;
     ggml::I128 r[kRows * kMaxColumns];
-    const std::uint8_t* down = record + 2 * static_cast<std::size_t>(kIntermediate) * format.gate_row_bytes;
+    const std::uint8_t* down = record + 2 * static_cast<std::size_t>(geometry.intermediate) * format.gate_row_bytes;
     for (int r0 = row_begin; r0 < row_end; r0 += kRows) {
         const int r1 = std::min(row_end, r0 + kRows);
-        ggml_row_sums(isa, format.down, down, static_cast<int>(format.down_row_bytes), kGgmlHSlices, r0, r1, h, ncols, r);
+        ggml_row_sums(isa, format.down, down, static_cast<int>(format.down_row_bytes), geometry.intermediate / 32, r0, r1,
+                      h, ncols, r);
         for (int row = r0; row < r1; ++row) {
             for (int c = 0; c < ncols; ++c) {
                 y[c][row] = ggml::output_bf16(r[static_cast<std::size_t>(row - r0) * ncols + c], h_emax[c], format.down);
@@ -493,25 +588,31 @@ void ggml_down(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& f
 }
 
 void ggml_expert_forward(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format, int ncols,
-                         const std::uint16_t* const* x, std::uint16_t* const* y) {
-    require(ncols >= 1 && ncols <= kMaxColumns && ggml_cpu_supported(format), "unsupported expert or width");
-    static thread_local CpuLimbSlice xs[kMaxColumns][kGgmlXSlices], hs[kMaxColumns][kGgmlHSlices];
-    static thread_local std::uint16_t hv[kMaxColumns][kIntermediate];
+                         const std::uint16_t* const* x, std::uint16_t* const* y, const Geometry& geometry) {
+    require(ncols >= 1 && ncols <= kMaxColumns && ggml_cpu_supported(format, geometry), "unsupported expert or width");
+    const int hidden = geometry.hidden, inter = geometry.intermediate;
+    static thread_local std::vector<CpuLimbSlice> xs, hs;
+    static thread_local std::vector<std::uint16_t> hv;
+    xs.resize(static_cast<std::size_t>(kMaxColumns) * (hidden / 32));
+    hs.resize(static_cast<std::size_t>(kMaxColumns) * (inter / 32));
+    hv.resize(static_cast<std::size_t>(kMaxColumns) * inter);
     int x_emax[kMaxColumns], h_emax[kMaxColumns];
     const CpuLimbSlice* xp[kMaxColumns];
     const CpuLimbSlice* hp[kMaxColumns];
     std::uint16_t* hvp[kMaxColumns];
     for (int c = 0; c < ncols; ++c) {
-        x_emax[c] = ggml_encode_column(x[c], kHidden, xs[c]);
-        xp[c]     = xs[c];
-        hvp[c]    = hv[c];
+        CpuLimbSlice* xc = &xs[static_cast<std::size_t>(c) * (hidden / 32)];
+        x_emax[c]        = ggml_encode_column(x[c], hidden, xc);
+        xp[c]            = xc;
+        hvp[c]           = &hv[static_cast<std::size_t>(c) * inter];
     }
-    ggml_gate_up(isa, record, format, xp, x_emax, ncols, 0, kIntermediate, hvp);
+    ggml_gate_up(isa, record, format, xp, x_emax, ncols, 0, inter, hvp, geometry);
     for (int c = 0; c < ncols; ++c) {
-        h_emax[c] = ggml_encode_column(hv[c], kIntermediate, hs[c]);
-        hp[c]     = hs[c];
+        CpuLimbSlice* hc = &hs[static_cast<std::size_t>(c) * (inter / 32)];
+        h_emax[c]        = ggml_encode_column(hvp[c], inter, hc);
+        hp[c]            = hc;
     }
-    ggml_down(isa, record, format, hp, h_emax, ncols, 0, kHidden, y);
+    ggml_down(isa, record, format, hp, h_emax, ncols, 0, hidden, y, geometry);
 }
 
 } // namespace infernix::ops::offloaded_moe

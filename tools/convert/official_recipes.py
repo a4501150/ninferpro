@@ -545,6 +545,37 @@ def glm5_3_flash_nvfp4_orcarouter_q8dense(model, recipe, sources):
             _assign(recipe, name, Q8, method=grouped_mse)
 
 
+def glm5_3_flash_gcsa_gsq_q4(model, recipe, sources):
+    """GLM-5.3-Flash from GCSA-AiLab's RCO-GSQ Q4 GGUF, bit-exact (tools/convert/glm5_next_gguf.py,
+    docs/maintainer/glm5_3-flash-design.md §3): the routed experts as ``ggml_expert_*_v1`` banks
+    (Q4_K, Q3_K and Q2_K blocks verbatim, the gate/up format per layer, the layout naming the down
+    format), every Q8_0 matrix as the identical ``q8_g32_fp16`` words, and the rest in its dtype
+    (BF16, or FP32 where the engine binds FP32). The arithmetic is A16 everywhere."""
+
+    from .sources.ggml_sources import GgmlExpertBank, import_ggml_expert_bank
+
+    if model.config.get("architectures") != ["Glm5NextForCausalLM"]:
+        raise ValueError("this official recipe requires Glm5Next mathematics")
+    banks = 0
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        source = parameter.source
+        if isinstance(source, GgmlExpertBank):
+            recipe.assign(name, format=source.gate_up_format, layout=source.layout, method=import_ggml_expert_bank,
+                          activation_policy="A16Only")
+            recipe.group(name, shape=parameter.shape)
+            banks += 1
+        elif parameter.source_factory is None and source.read_encoded is not None:
+            # The GGUF's own matrices; the checkpoint's (source_factory set) stay in their dtype.
+            stored = source.read_encoded(0, 1).format
+            if stored != Q8:
+                raise ValueError(f"{name}: the Glm5Next GGUF import stores Q8_0 matrices only, found {stored}")
+            recipe.assign(name, format=stored, method=import_encoded)
+    if banks == 0:
+        raise ValueError("this recipe requires a Glm5Next model built from a GGUF (tools.convert --gguf)")
+
+
 def glm5_3_flash_dflash2(model, recipe, sources):
     """A GLM-5.3-Flash DFlash2 drafter (incoai/GLM-5.3-Flash-DFlash2) as a companion artifact
     (``tools.convert --components dflash2``), stored as the Qwen3.8-Flash-Next drafter is: every
@@ -573,5 +604,6 @@ RECIPES = {
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
     "glm5_3_flash_nvfp4_orcarouter": glm5_3_flash_nvfp4_orcarouter,
     "glm5_3_flash_nvfp4_orcarouter_q8dense": glm5_3_flash_nvfp4_orcarouter_q8dense,
+    "glm5_3_flash_gcsa_gsq_q4": glm5_3_flash_gcsa_gsq_q4,
     "glm5_3_flash_dflash2": glm5_3_flash_dflash2,
 }

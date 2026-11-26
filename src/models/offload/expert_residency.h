@@ -119,6 +119,9 @@ public:
         std::uint64_t spilled = 0;     // bytes of a chunk the driver placed in system memory (given back)
         bool refused          = false; // the device had no memory for the next chunk
     };
+    // The frames resize(frames) backs when nothing stops it: frames itself with one pool, every
+    // layer's frames / layers share over several.
+    [[nodiscard]] std::uint32_t reachable_frames(std::uint32_t frames) const;
     // Backs `frames` frames over the pools (every layer frames / layers; clamped to frame_limit());
     // unchanged while frames are lent. Call only between rounds, with nothing in flight on the
     // compute stream: promotion copies are waited for, then a shrink evicts each pool's

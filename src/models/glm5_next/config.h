@@ -89,6 +89,13 @@ struct TextConfig {
     IndexerConfig indexer;
     MoeConfig moe;
     HyperConnectionConfig hc;
+    // The routed experts are a GGUF import's ggml banks (exact A16 over the records' block scales),
+    // set by the loader. Their record strides differ by layer: expert_frame_stride is the largest
+    // (staging, stream-ring and RAM slots take it) and expert_frame_bytes the mean, rounded up (the
+    // expert cache's sizing unit: ExpertResidency::average_frame_bytes). 0: the NVFP4 record's.
+    bool ggml_experts                 = false;
+    std::uint64_t expert_frame_stride = 0;
+    std::uint64_t expert_frame_bytes  = 0;
 
     [[nodiscard]] std::uint32_t moe_layers() const noexcept {
         return num_hidden_layers - dense_layers;

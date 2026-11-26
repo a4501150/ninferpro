@@ -4,7 +4,7 @@
 // §17.3). Shared by the GPU kernels and the CPU engine: every function returns identical bits on both.
 //
 // A weight is kappa * (d * sub * code - dmin * min_sub): an integer code, an integer sub-scale, a
-// binary16 block scale (and a second term for Q4_K/Q5_K) and a power-of-two format constant. An
+// binary16 block scale (and a second term for Q2_K/Q4_K/Q5_K) and a power-of-two format constant. An
 // activation column is the A16 encoding of design §17.3 (ops::canon::a16_value): integers X with
 // v = X * 2^(emax - 147). With d = mant * 2^(e - 25) (e >= 1; subnormals take e = 1), one output is
 //
@@ -67,7 +67,7 @@ INFERNIX_GGML_HD std::uint16_t output_bf16(const I128& r, int emax, QType q) {
 // ----------------------------------------------------------------------------------- chunks
 
 // Eight consecutive elements of a block: codes, their shared sub-scale and the block's scale
-// words (Q4_K/Q5_K: the min term too).
+// words (Q2_K/Q4_K/Q5_K: the min term too).
 struct Chunk {
     std::int32_t code[8];
     std::int32_t sub;
@@ -142,6 +142,27 @@ INFERNIX_GGML_HD Chunk chunk(const std::uint8_t* b, int part) {
             if constexpr (F == QType::GGML_Q5_K) { q += ((b[16 + li + j] >> sb) & 1) << 4; }
             c.code[j] = q;
         }
+    } else if constexpr (F == QType::GGML_Q2_K) {
+        // scales[16] (sub | min << 4 per 16 elements), qs[64] (four 2-bit planes per 128), d, dmin.
+        c.d    = u16_at(b + 80);
+        c.dmin = u16_at(b + 82);
+        const int e = 8 * part, half = e / 128, r = e % 128, plane = r / 32, l = r % 32;
+        const int sc = b[8 * half + 2 * plane + l / 16];
+        c.sub     = sc & 0xF;
+        c.min_sub = sc >> 4;
+        const std::uint8_t* qs = b + 16 + 32 * half + l;
+        for (int j = 0; j < 8; ++j) { c.code[j] = (qs[j] >> (2 * plane)) & 3; }
+    } else if constexpr (F == QType::GGML_Q3_K) {
+        // hmask[32] (bit 4 half + plane: the code's high bit, set = +0, clear = -4), qs[64] as Q2_K's,
+        // scales[12] (sixteen 6-bit sub-scales less 32), d.
+        c.d = u16_at(b + 108);
+        const int e = 8 * part, half = e / 128, r = e % 128, plane = r / 32, l = r % 32;
+        const int is = 8 * half + 2 * plane + l / 16;
+        const int lo = (b[96 + is % 8] >> (4 * (is / 8))) & 0xF, hi = (b[104 + is % 4] >> (2 * (is / 4))) & 3;
+        c.sub = (lo | (hi << 4)) - 32;
+        const std::uint8_t* qs = b + 32 + 32 * half + l;
+        const int bit          = 4 * half + plane;
+        for (int j = 0; j < 8; ++j) { c.code[j] = ((qs[j] >> (2 * plane)) & 3) - (((b[l + j] >> bit) & 1) != 0 ? 0 : 4); }
     } else if constexpr (F == QType::GGML_Q6_K) {
         c.d = u16_at(b + 208);
         const int e = 8 * part, half = e / 128, r = e % 128, quarter = r / 32, l = r % 32;

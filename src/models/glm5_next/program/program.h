@@ -317,7 +317,8 @@ struct ProgramDevicePlan {
     std::uint64_t draft     = 0; // the DFlash2 context ring, target features and KDA verify records
     std::uint64_t prefix    = 0; // the prefix cache's staging slots and saved head residuals
     std::uint64_t residency = 0; // the expert frame tables and route log
-    std::uint64_t expert_record_stride = 0; // one expert record (staging slots and frames)
+    std::uint64_t expert_record_stride = 0; // the largest expert record (staging, stream-ring and RAM slots)
+    std::uint64_t expert_frame_bytes   = 0; // one average expert frame (the cache's sizing unit)
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate
 

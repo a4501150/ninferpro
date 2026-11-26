@@ -65,11 +65,12 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
         // Without a bank (the SSD tier) every request is tiered: it carries its records' addresses.
         // A GGUF bank's records are its own size (ggml_expert.h) and carry no per-expert scalars.
         const std::uint64_t record =
-            layer.ggml.valid() ? 2ULL * kIntermediate * layer.ggml.gate_row_bytes +
-                                     static_cast<std::uint64_t>(kHidden) * layer.ggml.down_row_bytes
+            layer.ggml.valid() ? 2ULL * static_cast<std::uint64_t>(options_.geometry.intermediate) * layer.ggml.gate_row_bytes +
+                                     static_cast<std::uint64_t>(options_.geometry.hidden) * layer.ggml.down_row_bytes
                                : options_.geometry.record_bytes();
         if ((layer.records == nullptr && options_.records == nullptr) ||
-            (layer.ggml.valid() ? !ggml_cpu_supported(layer.ggml) || options_.activation != ExpertActivation::kA16
+            (layer.ggml.valid() ? !ggml_cpu_supported(layer.ggml, options_.geometry) ||
+                                      options_.activation != ExpertActivation::kA16
                                 : layer.scales == nullptr) ||
             layer.record_stride < record) {
             throw std::invalid_argument("CPU miss service layer is incomplete");

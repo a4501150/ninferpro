@@ -1,6 +1,5 @@
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
-#include "ops/linear/q8/q8_stream_launch.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -16,10 +15,11 @@ void sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t str
 
 // Glm5Next: the dense MLP's down projection, T = a call's columns.
 // bench/ops/q8_sweep.cu --n 4096 --k 12288 (RTX PRO 6000, trimmed mean of 21 cold-L2 graphs,
-// 2 % tolerance to T = 128 and 5 % beyond; T <= 8 from one column-invariant class):
-// T = 1 31.8 us (94% of the DRAM floor), T = 1024 468 us, T = 4096 1771 us.
+// 2 % tolerance to T = 128 and 5 % beyond): T = 1024 468 us, T = 4096 1771 us. T <= 16 is one
+// sliced-K route: the stream kernel the sweep proposed for T <= 2 sums in another order, so a
+// one-row decode round and a wider one gave a row different bits
+// (tests/ops/test_column_invariant_projections.cpp, its order-sensitive Q8 decode check).
 Q8Launch select_q8_n4096_k12288(std::int32_t tokens) {
-    if (tokens <= 2) return launch_q8_a16_stream_linear<Q8A16StreamSchedule<12288, 2, 8, 8, 4, 4, Q8StreamX::Global, 2>>;
     if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2;
     if (tokens <= 24) return sliced<Q8A16SlicedKMmaSchedule<24, 4, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg, Q8ActivationStage::PaddedZero>>;
     if (tokens <= 32) return sliced<Q8A16SlicedKMmaSchedule<32, 4, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg, Q8ActivationStage::PaddedZero>>;

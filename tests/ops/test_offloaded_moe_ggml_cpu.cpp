@@ -7,7 +7,8 @@
 // infernix_ggml_linear_test qualifies against an independent bignum oracle): x and h encoded under
 // their column exponents, gate/up rows rounded to BF16, SwiGLU, the down rows. Every ISA this host
 // runs, at every width 1-8, must return its bits, including columns of a wide dynamic range and a
-// non-finite column (NaN outputs).
+// non-finite column (NaN outputs). GLM-5.3-Flash's K-quant pairs (Q4_K, Q3_K, Q2_K; min terms) run at
+// its geometry (4096 x 2048, SwiGLU clamped at 10), through ggml_expert_forward and the worker team.
 
 #include "core/ggml_format.h"
 #include "ops/common/canonical_math.h"
@@ -41,12 +42,18 @@ std::uint32_t row_bytes(QType q, int k) { return k / infernix::ggml_block_elems(
 void random_rows(QType q, int rows, int k, std::mt19937& rng, std::uint8_t* out) {
     const int blocks = k / static_cast<int>(infernix::ggml_block_elems(q)), size = static_cast<int>(infernix::ggml_block_bytes(q));
     for (int i = 0; i < rows * blocks * size; ++i) { out[i] = static_cast<std::uint8_t>(rng()); }
+    // The block's binary16 words: d (and the K-quants' dmin).
+    const int words[2] = {q == QType::GGML_Q2_K ? 80 : q == QType::GGML_Q3_K ? 108 : 0,
+                          q == QType::GGML_Q2_K ? 82 : q == QType::GGML_Q4_K ? 2 : -1};
     for (int i = 0; i < rows * blocks; ++i) {
         std::uint8_t* b = out + static_cast<std::size_t>(i) * size;
-        // Small finite scales (exponent field 3..12) keep the outputs in BF16's normal range.
-        const auto w = static_cast<std::uint16_t>((rng() & 0x83FF) | ((3 + rng() % 10) << 10));
-        b[0] = static_cast<std::uint8_t>(w & 0xFF);
-        b[1] = static_cast<std::uint8_t>(w >> 8);
+        for (const int at : words) {
+            if (at < 0) { continue; }
+            // Small finite scales (exponent field 3..12) keep the outputs in BF16's normal range.
+            const auto w = static_cast<std::uint16_t>((rng() & 0x83FF) | ((3 + rng() % 10) << 10));
+            b[at]     = static_cast<std::uint8_t>(w & 0xFF);
+            b[at + 1] = static_cast<std::uint8_t>(w >> 8);
+        }
     }
 }
 
@@ -58,6 +65,9 @@ ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int 
     case QType::GGML_IQ4_XS: return ggml::row_dot<QType::GGML_IQ4_XS>(row, x, k);
     case QType::GGML_IQ4_NL: return ggml::row_dot<QType::GGML_IQ4_NL>(row, x, k);
     case QType::GGML_Q2_0: return ggml::row_dot<QType::GGML_Q2_0>(row, x, k);
+    case QType::GGML_Q4_K: return ggml::row_dot<QType::GGML_Q4_K>(row, x, k);
+    case QType::GGML_Q3_K: return ggml::row_dot<QType::GGML_Q3_K>(row, x, k);
+    case QType::GGML_Q2_K: return ggml::row_dot<QType::GGML_Q2_K>(row, x, k);
     default: throw std::logic_error("format");
     }
 }
@@ -91,8 +101,9 @@ std::uint16_t fp8_row(const std::uint8_t* codes, const std::uint16_t* tiles, con
     return infernix::fp8b128::output_bf16(infernix::fp8b128::row_dot(codes, tiles, x, k, e), e, emax);
 }
 
-std::vector<std::uint16_t> oracle(const std::uint8_t* record, const moe::GgmlExpertFormat& f, const std::uint16_t* xv) {
-    const int H = moe::kHidden, I = moe::kIntermediate;
+std::vector<std::uint16_t> oracle(const std::uint8_t* record, const moe::GgmlExpertFormat& f, const std::uint16_t* xv,
+                                  const moe::Geometry& geometry = moe::kDefaultGeometry) {
+    const int H = geometry.hidden, I = geometry.intermediate;
     int ex = 0;
     if (f.gate_up == QType::FP8_E4M3FN_B128) { // fp8_exact.h's scalar reference
         const auto x = encode(xv, H, ex);
@@ -118,7 +129,8 @@ std::vector<std::uint16_t> oracle(const std::uint8_t* record, const moe::GgmlExp
     for (int i = 0; i < I; ++i) {
         const auto yg = ggml::output_bf16(row_dot(f.gate_up, record + static_cast<std::size_t>(i) * f.gate_row_bytes, x.data(), H), ex, f.gate_up);
         const auto yu = ggml::output_bf16(row_dot(f.gate_up, record + static_cast<std::size_t>(I + i) * f.gate_row_bytes, x.data(), H), ex, f.gate_up);
-        h[static_cast<std::size_t>(i)] = canon::swiglu_bf16(yg, yu);
+        h[static_cast<std::size_t>(i)] = geometry.swiglu_limit > 0.0F ? canon::swiglu_bf16_clamped(yg, yu, geometry.swiglu_limit)
+                                                                       : canon::swiglu_bf16(yg, yu);
     }
     int eh = 0;
     const auto hx = encode(h.data(), I, eh);
@@ -136,13 +148,13 @@ std::uint16_t bf16(float f) {
     return static_cast<std::uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
 }
 
-void run(QType gu, QType down, std::mt19937& rng) {
-    const int H = moe::kHidden, I = moe::kIntermediate;
+void run(QType gu, QType down, std::mt19937& rng, const moe::Geometry& geometry = moe::kDefaultGeometry) {
+    const int H = geometry.hidden, I = geometry.intermediate;
     const bool fp8 = gu == QType::FP8_E4M3FN_B128;
     const moe::GgmlExpertFormat f{.gate_up = gu, .down = down,
                                   .gate_row_bytes = fp8 ? static_cast<std::uint32_t>(H) : row_bytes(gu, H),
                                   .down_row_bytes = fp8 ? static_cast<std::uint32_t>(I) : row_bytes(down, I)};
-    if (!moe::ggml_cpu_supported(f)) {
+    if (!moe::ggml_cpu_supported(f, geometry)) {
         std::fprintf(stderr, "FAIL: pair (%d, %d) is not supported\n", static_cast<int>(gu), static_cast<int>(down));
         ++g_failures;
         return;
@@ -168,7 +180,9 @@ void run(QType gu, QType down, std::mt19937& rng) {
     }
     x[static_cast<std::size_t>(7) * H + 123] = 0x7F80; // +inf: column 7's outputs are NaN
     std::vector<std::vector<std::uint16_t>> expected;
-    for (int c = 0; c < moe::kMaxColumns; ++c) { expected.push_back(oracle(record.data(), f, x.data() + static_cast<std::size_t>(c) * H)); }
+    for (int c = 0; c < moe::kMaxColumns; ++c) {
+        expected.push_back(oracle(record.data(), f, x.data() + static_cast<std::size_t>(c) * H, geometry));
+    }
     const moe::CpuIsa isas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni};
     for (const auto isa : isas) {
         if (!moe::cpu_isa_supported(isa) || (!g_only_isa.empty() && g_only_isa != moe::cpu_isa_name(isa))) { continue; }
@@ -182,7 +196,7 @@ void run(QType gu, QType down, std::mt19937& rng) {
                 xp[c] = x.data() + static_cast<std::size_t>(first + c) * H;
                 yp[c] = y.data() + static_cast<std::size_t>(c) * H;
             }
-            moe::ggml_expert_forward(isa, record.data(), f, ncols, xp, yp);
+            moe::ggml_expert_forward(isa, record.data(), f, ncols, xp, yp, geometry);
             std::size_t bad = 0;
             for (int c = 0; c < ncols; ++c) {
                 for (int r = 0; r < H; ++r) {
@@ -205,7 +219,7 @@ void run(QType gu, QType down, std::mt19937& rng) {
     std::uint16_t* yp[1] = {y.data()};
     const auto t0 = std::chrono::steady_clock::now();
     constexpr int kRepeats = 20;
-    for (int i = 0; i < kRepeats; ++i) { moe::ggml_expert_forward(best, record.data(), f, 1, xp, yp); }
+    for (int i = 0; i < kRepeats; ++i) { moe::ggml_expert_forward(best, record.data(), f, 1, xp, yp, geometry); }
     const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / kRepeats;
     std::printf("pair (%d, %d): %.0f us per expert on one %s thread (%.2f GB/s)\n", static_cast<int>(gu),
                 static_cast<int>(down), us, moe::cpu_isa_name(best), static_cast<double>(record.size()) / us / 1e3);
@@ -213,9 +227,9 @@ void run(QType gu, QType down, std::mt19937& rng) {
 
 // The worker team's GGUF route (CpuExpertTeam::work_ggml) against ggml_expert_forward: three jobs of
 // one, two and three columns at 1, 3 and 16 workers.
-void check_team_ggml(std::mt19937& rng) {
-    const int H = moe::kHidden, I = moe::kIntermediate;
-    const QType gu = QType::GGML_IQ2_S, down = QType::GGML_IQ4_NL;
+void check_team_ggml(std::mt19937& rng, QType gu = QType::GGML_IQ2_S, QType down = QType::GGML_IQ4_NL,
+                     const moe::Geometry& geometry = moe::kDefaultGeometry) {
+    const int H = geometry.hidden, I = geometry.intermediate;
     const moe::GgmlExpertFormat f{.gate_up = gu, .down = down, .gate_row_bytes = row_bytes(gu, H), .down_row_bytes = row_bytes(down, I)};
     const std::size_t record = 2ULL * I * f.gate_row_bytes + static_cast<std::size_t>(H) * f.down_row_bytes;
     constexpr int kJobs = 3, kCols = 3;
@@ -236,10 +250,11 @@ void check_team_ggml(std::mt19937& rng) {
             xp[c] = x.data() + static_cast<std::size_t>(c) * H;
             yp[c] = want.data() + at(j, c);
         }
-        moe::ggml_expert_forward(moe::best_cpu_isa(), bank.data() + j * record, f, j + 1, xp, yp);
+        moe::ggml_expert_forward(moe::best_cpu_isa(), bank.data() + j * record, f, j + 1, xp, yp, geometry);
     }
     for (const int workers : {1, 3, 16}) {
-        moe::CpuExpertTeam team({.workers = workers, .max_jobs = kJobs, .activation = moe::ExpertActivation::kA16, .ggml = true});
+        moe::CpuExpertTeam team(
+            {.workers = workers, .max_jobs = kJobs, .activation = moe::ExpertActivation::kA16, .ggml = true, .geometry = geometry});
         std::vector<std::uint16_t> got(want.size(), 0);
         std::vector<moe::CpuExpertJob> jobs(kJobs);
         for (int j = 0; j < kJobs; ++j) {
@@ -339,6 +354,11 @@ int main(int argc, char** argv) {
         for (const auto& [gu, down] : pairs) { run(gu, down, rng); }
         run(QType::FP8_E4M3FN_B128, QType::FP8_E4M3FN_B128, rng); // block-FP8 banks (cpu/fp8_expert.h)
         check_team_ggml(rng);
+        const moe::Geometry glm = moe::kGeometries[1];
+        const std::pair<QType, QType> glm_pairs[] = {{QType::GGML_Q4_K, QType::GGML_Q3_K}, {QType::GGML_Q3_K, QType::GGML_Q3_K},
+                                                     {QType::GGML_Q3_K, QType::GGML_Q2_K}, {QType::GGML_Q2_K, QType::GGML_Q2_K}};
+        for (const auto& [gu, down] : glm_pairs) { run(gu, down, rng, glm); }
+        check_team_ggml(rng, QType::GGML_Q3_K, QType::GGML_Q2_K, glm);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "error: %s\n", error.what());
         return 1;

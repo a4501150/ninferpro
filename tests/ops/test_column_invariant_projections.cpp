@@ -6,6 +6,11 @@
 //   tile boundaries and the slicing of wider calls;
 // - it does not change when every other column changes;
 // - every column of the widest call equals that column projected alone.
+//
+// It also checks the decode widths of GLM-5.3-Flash's registered Q8 problems under A16Only: a model
+// whose request may not depend on how many rows share a decode round takes its T <= 8 routes from
+// one bit class, so column 0's bits are one value at T = 1..8. The activations there have full
+// mantissas over several binades, so the FP32 sums round and two accumulation orders differ.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -25,6 +30,7 @@
 #include <functional>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -257,6 +263,62 @@ int check_head(QType qtype, const char* format) {
                   }});
 }
 
+// Full-mantissa BF16 values over several binades: FP32 sums of their products round, so two
+// accumulation orders give different bits.
+std::vector<std::uint16_t> rough_activation(std::int32_t k, std::int32_t columns, std::uint32_t seed) {
+    std::vector<std::uint16_t> out(static_cast<std::size_t>(k) * columns);
+    std::uint32_t state = seed;
+    for (auto& v : out) {
+        state = state * 1664525U + 1013904223U;
+        const auto mantissa = static_cast<std::uint16_t>((state >> 9) & 0x7FU);
+        const auto exponent = static_cast<std::uint16_t>(120U + ((state >> 16) % 12U));
+        v = static_cast<std::uint16_t>(((state >> 31) << 15) | (exponent << 7) | mantissa);
+    }
+    return out;
+}
+
+// Column 0 of a projection at T = 1..8 on order-sensitive activations.
+int check_decode_class(const Projection& p) {
+    const std::vector<std::uint16_t> x     = rough_activation(p.input_rows, 8, 0x1234U);
+    const std::vector<std::uint16_t> first = column_bits(p, run(p, x, 1), 0);
+    int failures                           = 0;
+    for (std::int32_t width = 2; width <= 8; ++width) {
+        if (column_bits(p, run(p, x, width), 0) != first) {
+            std::cerr << p.name << ": column 0 changes at width " << width << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+// GLM-5.3-Flash's Q8 problems (KDA, MLA, dense MLP, shared expert), whole and in row parts.
+int check_q8_decode_classes() {
+    constexpr auto kA16 = ops::LinearPolicy::A16Only;
+    int failures        = 0;
+    const std::pair<std::int32_t, std::int32_t> shapes[] = {{4096, 2048}, {4096, 4096},  {4096, 8192}, {4096, 12288},
+                                                            {4096, 16384}, {16384, 1536}, {24576, 4096}};
+    for (const auto& [n, k] : shapes) {
+        DeviceWeight w(QType::Q8_G32_FP16, n, k, 91U);
+        failures += check_decode_class({"Q8 decode [" + std::to_string(n) + "," + std::to_string(k) + "]", k, {n},
+                                        [&](const Tensor& x, std::vector<Tensor>& out, WorkspaceArena& ws) {
+                                            ops::linear(x, w.weight, out[0], kA16, ws, nullptr);
+                                        }});
+    }
+    const std::tuple<std::int32_t, std::int32_t, std::int32_t> packed[] = {{24576, 4096, 3}, {24576, 4096, 2}, {4096, 4096, 2}};
+    for (const auto& [n, k, count] : packed) {
+        DeviceWeight w(QType::Q8_G32_FP16, n, k, 93U);
+        failures += check_decode_class(
+            {"Q8 decode rows [" + std::to_string(n) + "," + std::to_string(k) + "]/" + std::to_string(count), k,
+             std::vector<std::int32_t>(static_cast<std::size_t>(count), n / count),
+             [&](const Tensor& x, std::vector<Tensor>& out, WorkspaceArena& ws) {
+                 std::vector<Tensor*> parts;
+                 for (auto& part : out) { parts.push_back(&part); }
+                 ops::linear_rows(x, w.weight, parts, kA16, ws, nullptr);
+             }});
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -272,6 +334,7 @@ int main() {
         failures += check_head(QType::FP8_E4M3FN_ROW_BF16, "FP8");
         failures += check_head(QType::Q8_G32_FP16, "Q8");
         failures += check_gating();
+        failures += check_q8_decode_classes();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " column-invariant projections\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

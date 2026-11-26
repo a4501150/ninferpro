@@ -176,19 +176,29 @@ NVFP4_EXPERT_RG16_V1 = Layout(
     frozenset(("nvfp4_mul",)),
 )
 
-GGML_ROWS_V1 = Layout("ggml_rows_v1", 256, frozenset(GGML_FORMATS))
+# The expert-only K-quants (GLM-5.3-Flash's banks) have no dense route.
+GGML_EXPERT_ONLY_FORMATS = frozenset(("ggml_q2_k", "ggml_q3_k"))
+GGML_ROWS_V1 = Layout("ggml_rows_v1", 256, frozenset(GGML_FORMATS) - GGML_EXPERT_ONLY_FORMATS)
 
 # The dense formats the tiled narrow kernels decode (ops/ggml/ggml_linear.cu, 256-element blocks).
 GGML_TILES16_FORMATS = frozenset(("ggml_q4_k", "ggml_q5_k", "ggml_q6_k", "ggml_iq4_xs"))
 GGML_TILES16_V1 = Layout("ggml_tiles16_v1", 256, GGML_TILES16_FORMATS)
 
 # Expert banks of GGUF formats: the layout names the down matrices' format; the bank's own format
-# is the gate/up format.
+# is the gate/up format (the pairs the engine's expert kernels serve: Qwen3.8-Flash-Next's IQ banks,
+# GLM-5.3-Flash's K-quant banks).
 _GGML_EXPERT_GATE_UP = frozenset(("ggml_iq2_s", "ggml_iq3_xxs", "ggml_iq3_s", "ggml_iq4_xs"))
 GGML_EXPERT_IQ4_NL_V1 = Layout("ggml_expert_iq4_nl_v1", EXPERT_RECORD_ALIGNMENT, _GGML_EXPERT_GATE_UP)
 GGML_EXPERT_Q2_0_V1 = Layout("ggml_expert_q2_0_v1", EXPERT_RECORD_ALIGNMENT, _GGML_EXPERT_GATE_UP)
+GGML_EXPERT_Q3_K_V1 = Layout("ggml_expert_q3_k_v1", EXPERT_RECORD_ALIGNMENT, frozenset(("ggml_q4_k", "ggml_q3_k")))
+GGML_EXPERT_Q2_K_V1 = Layout("ggml_expert_q2_k_v1", EXPERT_RECORD_ALIGNMENT, frozenset(("ggml_q3_k", "ggml_q2_k")))
 GGML_EXPERT_DOWN_FORMATS = MappingProxyType(
-    {GGML_EXPERT_IQ4_NL_V1.name: "ggml_iq4_nl", GGML_EXPERT_Q2_0_V1.name: "ggml_q2_0"}
+    {
+        GGML_EXPERT_IQ4_NL_V1.name: "ggml_iq4_nl",
+        GGML_EXPERT_Q2_0_V1.name: "ggml_q2_0",
+        GGML_EXPERT_Q3_K_V1.name: "ggml_q3_k",
+        GGML_EXPERT_Q2_K_V1.name: "ggml_q2_k",
+    }
 )
 
 FP8_EXPERT_B128_V1 = Layout("fp8_expert_b128_v1", EXPERT_RECORD_ALIGNMENT, frozenset(("fp8_e4m3fn_b128",)))
@@ -206,6 +216,8 @@ LAYOUTS = MappingProxyType(
             GGML_TILES16_V1,
             GGML_EXPERT_IQ4_NL_V1,
             GGML_EXPERT_Q2_0_V1,
+            GGML_EXPERT_Q3_K_V1,
+            GGML_EXPERT_Q2_K_V1,
             FP8_EXPERT_B128_V1,
         )
     }

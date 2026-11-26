@@ -23,8 +23,7 @@ def _random_blocks(fmt: ggml.GgmlType, blocks: int, rng: np.random.Generator) ->
     # Finite binary16 scales of moderate magnitude.
     words = (rng.integers(0, 1 << 10, size=(blocks, 2)) | (rng.integers(5, 21, size=(blocks, 2)) << 10)
              | (rng.integers(0, 2, size=(blocks, 2)) << 15)).astype("<u2")
-    offsets = [208] if fmt is ggml.Q6_K else [0, 2] if fmt.has_min else [0]
-    for i, offset in enumerate(offsets):
+    for i, offset in enumerate(ggml.scale_offsets(fmt)):
         data[:, offset : offset + 2] = words[:, i : i + 1].view(np.uint8).reshape(blocks, 2)
     return data
 
@@ -54,8 +53,7 @@ def test_non_finite_scales_are_rejected(name):
     k = fmt.block_elems * 2
     raw = _random_blocks(fmt, 3 * 2, rng)
     ggml.require_finite_scales(fmt, raw, 3, k, "finite")
-    offsets = [208] if fmt is ggml.Q6_K else [0, 2] if fmt.has_min else [0]
-    for offset in offsets:
+    for offset in ggml.scale_offsets(fmt):
         for word in (0x7C00, 0xFE00):  # +inf, a NaN
             bad = raw.copy()
             bad[5, offset : offset + 2] = np.array([word], "<u2").view(np.uint8)

@@ -218,7 +218,7 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
         demand.headroom    = options.vram_headroom_bytes;
         demand.graphs      = device_plan.graph_bound;
         demand.fixed       = dense + device_plan.fixed_bytes();
-        demand.frame_bytes = device_plan.expert_record_stride;
+        demand.frame_bytes = device_plan.expert_frame_bytes; // an average frame of the per-size pools
         demand.max_frames  = device_plan.max_frames;
         return offload::size_expert_frames(snapshot, demand);
     };
@@ -233,7 +233,7 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
     const offload::StartupPlacement placement = offload::resolve_startup_placement({
         .layers           = layers,
         .experts          = experts,
-        .stride           = device_plan.expert_record_stride,
+        .stride           = device_plan.expert_frame_bytes, // an average record (the sizing unit)
         .expert_banks     = demand.expert_banks,
         .experts_spec     = options.experts_spec,
         .expert_placement = options.expert_placement_path,
@@ -329,7 +329,7 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
     StartupPhaseScope program_phase(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program = std::make_unique<glm::Program>(instance->parameters, device, std::move(program_options));
     const offload::VramSizing& sizing = instance->program->vram_sizing();
-    const std::uint64_t frames_bytes  = static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_record_stride;
+    const std::uint64_t frames_bytes  = static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_frame_bytes;
     const std::uint64_t after_startup = vram->query().device_free;
     {
         const double gib = static_cast<double>(1ULL << 30);

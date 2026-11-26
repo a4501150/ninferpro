@@ -62,9 +62,9 @@ commit from Infernix commit `accbd1e3` ([Wallawalla47/Infernix](https://github.c
     thinking and the turn cannot end there; the thinking-recovery machinery is gone;
   - no spill detection without a WDDM budget (Linux allocations are VRAM-or-fail);
   - the GLM-5.3-Flash family (`glm5_next`, docs/maintainer/glm5_3-flash-design.md): KDA, sparse
-    MLA with the pooled indexer, mHC and NVFP4 experts on the shared three-tier placement, DFlash2
-    drafting, causal scoring, and a prefix cache of its own index (chunk-grid taps and the
-    zero-token resume, `--host-context-mib` default 2 GiB); image and video prompts
+    MLA with the pooled indexer, mHC and NVFP4 or GGUF K-quant experts on the shared three-tier
+    placement, DFlash2 drafting, causal scoring, and a prefix cache of its own index (chunk-grid
+    taps and the zero-token resume, `--host-context-mib` default 2 GiB); image and video prompts
     (`--vision`; `--vision-offload` streams the tower from pinned RAM, shared with
     Qwen3.8-Flash-Next through `src/models/common/vision/`).
 

@@ -8,10 +8,12 @@
 #include "models/registry.h"
 
 #include "core/device.h"
+#include "core/ggml_format.h"
 
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <utility>
 
 namespace infernix::models::glm5_next {
@@ -457,14 +459,34 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             bind_vision(bindings, *out->config.vision,
                         options.overlay_vision() ? Residency::HostPinned : Residency::Device);
     }
-    for (std::size_t i = out->config.text.dense_layers; i < out->weights.layers.size(); ++i) {
-        for (const auto& part : bindings.weights.at(moe_of(out->weights.layers[i]).experts.index).reference.binding.parts) {
-            const auto& tensor = reader.directory().tensor(part.object);
-            const auto g = weight_geometry(artifact::parse_format(tensor.format),
-                                           artifact::parse_layout(tensor.layout), tensor.shape);
-            if (g.layout != QuantLayout::ExpertRg16 || g.format != QType::NVFP4_MUL) {
-                throw ArtifactError("Glm5Next: routed experts must be nvfp4_mul banks in nvfp4_expert_rg16_v1");
+    {
+        // One bank kind for every layer: NVFP4 (nvfp4_mul in nvfp4_expert_rg16_v1), or a GGUF
+        // import's ggml banks, whose record strides differ by layer.
+        auto& text = out->config.text;
+        std::optional<bool> ggml;
+        std::uint64_t stride_sum = 0;
+        for (std::size_t i = text.dense_layers; i < out->weights.layers.size(); ++i) {
+            for (const auto& part : bindings.weights.at(moe_of(out->weights.layers[i]).experts.index).reference.binding.parts) {
+                const auto& tensor = reader.directory().tensor(part.object);
+                const auto g = weight_geometry(artifact::parse_format(tensor.format),
+                                               artifact::parse_layout(tensor.layout), tensor.shape);
+                const bool k = is_ggml_expert_layout(g.layout);
+                if (!k && (g.layout != QuantLayout::ExpertRg16 || g.format != QType::NVFP4_MUL)) {
+                    throw ArtifactError("Glm5Next: routed experts must be nvfp4_mul banks in nvfp4_expert_rg16_v1 or "
+                                        "ggml expert banks");
+                }
+                if (ggml && *ggml != k) { throw ArtifactError("Glm5Next: every layer's expert bank must be of one kind"); }
+                ggml = k;
+                if (k) {
+                    text.expert_frame_stride = std::max(text.expert_frame_stride, g.record_stride);
+                    stride_sum += g.record_stride;
+                }
             }
+        }
+        text.ggml_experts = ggml.value_or(false);
+        if (text.ggml_experts) {
+            const std::uint64_t layers = text.moe_layers();
+            text.expert_frame_bytes    = (stride_sum + layers - 1) / layers;
         }
     }
     {
@@ -560,10 +582,14 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         if (streamed) {
             const auto object  = data->pending.at(experts.index).reference.binding.parts.front().object;
             const auto& parent = *view.parts.front().parent;
-            std::vector<float> words(parent.geometry.scale_bytes / sizeof(float));
-            reader.read_into(artifact::object_offset(reader.directory().object(object)) + parent.geometry.scale_offset,
-                             std::as_writable_bytes(std::span(words)));
-            bank.planes = expert_bank_layout(parent.geometry, words.data());
+            // A ggml bank's scales are inside its records: no multiplier tail.
+            std::vector<float> words(is_ggml_expert_layout(parent.geometry.layout) ? 0
+                                                                                  : parent.geometry.scale_bytes / sizeof(float));
+            if (!words.empty()) {
+                reader.read_into(artifact::object_offset(reader.directory().object(object)) + parent.geometry.scale_offset,
+                                 std::as_writable_bytes(std::span(words)));
+            }
+            bank.planes = expert_bank_layout(parent.geometry, words.empty() ? nullptr : words.data());
             bank_objects.push_back(object);
             bank_strides.push_back(bank.planes.record_stride);
             multipliers.push_back(std::move(words));
@@ -574,7 +600,12 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             bank.planes.intermediate != c.moe.intermediate) {
             throw ArtifactError("expert bank geometry differs from the text config");
         }
-        bank.scales = a16_expert_scales(bank.planes, bound.at(experts.index).name);
+        if ((bank.planes.gate_up_format != QType::NVFP4_MUL) != c.ggml_experts) {
+            throw ArtifactError(bound.at(experts.index).name + ": expert bank kind differs from the plan's");
+        }
+        // A ggml bank runs exact A16 over its records' own block scales (ops/ggml/ggml_exact.h): no scalars.
+        bank.scales = c.ggml_experts ? std::vector<ops::offloaded_moe::ExpertScales>(bank.planes.experts)
+                                     : a16_expert_scales(bank.planes, bound.at(experts.index).name);
         banks.push_back(std::move(bank));
     }
     std::optional<offload::ExpertStore> store;

@@ -175,8 +175,9 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="SHARD",
-        help="Qwen4Exp: import the weights bit-exactly from these GGUF shards (all of one split model); "
-        "--model then supplies the config, frontend resources and, with the mtp component, the MTP head",
+        help="Qwen4Exp or Glm5Next: import the weights bit-exactly from these GGUF shards (all of one split "
+        "model); --model then supplies the config, frontend resources and the tensors the GGUF lacks "
+        "(Qwen4Exp's MTP head, Glm5Next's vision tower)",
     )
     parser.add_argument(
         "--mmproj",
@@ -219,9 +220,8 @@ def main(argv=None):
             )
         gguf_store = None
         if args.gguf:
-            if not qwen4:
-                raise ValueError("--gguf imports Qwen4Exp GGUFs; --model must be its Qwen checkpoint")
-            from . import qwen4_exp_gguf
+            if not (qwen4 or glm):
+                raise ValueError("--gguf imports Qwen4Exp or Glm5Next GGUFs; --model must be its checkpoint")
             from .sources.gguf_raw import GgufStore
 
             gguf_store = stack.enter_context(GgufStore(args.gguf))
@@ -237,15 +237,23 @@ def main(argv=None):
             family = glm5_next if glm else qwen4_exp
             model = family.build_dflash2_companion(base, sources["dflash2"])
         elif glm:
-            if gguf_store is not None or args.ngram_out is not None or args.ngram_reuse is not None:
-                raise ValueError("Glm5Next converts from its safetensors checkpoint; no GGUF or n-gram options apply")
-            model = glm5_next.build_model(base, components=components, resource_overrides=overrides)
+            if mmproj is not None or args.ngram_out is not None or args.ngram_reuse is not None:
+                raise ValueError("Glm5Next takes no mmproj or n-gram options")
+            if gguf_store is not None:
+                from . import glm5_next_gguf
+
+                model = glm5_next_gguf.build_model(base, gguf_store, components=components,
+                                                   resource_overrides=overrides)
+            else:
+                model = glm5_next.build_model(base, components=components, resource_overrides=overrides)
         elif qwen4:
             # A BF16 volume (tools/flash_next/ngram_bf16.py) binds the table as its unquantized rows.
             ngram_format = "fp8_e4m3fn"
             if args.ngram_reuse is not None:
                 ngram_format = qwen4_exp.ngram_volume_format(base, args.ngram_reuse)
             if gguf_store is not None:
+                from . import qwen4_exp_gguf
+
                 if ngram_format == "bf16":
                     raise ValueError("a GGUF import binds its own IQ4_NL volume; give it a BF16 volume at run "
                                      "time with --ngram-volume")

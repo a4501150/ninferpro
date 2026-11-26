@@ -14,25 +14,26 @@ namespace infernix::models::glm5_next::detail {
 
 namespace {
 
-// The RAM tier's floor in pinned slots beside its lists: GLM's records are 13.5 MiB, so the
+// The RAM tier's floor in pinned slots beside its lists: GLM's records are 8-13.5 MiB, so the
 // floor is in hundreds of slots, not the thousands of a smaller expert.
 constexpr std::uint32_t kMinTierSlots = 64;
 
 } // namespace
 
 void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64_t& allocated) {
+    // A GGUF import's banks differ in record stride by layer (the residency's per-size pools);
+    // NVFP4 banks share one.
     const auto& banks = parameters_.model.expert_banks();
     std::vector<const std::uint8_t*> records;
+    std::vector<std::uint64_t> host_strides;
     std::uint64_t record_stride = 0;
     for (const auto& bank : banks) {
         records.push_back(reinterpret_cast<const std::uint8_t*>(bank.planes.device_records));
-        if (record_stride != 0 && bank.planes.record_stride != record_stride) {
-            throw std::logic_error("Glm5Next: the expert banks' record strides differ");
-        }
-        record_stride = bank.planes.record_stride;
+        host_strides.push_back(bank.planes.record_stride);
+        record_stride = std::max(record_stride, bank.planes.record_stride);
     }
     if (record_stride != plan_.bytes.expert_record_stride) {
-        throw std::logic_error("Glm5Next: the expert banks' record stride differs from their format's");
+        throw std::logic_error("Glm5Next: the expert banks' largest record stride differs from the device plan's");
     }
 
     offload::ExpertPlacementRuntime::Options placement = options_.placement;
@@ -83,7 +84,7 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
     allocate(staging_, plan_.staging, allocated);
     experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
     experts.staging_slots = plan_.staging_slots;
-    residency_            = &placement_->create_residency(std::move(records), record_stride, columns_, {});
+    residency_            = &placement_->create_residency(std::move(records), record_stride, columns_, std::move(host_strides));
     allocated += plan_.bytes.residency;
 
     CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_stream_, cudaStreamNonBlocking));
@@ -129,7 +130,8 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
         for (const auto& bank : banks) {
             layers.push_back({.records = reinterpret_cast<const std::uint8_t*>(bank.planes.records),
                               .record_stride = bank.planes.record_stride,
-                              .scales        = bank.scales.data()});
+                              .scales        = bank.scales.data(),
+                              .ggml          = ggml_format(bank)});
         }
         const int decode_columns =
             std::max(ops::offloaded_moe::kMaxCpuColumns,
@@ -230,13 +232,13 @@ std::optional<ExpertCacheStats> ProgramImpl::expert_cache_stats(const Lane& lane
 ProgramImpl::StreamBindings ProgramImpl::stream_bindings() const {
     StreamBindings b;
     if (tier_ == nullptr) {
-        std::vector<const std::uint8_t*> banks; // pinned addresses: the stream batches its copies
+        // Pinned addresses (the stream batches its copies) and each bank's own stride.
+        std::vector<std::pair<const std::uint8_t*, std::uint64_t>> banks;
         for (const auto& bank : parameters_.model.expert_banks()) {
-            banks.push_back(reinterpret_cast<const std::uint8_t*>(bank.planes.device_records));
+            banks.emplace_back(reinterpret_cast<const std::uint8_t*>(bank.planes.device_records), bank.planes.record_stride);
         }
-        b.record_of = [banks = std::move(banks), stride = plan_.bytes.expert_record_stride](
-                          std::uint32_t layer, std::uint32_t expert) {
-            return banks[layer] + static_cast<std::size_t>(expert) * stride;
+        b.record_of = [banks = std::move(banks)](std::uint32_t layer, std::uint32_t expert) {
+            return banks[layer].first + static_cast<std::size_t>(expert) * banks[layer].second;
         };
         b.one_allocation = true;
         return b;

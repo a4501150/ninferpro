@@ -203,10 +203,13 @@ DeviceLayout ProgramImpl::plan_device(const ProgramOptions& o, const Config& con
         d.score_io        = align(4 * kScoreIoWords);
     }
 
-    // The expert records: every bank is NVFP4 rg16 at the family's geometry.
+    // The expert records: NVFP4 rg16 at the family's geometry, or a GGUF import's ggml banks (the
+    // largest per-layer record; the expert cache sizes average frames of its per-size pools).
     const std::uint64_t shape[] = {c.moe.experts, c.hidden_size, c.moe.intermediate};
     const std::uint64_t record_stride =
-        weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16, shape).record_stride;
+        c.expert_frame_stride != 0 ? c.expert_frame_stride
+                                   : weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16, shape).record_stride;
+    const std::uint64_t frame_bytes = c.expert_frame_bytes != 0 ? c.expert_frame_bytes : record_stride;
     // The widest decode or verify call: a plain round of every lane, or a one-row verification
     // (only one-row rounds draft, execution.cpp).
     const std::int32_t round_columns = std::min(std::max(d.lanes, d.width), kForkColumns);
@@ -227,6 +230,7 @@ DeviceLayout ProgramImpl::plan_device(const ProgramOptions& o, const Config& con
            d.score_io;
     b.residency            = offload::ExpertResidency::table_bytes(bank_geometry(c), d.columns);
     b.expert_record_stride = record_stride;
+    b.expert_frame_bytes   = frame_bytes;
     b.max_frames           = offload::ExpertResidency::max_frames(bank_geometry(c));
     // One decode graph per batch size; with the drafter, a proposal, verify and context graph per
     // batch size and verify width.

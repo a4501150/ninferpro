@@ -117,7 +117,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         if (!is_ggml(format) || shape.size() != 3 || format == QType::GGML_IQ4_NL || format == QType::GGML_Q2_0 ||
             shape[1] % ggml_block_elems(format) || shape[2] % ggml_block_elems(down)) {
             throw std::invalid_argument(
-                "a ggml expert bank requires an IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS [experts, hidden, intermediate] with whole "
+                "a ggml expert bank requires a 256-element-block [experts, hidden, intermediate] with whole "
                 "blocks on both matrices");
         }
         const auto experts = shape[0], hidden = shape[1], inter = shape[2];

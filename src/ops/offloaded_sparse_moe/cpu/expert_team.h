@@ -55,8 +55,7 @@ public:
         ExpertActivation activation = ExpertActivation::kA4; // of every job's expert
         bool ggml = false; // jobs may be GGUF records (ggml_expert.h; activation kA16)
         std::vector<int> cpus;         // optional: CPU of worker i (worker 0 is the caller, not pinned)
-        // The record geometry of the non-ggml jobs (expert_layout.h); A4 jobs and ggml records
-        // are the default geometry's.
+        // The record geometry of every job (expert_layout.h); A4 jobs are the default geometry's.
         Geometry geometry = kDefaultGeometry;
     };
 

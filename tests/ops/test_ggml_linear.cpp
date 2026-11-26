@@ -11,7 +11,9 @@
 // input permutation, into one output or split among several (ggml_split_segments). The
 // ggml-bf16-prefill route (run_bf16) is checked against a binary64 reference within an FP32-sum
 // bound instead. The row gathers must return each element's decoded value (exact in binary32)
-// rounded once to BF16.
+// rounded once to BF16. The expert-only K-quants (Q2_K, Q3_K; ggml_linear has no route for them) are
+// checked on the host: ggml_exact.h's row_dot, which the offloaded experts' GPU and CPU routes
+// reproduce bit for bit, against the same oracle.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -19,6 +21,7 @@
 #include "infernix/ops/ggml_linear.h"
 #include "infernix/ops/ggml_rows.h"
 #include "ops/common/canonical_math.h"
+#include "ops/ggml/ggml_exact.h"
 #include "ops/ggml/ggml_tables.h"
 
 #include <cmath>
@@ -102,6 +105,57 @@ void decode_block(QType q, const std::uint8_t* b, double* y) {
                 y[64 * ch + l]      = d * sc1 * lo - dmin * m1;
                 y[64 * ch + 32 + l] = d * sc2 * hi - dmin * m2;
             }
+        }
+        break;
+    }
+    case QType::GGML_Q2_K: { // block_q2_K: scales[16], qs[64], d, dmin
+        const double d = f16(u16(b + 80)), dmin = f16(u16(b + 82));
+        const std::uint8_t* q = b + 16;
+        double* out = y;
+        int is      = 0;
+        for (int n = 0; n < 256; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                int sc = b[is++];
+                double dl = d * (sc & 0xF), ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l) { *out++ = dl * ((q[l] >> shift) & 3) - ml; }
+                sc = b[is++];
+                dl = d * (sc & 0xF);
+                ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l) { *out++ = dl * ((q[l + 16] >> shift) & 3) - ml; }
+                shift += 2;
+            }
+            q += 32;
+        }
+        break;
+    }
+    case QType::GGML_Q3_K: { // block_q3_K: hmask[32], qs[64], scales[12], d
+        const std::uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+        std::uint32_t aux[4];
+        std::memcpy(aux, b + 96, 12);
+        const std::uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        const auto* scales = reinterpret_cast<const std::int8_t*>(aux);
+        const double d_all = f16(u16(b + 108));
+        const std::uint8_t* q  = b + 32;
+        const std::uint8_t* hm = b;
+        std::uint8_t m = 1;
+        double* out = y;
+        int is      = 0;
+        for (int n = 0; n < 256; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                double dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) { *out++ = dl * (((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)); }
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) { *out++ = dl * (((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4)); }
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
         }
         break;
     }
@@ -273,6 +327,11 @@ std::vector<std::uint8_t> random_blocks(QType q, int rows, int k, std::mt19937& 
         std::uint8_t* b = data.data() + static_cast<std::size_t>(i) * size;
         if (q == QType::GGML_Q6_K) {
             scale(b + 208);
+        } else if (q == QType::GGML_Q2_K) {
+            scale(b + 80);
+            scale(b + 82);
+        } else if (q == QType::GGML_Q3_K) {
+            scale(b + 108);
         } else {
             scale(b);
             if (q == QType::GGML_Q4_K || q == QType::GGML_Q5_K) { scale(b + 2); }
@@ -341,6 +400,30 @@ std::vector<std::uint16_t> oracle(QType q, const std::vector<std::uint8_t>& weig
     std::vector<std::uint16_t> out(bits.size());
     for (std::size_t i = 0; i < bits.size(); ++i) { out[i] = static_cast<std::uint16_t>(bits[i]); }
     return out;
+}
+
+// ggml_exact.h's row_dot and output rounding (the offloaded experts' arithmetic) against the oracle.
+template <QType F>
+void run_exact_host(int rows, int k, int columns, std::mt19937& rng, Scales scales) {
+    const auto weights = random_blocks(F, rows, k, rng, scales);
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(k) * columns);
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    for (auto& v : x) { v = bf16_rne(n(rng)); }
+    const auto expected = oracle(F, weights, rows, k, x, columns, nullptr, 1);
+    const int row_bytes = k / static_cast<int>(ggml_block_elems(F)) * static_cast<int>(ggml_block_bytes(F));
+    std::size_t bad = 0;
+    for (int t = 0; t < columns; ++t) {
+        const std::uint16_t* col = x.data() + static_cast<std::size_t>(t) * k;
+        const int emax = ops::canon::a16_column_exponent(col, k);
+        std::vector<std::int32_t> xs(static_cast<std::size_t>(k));
+        for (int j = 0; j < k; ++j) { xs[static_cast<std::size_t>(j)] = ops::canon::a16_value(col[j], emax); }
+        for (int r = 0; r < rows; ++r) {
+            const ggml::I128 sum = ggml::row_dot<F>(weights.data() + static_cast<std::size_t>(r) * row_bytes, xs.data(), k);
+            bad += ggml::output_bf16(sum, emax, F) != expected[static_cast<std::size_t>(t) * rows + r];
+        }
+    }
+    check(bad == 0, "ggml_exact row_dot format " + std::to_string(static_cast<int>(F)) + " k " + std::to_string(k) + ": " +
+                        std::to_string(bad) + " outputs differ");
 }
 
 void run_linear(QType q, int rows, int k, int columns, bool permute, std::mt19937& rng, bool wide_range = false,
@@ -1031,6 +1114,12 @@ int main(int argc, char** argv) {
             run_linear(q, 67, k, 72, false, rng, true);
         }
         run_linear(QType::GGML_Q6_K, 64, 6144, 40, false, rng, false, Scales::Narrow, true); // at the int64 bound
+        // The GLM-5.3-Flash experts' K-quants (K = 4096 gate/up, 2048 down) in ggml_exact.h.
+        for (const Scales scales : {Scales::Narrow, Scales::Wide, Scales::Wider, Scales::Edge}) {
+            run_exact_host<QType::GGML_Q2_K>(24, 4096, 3, rng, scales);
+            run_exact_host<QType::GGML_Q3_K>(24, 4096, 3, rng, scales);
+            run_exact_host<QType::GGML_Q4_K>(24, 2048, 3, rng, scales);
+        }
         // Projections of two formats (the mixed verification launch, and per-format launches otherwise).
         const std::pair<QType, QType> mixed[] = {{QType::GGML_Q6_K, QType::GGML_IQ4_XS}, {QType::GGML_IQ4_XS, QType::GGML_Q6_K},
                                                  {QType::GGML_Q4_K, QType::GGML_Q6_K},   {QType::GGML_Q5_K, QType::GGML_IQ4_XS},

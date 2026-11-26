@@ -7,6 +7,7 @@
 #include "models/glm5_next/weights.h"
 #include "models/common/vision/overlay_layout.h"
 #include "models/offload/expert_store.h"
+#include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
 #include <memory>
@@ -27,11 +28,21 @@ struct InstanceInfo {
 };
 
 // The routed experts of one MoE layer: the pinned host bank and each expert's stored multipliers.
-// The banks are W4A16 (records without activation scales), so alpha holds the multipliers.
+// NVFP4 banks are W4A16 (records without activation scales), so alpha holds the multipliers; a
+// GGUF import's ggml banks carry their scales in their records (zero scalars).
 struct ExpertBank {
     ExpertBankPlanes planes;
     std::vector<ops::offloaded_moe::ExpertScales> scales; // [experts]
 };
+
+// A GGUF import's bank: its records' ggml formats (invalid for an NVFP4 bank).
+[[nodiscard]] inline ops::offloaded_moe::GgmlExpertFormat ggml_format(const ExpertBank& bank) noexcept {
+    if (bank.planes.gate_up_format == QType::NVFP4_MUL) { return {}; }
+    return {.gate_up        = bank.planes.gate_up_format,
+            .down           = bank.planes.down_format,
+            .gate_row_bytes = static_cast<std::uint32_t>(bank.planes.gate_row_bytes),
+            .down_row_bytes = static_cast<std::uint32_t>(bank.planes.down_row_bytes)};
+}
 
 class LoadPlan;
 

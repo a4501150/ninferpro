@@ -301,6 +301,55 @@ read directly would not.
 W_uk transposed, both BF16, so the absorbed products (§7.1) read one contiguous row per output. The
 converter transposes it once.
 
+### 3.3 The GGUF artifact
+
+[GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF](https://huggingface.co/GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF)
+`Q4/GLM-5.3-Flash-Uncensored-GSQ-RCO-Q4.gguf` (llama.cpp arch `glm5-next`, 1,383 tensors) imports
+bit-exactly: `tools.convert --model <orcarouter snapshot> --gguf <file> --recipe
+glm5_3_flash_gcsa_gsq_q4` (`tools/convert/glm5_next_gguf.py`). Its abliteration is GCSA's, not
+orcarouter's: the plain tensors equal the orcarouter checkpoint's, but the residual-writing
+matrices (`attn_output`, `ffn_down`, the shared expert's down) and the embedding differ.
+
+| Tensor class | GGUF | Artifact |
+|---|---|---|
+| Routed experts, layer 3 | Q4_K gate/up, Q3_K down | `ggml_expert_q3_k_v1` banks, records verbatim (13.0 MB) |
+| Routed experts, layers 4-37 | Q3_K | `ggml_expert_q3_k_v1` (10.8 MB) |
+| Routed experts, layer 38 | Q3_K gate/up, Q2_K down | `ggml_expert_q2_k_v1` (9.96 MB) |
+| Routed experts, layers 39-44 | Q2_K | `ggml_expert_q2_k_v1` (8.26 MB) |
+| KDA q/k/v/o, MLA query up and output, dense MLP, shared expert | Q8_0 | `q8_g32_fp16`, the same codes and scales |
+| `kv_a_mqa`, `k_b`, `v_b`, KDA beta and gate/forget ranks | BF16 | BF16 (`k_b`/`v_b` are already the absorbed blocks of §3.2) |
+| Norms, router, mHC, indexer, `dt_bias`, convolutions | F32 | BF16 where every value is a BF16 value, FP32 where the engine binds FP32; the three KDA kernels fused as §8 reads them |
+| Token embedding | Q8_0 | BF16 rows: d × code rounded once |
+| `lm_head`, MLA `q_a`, KDA `A_log` | Q8_0, Q8_0, A = -exp(A_log) | from the checkpoint (the head and `q_a` BF16, because the head's rows and `q_a`'s packing with the BF16 latent need BF16), each checked against the GGUF: every Q8_0 value within half a step plus its binary16 scale's rounding of the checkpoint's, and -exp(A_log) within one binary32 ulp of A |
+| MTP layer, vision tower | absent | no MTP; the tower from the checkpoint |
+
+The routed experts take 118.1 GiB against the NVFP4 artifact's 159.5 GiB. The experts run the exact
+A16 ggml arithmetic (`src/ops/ggml/ggml_exact.h`; Q2_K's per-16 minimum term reads each column's
+16-element X sums) on the GPU narrow kernels at every width and on the CPU miss lane, so a miss's
+route never changes the bits. The record strides differ by layer, so the expert cache keeps one
+frame pool per stride and gives every layer the same frame count (a switch target rounds down to a
+multiple of 42). The RAM tier sizes every slot at the largest stride (layer 3's 13.0 MB), so it
+holds about 20 % fewer records than its bytes would at the mean stride.
+
+Measured against the NVFP4 artifact (2026-11-26; `infernix_glm5_next_engine_bench --concurrency 1
+--tokens 512 --draft-tokens auto`, ten sets, the GGUF's at the plateau after its cache warms over
+three sets; fresh prompts on `infernix-serve`; `infernix-perplexity` quick corpus, context 8192,
+stride 4096, INT8 KV, 252,823 positions):
+
+| Measurement | NVFP4, `vram=40%` (4,838 experts in VRAM) | GGUF, `vram=59%` (7,098) |
+|---|---|---|
+| Decode, one request, greedy | 48.0 (43.9-52.5) tok/s | 82.8 (80.1-86.9) tok/s, sets 4-10 |
+| Decode, one request, temperature 1 | 47.0 (42.3-48.0), four sets | 75.1 (72.7-80.7), sets 4-10 |
+| Same split for both, `vram=40%`, greedy (four sets) | 46.0 (41.7-47.7) | 49.7 (42.5-50.2) |
+| Prefill, fresh 12.9K and 52.6K-token prompts | 2.46k, 2.45k tok/s | 475, 455 tok/s (≈ 5 × slower: the K-quant banks have no tensor-core wide route at this geometry, so prefill runs the narrow kernels four columns at a time) |
+| Serving process, production flags, three 1,024-token decodes beside a 15.7K prompt and its cached repeat | peak 92,680 MiB | peak 91,984 MiB (91,156 at `vram=58%`) |
+| Perplexity; KL against the NVFP4 artifact | 3.1489 | 3.2541; mean 0.093, median 0.018, p99 1.27, top-1 89.7 % (the KL includes GCSA's different abliteration as well as the 2-3-bit experts) |
+
+A placement switch that shrinks the RAM tier while keeping its records allocates the new pinned
+tier, copies the records and frees the old one on the engine thread: on this artifact (an 86 GiB
+tier to 60 GiB) that held every request for 17 s and more, past the Engine's 30 s queue timeout
+in two of four T2 runs.
+
 ## 4. Ownership in the engine
 
 ### 4.1 The family

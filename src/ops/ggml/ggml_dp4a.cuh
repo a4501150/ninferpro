@@ -12,6 +12,8 @@
 //   P = sub0 * dot(codes[0..16), X) + sub1 * dot(codes[16..32), X)          exact, int64
 //   R += mant(d) * P * 2^(e(d) - 1)  [ - mant(dmin) * min * sum(X) * 2^(e(dmin) - 1) ]
 //
+// (Q2_K's min term is per 16-element half: add_slice_halves takes the halves' X sums.)
+//
 // where each 16-element dot is three dp4a chains over the limbs (|partial| < 2^18), so a slice
 // costs 24 dp4a per column and one int128 addition. Bounds: |sub| <= 127 and |code| <= 127 give
 // |sub * chain| < 2^26 (int32), |P| < 2^42 and |mant * P| < 2^53 (int64).
@@ -64,15 +66,19 @@ __device__ __forceinline__ int store_group(std::int32_t* column, int g, int x0, 
 
 // ------------------------------------------------------------------------------- weight slices
 
-// Formats with a min term (whose slices read the column's slice sums).
+// Formats with a min term per slice (whose slices read the column's slice sums), and per 16-element
+// half (Q2_K: add_slice_halves only).
 template <QType F>
 inline constexpr bool kMin = F == QType::GGML_Q4_K || F == QType::GGML_Q5_K;
+template <QType F>
+inline constexpr bool kMinHalf = F == QType::GGML_Q2_K;
 
 struct Slice {
     int q[8];          // signed byte codes, element 4w + j in byte j of q[w]
     int sub0, sub1;    // sub-scales of elements 0-15 and 16-31
     std::uint16_t d;
-    int min;           // Q4_K/Q5_K: the slice's min sub-scale (0 otherwise)
+    int min;           // Q4_K/Q5_K: the slice's min sub-scale; Q2_K: elements 0-15's (0 otherwise)
+    int min1;          // the min sub-scale of elements 16-31 (Q4_K/Q5_K: min)
     std::uint16_t dmin;
 };
 
@@ -150,6 +156,7 @@ template <QType F>
 __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
     Slice o;
     o.min  = 0;
+    o.min1 = 0;
     o.dmin = 0;
     if constexpr (F == QType::GGML_Q2_0) {
         const std::uint8_t* b = row + (s / 2) * 18;
@@ -202,13 +209,45 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
         int sc, m;
         scale_min_k4(sb, b + 4, sc, m);
         o.sub0 = o.sub1 = sc;
-        o.min           = m;
+        o.min = o.min1  = m;
         const std::uint8_t* qs = b + (F == QType::GGML_Q4_K ? 16 : 48) + 32 * ch;
 #pragma unroll
         for (int w = 0; w < 8; ++w) {
             std::uint32_t v = (ld_u32_a4(qs + 4 * w) >> shift) & 0x0F0F0F0FU;
             if constexpr (F == QType::GGML_Q5_K) { v |= ((ld_u32_a4(b + 16 + 4 * w) >> sb) & 0x01010101U) << 4; }
             o.q[w] = static_cast<int>(v);
+        }
+    } else if constexpr (F == QType::GGML_Q2_K) {
+        const std::uint8_t* b = row + (s / 8) * 84; // 84-byte blocks: 4-byte aligned in 4-byte aligned rows
+        const int sb = s % 8, half = sb / 4, plane = sb % 4;
+        o.d    = static_cast<std::uint16_t>(ld_u16(b + 80));
+        o.dmin = static_cast<std::uint16_t>(ld_u16(b + 82));
+        const std::uint32_t scales = ld_u16(b + 8 * half + 2 * plane);
+        o.sub0 = static_cast<int>(scales & 0xFU);
+        o.min  = static_cast<int>((scales >> 4) & 0xFU);
+        o.sub1 = static_cast<int>((scales >> 8) & 0xFU);
+        o.min1 = static_cast<int>(scales >> 12);
+        const std::uint8_t* qs = b + 16 + 32 * half;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) { o.q[w] = static_cast<int>((ld_u32_a4(qs + 4 * w) >> (2 * plane)) & 0x03030303U); }
+    } else if constexpr (F == QType::GGML_Q3_K) {
+        const std::uint8_t* b = row + (s / 8) * 110;
+        const int sb = s % 8, half = sb / 4, plane = sb % 4;
+        o.d = static_cast<std::uint16_t>(ld_u16(b + 108));
+        const int is = 8 * half + 2 * plane;
+        const auto sub = [&](int i) {
+            return (((b[96 + i % 8] >> (4 * (i / 8))) & 0xF) | (((b[104 + i % 4] >> (2 * (i / 4))) & 3) << 4)) - 32;
+        };
+        o.sub0 = sub(is);
+        o.sub1 = sub(is + 1);
+        std::uint32_t qw[8], hw[8];
+        ld_words_a2<8>(b + 32 + 32 * half, qw);
+        ld_words_a2<8>(b, hw);
+        const int bit = 4 * half + plane;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            const std::uint32_t q = (qw[w] >> (2 * plane)) & 0x03030303U, h = (hw[w] >> bit) & 0x01010101U;
+            o.q[w] = sub_bytes4(q | (h << 2), 0x04040404U);
         }
     } else if constexpr (F == QType::GGML_Q6_K) {
         const std::uint8_t* b = row + (s / 8) * 210;
@@ -407,7 +446,8 @@ __device__ __forceinline__ Chunk chunk(const std::uint8_t* row, int s, int p) {
 struct SliceScale {
     long long mant;
     int shift;
-    long long min_mant; // signed, 0 without a min term
+    long long min_mant;  // signed, 0 without a min term
+    long long min_mant1; // the 16-31 half's (add_slice_halves)
     int min_shift;
 };
 
@@ -418,11 +458,13 @@ __device__ __forceinline__ SliceScale slice_scale(const Slice& w) {
     f16_parts(w.d, m, o.shift, negative);
     o.mant = negative ? -m : m;
     o.min_mant  = 0;
+    o.min_mant1 = 0;
     o.min_shift = 0;
-    if (w.min != 0) {
+    if (w.min != 0 || w.min1 != 0) {
         f16_parts(w.dmin, m, o.min_shift, negative);
         // The min term is subtracted: R -= dmin * min * sum(X).
-        o.min_mant = (negative ? m : -m) * w.min;
+        o.min_mant  = (negative ? m : -m) * w.min;
+        o.min_mant1 = (negative ? m : -m) * w.min1;
     }
     return o;
 }
@@ -444,6 +486,20 @@ __device__ __forceinline__ void add_slice(I128& r, const Slice& w, const SliceSc
     p += static_cast<long long>(limb_dot(w, l4[0], l4[1])) << 16;
     add_shifted(r, sc.mant * p, sc.shift);
     if (sc.min_mant != 0) { add_shifted(r, sc.min_mant * xsum, sc.min_shift); }
+}
+
+// add_slice with the X sums of the slice's halves (elements 0-15, 16-31): every min format.
+// |min_mant * xsum| < 2^11 * 2^6 * 2^25 per half.
+__device__ __forceinline__ void add_slice_halves(I128& r, const Slice& w, const SliceScale& sc, const std::int32_t* limbs,
+                                                 int xsum0, int xsum1) {
+    const int4* l4 = reinterpret_cast<const int4*>(limbs);
+    long long p = limb_dot(w, l4[4], l4[5]);
+    p += static_cast<long long>(limb_dot(w, l4[2], l4[3])) << 8;
+    p += static_cast<long long>(limb_dot(w, l4[0], l4[1])) << 16;
+    add_shifted(r, sc.mant * p, sc.shift);
+    if (sc.min_mant != 0 || sc.min_mant1 != 0) {
+        add_shifted(r, sc.min_mant * xsum0 + sc.min_mant1 * xsum1, sc.min_shift);
+    }
 }
 
 } // namespace infernix::ggml::fast

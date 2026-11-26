@@ -35,6 +35,9 @@ enum class QType : std::uint16_t {
     // Two-bit grouped codes {-2, -1, 0, 1}, one FP16 scale per 64 (row-split, four codes per byte):
     // draft-only weights (the Qwen4Exp MTP drafter's experts; tensor-formats.md).
     Q2_G64_FP16 = 20,
+    // GGUF K-quants of the GLM-5.3-Flash GSQ builds' experts (ggml formats like GGML_Q2_0 ..).
+    GGML_Q2_K = 21,
+    GGML_Q3_K = 22,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -58,6 +61,9 @@ enum class QuantLayout : std::uint16_t {
     // 16 i row_bytes; block b of its row r at (16 b + r) * block_bytes; the last tile padded with
     // zero blocks): ggml_rows_v1's bytes, each tile's block b one contiguous run.
     GgmlTiles16 = 9,
+    // ggml_expert_{q3_k,q2_k}_v1: GgmlExpertIq4Nl's records with Q3_K or Q2_K down rows.
+    GgmlExpertQ3K = 10,
+    GgmlExpertQ2K = 11,
 };
 
 // Whether `layout` stores a matrix of GGUF blocks (ggml_rows_v1 or ggml_tiles16_v1).
@@ -68,7 +74,8 @@ enum class QuantLayout : std::uint16_t {
 // Whether `layout` stores routed-expert banks (one 4 KiB-aligned record per expert).
 [[nodiscard]] constexpr bool is_expert_bank_layout(QuantLayout layout) noexcept {
     return layout == QuantLayout::ExpertRg16 || layout == QuantLayout::GgmlExpertIq4Nl ||
-           layout == QuantLayout::GgmlExpertQ2_0 || layout == QuantLayout::Fp8ExpertB128;
+           layout == QuantLayout::GgmlExpertQ2_0 || layout == QuantLayout::GgmlExpertQ3K ||
+           layout == QuantLayout::GgmlExpertQ2K || layout == QuantLayout::Fp8ExpertB128;
 }
 
 struct Weight {

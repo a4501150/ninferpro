@@ -7,7 +7,9 @@
 // forked, or computed by the CPU route through the miss service; calls of 1 and 3 columns cover
 // decode and verification, and calls of 9, 40 and 300
 // columns the wide route (jobs of more than 8 columns run the tensor-core tiles, the others the
-// narrow kernels; at 300 columns two favoured experts take several 64-column tiles each). Oracle:
+// narrow kernels; at 300 columns two favoured experts take several 64-column tiles each). GLM-5.3-Flash's
+// K-quant pairs run at its geometry (4096 x 2048, SwiGLU clamped at 10), where the narrow kernels
+// serve every width. Oracle:
 // each routed (column, expert) pair computed on the host by
 // the exact arithmetic (ops/ggml/ggml_exact.h, whose decode, sums and rounding
 // infernix_ggml_linear_test qualifies against an independent bignum oracle): x and h A16-encoded,
@@ -75,16 +77,22 @@ enum class Spread { kMixed, kModel, kEdge, kWide };
 void random_rows(QType q, int rows, int k, std::mt19937& rng, std::uint8_t* out, Spread spread = Spread::kMixed) {
     const int blocks = k / static_cast<int>(infernix::ggml_block_elems(q)), size = static_cast<int>(infernix::ggml_block_bytes(q));
     for (int i = 0; i < rows * blocks * size; ++i) { out[i] = static_cast<std::uint8_t>(rng()); }
+    // The block's binary16 words: d (and the K-quants' dmin).
+    const int words[2] = {q == QType::GGML_Q2_K ? 80 : q == QType::GGML_Q3_K ? 108 : 0,
+                          q == QType::GGML_Q2_K ? 82 : q == QType::GGML_Q4_K ? 2 : -1};
     for (int i = 0; i < rows * blocks; ++i) {
         std::uint8_t* b = out + static_cast<std::size_t>(i) * size;
-        const unsigned field = spread == Spread::kModel  ? 10 + rng() % 2
-                               : spread == Spread::kMixed ? 3 + rng() % 10
-                               : spread == Spread::kEdge  ? (rng() % 2 == 0 ? 1 : 21)
-                                                          : 1 + rng() % 30;
-        const unsigned mant = spread == Spread::kEdge ? 0x3FFU : rng() & 0x3FFU;
-        const auto w = static_cast<std::uint16_t>((rng() & 0x8000U) | mant | (field << 10));
-        b[0] = static_cast<std::uint8_t>(w & 0xFF);
-        b[1] = static_cast<std::uint8_t>(w >> 8);
+        for (const int at : words) {
+            if (at < 0) { continue; }
+            const unsigned field = spread == Spread::kModel  ? 10 + rng() % 2
+                                   : spread == Spread::kMixed ? 3 + rng() % 10
+                                   : spread == Spread::kEdge  ? (rng() % 2 == 0 ? 1 : 21)
+                                                              : 1 + rng() % 30;
+            const unsigned mant = spread == Spread::kEdge ? 0x3FFU : rng() & 0x3FFU;
+            const auto w = static_cast<std::uint16_t>((rng() & 0x8000U) | mant | (field << 10));
+            b[at]     = static_cast<std::uint8_t>(w & 0xFF);
+            b[at + 1] = static_cast<std::uint8_t>(w >> 8);
+        }
     }
 }
 
@@ -98,6 +106,9 @@ ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int 
     case QType::GGML_IQ4_XS: return dot<QType::GGML_IQ4_XS>(row, x, k);
     case QType::GGML_IQ4_NL: return dot<QType::GGML_IQ4_NL>(row, x, k);
     case QType::GGML_Q2_0: return dot<QType::GGML_Q2_0>(row, x, k);
+    case QType::GGML_Q4_K: return dot<QType::GGML_Q4_K>(row, x, k);
+    case QType::GGML_Q3_K: return dot<QType::GGML_Q3_K>(row, x, k);
+    case QType::GGML_Q2_K: return dot<QType::GGML_Q2_K>(row, x, k);
     default: throw std::logic_error("format");
     }
 }
@@ -112,8 +123,9 @@ std::vector<std::int32_t> encode(const std::uint16_t* v, int n, int& emax) {
 }
 
 // The exact expert on the host.
-std::vector<std::uint16_t> expert(const std::uint8_t* record, QType gu, QType down, const std::uint16_t* xv) {
-    const int H = moe::kHidden, I = moe::kIntermediate;
+std::vector<std::uint16_t> expert(const std::uint8_t* record, QType gu, QType down, const std::uint16_t* xv,
+                                  const moe::Geometry& geometry = moe::kDefaultGeometry) {
+    const int H = geometry.hidden, I = geometry.intermediate;
     const std::uint32_t gr = row_bytes(gu, H), dr = row_bytes(down, I);
     int ex = 0;
     const auto x = encode(xv, H, ex);
@@ -121,7 +133,8 @@ std::vector<std::uint16_t> expert(const std::uint8_t* record, QType gu, QType do
     for (int i = 0; i < I; ++i) {
         const auto yg = ggml::output_bf16(row_dot(gu, record + static_cast<std::size_t>(i) * gr, x.data(), H), ex, gu);
         const auto yu = ggml::output_bf16(row_dot(gu, record + static_cast<std::size_t>(I + i) * gr, x.data(), H), ex, gu);
-        h[static_cast<std::size_t>(i)] = canon::swiglu_bf16(yg, yu);
+        h[static_cast<std::size_t>(i)] = geometry.swiglu_limit > 0.0F ? canon::swiglu_bf16_clamped(yg, yu, geometry.swiglu_limit)
+                                                                       : canon::swiglu_bf16(yg, yu);
     }
     int eh = 0;
     const auto hx = encode(h.data(), I, eh);
@@ -133,9 +146,10 @@ std::vector<std::uint16_t> expert(const std::uint8_t* record, QType gu, QType do
     return y;
 }
 
-void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = Spread::kMixed) {
+void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = Spread::kMixed,
+         const moe::Geometry& geometry = moe::kDefaultGeometry) {
     constexpr int experts = 24, top_k = 4;
-    const int H = moe::kHidden, I = moe::kIntermediate;
+    const int H = geometry.hidden, I = geometry.intermediate;
     const std::uint64_t record = 2ULL * I * row_bytes(gu, H) + static_cast<std::uint64_t>(H) * row_bytes(down, I);
     const std::uint64_t stride = (record + 4095) / 4096 * 4096;
     const std::uint64_t pitch  = stride + 8192; // the frame pool's pitch: a larger record elsewhere
@@ -206,7 +220,7 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
             for (int i = next++; i < columns * top_k; i = next++) {
                 const int t = i / top_k;
                 const int e = ids[static_cast<std::size_t>(i)];
-                const auto y = expert(host + e * stride, gu, down, &x[static_cast<std::size_t>(t) * H]);
+                const auto y = expert(host + e * stride, gu, down, &x[static_cast<std::size_t>(t) * H], geometry);
                 std::memcpy(&expected[static_cast<std::size_t>(i) * H], y.data(), H * sizeof(std::uint16_t));
             }
         };
@@ -220,7 +234,8 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
     cuda_check(cudaMalloc(&d_staging, pitch * 64), "cudaMalloc");
     void* d_workspace = nullptr;
     cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns,
-                                                                                  moe::ExpertActivation::kA16)),
+                                                                                  moe::ExpertActivation::kA16,
+                                                                                  moe::WideA16::kExact, geometry)),
                "cudaMalloc");
     std::vector<moe::ExpertScales> scales(experts);
     auto* d_scales = device_copy(scales);
@@ -238,7 +253,7 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
                                        .down_row_bytes = row_bytes(down, I)};
     moe::CpuMissService service({{.records = host, .record_stride = stride, .scales = no_scales.data(), .ggml = format}},
                                 {.workers = 4, .max_jobs = 8, .max_columns = 64, .pcie_divisor = 2, .cpus = {},
-                                 .activation = moe::ExpertActivation::kA16});
+                                 .activation = moe::ExpertActivation::kA16, .geometry = geometry});
 
     struct Config {
         int slots;
@@ -263,6 +278,7 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
                                               .staging_slots = config.slots};
         source.activation   = moe::ExpertActivation::kA16;
         source.frame_stride = pitch;
+        source.geometry     = geometry;
         source.ggml         = {.gate_up_format = gu,
                                .down_format    = down,
                                .gate_row_bytes = row_bytes(gu, H),
@@ -644,7 +660,10 @@ int main(int argc, char** argv) {
         {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
         {QType::GGML_IQ3_S, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_S, QType::GGML_Q2_0},
         {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL}, {QType::GGML_IQ4_XS, QType::GGML_Q2_0}};
+    // --glm: GLM-5.3-Flash's pairs only.
+    const bool glm_only = argc > 1 && std::strcmp(argv[1], "--glm") == 0;
     for (const auto& [gu, down] : pairs) {
+        if (glm_only) { break; }
         // 9, 40 and 300 columns: calls of the wide route (tensor-core tiles for jobs over 8 columns).
         for (const int columns : {1, 3, 9, 40, 300}) { run(gu, down, columns, rng); }
         // The model's scale spread, the per-limb bound's limit, and spreads past it (int128).
@@ -656,6 +675,16 @@ int main(int argc, char** argv) {
         // The ggml-bf16-prefill route at a width that carves its planes (a partial last tile).
         run_bf16(gu, down, 14336 + 37, rng); // wide_expert.h kGgmlBf16MinColumns = 14336
     }
+    // GLM-5.3-Flash's pairs at its geometry: the narrow kernels at every width, the CPU route.
+    const moe::Geometry glm = moe::kGeometries[1];
+    const std::pair<QType, QType> glm_pairs[] = {{QType::GGML_Q4_K, QType::GGML_Q3_K}, {QType::GGML_Q3_K, QType::GGML_Q3_K},
+                                                 {QType::GGML_Q3_K, QType::GGML_Q2_K}, {QType::GGML_Q2_K, QType::GGML_Q2_K}};
+    for (const auto& [gu, down] : glm_pairs) {
+        for (const int columns : {1, 3, 9, 40}) { run(gu, down, columns, rng, Spread::kMixed, glm); }
+        run(gu, down, 40, rng, Spread::kModel, glm);
+        run(gu, down, 40, rng, Spread::kWide, glm);
+    }
+    run(QType::GGML_Q3_K, QType::GGML_Q3_K, 300, rng, Spread::kModel, glm);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d ggml expert checks failed\n", g_failures);
         return 1;
