@@ -386,8 +386,11 @@ frees the old tier before it pins the new one, which then lands empty for the ti
 two large tiers never coexist. Tiers pin in chunks of about 256 MiB with a 1 ms pause after
 each chunk's `cudaHostAlloc` and `cudaFreeHost`: those calls hold the driver's lock, and 5.4 GB
 chunks held the engine thread's launches for 3-5 s. Available host memory on Linux is
-MemAvailable less CmaFree, since page-locked memory cannot use CMA pages (an OOM kill hit with
-18 GB of them reported free). `GET
+MemAvailable less the whole CMA area (`/proc/zoneinfo`): page-locked memory cannot use CMA pages,
+and reclaiming the cache that sits in them frees only more of them (two OOM kills hit with 17-18
+GB of CMA reported free). The tier fill that follows a rebuild or shrink reads its records on the
+tier's read agent in 512 MiB batches into lent slots, which join the tier at the boundary after
+they land. `GET
 /admin/expert-placement` reports the placement's counts, bytes, KV, free device and host
 memory, the fill's progress, the swap counters and the last switch's outcome; `?export=PATH`
 writes the current placement as a loadable file whose row order reproduces the ranking. The
