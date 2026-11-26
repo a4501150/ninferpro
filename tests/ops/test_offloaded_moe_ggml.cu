@@ -8,8 +8,8 @@
 // decode and verification, and calls of 9, 40 and 300
 // columns the wide route (jobs of more than 8 columns run the tensor-core tiles, the others the
 // narrow kernels; at 300 columns two favoured experts take several 64-column tiles each). GLM-5.3-Flash's
-// K-quant pairs run at its geometry (4096 x 2048, SwiGLU clamped at 10), where the narrow kernels
-// serve every width. Oracle:
+// K-quant and Q8_0 pairs run at its geometry (4096 x 2048, SwiGLU clamped at 10) through the same routes
+// (its down tiles decode in the K loop instead of keeping their rows resident). Oracle:
 // each routed (column, expert) pair computed on the host by
 // the exact arithmetic (ops/ggml/ggml_exact.h, whose decode, sums and rounding
 // infernix_ggml_linear_test qualifies against an independent bignum oracle): x and h A16-encoded,
@@ -109,6 +109,7 @@ ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int 
     case QType::GGML_Q4_K: return dot<QType::GGML_Q4_K>(row, x, k);
     case QType::GGML_Q3_K: return dot<QType::GGML_Q3_K>(row, x, k);
     case QType::GGML_Q2_K: return dot<QType::GGML_Q2_K>(row, x, k);
+    case QType::GGML_Q8_0: return dot<QType::GGML_Q8_0>(row, x, k);
     default: throw std::logic_error("format");
     }
 }
@@ -545,9 +546,10 @@ void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
 // --bench: one layer call of the real geometry (512 experts, top-10; 4,096 tokens, a prefill chunk of
 // about 80 columns per expert, or a decode or verification width) with every record resident and
 // the model's job bound, timed over repeated moe_experts calls.
-void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 route) {
-    constexpr int experts = 512, top_k = 10, reps = 10;
-    const int H = moe::kHidden, I = moe::kIntermediate;
+void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 route,
+           const moe::Geometry& geometry = moe::kDefaultGeometry, int experts = 512, int top_k = 10) {
+    constexpr int reps = 10;
+    const int H = geometry.hidden, I = geometry.intermediate;
     const std::uint64_t record = 2ULL * I * row_bytes(gu, H) + static_cast<std::uint64_t>(H) * row_bytes(down, I);
     const std::uint64_t stride = (record + 4095) / 4096 * 4096;
     std::vector<std::uint8_t> host(stride * experts);
@@ -586,7 +588,8 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 ro
     auto* d_x = device_copy(x);
     void* d_workspace = nullptr;
     cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(experts, top_k * columns, columns,
-                                                                                  moe::ExpertActivation::kA16, route)),
+                                                                                  moe::ExpertActivation::kA16, route,
+                                                                                  geometry)),
                "cudaMalloc");
     std::vector<moe::ExpertScales> scales(experts);
     auto* d_scales = device_copy(scales);
@@ -599,6 +602,7 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 ro
     source.activation   = moe::ExpertActivation::kA16;
     source.frame_stride = stride;
     source.wide_a16     = route;
+    source.geometry     = geometry;
     source.ggml         = {.gate_up_format = gu, .down_format = down, .gate_row_bytes = row_bytes(gu, H),
                            .down_row_bytes = row_bytes(down, I), .record_bytes = record};
     Tensor tx(d_x, DType::BF16, {H, columns});
@@ -655,6 +659,21 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    if (argc > 1 && std::strcmp(argv[1], "--bench-glm") == 0) {
+        // --bench-glm [tokens]: GLM-5.3-Flash's pairs at its geometry (288 experts, top-8).
+        const int columns = argc > 2 ? std::atoi(argv[2]) : 4096;
+        for (const auto& [gu, down] : {std::pair{QType::GGML_Q4_K, QType::GGML_Q3_K}, std::pair{QType::GGML_Q3_K, QType::GGML_Q3_K},
+                                       std::pair{QType::GGML_Q3_K, QType::GGML_Q2_K}, std::pair{QType::GGML_Q2_K, QType::GGML_Q2_K},
+                                       std::pair{QType::GGML_Q8_0, QType::GGML_Q8_0}}) {
+            try {
+                bench(gu, down, columns, rng, moe::WideA16::kExact, moe::kGeometries[1], 288, 8);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "bench: %s\n", e.what());
+                return 1;
+            }
+        }
+        return 0;
+    }
     const std::pair<QType, QType> pairs[] = {
         {QType::GGML_IQ2_S, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_S, QType::GGML_Q2_0},
         {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
@@ -675,16 +694,17 @@ int main(int argc, char** argv) {
         // The ggml-bf16-prefill route at a width that carves its planes (a partial last tile).
         run_bf16(gu, down, 14336 + 37, rng); // wide_expert.h kGgmlBf16MinColumns = 14336
     }
-    // GLM-5.3-Flash's pairs at its geometry: the narrow kernels at every width, the CPU route.
+    // GLM-5.3-Flash's pairs at its geometry: the narrow kernels, the wide tiles, the CPU route.
     const moe::Geometry glm = moe::kGeometries[1];
     const std::pair<QType, QType> glm_pairs[] = {{QType::GGML_Q4_K, QType::GGML_Q3_K}, {QType::GGML_Q3_K, QType::GGML_Q3_K},
-                                                 {QType::GGML_Q3_K, QType::GGML_Q2_K}, {QType::GGML_Q2_K, QType::GGML_Q2_K}};
+                                                 {QType::GGML_Q3_K, QType::GGML_Q2_K}, {QType::GGML_Q2_K, QType::GGML_Q2_K},
+                                                 {QType::GGML_Q8_0, QType::GGML_Q8_0}};
     for (const auto& [gu, down] : glm_pairs) {
-        for (const int columns : {1, 3, 9, 40}) { run(gu, down, columns, rng, Spread::kMixed, glm); }
+        for (const int columns : {1, 3, 9, 40, 300}) { run(gu, down, columns, rng, Spread::kMixed, glm); }
         run(gu, down, 40, rng, Spread::kModel, glm);
+        run(gu, down, 40, rng, Spread::kEdge, glm);
         run(gu, down, 40, rng, Spread::kWide, glm);
     }
-    run(QType::GGML_Q3_K, QType::GGML_Q3_K, 300, rng, Spread::kModel, glm);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d ggml expert checks failed\n", g_failures);
         return 1;

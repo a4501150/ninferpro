@@ -374,7 +374,20 @@ evicts each pool's lowest-score residents (pinned keys never), demotes what the 
 for and drops the rest, then releases the freed VMM chunks. A grow resizes and then walks the
 usage-rank order into the new frames as a resident refill, batched per maintenance tick,
 reading through the tier (a reader-sized tier is temporarily grown to stage the walk). A
-switch that names no RAM tier while holding every key releases the tier. `GET
+switch that names no RAM tier while holding every key releases the tier. A switch that
+rebuilds the pinned RAM tier at another size does not stop the engine; requests run while it
+proceeds, and the status reports `switching` until it lands. When the new tier fits beside the
+old one with `--ram-headroom-mib` left free, a worker thread pins it, the next boundary
+rebuild-pins the records it keeps in the old tier (so the swaps cannot evict them), the worker
+copies them, and the boundary after that waits for in-flight reads of the old tier, moves the
+residency to the new one and frees the old tier on a reaper thread. Otherwise the boundary
+swaps in a reader-sized tier (the lists SSD reads stage through, about 2 GiB), and the worker
+frees the old tier before it pins the new one, which then lands empty for the tier fill; the
+two large tiers never coexist. Tiers pin in chunks of about 256 MiB with a 1 ms pause after
+each chunk's `cudaHostAlloc` and `cudaFreeHost`: those calls hold the driver's lock, and 5.4 GB
+chunks held the engine thread's launches for 3-5 s. Available host memory on Linux is
+MemAvailable less CmaFree, since page-locked memory cannot use CMA pages (an OOM kill hit with
+18 GB of them reported free). `GET
 /admin/expert-placement` reports the placement's counts, bytes, KV, free device and host
 memory, the fill's progress, the swap counters and the last switch's outcome; `?export=PATH`
 writes the current placement as a loadable file whose row order reproduces the ranking. The

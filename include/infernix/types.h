@@ -1274,7 +1274,7 @@ struct ExpertPlacementSwitch {
 struct ExpertPlacementReport {
     bool supported = false; // false on a model without an expert cache
     bool resident  = false; // every routed expert held in VRAM; nothing takes a frame
-    bool switching = false; // a switch is pending (applied at the next boundary)
+    bool switching = false; // a switch is pending (applied at the next boundary) or its RAM tier rebuild runs
     std::uint32_t frames      = 0; // average frames backed
     std::uint32_t frame_limit = 0;
     std::uint32_t target     = 0;  // the pending switch's frame target

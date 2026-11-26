@@ -56,7 +56,7 @@ public:
         std::uint32_t prefetch  = 16;
         std::uint32_t demotion  = 32;
         double half_life        = 64;
-        std::uint32_t slots_per_chunk = 512; // pinned in chunks of this many slots
+        std::uint32_t slots_per_chunk = 0; // pinned in chunks of this many slots (0: about 256 MiB each)
         // Fewest pinned slots the tier runs with (default: the lists plus one resident slot).
         std::uint32_t min_slots = 0;
         // Unpinned records beyond the slots (at most the keys the resident slots leave).
@@ -185,13 +185,17 @@ public:
     [[nodiscard]] std::uint8_t* stream_bounce_slot(std::uint32_t i) const noexcept {
         return const_cast<std::uint8_t*>(slot_bytes(pinned_.slots - stream_bounce_ + i));
     }
-    // Engine thread: copies whole records (destination, source) on the copy threads and this
-    // thread, and returns once all have landed.
+    // Copies whole records (destination, source) on the copy threads (or, without them, threads of
+    // its own) and this thread, and returns once all have landed. The engine thread, or a rebuild's
+    // worker on a tier no round uses yet.
     void copy_records(std::span<const std::pair<std::uint8_t*, const std::uint8_t*>> copies);
     // The prefill expert stream's hold on the records it plans to copy (HostTier::stream_pin) and
     // its release at a boundary after the copies landed.
     void stream_pin(std::uint32_t key) { tier_.stream_pin(key); }
     void release_stream_pins() { tier_.release_stream_pins(); }
+    // A rebuild's hold on the records it copies into the next tier (HostTier::rebuild_pin).
+    void rebuild_pin(std::uint32_t key) { tier_.rebuild_pin(key); }
+    void release_rebuild_pins() { tier_.release_rebuild_pins(); }
     // Keys whose host pointer changed since the last call (the device table's dirty set).
     void take_dirty(std::vector<std::uint32_t>& keys) { tier_.take_dirty(keys); }
     // ---- stream slots (Options::stream)
@@ -278,7 +282,7 @@ private:
     // Runs `copy` and reports it (copy_mutex_ not held).
     void finish_copy(const Copy& copy);
 
-    static Options normalized(Options options);
+    static Options normalized(Options options, std::uint64_t record_bytes);
     static Pinned pin_slots(const ExpertStore& store, const Options& options);
     void copier_main() noexcept;
 

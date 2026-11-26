@@ -7,8 +7,9 @@
 // infernix_ggml_linear_test qualifies against an independent bignum oracle): x and h encoded under
 // their column exponents, gate/up rows rounded to BF16, SwiGLU, the down rows. Every ISA this host
 // runs, at every width 1-8, must return its bits, including columns of a wide dynamic range and a
-// non-finite column (NaN outputs). GLM-5.3-Flash's K-quant pairs (Q4_K, Q3_K, Q2_K; min terms) run at
-// its geometry (4096 x 2048, SwiGLU clamped at 10), through ggml_expert_forward and the worker team.
+// non-finite column (NaN outputs). GLM-5.3-Flash's K-quant pairs (Q4_K, Q3_K, Q2_K; min terms) and its
+// Q8_0 pair run at its geometry (4096 x 2048, SwiGLU clamped at 10), through ggml_expert_forward and
+// the worker team.
 
 #include "core/ggml_format.h"
 #include "ops/common/canonical_math.h"
@@ -68,6 +69,7 @@ ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int 
     case QType::GGML_Q4_K: return ggml::row_dot<QType::GGML_Q4_K>(row, x, k);
     case QType::GGML_Q3_K: return ggml::row_dot<QType::GGML_Q3_K>(row, x, k);
     case QType::GGML_Q2_K: return ggml::row_dot<QType::GGML_Q2_K>(row, x, k);
+    case QType::GGML_Q8_0: return ggml::row_dot<QType::GGML_Q8_0>(row, x, k);
     default: throw std::logic_error("format");
     }
 }
@@ -356,7 +358,8 @@ int main(int argc, char** argv) {
         check_team_ggml(rng);
         const moe::Geometry glm = moe::kGeometries[1];
         const std::pair<QType, QType> glm_pairs[] = {{QType::GGML_Q4_K, QType::GGML_Q3_K}, {QType::GGML_Q3_K, QType::GGML_Q3_K},
-                                                     {QType::GGML_Q3_K, QType::GGML_Q2_K}, {QType::GGML_Q2_K, QType::GGML_Q2_K}};
+                                                     {QType::GGML_Q3_K, QType::GGML_Q2_K}, {QType::GGML_Q2_K, QType::GGML_Q2_K},
+                                                     {QType::GGML_Q8_0, QType::GGML_Q8_0}};
         for (const auto& [gu, down] : glm_pairs) { run(gu, down, rng, glm); }
         check_team_ggml(rng, QType::GGML_Q3_K, QType::GGML_Q2_K, glm);
     } catch (const std::exception& error) {

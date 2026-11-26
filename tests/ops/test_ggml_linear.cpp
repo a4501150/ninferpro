@@ -11,9 +11,9 @@
 // input permutation, into one output or split among several (ggml_split_segments). The
 // ggml-bf16-prefill route (run_bf16) is checked against a binary64 reference within an FP32-sum
 // bound instead. The row gathers must return each element's decoded value (exact in binary32)
-// rounded once to BF16. The expert-only K-quants (Q2_K, Q3_K; ggml_linear has no route for them) are
-// checked on the host: ggml_exact.h's row_dot, which the offloaded experts' GPU and CPU routes
-// reproduce bit for bit, against the same oracle.
+// rounded once to BF16. The expert-only formats (Q2_K, Q3_K, and Q8_0 expert rows; ggml_linear has
+// no route for them) are checked on the host: ggml_exact.h's row_dot, which the offloaded experts'
+// GPU and CPU routes reproduce bit for bit, against the same oracle.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -61,6 +61,11 @@ void decode_block(QType q, const std::uint8_t* b, double* y) {
     case QType::GGML_Q2_0: {
         const double d = f16(u16(b));
         for (int j = 0; j < 64; ++j) { y[j] = ((b[2 + j / 4] >> (2 * (j % 4))) & 3) - 1.0; y[j] *= d; }
+        break;
+    }
+    case QType::GGML_Q8_0: { // block_q8_0: d, qs[32]
+        const double d = f16(u16(b));
+        for (int j = 0; j < 32; ++j) { y[j] = d * static_cast<std::int8_t>(b[2 + j]); }
         break;
     }
     case QType::GGML_IQ4_NL: {
@@ -1119,6 +1124,7 @@ int main(int argc, char** argv) {
             run_exact_host<QType::GGML_Q2_K>(24, 4096, 3, rng, scales);
             run_exact_host<QType::GGML_Q3_K>(24, 4096, 3, rng, scales);
             run_exact_host<QType::GGML_Q4_K>(24, 2048, 3, rng, scales);
+            run_exact_host<QType::GGML_Q8_0>(24, 4096, 3, rng, scales); // the Q8_0 build's experts
         }
         // Projections of two formats (the mixed verification launch, and per-format launches otherwise).
         const std::pair<QType, QType> mixed[] = {{QType::GGML_Q6_K, QType::GGML_IQ4_XS}, {QType::GGML_IQ4_XS, QType::GGML_Q6_K},

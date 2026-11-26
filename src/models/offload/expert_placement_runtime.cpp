@@ -25,7 +25,13 @@ ExpertPlacementRuntime::ExpertPlacementRuntime(DeviceContext& device, VramBudget
                                                Hooks hooks)
     : device_(device), vram_(vram), options_(std::move(options)), hooks_(std::move(hooks)) {}
 
-ExpertPlacementRuntime::~ExpertPlacementRuntime() = default;
+ExpertPlacementRuntime::~ExpertPlacementRuntime() {
+    // Both hold tiers that read the stores and the fetch channel destroyed after this body.
+    try {
+        cancel_tier_rebuild();
+    } catch (...) {}
+    if (tier_reaper_.joinable()) { tier_reaper_.join(); }
+}
 
 void ExpertPlacementRuntime::diagnostic(const std::string& text, DiagnosticLevel level) const noexcept {
     if (hooks_.diagnostic) {
@@ -459,74 +465,205 @@ void ExpertPlacementRuntime::trim_host_heap() {
 #endif
 }
 
-void ExpertPlacementRuntime::ensure_tier(std::uint32_t residents) {
+HostExpertTier::Options ExpertPlacementRuntime::rebuild_options(std::uint32_t residents) const {
+    HostExpertTier::Options options = tier_options_;
+    const std::uint32_t lists       = options.ring + options.prefetch + options.demotion;
+    // ram=0 below full VRAM still stages SSD reads through the tier's lists; the tier needs
+    // one resident slot beyond them.
+    residents             = std::max<std::uint32_t>(residents, 1);
+    options.slots         = residents + lists;
+    options.unpinned      = 0; // a rebuild holds no pageable records
+    options.bounce        = 0; // nothing to stage without them
+    options.stream_bounce = 0;
+    options.min_slots     = lists + 1;
+    return options;
+}
+
+std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> ExpertPlacementRuntime::kept_records(HostExpertTier& next,
+                                                                                                 std::uint32_t residents) {
+    // The keys the old tier holds, best first: its own decayed usage, else identity.
+    const std::uint32_t total = keys();
+    std::vector<std::uint32_t> order(total);
+    for (std::uint32_t k = 0; k < total; ++k) { order[k] = k; }
+    const auto& lfu = tier_->controller().lfu();
+    std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) { return lfu.value(a) > lfu.value(b); });
+    std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> copies;
+    for (const std::uint32_t key : order) {
+        if (copies.size() >= residents) { break; }
+        const std::uint8_t* record = tier_->host_record(key);
+        if (record == nullptr) { continue; }
+        std::int32_t slot = -1;
+        if (next.controller().prefill(key, slot)) {
+            copies.emplace_back(const_cast<std::uint8_t*>(next.slot_bytes(static_cast<std::uint32_t>(slot))), record);
+            tier_->rebuild_pin(key);
+        }
+    }
+    return copies;
+}
+
+std::unique_ptr<HostExpertTier> ExpertPlacementRuntime::swap_tier(std::unique_ptr<HostExpertTier> next) {
+    residency_->retier(next.get(), device_.stream);
+    device_.synchronize();
+    std::unique_ptr<HostExpertTier> old = std::move(tier_);
+    tier_                               = std::move(next);
+    tier_capacity_.store(tier_->resident_capacity(), std::memory_order_relaxed);
+    // The stream's callbacks captured the tier a rebuild replaced: the family's hook retargets
+    // them to this one.
+    if (hooks_.on_tier_changed) { hooks_.on_tier_changed(tier_.get(), true); }
+    return old;
+}
+
+void ExpertPlacementRuntime::install_tier(std::unique_ptr<HostExpertTier> next, std::size_t kept) {
+    const std::uint32_t residents = next->resident_capacity();
+    std::unique_ptr<HostExpertTier> old = swap_tier(std::move(next));
+    diagnostic("expert placement: RAM tier rebuilt for " + std::to_string(residents) + " resident slots (" +
+                   std::to_string(kept) + " records kept)",
+               DiagnosticLevel::Info);
+    retire_tier(std::move(old));
+}
+
+void ExpertPlacementRuntime::retire_tier(std::unique_ptr<HostExpertTier> old) {
+    if (old == nullptr) { return; }
+    if (tier_reaper_.joinable()) { tier_reaper_.join(); }
+    // The old tier's pinned chunks release, and its pageable records go back to the OS.
+    tier_reaper_ = std::thread([tier = std::move(old)]() mutable {
+        tier.reset();
+        trim_host_heap();
+    });
+}
+
+void ExpertPlacementRuntime::ensure_tier(std::uint32_t residents, bool background) {
     if (tier_store_ == nullptr) {
         diagnostic("expert placement: this engine runs without the SSD expert tier; the RAM target is ignored",
                    DiagnosticLevel::Warning);
         return;
     }
+    if (tier_rebuild_.phase.load() != TierRebuild::Phase::kIdle) {
+        if (background && tier_rebuild_.residents == residents) { return; }
+        cancel_tier_rebuild();
+    }
     if (tier_ != nullptr && tier_->resident_capacity() == residents) { return; }
+    const bool beside = tier_ != nullptr && tier_bytes(residents) + options_.ram_headroom_bytes <=
+                                                host_memory_snapshot().available_physical;
+    if (background && tier_ != nullptr) {
+        auto& rebuild     = tier_rebuild_;
+        rebuild.residents = residents;
+        rebuild.fresh     = !beside;
+        rebuild.begin     = std::chrono::steady_clock::now();
+        if (rebuild.fresh) {
+            // The reader-sized tier serves the misses while the worker frees the old tier and pins
+            // the new one; the old tier's slots must not still be receiving demotions.
+            residency_->quiesce_tier(device_.stream);
+            tier_backfill_.active = false;
+            rebuild.old = swap_tier(std::make_unique<HostExpertTier>(*tier_store_, rebuild_options(0)));
+        }
+        rebuild.phase.store(TierRebuild::Phase::kPinning);
+        tier_rebuild_target_.store(residents, std::memory_order_relaxed);
+        rebuild.worker = std::thread([this, options = rebuild_options(residents)]() mutable {
+            auto& r = tier_rebuild_;
+            try {
+                if (r.old != nullptr) {
+                    r.old.reset();
+                    trim_host_heap();
+                }
+                r.next = std::make_unique<HostExpertTier>(*tier_store_, std::move(options));
+                r.phase.store(TierRebuild::Phase::kPinned);
+            } catch (const std::exception& error) {
+                r.error = error.what();
+                r.phase.store(TierRebuild::Phase::kFailed);
+            }
+            wake_maintenance();
+        });
+        diagnostic("expert placement: RAM tier rebuild for " + std::to_string(residents) + " resident slots started " +
+                       (rebuild.fresh ? "after the current tier (a reader-sized tier serves meanwhile)"
+                                      : "beside the current tier"),
+                   DiagnosticLevel::Info);
+        return;
+    }
     // The old tier's records seed the new one: no demotion may still be landing in its slots.
     residency_->quiesce_tier(device_.stream);
     // A new tier that does not fit beside the old one (a tier holding most of the host's RAM)
     // replaces it empty: the old releases first and the fill reads the records again.
-    if (tier_ != nullptr && tier_bytes(residents) > host_memory_snapshot().available_physical) {
-        release_tier("its rebuild does not fit beside it");
-    }
-    HostExpertTier::Options options = tier_options_;
-    const std::uint32_t lists       = options.ring + options.prefetch + options.demotion;
-    // ram=0 below full VRAM still stages SSD reads through the tier's lists; the tier needs
-    // one resident slot beyond them.
-    residents                        = std::max<std::uint32_t>(residents, 1);
-    options.slots                    = residents + lists;
-    options.unpinned                 = 0; // a rebuild holds no pageable records
-    options.bounce                   = 0; // nothing to stage without them
-    options.stream_bounce            = 0;
-    options.min_slots                = lists + 1;
-    auto next                        = std::make_unique<HostExpertTier>(*tier_store_, std::move(options));
-    std::size_t kept                 = 0;
+    if (tier_ != nullptr && !beside) { release_tier("its rebuild does not fit beside it"); }
+    auto next = std::make_unique<HostExpertTier>(*tier_store_, rebuild_options(residents));
     if (tier_ != nullptr) {
-        // The keys the old tier holds, best first: its own decayed usage, else identity.
-        const std::uint32_t total = keys();
-        std::vector<std::uint32_t> order(total);
-        for (std::uint32_t k = 0; k < total; ++k) { order[k] = k; }
-        const auto& lfu = tier_->controller().lfu();
-        std::sort(order.begin(), order.end(),
-                  [&](std::uint32_t a, std::uint32_t b) { return lfu.value(a) > lfu.value(b); });
-        std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> copies;
-        for (const std::uint32_t key : order) {
-            if (copies.size() >= residents) { break; }
-            const std::uint8_t* record = tier_->host_record(key);
-            if (record == nullptr) { continue; }
-            std::int32_t slot = -1;
-            if (next->controller().prefill(key, slot)) {
-                copies.emplace_back(const_cast<std::uint8_t*>(next->slot_bytes(static_cast<std::uint32_t>(slot))),
-                                    record);
-            }
-        }
+        const auto copies = kept_records(*next, residents);
         next->copy_records(copies);
-        kept = copies.size();
-        residency_->retier(next.get(), device_.stream);
-        device_.synchronize();
-        tier_ = std::move(next); // the old tier's pinned chunks release
-        tier_capacity_.store(tier_->resident_capacity(), std::memory_order_relaxed);
-        trim_host_heap();       // and its pageable records go back to the OS
-        diagnostic("expert placement: RAM tier rebuilt for " + std::to_string(residents) +
-                       " resident slots (" + std::to_string(kept) + " records kept)",
-                   DiagnosticLevel::Info);
-        // The stream's callbacks captured the tier a rebuild replaced: the family's hook
-        // retargets them to this one.
-        if (hooks_.on_tier_changed) { hooks_.on_tier_changed(tier_.get(), true); }
+        tier_->release_rebuild_pins();
+        install_tier(std::move(next), copies.size());
     } else {
         tier_ = std::move(next);
         tier_capacity_.store(tier_->resident_capacity(), std::memory_order_relaxed);
         residency_->retier(tier_.get(), device_.stream);
         device_.synchronize();
-        diagnostic("expert placement: RAM tier built for " + std::to_string(residents) + " resident slots",
+        diagnostic("expert placement: RAM tier built for " + std::to_string(std::max<std::uint32_t>(residents, 1)) +
+                       " resident slots",
                    DiagnosticLevel::Info);
         if (hooks_.on_tier_changed) { hooks_.on_tier_changed(tier_.get(), false); }
     }
     start_tier_fill();
+}
+
+void ExpertPlacementRuntime::advance_tier_rebuild() {
+    auto& rebuild = tier_rebuild_;
+    const TierRebuild::Phase phase = rebuild.phase.load();
+    if (phase == TierRebuild::Phase::kPinned && !rebuild.fresh) {
+        rebuild.worker.join();
+        if (tier_ == nullptr) { // nothing to seed from (release_tier cancels a rebuild first)
+            cancel_tier_rebuild();
+            return;
+        }
+        rebuild.copies = kept_records(*rebuild.next, rebuild.residents);
+        rebuild.phase.store(TierRebuild::Phase::kCopying);
+        rebuild.worker = std::thread([this] {
+            auto& r = tier_rebuild_;
+            try {
+                r.next->copy_records(r.copies);
+                r.phase.store(TierRebuild::Phase::kCopied);
+            } catch (const std::exception& error) {
+                r.error = error.what();
+                r.phase.store(TierRebuild::Phase::kFailed);
+            }
+            wake_maintenance();
+        });
+    } else if (phase == TierRebuild::Phase::kCopied || phase == TierRebuild::Phase::kPinned) { // fresh: nothing to copy
+        rebuild.worker.join();
+        // No demotion may still be landing in the old tier's slots when the residency leaves it.
+        residency_->quiesce_tier(device_.stream);
+        tier_->release_rebuild_pins();
+        const std::size_t kept = rebuild.copies.size();
+        rebuild.copies.clear();
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - rebuild.begin).count();
+        install_tier(std::move(rebuild.next), kept);
+        rebuild.phase.store(TierRebuild::Phase::kIdle);
+        tier_rebuild_target_.store(-1, std::memory_order_relaxed);
+        diagnostic("expert placement: RAM tier rebuild completed in " + std::to_string(seconds) + " s",
+                   DiagnosticLevel::Info);
+        record_switch(true, "RAM tier rebuilt: " + std::to_string(tier_resident_slots()) + " slots");
+        start_tier_fill();
+        if (hooks_.on_switch_settled) { hooks_.on_switch_settled("the RAM tier rebuild completed"); }
+    } else if (phase == TierRebuild::Phase::kFailed) {
+        const std::string error = rebuild.error;
+        const bool fresh        = rebuild.fresh;
+        cancel_tier_rebuild();
+        diagnostic("expert placement: RAM tier rebuild failed: " + error +
+                       (fresh ? "; the reader-sized tier stays" : "; the current tier stays"),
+                   DiagnosticLevel::Error);
+        record_switch(false, "RAM tier rebuild failed: " + error);
+    }
+}
+
+void ExpertPlacementRuntime::cancel_tier_rebuild() {
+    auto& rebuild = tier_rebuild_;
+    if (rebuild.worker.joinable()) { rebuild.worker.join(); }
+    if (tier_ != nullptr) { tier_->release_rebuild_pins(); }
+    rebuild.copies.clear();
+    retire_tier(std::move(rebuild.old)); // a fresh rebuild's worker failed before it freed the old tier
+    retire_tier(std::move(rebuild.next));
+    rebuild.fresh = false;
+    rebuild.error.clear();
+    rebuild.phase.store(TierRebuild::Phase::kIdle);
+    tier_rebuild_target_.store(-1, std::memory_order_relaxed);
 }
 
 void ExpertPlacementRuntime::shrink_tier_to_reader(const char* why) {
@@ -537,12 +674,13 @@ void ExpertPlacementRuntime::shrink_tier_to_reader(const char* why) {
         release_tier(why); // every key holds a frame: nothing is read through RAM
         return;
     }
-    ensure_tier(0);
-    diagnostic(std::string("expert placement: RAM tier reduced to its artifact reader (") + why + ")",
+    ensure_tier(0, true);
+    diagnostic(std::string("expert placement: RAM tier reduces to its artifact reader (") + why + ")",
                DiagnosticLevel::Info);
 }
 
 void ExpertPlacementRuntime::release_tier(const char* why) {
+    cancel_tier_rebuild();
     if (tier_ == nullptr) { return; }
     tier_backfill_.active = false;
     residency_->retier(nullptr, device_.stream);
@@ -690,7 +828,7 @@ void ExpertPlacementRuntime::apply_pending_placement() {
             } else {
                 placement_wants_no_tier_ = false;
                 if (tier_ == nullptr || tier_resident_slots() != request.ram_target) {
-                    ensure_tier(request.ram_target);
+                    ensure_tier(request.ram_target, true);
                 } else {
                     start_tier_fill(); // the capacity is right; top up what a drop left free
                 }
@@ -873,7 +1011,7 @@ void ExpertPlacementRuntime::finish_placement_fill() {
     }
     if (placement_fill_.restore_tier) {
         placement_fill_.restore_tier = false;
-        ensure_tier(placement_fill_.tier_after); // the staging tier's slots return
+        ensure_tier(placement_fill_.tier_after, true); // the staging tier's slots return
     } else if (tier_ != nullptr && tier_resident_slots() > 1) {
         // Exclusive tiers: the keys the refill seeded into VRAM give their RAM slots back, and
         // the tier fill gives them to the next keys without a frame.
@@ -883,6 +1021,7 @@ void ExpertPlacementRuntime::finish_placement_fill() {
 }
 
 bool ExpertPlacementRuntime::apply_placement(bool idle) {
+    advance_tier_rebuild();   // a background RAM tier rebuild: pinned, copied, installed
     apply_pending_placement();
     advance_placement_fill(); // the placement grow's refill: advances at every boundary and idle
     advance_tier_fill();      // the RAM tier's fill: the same cadence
@@ -905,6 +1044,11 @@ ExpertPlacementStatus ExpertPlacementRuntime::placement_status() const {
         status.target = placement_pending_set_ ? placement_pending_.frame_target : 0;
         status.has_tier_target = placement_pending_set_ && placement_pending_.has_ram_target;
         status.tier_target = status.has_tier_target ? placement_pending_.ram_target : 0;
+    }
+    if (const std::int64_t rebuilding = tier_rebuild_target_.load(std::memory_order_relaxed);
+        rebuilding >= 0 && !status.has_tier_target) {
+        status.has_tier_target = true; // the rebuild still runs: the tier has not reached it
+        status.tier_target     = static_cast<std::uint32_t>(rebuilding);
     }
     status.pinned     = residency_->pinned_keys_total();
     status.residents  = residency_->resident_count();

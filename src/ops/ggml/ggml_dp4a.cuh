@@ -15,8 +15,8 @@
 // (Q2_K's min term is per 16-element half: add_slice_halves takes the halves' X sums.)
 //
 // where each 16-element dot is three dp4a chains over the limbs (|partial| < 2^18), so a slice
-// costs 24 dp4a per column and one int128 addition. Bounds: |sub| <= 127 and |code| <= 127 give
-// |sub * chain| < 2^26 (int32), |P| < 2^42 and |mant * P| < 2^53 (int64).
+// costs 24 dp4a per column and one int128 addition. Bounds: |sub| <= 127 and |code| <= 128 (Q8_0's
+// -128; its sub-scale is 1) give |sub * chain| < 2^26 (int32), |P| < 2^42 and |mant * P| < 2^53 (int64).
 
 #include "core/weight.h"
 #include "ops/common/canonical_math.h"
@@ -158,7 +158,15 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
     o.min  = 0;
     o.min1 = 0;
     o.dmin = 0;
-    if constexpr (F == QType::GGML_Q2_0) {
+    if constexpr (F == QType::GGML_Q8_0) {
+        const std::uint8_t* b = row + s * 34;
+        o.d    = static_cast<std::uint16_t>(ld_u16(b));
+        o.sub0 = o.sub1 = 1;
+        std::uint32_t qw[8];
+        ld_words_a2<8>(b + 2, qw);
+#pragma unroll
+        for (int w = 0; w < 8; ++w) { o.q[w] = static_cast<int>(qw[w]); }
+    } else if constexpr (F == QType::GGML_Q2_0) {
         const std::uint8_t* b = row + (s / 2) * 18;
         o.d    = static_cast<std::uint16_t>(ld_u16(b));
         o.sub0 = o.sub1 = 1;

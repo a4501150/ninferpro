@@ -30,6 +30,7 @@ constexpr std::array kFormats = {
     std::pair{QType::GGML_IQ4_NL, std::string_view{"ggml_iq4_nl"}},
     std::pair{QType::GGML_Q2_K, std::string_view{"ggml_q2_k"}},
     std::pair{QType::GGML_Q3_K, std::string_view{"ggml_q3_k"}},
+    std::pair{QType::GGML_Q8_0, std::string_view{"ggml_q8_0"}},
     std::pair{QType::FP8_E4M3FN_B128, std::string_view{"fp8_e4m3fn_b128"}},
 };
 constexpr std::array kLayouts = {
@@ -43,6 +44,7 @@ constexpr std::array kLayouts = {
     std::pair{QuantLayout::GgmlExpertQ2_0, std::string_view{"ggml_expert_q2_0_v1"}},
     std::pair{QuantLayout::GgmlExpertQ3K, std::string_view{"ggml_expert_q3_k_v1"}},
     std::pair{QuantLayout::GgmlExpertQ2K, std::string_view{"ggml_expert_q2_k_v1"}},
+    std::pair{QuantLayout::GgmlExpertQ8_0, std::string_view{"ggml_expert_q8_0_v1"}},
     std::pair{QuantLayout::Fp8ExpertB128, std::string_view{"fp8_expert_b128_v1"}},
     std::pair{QuantLayout::GgmlTiles16, std::string_view{"ggml_tiles16_v1"}},
 };

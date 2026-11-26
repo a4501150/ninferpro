@@ -22,7 +22,7 @@ namespace infernix::models::offload {
     ExpertPlacementReport report;
     report.supported      = true;
     report.resident      = status.resident;
-    report.switching     = status.target != 0;
+    report.switching     = status.target != 0 || status.has_tier_target;
     report.frames        = status.frames;
     report.frame_limit   = status.frame_limit;
     report.target        = status.target;

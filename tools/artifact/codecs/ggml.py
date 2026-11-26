@@ -32,6 +32,7 @@ class GgmlType:
 
 
 Q2_0 = GgmlType("ggml_q2_0", 42, 64, 18, 1.0)
+Q8_0 = GgmlType("ggml_q8_0", 8, 32, 34, 1.0)
 Q2_K = GgmlType("ggml_q2_k", 10, 256, 84, 1.0, has_min=True)
 Q3_K = GgmlType("ggml_q3_k", 11, 256, 110, 1.0)
 Q4_K = GgmlType("ggml_q4_k", 12, 256, 144, 1.0, has_min=True)
@@ -44,7 +45,7 @@ IQ2_S = GgmlType("ggml_iq2_s", 22, 256, 82, 0.125)
 IQ4_XS = GgmlType("ggml_iq4_xs", 23, 256, 136, 1.0)
 
 GGML_TYPES = MappingProxyType(
-    {t.name: t for t in (Q2_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS)})
+    {t.name: t for t in (Q2_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS)})
 BY_GGML_ID = MappingProxyType({t.ggml_id: t for t in GGML_TYPES.values()})
 
 # Plain GGUF types the converter reads as values (not stored as ggml blocks).
@@ -166,7 +167,9 @@ def decode_terms(fmt: GgmlType, raw, n: int, k: int) -> Terms:
     min_sub = None
     dmin = None
     d = _f16(b[:, 0:2])
-    if fmt is Q2_0:
+    if fmt is Q8_0:
+        code[:] = b[:, 2:34].view(np.int8).astype(np.int32)
+    elif fmt is Q2_0:
         qs = b[:, 2:18].astype(np.int32)
         j = np.arange(64)
         code[:] = ((qs[:, j // 4] >> (2 * (j % 4))) & 3) - 1

@@ -440,6 +440,8 @@ struct ProgramOptions {
     // Pinned allocations the Program makes after the tier (the prefix cache's Host tier and an
     // allowance): when the OS refuses a slot chunk, the tier leaves this much below the limit.
     std::uint64_t later_pinned_bytes = 0;
+    // Host memory a RAM tier rebuilt beside the current one must leave free (--ram-headroom-mib).
+    std::uint64_t ram_headroom_bytes = 0;
     // Speculative decoding with n-gram copy proposals (design section 11.7): at most this many
     // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
     // ngram_min_match tokens (4..64) earlier in the request.

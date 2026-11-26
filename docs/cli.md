@@ -271,7 +271,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8, K8V4, VQ2 or K4V2 KV unless an original prompt kernel is selected | `16384` for Qwen3.8-Flash-Next, `1024` otherwise |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
+| `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger), and a placement switch rebuilds the RAM tier beside the old one only when it stays free | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)) | `auto` (what the ledger leaves) |
 | `--ngram-residency auto\|ram\|volume` | Qwen3.8-Flash-Next: where the PLE n-gram table lives ([details](qwen3_8-flash-next.md#n-gram-table-in-ram)) | `auto` |
 | `--expert-pin-mib N\|auto` | Qwen3.8-Flash-Next: at most N MiB of the experts' RAM page-locked for the GPU; the rest stays unpinned and the CPU serves it ([Page-locking limit](qwen3_8-flash-next.md#page-locking-limit)) | `auto` (what Windows lets the GPU page-lock) |

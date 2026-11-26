@@ -202,6 +202,7 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
                                              : options.max_context * options.max_concurrency;
     offload::ExpertPlacementRuntime::Options& experts_options = program_options.placement;
     experts_options.vram_headroom = options.vram_headroom_bytes;
+    experts_options.ram_headroom_bytes = options.ram_headroom_bytes;
     experts_options.expert_swap   = options.expert_swap;
     if (!options.expert_state_path.empty()) {
         experts_options.expert_state          = options.expert_state_path;

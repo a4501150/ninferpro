@@ -509,7 +509,7 @@ void launch_expert_pass_fp8(const MoeDispatch& dispatch, const MoeExpertSource& 
         layout.x_limbs, layout.x_emax, dispatch, source, top_k, job_records, layout.tiles, layout.pass_tiles, base, jobs,
         h_plane);
     check_launch("fp8 gate/up tiles");
-    encode_h_ggml<<<ggml_encode_h_ctas(), kThreads, 0, stream>>>(dispatch, layout.tiles, layout.pass_tiles, base,
+    encode_h_ggml<GgmlDefault><<<ggml_encode_h_ctas(), kThreads, 0, stream>>>(dispatch, layout.tiles, layout.pass_tiles, base,
                                                                          jobs, h_plane, layout.h_emax);
     check_launch("fp8 encode h");
     down_tile_fp8<<<dim3(moe::kHidden / fp8t::kRows, tile_bound, 2), fp8t::kThreads, 0, stream>>>(

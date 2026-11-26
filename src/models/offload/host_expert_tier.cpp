@@ -51,17 +51,29 @@ void relax() {
 #endif
 }
 
+// cudaHostAlloc and cudaFreeHost hold the driver's lock for a whole chunk, and every other thread's
+// CUDA calls wait behind it: a tier pinned or freed beside a serving engine (a placement switch's
+// rebuild, the old tier on its reaper) stalled the engine thread 3-5 s on 5.4 GB chunks. Chunks
+// of about kChunkBytes with a pause after each keep the waits to one chunk's.
+constexpr std::uint64_t kChunkBytes = 256ULL << 20;
+
+void pace() { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+
 // Null when the OS refuses: on Windows page-locking stops at the adapter's shared system memory.
 void* pinned_allocate(std::size_t bytes) {
     void* p = nullptr;
     if (cudaHostAlloc(&p, bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
         (void)cudaGetLastError();
-        return nullptr;
+        p = nullptr;
     }
+    pace();
     return p;
 }
 
-void pinned_release(void* p) { (void)cudaFreeHost(p); }
+void pinned_release(void* p) {
+    (void)cudaFreeHost(p);
+    pace();
+}
 
 } // namespace
 
@@ -74,10 +86,12 @@ HostExpertTier::Pinned::~Pinned() {
     for (auto* p : chunks) { release(p); }
 }
 
-HostExpertTier::Options HostExpertTier::normalized(Options options) {
+HostExpertTier::Options HostExpertTier::normalized(Options options, std::uint64_t record_bytes) {
     if (!options.allocate) { options.allocate = pinned_allocate; }
     if (!options.release) { options.release = pinned_release; }
-    if (options.slots_per_chunk == 0) { throw std::invalid_argument("SSD tier: slots per chunk must be positive"); }
+    if (options.slots_per_chunk == 0) {
+        options.slots_per_chunk = static_cast<std::uint32_t>(std::max<std::uint64_t>(1, kChunkBytes / std::max<std::uint64_t>(record_bytes, 1)));
+    }
     if (options.min_slots == 0) { options.min_slots = options.ring + options.prefetch + options.demotion + 1; }
     if (options.copy_threads == 0) {
         options.copy_threads = std::clamp(std::thread::hardware_concurrency() / 3, 2U, 8U);
@@ -140,7 +154,7 @@ HostExpertTier::Pinned HostExpertTier::pin_slots(const ExpertStore& store, const
 }
 
 HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
-    : store_(store), options_(normalized(std::move(options))), pinned_(pin_slots(store_, options_)),
+    : store_(store), options_(normalized(std::move(options), store.record_bytes())), pinned_(pin_slots(store_, options_)),
       bounce_(options_.unpinned > 0 || pinned_.refused > 0 ? options_.bounce : 0),
       stream_bounce_(options_.unpinned > 0 || pinned_.refused > 0 ? options_.stream_bounce : 0),
       tier_(expert_cache::HostTier::Config{.num_keys  = store.layers() * store.experts(),
@@ -501,20 +515,29 @@ void HostExpertTier::copy_records(std::span<const std::pair<std::uint8_t*, const
         for (const auto& [destination, source] : copies) { copies_.push_back({destination, source, 0, &left}); }
     }
     copy_wake_.notify_all();
-    // This thread copies too, then waits for the copies the threads took.
-    for (;;) {
-        Copy copy;
-        {
-            std::unique_lock<std::mutex> lock(copy_mutex_);
-            if (copies_.empty()) {
-                copy_done_.wait(lock, [&] { return left == 0; });
-                return;
+    const auto drain = [this] {
+        for (;;) {
+            Copy copy;
+            {
+                std::lock_guard<std::mutex> lock(copy_mutex_);
+                if (copies_.empty()) { return; }
+                copy = copies_.front();
+                copies_.pop_front();
             }
-            copy = copies_.front();
-            copies_.pop_front();
+            finish_copy(copy);
         }
-        finish_copy(copy);
+    };
+    // A tier without unpinned records runs no copy threads: the batch takes its own.
+    std::vector<std::thread> helpers;
+    if (copiers_.empty()) {
+        const auto extra = std::min<std::size_t>(options_.copy_threads, copies.size()) - 1;
+        for (std::size_t i = 0; i < extra; ++i) { helpers.emplace_back(drain); }
     }
+    // This thread copies too, then waits for the copies the threads took.
+    drain();
+    for (auto& helper : helpers) { helper.join(); }
+    std::unique_lock<std::mutex> lock(copy_mutex_);
+    copy_done_.wait(lock, [&] { return left == 0; });
 }
 
 void HostExpertTier::agent_main() noexcept {

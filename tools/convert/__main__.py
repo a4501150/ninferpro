@@ -180,6 +180,15 @@ def main(argv=None):
         "(Qwen4Exp's MTP head, Glm5Next's vision tower)",
     )
     parser.add_argument(
+        "--gguf-experts",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="SHARD",
+        help="Glm5Next with --gguf: the routed experts from these GGUF shards (another build of the same "
+        "weights, every other tensor of which must equal --gguf's or be its Q8_0 rounding)",
+    )
+    parser.add_argument(
         "--mmproj",
         type=Path,
         help="Qwen4Exp with --gguf and the vision component: the vision tower from this BF16 mmproj GGUF",
@@ -225,6 +234,13 @@ def main(argv=None):
             from .sources.gguf_raw import GgufStore
 
             gguf_store = stack.enter_context(GgufStore(args.gguf))
+        experts_store = None
+        if args.gguf_experts:
+            if gguf_store is None or not glm:
+                raise ValueError("--gguf-experts replaces the routed experts of a Glm5Next --gguf import")
+            from .sources.gguf_raw import GgufStore
+
+            experts_store = stack.enter_context(GgufStore(args.gguf_experts))
         mmproj = None
         if args.mmproj is not None:
             if gguf_store is None:
@@ -243,7 +259,7 @@ def main(argv=None):
                 from . import glm5_next_gguf
 
                 model = glm5_next_gguf.build_model(base, gguf_store, components=components,
-                                                   resource_overrides=overrides)
+                                                   resource_overrides=overrides, experts=experts_store)
             else:
                 model = glm5_next.build_model(base, components=components, resource_overrides=overrides)
         elif qwen4:
@@ -313,6 +329,8 @@ def main(argv=None):
         }
         if gguf_store is not None:
             provenance["gguf"] = [str(path) for path in gguf_store.paths]
+        if experts_store is not None:
+            provenance["gguf_experts"] = [str(path) for path in experts_store.paths]
         if mmproj is not None:
             provenance["mmproj"] = str(mmproj.path)
         if args.override:

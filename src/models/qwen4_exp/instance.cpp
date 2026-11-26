@@ -255,6 +255,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                         ? models::offload::testing::route_trace()
                                         : options.route_trace_path;
     program_options.vram_headroom = options.vram_headroom_bytes;
+    program_options.ram_headroom_bytes = options.ram_headroom_bytes;
     program_options.vram_past_budget = options.vram_past_budget;
     program_options.expert_tail_skip = options.expert_tail_skip;
     program_options.expert_swap      = options.expert_swap;

@@ -19,7 +19,9 @@ namespace infernix::ops::offloaded_moe {
 namespace {
 
 // Slices per block (the period of the d words).
-constexpr int block_slices(QType q) { return q == QType::GGML_IQ4_NL ? 1 : q == QType::GGML_Q2_0 ? 2 : 8; }
+constexpr int block_slices(QType q) {
+    return q == QType::GGML_IQ4_NL || q == QType::GGML_Q8_0 ? 1 : q == QType::GGML_Q2_0 ? 2 : 8;
+}
 
 // The slice's X values from its limbs.
 void limbs_to_x(const CpuLimbSlice& l, std::int32_t (&x)[32]) {
@@ -110,7 +112,12 @@ template <QType F>
 INFERNIX_TARGET("avx2")
 inline Decoded decode(const std::uint8_t* row, int s) {
     Decoded o;
-    if constexpr (F == QType::GGML_IQ4_NL) {
+    if constexpr (F == QType::GGML_Q8_0) {
+        const std::uint8_t* b = row + static_cast<std::size_t>(s) * 34;
+        o.d    = u16(b);
+        o.sub0 = o.sub1 = 1;
+        o.q    = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 2));
+    } else if constexpr (F == QType::GGML_IQ4_NL) {
         const std::uint8_t* b = row + static_cast<std::size_t>(s) * 18;
         o.d    = u16(b);
         o.sub0 = o.sub1 = 1;
@@ -215,9 +222,10 @@ inline Decoded decode(const std::uint8_t* row, int s) {
 
 // ------------------------------------------------------------------------ AVX2 dot products
 //
-// The sub-scales go into the codes (|code * sub| <= 127 * 32 = 4064, a signed 16-bit word), so a
-// column's slice is four 16-bit multiply-adds (vpmaddwd, or vpdpwssd with VNNI) against its two
-// limb planes: per lane |w * x| < 2^24 per pair, below 2^29 over the four slices of a unit.
+// The sub-scales go into the codes (|code * sub| <= 127 * 32 = 4064, or Q8_0's 128 * 1: a signed
+// 16-bit word), so a column's slice is four 16-bit multiply-adds (vpmaddwd, or vpdpwssd with VNNI)
+// against its two limb planes: per lane |w * x| < 2^24 per pair, below 2^29 over the four slices of
+// a unit.
 
 struct Weights {
     __m256i lo, hi; // code * sub as int16: elements 0-15, 16-31
@@ -235,7 +243,7 @@ using x86::hsum8;
 
 // Slices per unit (one int32 accumulation), and units per block.
 template <QType F>
-inline constexpr int kUnitSlices = F == QType::GGML_IQ4_NL ? 1 : F == QType::GGML_Q2_0 ? 2 : 4;
+inline constexpr int kUnitSlices = F == QType::GGML_IQ4_NL || F == QType::GGML_Q8_0 ? 1 : F == QType::GGML_Q2_0 ? 2 : 4;
 
 // The min terms of a row's blocks (Q4_K, Q2_K): - mant(dmin) * sum(min * X sum) per block from the
 // columns' 16-element X sums, the integers of ggml_exact.h's chunk terms (|min * sum| < 2^31 per
@@ -493,7 +501,8 @@ bool ggml_cpu_supported(const GgmlExpertFormat& format, const Geometry& geometry
         // The GPU's pairs at GLM-5.3-Flash's geometry.
         pair = (format.gate_up == QType::GGML_Q4_K && format.down == QType::GGML_Q3_K) ||
                (format.gate_up == QType::GGML_Q3_K && (format.down == QType::GGML_Q3_K || format.down == QType::GGML_Q2_K)) ||
-               (format.gate_up == QType::GGML_Q2_K && format.down == QType::GGML_Q2_K);
+               (format.gate_up == QType::GGML_Q2_K && format.down == QType::GGML_Q2_K) ||
+               (format.gate_up == QType::GGML_Q8_0 && format.down == QType::GGML_Q8_0);
     }
     const auto hidden = static_cast<std::uint32_t>(geometry.hidden), inter = static_cast<std::uint32_t>(geometry.intermediate);
     return pair && format.gate_row_bytes == hidden / ggml_block_elems(format.gate_up) * ggml_block_bytes(format.gate_up) &&
@@ -532,6 +541,7 @@ void ggml_row_sums(CpuIsa isa, QType format, const std::uint8_t* matrix, int row
         INFERNIX_GGML_FORMAT(QType::GGML_Q4_K)
         INFERNIX_GGML_FORMAT(QType::GGML_Q3_K)
         INFERNIX_GGML_FORMAT(QType::GGML_Q2_K)
+        INFERNIX_GGML_FORMAT(QType::GGML_Q8_0)
     default:
         throw std::invalid_argument("offloaded_moe ggml: not an expert format of the CPU route");
     }

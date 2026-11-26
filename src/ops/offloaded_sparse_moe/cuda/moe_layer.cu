@@ -2749,7 +2749,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         prepare_x(x, source, max_jobs, layout, stream);
     }
     // A ggml bank's wide jobs' work tiles, planned once the dispatch is known.
-    if (ggml && x.ne[1] > moe::kMaxColumns && geometry.hidden == moe::kDefaultGeometry.hidden) {
+    if (ggml && x.ne[1] > moe::kMaxColumns) {
         launch_plan_ggml(dispatch, max_jobs, layout, stream);
     }
     // Passes of at most staging_slots jobs (one pass covering every job without staging).

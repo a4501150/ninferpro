@@ -26,6 +26,12 @@ Three tensors come from the checkpoint instead, each checked against the GGUF ov
 The token embedding is a row gather the engine binds BF16: each row is the GGUF's Q8_0 value
 d * code rounded once to BF16, the value the Q8 gather would produce. The GGUF holds no MTP
 layer, so the artifact records none.
+
+With ``experts`` (``tools.convert --gguf-experts``) the routed expert banks come from another build
+of the same weights instead (GCSA-AiLab's Q8_0 GGUF beside its Q4-class one: an artifact that differs
+from the Q4 one in the experts alone, the Q4 build's quality reference). Every other tensor of that
+build must be the main GGUF's bytes, or the Q8_0 rounding of its BF16/F32 values
+(require_shared_tensors).
 """
 
 from __future__ import annotations
@@ -103,6 +109,17 @@ def _q8_blocks(store: GgufStore, name: str, begin: int, end: int, k: int) -> tup
     return codes, scales.view(np.float16).astype(np.float64)
 
 
+def _q8_rounding_rows(codes: np.ndarray, scales: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Whether each row's Q8_0 values (codes [rows, k], scales [rows, k / 32]) are not the Q8_0
+    rounding of ``ref`` [rows, k] (require_q8_rounding's bound)."""
+
+    rows, k = codes.shape
+    c = codes.reshape(rows, k // 32, 32)
+    stored = c * scales[..., None]
+    bound = scales[..., None] * (0.5 * (1 + 2.0**-10) + np.abs(c) * 2.0**-10)
+    return (np.abs(stored - ref.reshape(rows, k // 32, 32)) > bound).any(axis=(1, 2))
+
+
 def require_q8_rounding(store: GgufStore, name: str, base: SafetensorsSource, source_name: str,
                         shape: tuple[int, int]) -> None:
     """The GGUF's Q8_0 ``name`` must be the Q8_0 rounding of the checkpoint's ``source_name``: every
@@ -120,13 +137,40 @@ def require_q8_rounding(store: GgufStore, name: str, base: SafetensorsSource, so
     for first in range(0, rows, _ROW_CHUNK):
         last = min(rows, first + _ROW_CHUNK)
         codes, scales = _q8_blocks(store, name, first, last, k)
-        stored = codes.reshape(last - first, k // 32, 32) * scales[..., None]
-        ref = base.read_flat(source_name, first * k, last * k).to(torch.float64).numpy().reshape(last - first, k // 32, 32)
-        bound = scales[..., None] * (0.5 * (1 + 2.0**-10) + np.abs(codes.reshape(last - first, k // 32, 32)) * 2.0**-10)
-        bad = np.abs(stored - ref) > bound
+        ref = base.read_flat(source_name, first * k, last * k).to(torch.float64).numpy().reshape(last - first, k)
+        bad = _q8_rounding_rows(codes, scales, ref)
         if bad.any():
-            row = first + int(np.flatnonzero(bad.any(axis=(1, 2)))[0])
+            row = first + int(np.flatnonzero(bad)[0])
             raise ValueError(f"{name}: row {row} is not the Q8_0 rounding of the checkpoint's {source_name}")
+
+
+def require_shared_tensors(store: GgufStore, other: GgufStore) -> None:
+    """Every tensor of ``store`` but the routed experts must be in ``other`` (and ``other`` holds no
+    further one) as the same bytes, or, for a BF16/F32/F16 tensor of ``store``, as a Q8_0 tensor that is
+    its Q8_0 rounding."""
+
+    names = {n for n in store.tensors if "_exps." not in n}
+    other_names = {n for n in other.tensors if "_exps." not in n}
+    if names != other_names:
+        raise ValueError(f"{other.path}: its tensors differ from {store.path}'s: "
+                         f"{sorted(names ^ other_names)[:4]}")
+    for name in sorted(names):
+        t, o = store.tensor(name), other.tensor(name)
+        if o.shape != t.shape:
+            raise ValueError(f"{name}: shape {o.shape} in {other.path}, {t.shape} in {store.path}")
+        if o.ggml_type != t.ggml_type and not (o.ggml_type == 8 and t.ggml_type in (0, 1, 30)):
+            raise ValueError(f"{name}: type {o.ggml_type} in {other.path} against {t.ggml_type} in {store.path}")
+        values = store.plain(name).reshape(t.rows, t.row_elems) if o.ggml_type != t.ggml_type else None
+        for first in range(0, t.rows, _ROW_CHUNK):
+            last = min(t.rows, first + _ROW_CHUNK)
+            if values is None:
+                bad = ~(store.raw(name, first, last) == other.raw(name, first, last)).all(axis=1)
+            else:
+                codes, scales = _q8_blocks(other, name, first, last, t.row_elems)
+                bad = _q8_rounding_rows(codes, scales, values[first:last])
+            if bad.any():
+                row = first + int(np.flatnonzero(bad)[0])
+                raise ValueError(f"{name}: row {row} of {other.path} is not {store.path}'s (or its Q8_0 rounding)")
 
 
 def require_a_log(store: GgufStore, name: str, base: SafetensorsSource, source_name: str, heads: int) -> None:
@@ -171,9 +215,11 @@ def kda_convolution(store: GgufStore, blk: str, taps: int, width: int) -> Logica
 
 
 class _Builder:
-    def __init__(self, model: Model, store: GgufStore, base: SafetensorsSource, config: dict):
+    def __init__(self, model: Model, store: GgufStore, base: SafetensorsSource, config: dict,
+                 experts: GgufStore):
         self.model = model
         self.store = store
+        self.experts = experts
         self.base = base
         self.config = config
         self.checkpoint = glm5_next._Builder(model)
@@ -263,7 +309,7 @@ class _Builder:
         self.matrix(p + "router", blk + "ffn_gate_inp.weight", (e, h), inputs=(ffn_input,))
         self.add(p + "router_bias", plain(self.store, blk + "exp_probs_b.bias", (e,), bf16_exact=False), direct="fp32")
         self.mlp(p + "shared/", blk, "_shexp", ir, ffn_input)
-        bank = GgmlExpertBank(self.store, layer, (e, h, ir))
+        bank = GgmlExpertBank(self.experts, layer, (e, h, ir))
         self.model.add(Parameter(p + "experts", (e, h, ir), bank, None, (ffn_input,), bank.gate_up_format,
                                  residency="text"))
 
@@ -286,9 +332,11 @@ class _Builder:
 
 
 def build_model(base: SafetensorsSource, store: GgufStore, *, components: tuple[str, ...] = ("text",),
-                resource_overrides: Mapping[str, str | Path] | None = None) -> Model:
+                resource_overrides: Mapping[str, str | Path] | None = None,
+                experts: GgufStore | None = None) -> Model:
     """The Glm5Next logical model of a GGUF (``store``), configured by the checkpoint (``base``),
-    whose vision tower the ``vision`` component stores (glm5_next._Builder.vision)."""
+    whose vision tower the ``vision`` component stores (glm5_next._Builder.vision); the routed
+    experts from ``experts`` when given (require_shared_tensors)."""
 
     selected = set(components)
     if "text" not in selected or selected - {"text", "vision"}:
@@ -298,6 +346,9 @@ def build_model(base: SafetensorsSource, store: GgufStore, *, components: tuple[
         raise ValueError("vision requested, but the checkpoint has no model.visual tensors")
     config = glm5_next.text_config(base.config)
     _metadata_checks(store, config)
+    if experts is not None:
+        _metadata_checks(experts, config)
+        require_shared_tensors(store, experts)
     config["mtp_layers"] = 0  # the GGUF holds no MTP layer
     vision = glm5_next.vision_config(base.config, config) if want_vision else None
     refs, resources, count, special = load_resources(
@@ -308,7 +359,7 @@ def build_model(base: SafetensorsSource, store: GgufStore, *, components: tuple[
     if want_vision:
         records["vision"] = {"config": vision, "resources": refs["vision"], "target": "text"}
     model = Model(records, resources=resources, token_count=count, special_token_ids=special)
-    b = _Builder(model, store, base, config)
+    b = _Builder(model, store, base, config, experts if experts is not None else store)
     h, v = config["hidden_size"], config["vocab_size"]
     b.add("text/token_embedding", q8_bf16_rows(store, "token_embd.weight", (v, h)))
     require_q8_rounding(store, "output.weight", base, "lm_head.weight", (v, h))

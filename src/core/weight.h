@@ -38,6 +38,8 @@ enum class QType : std::uint16_t {
     // GGUF K-quants of the GLM-5.3-Flash GSQ builds' experts (ggml formats like GGML_Q2_0 ..).
     GGML_Q2_K = 21,
     GGML_Q3_K = 22,
+    // GGUF Q8_0 expert rows (the GLM-5.3-Flash Q8_0 build: the GSQ builds' quality reference).
+    GGML_Q8_0 = 23,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -64,6 +66,8 @@ enum class QuantLayout : std::uint16_t {
     // ggml_expert_{q3_k,q2_k}_v1: GgmlExpertIq4Nl's records with Q3_K or Q2_K down rows.
     GgmlExpertQ3K = 10,
     GgmlExpertQ2K = 11,
+    // ggml_expert_q8_0_v1: GgmlExpertIq4Nl's records with Q8_0 down rows.
+    GgmlExpertQ8_0 = 12,
 };
 
 // Whether `layout` stores a matrix of GGUF blocks (ggml_rows_v1 or ggml_tiles16_v1).
@@ -75,7 +79,8 @@ enum class QuantLayout : std::uint16_t {
 [[nodiscard]] constexpr bool is_expert_bank_layout(QuantLayout layout) noexcept {
     return layout == QuantLayout::ExpertRg16 || layout == QuantLayout::GgmlExpertIq4Nl ||
            layout == QuantLayout::GgmlExpertQ2_0 || layout == QuantLayout::GgmlExpertQ3K ||
-           layout == QuantLayout::GgmlExpertQ2K || layout == QuantLayout::Fp8ExpertB128;
+           layout == QuantLayout::GgmlExpertQ2K || layout == QuantLayout::GgmlExpertQ8_0 ||
+           layout == QuantLayout::Fp8ExpertB128;
 }
 
 struct Weight {

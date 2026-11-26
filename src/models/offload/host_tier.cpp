@@ -337,6 +337,25 @@ void HostTier::release_stream_pins() {
     streamed_.clear();
 }
 
+void HostTier::rebuild_pin(std::uint32_t key) {
+    const std::int32_t s = slot_of_[key];
+    if (s < 0) { return; }
+    const auto slot = static_cast<std::uint32_t>(s);
+    if (!(slots_[slot].pins & kPinRebuild)) {
+        slots_[slot].pins |= kPinRebuild;
+        rebuilt_.push_back(slot);
+        push_victim(slot);
+    }
+}
+
+void HostTier::release_rebuild_pins() {
+    for (const auto s : rebuilt_) {
+        slots_[s].pins &= static_cast<std::uint8_t>(~kPinRebuild);
+        push_victim(s);
+    }
+    rebuilt_.clear();
+}
+
 void HostTier::record_uses(double dt, std::span<const std::uint32_t> keys, double weight) {
     if (const int halvings = lfu_.advance(dt); halvings > 0) { rescale_victims(halvings); }
     for (const auto k : keys) {
@@ -546,6 +565,15 @@ void HostTier::check() const {
     }
     for (const Slot& slot : slots_) { stream_pins += (slot.pins & kPinStream) ? 1 : 0; }
     if (stream_pins != streamed_.size()) { fail("stream pins"); }
+    std::size_t rebuild_pins = 0;
+    for (const auto s : rebuilt_) {
+        const Slot& slot = slots_[s];
+        if (!(slot.pins & kPinRebuild) || (slot.state != SlotState::kResident && slot.state != SlotState::kShadow)) {
+            fail("rebuild pin");
+        }
+    }
+    for (const Slot& slot : slots_) { rebuild_pins += (slot.pins & kPinRebuild) ? 1 : 0; }
+    if (rebuild_pins != rebuilt_.size()) { fail("rebuild pins"); }
     if (residents != resident_count_ || shadows != shadow_count_) { fail("counts"); }
     // The victim heaps: every eligible slot once, in (value, slot) order, a shadow at its current value
     // and a resident at most at it.

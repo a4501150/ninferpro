@@ -7,10 +7,10 @@
 // expert's outputs depend neither on where its record lives nor on how many columns share the
 // call, on the narrow and the wide routes alike.
 //
-// The narrow kernels take the record geometry G (expert_layout.h Nvfp4Geometry): the default one
-// (Qwen3.8-Flash-Next's IQ banks) and GLM-5.3-Flash's 4096 x 2048 K-quant banks, whose SwiGLU clamps
-// at the geometry's limit. The wide routes below are the default geometry's; a bank of another
-// geometry runs the narrow kernels at every width (the same bits, columns four at a time).
+// The kernels take the record geometry G (expert_layout.h Nvfp4Geometry): the default one (the IQ
+// banks) and the 4096 x 2048 K-quant banks, whose SwiGLU clamps at the geometry's limit. Both take
+// the exact wide tiles below; the default geometry's down tiles keep their rows resident, and its
+// banks also have the ggml-bf16-prefill route.
 //
 // - ggml_encode_x_kernel encodes every token's x once per call into the A16 workspace's x limb
 //   rows (H / 32 slices of kSliceWords words: exactly the geometry's A16 x row) and x_emax; for a
@@ -255,8 +255,8 @@ __global__ void __launch_bounds__(kGgmlThreads)
 // first tile index (first_tile, max_jobs + 1 entries), so a pass over jobs [base, base + n) owns
 // tiles [first_tile[base], first_tile[base + n]); the workspace's tile list, sized for 64-column
 // tiles (moe::wide::max_tiles), holds them. Gate/up CTAs own 32 intermediates (their 32 gate rows
-// and 32 up rows) and write BF16 h; the pass's wide h rows are then rewritten in place as limbs (20
-// slices of kSliceWords words: kA16HRowBytes), and down CTAs own 64 output rows.
+// and 32 up rows) and write BF16 h; the pass's wide h rows are then rewritten in place as limbs (I /
+// 32 slices of kSliceWords words: the geometry's A16 h row), and down CTAs own 64 output rows.
 
 constexpr int kGgmlPlanThreads = 512;
 constexpr int kGgmlTileColumns = ggml::tile::kTileColumns; // columns per planned tile (one CTA)
@@ -331,12 +331,13 @@ __device__ __forceinline__ bool ggml_tile_of(const MoeDispatch& dispatch, const 
     return out.column0 < out.count;
 }
 
-template <QType GU>
+template <QType GU, class G>
 __global__ void __launch_bounds__(kGgmlTileThreads, 1)
     gate_up_tile_ggml(const std::uint8_t* __restrict__ x_limbs, const std::int32_t* __restrict__ x_emax,
                       MoeDispatch dispatch, MoeExpertSource source, int top_k,
                       const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ tiles,
                       const std::int32_t* __restrict__ first_tile, int job_base, int jobs, std::uint16_t* __restrict__ h_plane) {
+    using Dm = GgmlDims<G>;
     extern __shared__ __align__(16) unsigned char tile_shared[];
     auto& sm = *reinterpret_cast<ggml::tile::Shared*>(tile_shared);
     __shared__ std::uint16_t up[kGgmlTileUnits][ggml::tile::kTileColumns];
@@ -348,16 +349,16 @@ __global__ void __launch_bounds__(kGgmlTileThreads, 1)
     const int row_bytes = static_cast<int>(source.ggml.gate_row_bytes);
     const auto row_of   = [&](int r) {
         return record +
-               static_cast<std::size_t>(r < kGgmlTileUnits ? i0 + r : moe::kIntermediate + i0 + r - kGgmlTileUnits) * row_bytes;
+               static_cast<std::size_t>(r < kGgmlTileUnits ? i0 + r : Dm::kIntermediate + i0 + r - kGgmlTileUnits) * row_bytes;
     };
     const auto token = [&](int c) { return dispatch.entries[tl.first + min(tl.column0 + c, tl.count - 1)] / top_k; };
     const auto limbs = [&](int c) {
-        return reinterpret_cast<const std::int32_t*>(x_limbs + static_cast<std::size_t>(token(c)) * moe::wide::kA16XRowBytes);
+        return reinterpret_cast<const std::int32_t*>(x_limbs + static_cast<std::size_t>(token(c)) * Dm::kXRowBytes);
     };
     ggml::tile::Accumulators acc;
     const int columns = min(ggml::tile::kTileColumns, tl.count - tl.column0);
     const ggml::tile::WarpTile wt = ggml::tile::warp_tile<kGgmlTileThreads>(columns);
-    ggml::tile::compute<GU, kGgmlTileThreads>(sm, row_of, kGgmlXSlices, limbs, 0, columns, acc);
+    ggml::tile::compute<GU, kGgmlTileThreads>(sm, row_of, Dm::kXSlices, limbs, columns, acc);
     const int lane = threadIdx.x % 32;
 #pragma unroll
     for (int mi = 0; mi < ggml::tile::kMTiles; ++mi) {
@@ -382,8 +383,8 @@ __global__ void __launch_bounds__(kGgmlTileThreads, 1)
                 const int r = ggml::tile::out_row(wt, lane, mi, q), c = ggml::tile::out_column(wt, lane, nt, q);
                 if (mi < wt.mtiles && nt < wt.ntiles && r < kGgmlTileUnits && tl.column0 + c < tl.count) {
                     const std::uint16_t y = ggml::output_bf16(acc.r[mi][nt][q], x_emax[token(c)], GU);
-                    h_plane[static_cast<std::size_t>(tl.first + tl.column0 + c) * moe::wide::kA16HRowElements + i0 + r] =
-                        canon::swiglu_bf16(y, up[r][c]);
+                    h_plane[static_cast<std::size_t>(tl.first + tl.column0 + c) * Dm::kHRowElements + i0 + r] =
+                        Dm::kLimit > 0.0F ? canon::swiglu_bf16_clamped(y, up[r][c], Dm::kLimit) : canon::swiglu_bf16(y, up[r][c]);
                 }
             }
         }
@@ -391,11 +392,13 @@ __global__ void __launch_bounds__(kGgmlTileThreads, 1)
 }
 
 // The pass's wide entries' h rows rewritten in place from BF16 to limbs: one warp per entry, which
-// holds the whole row in registers (five 4-element groups per lane) before it writes.
+// holds the whole row in registers (I / 128 4-element groups per lane) before it writes.
+template <class G>
 __global__ void __launch_bounds__(kThreads)
     encode_h_ggml(MoeDispatch dispatch, const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ first_tile,
                   int job_base, int jobs, std::uint16_t* __restrict__ h_plane, std::int32_t* __restrict__ h_emax) {
-    constexpr int kGroups = moe::kIntermediate / 4 / 32; // per lane
+    using Dm = GgmlDims<G>;
+    constexpr int kGroups = Dm::kIntermediate / 4 / 32; // per lane
     const int lane = static_cast<int>(threadIdx.x) % 32;
     const int warp = static_cast<int>(blockIdx.x) * kWarps + static_cast<int>(threadIdx.x) / 32;
     const int t0 = first_tile[job_base], tasks = (first_tile[job_base + jobs] - t0) * kGgmlTileColumns;
@@ -405,7 +408,7 @@ __global__ void __launch_bounds__(kThreads)
         const int expert = dispatch.jobs[job];
         const int entry  = dispatch.offsets[expert] + column;
         if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
-        std::uint16_t* h = h_plane + static_cast<std::size_t>(entry) * moe::wide::kA16HRowElements;
+        std::uint16_t* h = h_plane + static_cast<std::size_t>(entry) * Dm::kHRowElements;
         std::uint16_t v[kGroups][4];
         unsigned key = 0;
 #pragma unroll
@@ -483,6 +486,50 @@ __global__ void __launch_bounds__(kGgmlTileThreads, 1)
                         reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(dispatch.entries[entry(c)]) * hidden +
                                                                   row] = ggml::output_bf16(acc.r[mi][nt][q], h_emax[entry(c)], D);
                     }
+                }
+            }
+        }
+    }
+}
+
+// Down tiles of a geometry whose rows do not fit resident (the 4096 x 2048 one: 32 stages): CTA
+// (x, y) computes output rows 64x .. 64x + 63 of the pass's tile y, decoding its rows in the K loop.
+template <QType D, class G>
+__global__ void __launch_bounds__(kGgmlTileThreads, 1)
+    down_tile_ggml(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
+                   const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ first_tile, int job_base, int jobs,
+                   const std::uint16_t* __restrict__ h_plane, const std::int32_t* __restrict__ h_emax,
+                   bf16* __restrict__ outputs) {
+    using Dm = GgmlDims<G>;
+    extern __shared__ __align__(16) unsigned char tile_shared[];
+    auto& sm = *reinterpret_cast<ggml::tile::Shared*>(tile_shared);
+    GgmlTile tl;
+    if (!ggml_tile_of(dispatch, tiles, first_tile, job_base, jobs, tl)) { return; }
+    const std::uint8_t* record = job_records[tl.job];
+    if (record == nullptr) { return; }
+    const int row0 = static_cast<int>(blockIdx.x) * ggml::tile::kTileRows;
+    const std::uint8_t* down = record + 2 * static_cast<std::size_t>(Dm::kIntermediate) * source.ggml.gate_row_bytes;
+    const auto row_of = [&](int r) { return down + static_cast<std::size_t>(row0 + r) * source.ggml.down_row_bytes; };
+    const auto entry  = [&](int c) { return tl.first + min(tl.column0 + c, tl.count - 1); };
+    const auto limbs  = [&](int c) {
+        return reinterpret_cast<const std::int32_t*>(h_plane + static_cast<std::size_t>(entry(c)) * Dm::kHRowElements);
+    };
+    ggml::tile::Accumulators acc;
+    const int columns = min(ggml::tile::kTileColumns, tl.count - tl.column0);
+    const ggml::tile::WarpTile wt = ggml::tile::warp_tile<kGgmlTileThreads>(columns);
+    ggml::tile::compute<D, kGgmlTileThreads>(sm, row_of, Dm::kHSlices, limbs, columns, acc);
+    const int lane = threadIdx.x % 32;
+#pragma unroll
+    for (int mi = 0; mi < ggml::tile::kMTiles; ++mi) {
+#pragma unroll
+        for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int c = ggml::tile::out_column(wt, lane, nt, q);
+                if (mi < wt.mtiles && nt < wt.ntiles && tl.column0 + c < tl.count) {
+                    const int row = row0 + ggml::tile::out_row(wt, lane, mi, q);
+                    reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(dispatch.entries[entry(c)]) * Dm::kHidden +
+                                                              row] = ggml::output_bf16(acc.r[mi][nt][q], h_emax[entry(c)], D);
                 }
             }
         }
@@ -816,42 +863,57 @@ void launch_narrow_pass_ggml(const MoeDispatch& dispatch, const MoeExpertSource&
 }
 
 // `entries` is the call's entry count when the call is wide (planned by launch_plan_ggml), else 0.
-template <QType GU, QType D>
+template <QType GU, QType D, class G = GgmlDefault>
 void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                              const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                              const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream,
                              PassPhase phase, int entries) {
+    using Dm             = GgmlDims<G>;
+    constexpr bool kDefault = std::is_same_v<G, GgmlDefault>;
     auto* h_plane        = reinterpret_cast<std::uint16_t*>(layout.h_rows);
     const int narrow_max = entries > 0 ? moe::kMaxColumns : std::numeric_limits<int>::max();
-    launch_narrow_pass_ggml<GU, D, GgmlDefault>(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,
-                                                stream, phase, narrow_max);
+    launch_narrow_pass_ggml<GU, D, G>(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream,
+                                      phase, narrow_max);
     if (entries == 0) { return; }
-    if (source.wide_a16 == moe::WideA16::kGgmlBf16 && layout.ggml_planes != nullptr) {
-        launch_bf16_pass_ggml<GU, D>(reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k, job_records, flags,
-                                     base, jobs, layout, outputs, stream);
-        return;
+    if constexpr (kDefault) {
+        if (source.wide_a16 == moe::WideA16::kGgmlBf16 && layout.ggml_planes != nullptr) {
+            launch_bf16_pass_ggml<GU, D>(reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k, job_records,
+                                         flags, base, jobs, layout, outputs, stream);
+            return;
+        }
     }
     // At most one partial tile per job plus one per 64 entries; CTAs past the pass's tiles exit.
     const unsigned tile_bound = static_cast<unsigned>(jobs + (entries + kGgmlTileColumns - 1) / kGgmlTileColumns);
     constexpr int kTileShared = static_cast<int>(sizeof(ggml::tile::Shared));
-    constexpr int kDownShared = static_cast<int>(sizeof(GgmlDownShared<D>));
+    constexpr int kDownShared = kDefault ? static_cast<int>(sizeof(GgmlDownShared<D>)) : kTileShared;
     static const bool configured = [] {
-        return cudaFuncSetAttribute(gate_up_tile_ggml<GU>, cudaFuncAttributeMaxDynamicSharedMemorySize, kTileShared) ==
-                   cudaSuccess &&
-               cudaFuncSetAttribute(down_resident_ggml<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, kDownShared) ==
-                   cudaSuccess;
+        bool ok = cudaFuncSetAttribute(gate_up_tile_ggml<GU, G>, cudaFuncAttributeMaxDynamicSharedMemorySize, kTileShared) ==
+                  cudaSuccess;
+        if constexpr (kDefault) {
+            ok = ok && cudaFuncSetAttribute(down_resident_ggml<D>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            kDownShared) == cudaSuccess;
+        } else {
+            ok = ok && cudaFuncSetAttribute(down_tile_ggml<D, G>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            kDownShared) == cudaSuccess;
+        }
+        return ok;
     }();
     if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the ggml tiles' shared memory exceeds the device's"); }
-    gate_up_tile_ggml<GU><<<dim3(moe::kIntermediate / kGgmlTileUnits, tile_bound), kGgmlTileThreads, kTileShared, stream>>>(
+    gate_up_tile_ggml<GU, G><<<dim3(Dm::kIntermediate / kGgmlTileUnits, tile_bound), kGgmlTileThreads, kTileShared, stream>>>(
         layout.x_limbs, layout.x_emax, dispatch, source, top_k, job_records, layout.tiles, layout.pass_tiles, base, jobs,
         h_plane);
     check_launch("ggml gate/up tiles");
-    encode_h_ggml<<<ggml_encode_h_ctas(), kThreads, 0, stream>>>(dispatch, layout.tiles, layout.pass_tiles, base,
-                                                                         jobs, h_plane, layout.h_emax);
+    encode_h_ggml<G><<<ggml_encode_h_ctas(), kThreads, 0, stream>>>(dispatch, layout.tiles, layout.pass_tiles, base, jobs,
+                                                                     h_plane, layout.h_emax);
     check_launch("ggml encode h");
-    down_resident_ggml<D><<<dim3(moe::kHidden / ggml::tile::kTileRows, jobs), kGgmlTileThreads, kDownShared, stream>>>(
-        dispatch, source, static_cast<int>(moe::kHidden), job_records, layout.tiles, layout.pass_tiles, base, h_plane,
-        layout.h_emax, outputs);
+    if constexpr (kDefault) {
+        down_resident_ggml<D><<<dim3(moe::kHidden / ggml::tile::kTileRows, jobs), kGgmlTileThreads, kDownShared, stream>>>(
+            dispatch, source, static_cast<int>(moe::kHidden), job_records, layout.tiles, layout.pass_tiles, base, h_plane,
+            layout.h_emax, outputs);
+    } else {
+        down_tile_ggml<D, G><<<dim3(Dm::kHidden / ggml::tile::kTileRows, tile_bound), kGgmlTileThreads, kDownShared, stream>>>(
+            dispatch, source, job_records, layout.tiles, layout.pass_tiles, base, jobs, h_plane, layout.h_emax, outputs);
+    }
     check_launch("ggml down tiles");
 }
 
@@ -861,30 +923,30 @@ void launch_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const MoeExper
                       const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream, PassPhase phase,
                       int entries) {
     const QType gu = source.ggml.gate_up_format, d = source.ggml.down_format;
-    // The K-quant banks of the 4096 x 2048 geometry: the narrow kernels at every width.
+    // The wide tiles run every job of the pass: a forked call (Staged/Resident phases) must not have
+    // wide entries, which forked()'s column bound guarantees today.
+    if (entries > 0 && phase != PassPhase::All) {
+        throw std::logic_error("offloaded_sparse_moe: the GGUF wide tiles do not split by pass phase");
+    }
+    // The K-quant and Q8_0 banks of the 4096 x 2048 geometry.
     if (source.geometry.hidden != moe::kDefaultGeometry.hidden) {
         using H4096 = moe::Nvfp4Geometry<moe::kGeometries[1].hidden, moe::kGeometries[1].intermediate>;
         if (source.geometry.hidden != H4096::kHidden || source.geometry.intermediate != H4096::kIntermediate) {
             throw std::invalid_argument("offloaded_sparse_moe: unsupported ggml expert geometry");
         }
-        constexpr int kAll = std::numeric_limits<int>::max();
 #define INFERNIX_GGML_KQUANT_PAIR(G, DD)                                                                                   \
     if (gu == G && d == DD) {                                                                                          \
-        launch_narrow_pass_ggml<G, DD, H4096>(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,  \
-                                            stream, phase, kAll);                                                      \
+        launch_expert_pass_ggml<G, DD, H4096>(x, dispatch, source, top_k, job_records, flags, base, jobs, layout,       \
+                                            outputs, stream, phase, entries);                                          \
         return;                                                                                                        \
     }
         INFERNIX_GGML_KQUANT_PAIR(QType::GGML_Q4_K, QType::GGML_Q3_K)
         INFERNIX_GGML_KQUANT_PAIR(QType::GGML_Q3_K, QType::GGML_Q3_K)
         INFERNIX_GGML_KQUANT_PAIR(QType::GGML_Q3_K, QType::GGML_Q2_K)
         INFERNIX_GGML_KQUANT_PAIR(QType::GGML_Q2_K, QType::GGML_Q2_K)
+        INFERNIX_GGML_KQUANT_PAIR(QType::GGML_Q8_0, QType::GGML_Q8_0) // the Q8_0 build (the quality reference)
 #undef INFERNIX_GGML_KQUANT_PAIR
         throw std::invalid_argument("offloaded_sparse_moe: unsupported ggml expert format pair at this geometry");
-    }
-    // The wide tiles run every job of the pass: a forked call (Staged/Resident phases) must not have
-    // wide entries, which forked()'s column bound guarantees today.
-    if (entries > 0 && phase != PassPhase::All) {
-        throw std::logic_error("offloaded_sparse_moe: the GGUF wide tiles do not split by pass phase");
     }
 #define INFERNIX_GGML_PAIR(G, DD)                                                                                       \
     if (gu == G && d == DD) {                                                                                          \

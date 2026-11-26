@@ -60,8 +60,12 @@ std::uint64_t available_host_memory_bytes() {
     }
     return status.ullAvailPhys;
 #else
-    if (const auto available = proc_kib_field("/proc/meminfo", "MemAvailable:")) { return *available; }
-    throw std::runtime_error("/proc/meminfo has no MemAvailable");
+    const auto available = proc_kib_field("/proc/meminfo", "MemAvailable:");
+    if (!available) { throw std::runtime_error("/proc/meminfo has no MemAvailable"); }
+    // MemAvailable counts free CMA pages, which only movable allocations may take: a page-locked
+    // block migrates out of them. A 2026-11-26 OOM kill hit with 18 GB "free", all of it CMA.
+    const std::uint64_t cma = proc_kib_field("/proc/meminfo", "CmaFree:").value_or(0);
+    return *available > cma ? *available - cma : 0;
 #endif
 }
 

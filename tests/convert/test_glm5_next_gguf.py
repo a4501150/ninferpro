@@ -10,7 +10,8 @@ import torch
 
 gguf = pytest.importorskip("gguf")
 
-from tools.convert.glm5_next_gguf import kda_convolution, q8_bf16_rows, require_a_log, require_q8_rounding
+from tools.convert.glm5_next_gguf import (kda_convolution, q8_bf16_rows, require_a_log, require_q8_rounding,
+                                         require_shared_tensors)
 from tools.convert.sources.gguf_raw import GgufStore
 
 
@@ -75,3 +76,31 @@ def test_kda_convolution_fuses_q_k_v_channels(tmp_path):
         fused = kda_convolution(store, "blk.0.", taps, width).values().reshape(taps, 3 * width)
     expected = np.concatenate([kernels[f].reshape(width, taps).T for f in "qkv"], axis=1)
     assert np.array_equal(fused.numpy(), expected)
+
+
+def test_shared_tensors_of_another_build(tmp_path):
+    """The Q8_0 build's non-expert tensors: the Q4 build's bytes, or the Q8_0 rounding of its BF16 ones."""
+
+    rng = np.random.default_rng(7)
+    q8 = gguf.GGMLQuantizationType.Q8_0
+    shared = gguf.quants.quantize(rng.standard_normal((4, 64)).astype(np.float32), q8)
+    bf16 = torch.from_numpy(rng.standard_normal((4, 64)).astype(np.float32)).to(torch.bfloat16)
+    bf16_raw = bf16.view(torch.int16).numpy().view(np.uint8).reshape(4, 128)
+    rounded = gguf.quants.quantize(bf16.float().numpy(), q8)
+    experts = rng.integers(0, 256, size=(2, 4, 34), dtype=np.uint8)
+    main = {"a.weight": (shared, q8), "b.weight": (bf16_raw, gguf.GGMLQuantizationType.BF16),
+            "blk.0.ffn_down_exps.weight": (experts, q8)}
+    other = dict(main, **{"b.weight": (rounded, q8), "blk.0.ffn_down_exps.weight": (experts[:, :2], q8)})
+    with _write(tmp_path / "main.gguf", main) as m, _write(tmp_path / "other.gguf", other) as o:
+        require_shared_tensors(m, o)  # the experts may differ in every way
+    changed = shared.copy()
+    changed[2, 5] ^= 1
+    with _write(tmp_path / "main2.gguf", main) as m, _write(tmp_path / "bad.gguf", dict(other, **{"a.weight": (changed, q8)})) as o:
+        with pytest.raises(ValueError, match="row 2"):
+            require_shared_tensors(m, o)
+    far = bf16.clone()
+    far[1, 3] += 0.5
+    with _write(tmp_path / "main3.gguf", main) as m, \
+         _write(tmp_path / "far.gguf", dict(other, **{"b.weight": (gguf.quants.quantize(far.float().numpy(), q8), q8)})) as o:
+        with pytest.raises(ValueError, match="row 1"):
+            require_shared_tensors(m, o)

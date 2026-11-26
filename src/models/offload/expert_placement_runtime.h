@@ -43,6 +43,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace infernix::models::offload {
@@ -115,6 +117,8 @@ public:
         std::uint64_t expert_ram_bytes      = 0;
         std::uint64_t expert_unpinned_bytes = 0;
         std::uint64_t later_pinned_bytes    = 0;
+        // Host memory a RAM tier rebuilt beside the current one must leave free (--ram-headroom-mib).
+        std::uint64_t ram_headroom_bytes = 0;
         std::filesystem::path expert_stripe;
         artifact::ArtifactId stripe_artifact_id; // the stripe must be of this artifact
         // Tier ring sizing inputs that come from the family:
@@ -331,7 +335,55 @@ private:
     // boundary. An existing tier's records seed the new one best-first when the new one fits in
     // the host's free memory beside it, else the old releases first; the rest fill by the tier
     // fill and demand below. The old tier's pinned chunks release with it.
-    void ensure_tier(std::uint32_t residents);
+    // With `background`, the rebuild runs as a TierRebuild instead and ensure_tier returns at once.
+    void ensure_tier(std::uint32_t residents, bool background = false);
+
+    // A RAM tier rebuild off the engine thread. Pinning tens of GiB, copying the kept records and
+    // releasing the old tier's chunks took 17 s or more on the engine thread (a 86 -> 60 GiB
+    // shrink), past the Engine's queue timeout. Two forms:
+    // - Seeded, when the new tier fits beside the old one with the RAM headroom left free: a
+    //   worker pins the new tier (kPinning); at the next boundary the engine thread picks the kept
+    //   keys best-first and rebuild-pins their slots in the old tier, which keeps serving
+    //   (HostTier::rebuild_pin); the worker copies them (kCopying); at the boundary after that the
+    //   engine thread quiesces the old tier and retiers to the new one (milliseconds), and the old
+    //   tier is destroyed on tier_reaper_.
+    // - Fresh, otherwise: the engine thread swaps in a reader-sized tier (its lists and one slot,
+    //   which SSD reads stage through) and hands the old tier to the worker, which destroys it
+    //   before it pins the new one, so the two never coexist; the next boundary installs the new
+    //   tier empty and the tier fill reads its records.
+    struct TierRebuild {
+        enum class Phase : std::uint8_t { kIdle, kPinning, kPinned, kCopying, kCopied, kFailed };
+        std::atomic<Phase> phase{Phase::kIdle};
+        std::uint32_t residents = 0;
+        bool fresh = false;
+        std::unique_ptr<HostExpertTier> old; // fresh: the replaced tier, destroyed by the worker
+        std::unique_ptr<HostExpertTier> next;
+        std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> copies;
+        std::string error;
+        std::thread worker;
+        std::chrono::steady_clock::time_point begin{};
+    } tier_rebuild_;
+    // The pending rebuild's resident target for the status (-1: none).
+    std::atomic<std::int64_t> tier_rebuild_target_{-1};
+    std::thread tier_reaper_;
+
+    // The rebuilt tier's options for `residents` resident slots (no pageable records).
+    [[nodiscard]] HostExpertTier::Options rebuild_options(std::uint32_t residents) const;
+    // The old tier's keys best-first that `next` takes, prefilled into its controller: (slot in
+    // next, record in the old tier) for each.
+    [[nodiscard]] std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> kept_records(HostExpertTier& next,
+                                                                                           std::uint32_t residents);
+    // Retiers to `next` in place of the current tier (engine thread, the old tier quiesced) and
+    // returns the old one.
+    [[nodiscard]] std::unique_ptr<HostExpertTier> swap_tier(std::unique_ptr<HostExpertTier> next);
+    // swap_tier, then retires the old tier on the reaper.
+    void install_tier(std::unique_ptr<HostExpertTier> next, std::size_t kept);
+    // Advances a background rebuild at a maintenance boundary.
+    void advance_tier_rebuild();
+    // Abandons a background rebuild (waiting for its worker) and releases its pins.
+    void cancel_tier_rebuild();
+    // Destroys a replaced tier off the engine thread (one at a time).
+    void retire_tier(std::unique_ptr<HostExpertTier> old);
 
     // The host memory a tier of `residents` resident records and its lists takes (an estimate
     // in frame sizes).

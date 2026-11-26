@@ -17,7 +17,8 @@
 namespace infernix {
 
 [[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr bool is_ggml(QType q) noexcept {
-    return (q >= QType::GGML_Q2_0 && q <= QType::GGML_IQ4_NL) || q == QType::GGML_Q2_K || q == QType::GGML_Q3_K;
+    return (q >= QType::GGML_Q2_0 && q <= QType::GGML_IQ4_NL) || q == QType::GGML_Q2_K || q == QType::GGML_Q3_K ||
+           q == QType::GGML_Q8_0;
 }
 
 // Elements per block (the K-axis unit of a row).
@@ -26,6 +27,7 @@ namespace infernix {
     case QType::GGML_Q2_0:
         return 64;
     case QType::GGML_IQ4_NL:
+    case QType::GGML_Q8_0:
         return 32;
     case QType::GGML_Q2_K:
     case QType::GGML_Q3_K:
@@ -48,6 +50,8 @@ namespace infernix {
         return 18;
     case QType::GGML_IQ4_NL:
         return 18;
+    case QType::GGML_Q8_0:
+        return 34;
     case QType::GGML_Q2_K:
         return 84;
     case QType::GGML_Q3_K:
@@ -77,12 +81,14 @@ namespace infernix {
            : layout == QuantLayout::GgmlExpertQ2_0 ? QType::GGML_Q2_0
            : layout == QuantLayout::GgmlExpertQ3K  ? QType::GGML_Q3_K
            : layout == QuantLayout::GgmlExpertQ2K  ? QType::GGML_Q2_K
+           : layout == QuantLayout::GgmlExpertQ8_0 ? QType::GGML_Q8_0
                                                     : QType::FP32;
 }
 
 [[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr bool is_ggml_expert_layout(QuantLayout layout) noexcept {
     return layout == QuantLayout::GgmlExpertIq4Nl || layout == QuantLayout::GgmlExpertQ2_0 ||
-           layout == QuantLayout::GgmlExpertQ3K || layout == QuantLayout::GgmlExpertQ2K;
+           layout == QuantLayout::GgmlExpertQ3K || layout == QuantLayout::GgmlExpertQ2K ||
+           layout == QuantLayout::GgmlExpertQ8_0;
 }
 
 } // namespace infernix

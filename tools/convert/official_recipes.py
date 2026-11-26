@@ -545,12 +545,13 @@ def glm5_3_flash_nvfp4_orcarouter_q8dense(model, recipe, sources):
             _assign(recipe, name, Q8, method=grouped_mse)
 
 
-def glm5_3_flash_gcsa_gsq_q4(model, recipe, sources):
-    """GLM-5.3-Flash from GCSA-AiLab's RCO-GSQ Q4 GGUF, bit-exact (tools/convert/glm5_next_gguf.py,
+def glm5_3_flash_gcsa_gguf(model, recipe, sources):
+    """GLM-5.3-Flash from GCSA-AiLab's GGUF builds, bit-exact (tools/convert/glm5_next_gguf.py,
     docs/maintainer/glm5_3-flash-design.md §3): the routed experts as ``ggml_expert_*_v1`` banks
-    (Q4_K, Q3_K and Q2_K blocks verbatim, the gate/up format per layer, the layout naming the down
-    format), every Q8_0 matrix as the identical ``q8_g32_fp16`` words, and the rest in its dtype
-    (BF16, or FP32 where the engine binds FP32). The arithmetic is A16 everywhere."""
+    (the RCO-GSQ Q4 build's Q4_K, Q3_K and Q2_K blocks, or with ``--gguf-experts`` the Q8_0 build's
+    Q8_0 blocks, verbatim; the gate/up format per layer, the layout naming the down format), every
+    Q8_0 matrix as the identical ``q8_g32_fp16`` words, and the rest in its dtype (BF16, or FP32
+    where the engine binds FP32). The arithmetic is A16 everywhere."""
 
     from .sources.ggml_sources import GgmlExpertBank, import_ggml_expert_bank
 
@@ -604,6 +605,6 @@ RECIPES = {
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
     "glm5_3_flash_nvfp4_orcarouter": glm5_3_flash_nvfp4_orcarouter,
     "glm5_3_flash_nvfp4_orcarouter_q8dense": glm5_3_flash_nvfp4_orcarouter_q8dense,
-    "glm5_3_flash_gcsa_gsq_q4": glm5_3_flash_gcsa_gsq_q4,
+    "glm5_3_flash_gcsa_gguf": glm5_3_flash_gcsa_gguf,
     "glm5_3_flash_dflash2": glm5_3_flash_dflash2,
 }

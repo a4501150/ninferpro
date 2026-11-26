@@ -425,6 +425,38 @@ void test_stream_pins() {
     tier.check();
 }
 
+// ---- tier rebuild pins: a record a background rebuild copies keeps its slot until the rebuild
+// releases it, whatever the prefill stream releases at the boundaries in between.
+void test_rebuild_pins() {
+    HostTier tier(small_config());
+    for (std::uint32_t k = 0; k < 8; ++k) {
+        std::int32_t slot = -1;
+        check(tier.prefill(k, slot), "prefill");
+        const std::uint32_t one[] = {k};
+        tier.record_uses(0, one, static_cast<double>(k + 1));
+    }
+    const std::int32_t slot0 = tier.slot_of(0);
+    tier.rebuild_pin(0);
+    tier.stream_pin(1);
+    tier.rebuild_pin(60); // no host copy: ignored
+    tier.check();
+    tier.release_stream_pins(); // a stream boundary leaves the rebuild's pin
+    check((tier.pins(static_cast<std::uint32_t>(slot0)) & kPinRebuild) != 0, "rebuild pin survives the stream's release");
+    for (const std::uint32_t key : {50U, 51U}) {
+        tier.begin_round(0);
+        const std::uint32_t used[] = {key};
+        tier.record_uses(1, used, 100.0);
+        const Landing landing{tier.ring()[0], tier.serial(tier.ring()[0]), key};
+        check(tier.admit({&landing, 1}, false) == 1, "a landing is admitted beside the rebuild pin");
+        tier.check();
+    }
+    check(tier.host_copy(0) && tier.slot_of(0) == slot0, "the rebuild-pinned record keeps its slot");
+    check(!tier.host_copy(1) && !tier.host_copy(2), "the stream-released key and the next-lowest were the victims");
+    tier.release_rebuild_pins();
+    check(tier.pins(static_cast<std::uint32_t>(slot0)) == 0, "rebuild pins released");
+    tier.check();
+}
+
 // ---- the warm start's fill (seeded ranking, released shadows)
 void test_warm_fill() {
     // Without seeds every pre-filled key scores 0 and the lowest slot, which the pre-fill gave the
@@ -550,6 +582,7 @@ int main() {
         test_warm_fill();
         test_held();
         test_stream_pins();
+        test_rebuild_pins();
         test_random();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';

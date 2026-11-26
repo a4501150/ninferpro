@@ -44,33 +44,41 @@ constexpr int kNTiles       = 2;   // n8 tiles per warp
 constexpr int kStageSlices  = 2;   // 64 elements of K per stage
 constexpr int kUnitSlices   = 8;   // 256 elements of K per raw unit
 constexpr int kBWords       = 28;  // shared column pitch of a slice's 24 limb words
-// 16-byte chunks of one row's raw unit: at most 225 bytes (a 210-byte Q6_K block from a 16-byte
-// aligned start, so at most 15 bytes before it).
-constexpr int kRawChunks    = 15;
+// 16-byte chunks of one row's raw unit: at most 287 bytes (eight 34-byte Q8_0 blocks from a 16-byte
+// aligned start, so at most 15 bytes before them).
+constexpr int kRawChunks    = 18;
 
 // Elements per block of F (the period of the int128 flush).
 template <QType F>
-inline constexpr int kBlockSlices = F == QType::GGML_IQ4_NL ? 1 : F == QType::GGML_Q2_0 ? 2 : 8;
+inline constexpr int kBlockSlices = F == QType::GGML_IQ4_NL || F == QType::GGML_Q8_0 ? 1 : F == QType::GGML_Q2_0 ? 2 : 8;
 static_assert(kUnitSlices % kStageSlices == 0);
 
 // log2 of a bound on one block's term |mant(d) * P| (with the K-quants' min term): elements x
 // |sub| x |code| x |X| (< 2^21) x mant (< 2^11). Q6_K 2^8 2^7 2^5; Q5_K 2^8 2^6 2^5 (+ the min term
-// < 2^46); Q4_K 2^8 2^6 2^4 (+ 2^46); IQ4_XS 2^8 2^5 2^7; IQ4_NL 2^5 1 2^7; IQ3_S 2^8 2^5 2^4;
-// IQ3_XXS 2^8 2^5 2^6; IQ2_S 2^8 2^5 2^6; Q2_0 2^6 1 2^1.
+// < 2^46); Q4_K 2^8 2^6 2^4 (+ 2^46); Q3_K 2^8 2^5 2^2; Q2_K 2^8 2^4 2^2 (+ 2^44); IQ4_XS 2^8 2^5
+// 2^7; IQ4_NL 2^5 1 2^7; Q8_0 2^5 1 2^7 (|code| <= 128); IQ3_S 2^8 2^5 2^4; IQ3_XXS 2^8 2^5 2^6;
+// IQ2_S 2^8 2^5 2^6; Q2_0 2^6 1 2^1.
 template <QType F>
 inline constexpr int kTermLog2 = F == QType::GGML_Q6_K || F == QType::GGML_Q5_K || F == QType::GGML_IQ4_XS ? 52
                                  : F == QType::GGML_Q4_K || F == QType::GGML_IQ3_XXS || F == QType::GGML_IQ2_S ? 51
                                  : F == QType::GGML_IQ3_S                                                          ? 49
-                                 : F == QType::GGML_IQ4_NL                                                         ? 44
+                                 : F == QType::GGML_Q3_K || F == QType::GGML_Q2_K                                  ? 47
+                                 : F == QType::GGML_IQ4_NL || F == QType::GGML_Q8_0                                ? 44
                                                                                                                    : 39;
 
 // Formats whose sub-scales are all 1 (the MMA sums need no scaling).
 template <QType F>
-inline constexpr bool kUnitSub = F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0;
+inline constexpr bool kUnitSub = F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0 || F == QType::GGML_Q8_0;
 
 // Formats whose sub-scale covers 16 elements: two k16 MMAs per slice, each scaled by its own.
 template <QType F>
-inline constexpr bool kHalfSub = F == QType::GGML_Q6_K || F == QType::GGML_IQ2_S;
+inline constexpr bool kHalfSub =
+    F == QType::GGML_Q6_K || F == QType::GGML_IQ2_S || F == QType::GGML_Q3_K || F == QType::GGML_Q2_K;
+
+// Formats with a min term: per slice (Q4_K, Q5_K) or per 16-element half (Q2_K, whose stage `min`
+// word holds the halves' min sub-scales as min0 | min1 << 8).
+template <QType F>
+inline constexpr bool kTileMin = fast::kMin<F> || fast::kMinHalf<F>;
 
 // d = a * b over one 16x8x32 int8 tile (exact int32).
 __device__ __forceinline__ void mma_k32(int (&d)[4], int a0, int a1, int a2, int a3, int b0, int b1) {
@@ -137,7 +145,7 @@ struct UnitCodeStage {
 
 // Bytes of a stage image a tile reads for format F.
 template <QType F>
-inline constexpr int kImageBytes = fast::kMin<F> ? static_cast<int>(sizeof(CodeStage))
+inline constexpr int kImageBytes = kTileMin<F> ? static_cast<int>(sizeof(CodeStage))
                                                  : static_cast<int>(offsetof(CodeStage, dmin));
 static_assert(offsetof(CodeStage, dmin) % 16 == 0);
 
@@ -147,7 +155,7 @@ struct Shared {
     static constexpr int kBufs = 2;                            // limb buffers
     CodeStage code;                                            // the current stage's codes
     alignas(16) int b[2][kStageSlices][kTileColumns][kBWords]; // limbs a, b, c (8 words each), two stages
-    int xsum[2][kStageSlices][kTileColumns];
+    int xsum[2][kStageSlices][kTileColumns]; // min formats: the stage's X sums of each 16-element half
     alignas(16) std::uint8_t raw[2][kTileRows][kRawChunks * 16]; // raw units, two
     int raw_offset[2][kTileRows]; // where row r's unit bytes start in raw[.][r]
     int base[kTileRows];          // row r's smallest scale shift (the int64 accumulators' unit)
@@ -257,7 +265,8 @@ struct LimbCopies {
     int xdst;                  // word offset in sm.xsum[buf]
 };
 
-template <QType F, int Threads, class ColumnLimbs>
+// CopySums false: no slice-sum copies (the decoding tiles form the sums from the limbs).
+template <QType F, int Threads, bool CopySums = true, class ColumnLimbs>
 __device__ __forceinline__ LimbCopies<Threads> limb_copies(ColumnLimbs limbs, int xsum_offset) {
     LimbCopies<Threads> lc{};
 #pragma unroll
@@ -267,7 +276,7 @@ __device__ __forceinline__ LimbCopies<Threads> limb_copies(ColumnLimbs limbs, in
         lc.src[k] = i < kStageCopies ? limbs(c) + j * fast::kSliceWords + 4 * u : nullptr;
         lc.dst[k] = (j * kTileColumns + c) * kBWords + 4 * u;
     }
-    if constexpr (fast::kMin<F>) {
+    if constexpr (fast::kMin<F> && CopySums) {
         const int i = static_cast<int>(threadIdx.x);
         if (i < kStageSlices * kTileColumns) {
             const int j = i / kTileColumns, c = i % kTileColumns;
@@ -307,7 +316,11 @@ template <QType F>
 __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part) {
     TileChunk o{};
     o.sub = 1;
-    if constexpr (F == QType::GGML_IQ3_S) {
+    if constexpr (F == QType::GGML_Q8_0) {
+        o.w[0] = static_cast<int>(u32_at(b + 2 + 8 * part));
+        o.w[1] = static_cast<int>(u32_at(b + 6 + 8 * part));
+        o.d    = u16_at(b);
+    } else if constexpr (F == QType::GGML_IQ3_S) {
         const int sb = part / 4, l = part % 4;
         const int qh = b[66 + sb];
         const int i1 = b[2 + 8 * sb + 2 * l] | ((qh << (8 - 2 * l)) & 256);
@@ -380,6 +393,32 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part)
         }
         o.sub = static_cast<std::int8_t>(b[192 + 8 * half + l / 16 + 2 * quarter]);
         o.d   = u16_at(b + 208);
+    } else if constexpr (F == QType::GGML_Q3_K || F == QType::GGML_Q2_K) {
+        // Slice sb of a block: 2-bit plane sb % 4 of the 32 code bytes of half sb / 4; its halves'
+        // scale entries are 8 (sb / 4) + 2 (sb % 4) and the next.
+        const int e = 8 * part, sb = e / 32, half = sb / 4, plane = sb % 4, l = e % 32;
+        const int is = 8 * half + 2 * plane;
+        if constexpr (F == QType::GGML_Q3_K) {
+            const std::uint8_t* qs = b + 32 + 32 * half + l;
+            const int bit = 4 * half + plane;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const std::uint32_t q = (u32_at(qs + 4 * h) >> (2 * plane)) & 0x03030303U;
+                const std::uint32_t m = (u32_at(b + l + 4 * h) >> bit) & 0x01010101U;
+                o.w[h] = fast::sub_bytes4(q | (m << 2), 0x04040404U);
+            }
+            const int i = is + l / 16;
+            o.sub = (((b[96 + i % 8] >> (4 * (i / 8))) & 0xF) | (((b[104 + i % 4] >> (2 * (i / 4))) & 3) << 4)) - 32;
+            o.d   = u16_at(b + 108);
+        } else {
+            const std::uint8_t* qs = b + 16 + 32 * half + l;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) { o.w[h] = static_cast<int>((u32_at(qs + 4 * h) >> (2 * plane)) & 0x03030303U); }
+            o.sub     = b[is + l / 16] & 0xF;
+            o.min_sub = (b[is] >> 4) | ((b[is + 1] >> 4) << 8);
+            o.d       = u16_at(b + 80);
+            o.dmin    = u16_at(b + 82);
+        }
     } else {
         static_assert(F == QType::GGML_IQ3_S, "tile_chunk: no decoder for this format");
     }
@@ -396,10 +435,11 @@ __device__ __forceinline__ long long shl64(long long v, int shift) {
 template <QType F>
 __device__ __forceinline__ void scale_shift_range(const std::uint8_t* block, int& lo, int& hi) {
     const auto shift = [](unsigned w) { return max(static_cast<int>((w >> 10) & 0x1FU), 1) - 1; };
-    const auto* d = reinterpret_cast<const unsigned short*>(block + (F == QType::GGML_Q6_K ? 208 : 0));
+    constexpr int kD = F == QType::GGML_Q6_K ? 208 : F == QType::GGML_Q3_K ? 108 : F == QType::GGML_Q2_K ? 80 : 0;
+    const auto* d = reinterpret_cast<const unsigned short*>(block + kD);
     lo = min(lo, shift(__ldg(d)));
     hi = max(hi, shift(__ldg(d)));
-    if constexpr (fast::kMin<F>) {
+    if constexpr (kTileMin<F>) {
         lo = min(lo, shift(__ldg(d + 1)));
         hi = max(hi, shift(__ldg(d + 1)));
     }
@@ -416,7 +456,7 @@ enum class Accum {
 // Tiles whose int64 mode is kLimbs (else kNarrow): formats without a min term and CTAs of 512
 // threads (8 outputs per thread; 256-thread tiles' 16 would need 96 registers for them).
 template <QType F, int Threads>
-inline constexpr bool kLimbsMode = !fast::kMin<F> && Threads == 512;
+inline constexpr bool kLimbsMode = !kTileMin<F> && Threads == 512;
 
 // log2 of a bound on one limb plane's block sum |sum of sub * code * limb| (kTermLog2 with the limb's
 // 2^7 for X's 2^21 and without the mantissa's 2^11); formats without a min term.
@@ -475,7 +515,7 @@ __device__ __forceinline__ void store_chunk(Stage& cs, int dr, int dj, int dp, i
     }
     if (dp == 0) {
         cs.d[dj][dr] = d;
-        if constexpr (fast::kMin<F>) {
+        if constexpr (kTileMin<F>) {
             cs.min[dj][dr]  = min_sub;
             cs.dmin[dj][dr] = dmin;
         }
@@ -509,7 +549,7 @@ __device__ __forceinline__ void issue_image(CodeStage& cs, const std::uint8_t* p
 
 // The resident tiles' stage type of format F.
 template <QType F>
-using ResidentStage = std::conditional_t<kUnitSub<F> && !fast::kMin<F>, UnitCodeStage, CodeStage>;
+using ResidentStage = std::conditional_t<kUnitSub<F> && !kTileMin<F>, UnitCodeStage, CodeStage>;
 
 // Dynamic shared memory of a weight-stationary tile CTA: every one of its Stages stages decoded once
 // (decode_resident into code[st]) and kept while it computes several column tiles, the columns'
@@ -545,6 +585,10 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
     constexpr bool Narrow = Mode == Accum::kNarrow;
     constexpr bool Limbs  = Mode == Accum::kLimbs;
     static_assert(!Limbs || kLimbsMode<F, Threads>, "per-limb accumulators: kLimbsMode tiles only");
+    // Decoding tiles of min formats form the X sums of each 16-element half from the stage's limbs
+    // (sm.xsum[h]); the others copy each slice's sum (sm.xsum[buf]).
+    constexpr bool kOwnSums = Source == StageSource::kDecode && kTileMin<F>;
+    static_assert(!fast::kMinHalf<F> || kOwnSums, "per-half min terms: decoding tiles only");
     constexpr int kBlockElems = static_cast<int>(ggml_block_elems(F));
     constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
     constexpr int kUnitStages = kUnitSlices / kStageSlices;
@@ -623,6 +667,27 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
                 const std::uint8_t* block = &sm.raw[ubuf][dr][sm.raw_offset[ubuf][dr]] + e / kBlockElems * kBlockBytes;
                 const TileChunk ch = tile_chunk<F>(block, e % kBlockElems / 8);
                 store_chunk<F>(sm.code, dr, dj, dp, ch.w[0], ch.w[1], ch.sub, ch.d, ch.min_sub, ch.dmin);
+            }
+            if constexpr (kOwnSums) {
+                // The stage's X sums of every 16-element half from its limbs (X = 2^16 a + 2^8 b + c):
+                // xsum[h][j][c] for half h of slice j, column c.
+                static_assert(kStageSlices * kTileColumns <= Threads);
+                const int i = static_cast<int>(threadIdx.x);
+                if (i < kStageSlices * kTileColumns) {
+                    const int j = i / kTileColumns, c = i % kTileColumns;
+                    const int* w = sm.b[buf][j][c];
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        int a = 0, b = 0, z = 0;
+#pragma unroll
+                        for (int k = 0; k < 4; ++k) {
+                            a = __dp4a(w[4 * h + k], 0x01010101, a);
+                            b = __dp4a(w[8 + 4 * h + k], 0x01010101, b);
+                            z = __dp4a(w[16 + 4 * h + k], 0x01010101, z);
+                        }
+                        sm.xsum[h][j][c] = a * 65536 + b * 256 + z;
+                    }
+                }
             }
             __syncthreads();
         }
@@ -705,10 +770,19 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
 #pragma unroll
                 for (int nt = 0; nt < kNTiles; ++nt) {
                     if (nt >= kN) { continue; }
-                    if constexpr (fast::kMin<F>) {
+                    [[maybe_unused]] const int col = col0 + 8 * nt + 2 * t;
+                    if constexpr (fast::kMinHalf<F>) {
+                        // Per half: min0 * (X sum of elements 0-15) + min1 * (16-31), |.| < 2^30.
                         const int m_lo = cs.min[j][ra], m_hi = cs.min[j][ra + 8];
-                        const int col  = col0 + 8 * nt + 2 * t;
-                        const int x0 = sm.xsum[buf][j][col], x1 = sm.xsum[buf][j][col + 1];
+#pragma unroll
+                        for (int q = 0; q < 4; ++q) {
+                            const int m = q < 2 ? m_lo : m_hi, c = col + (q & 1);
+                            mt[mi][nt][q] += (m & 0xFF) * sm.xsum[0][j][c] + (m >> 8) * sm.xsum[1][j][c];
+                        }
+                    } else if constexpr (fast::kMin<F>) {
+                        const int m_lo = cs.min[j][ra], m_hi = cs.min[j][ra + 8];
+                        const int x0 = kOwnSums ? sm.xsum[0][j][col] + sm.xsum[1][j][col] : sm.xsum[buf][j][col];
+                        const int x1 = kOwnSums ? sm.xsum[0][j][col + 1] + sm.xsum[1][j][col + 1] : sm.xsum[buf][j][col + 1];
                         mt[mi][nt][0] += static_cast<long long>(m_lo) * x0;
                         mt[mi][nt][1] += static_cast<long long>(m_lo) * x1;
                         mt[mi][nt][2] += static_cast<long long>(m_hi) * x0;
@@ -724,7 +798,7 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
                         bool negative;
                         f16_parts(cs.d[j][ra + 8 * h], mant[h], shift[h], negative);
                         if (negative) { mant[h] = -mant[h]; }
-                        if constexpr (fast::kMin<F>) {
+                        if constexpr (kTileMin<F>) {
                             f16_parts(cs.dmin[j][ra + 8 * h], min_mant[h], min_shift[h], negative);
                             min_mant[h] = negative ? min_mant[h] : -min_mant[h]; // the min term is subtracted
                         }
@@ -763,7 +837,7 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
                                 }
 #pragma unroll
                                 for (int l = 0; l < 3; ++l) { s[l][mi][nt][q] = 0; }
-                                if constexpr (fast::kMin<F>) {
+                                if constexpr (kTileMin<F>) {
                                     if constexpr (Narrow) {
                                         n64[mi][nt][q] += shl64(min_mant[h] * mt[mi][nt][q], min_shift[h] - base[mi][h]);
                                     } else {
@@ -821,16 +895,16 @@ __device__ __forceinline__ void dispatch_loop(Sm& sm, RowOf row_of, int slices, 
 
 // Computes a tile of kTileRows weight rows (tile row r at row_of(r), a valid row even where the
 // caller ignores its outputs) against kTileColumns columns: column c's limbs for slice s at
-// limbs(c) + s * kSliceWords (16-byte aligned), its slice sums (min formats only) at
-// limbs(c) + xsum_offset + s. `slices` is K / 32, a multiple of kStageSlices. `columns` is the
-// tile's valid columns: the thread's outputs (Accumulators) are those of its warp tile
-// (warp_tile<Threads>(columns)); columns past the valid ones are computed on padding (column limbs
-// that the caller clamps to a valid column) and ignored. Every thread of the CTA (Threads of them)
-// calls it. The outputs are the same integers whichever accumulator the rows' scales allow.
+// limbs(c) + s * kSliceWords (16-byte aligned); a min format's X sums are formed from the limbs.
+// `slices` is K / 32, a multiple of kStageSlices. `columns` is the tile's valid columns: the
+// thread's outputs (Accumulators) are those of its warp tile (warp_tile<Threads>(columns)); columns
+// past the valid ones are computed on padding (column limbs that the caller clamps to a valid
+// column) and ignored. Every thread of the CTA (Threads of them) calls it. The outputs are the same
+// integers whichever accumulator the rows' scales allow.
 template <QType F, int Threads = kThreads, class RowOf, class ColumnLimbs>
-__device__ __forceinline__ void compute(Shared& sm, RowOf row_of, int slices, ColumnLimbs limbs, int xsum_offset,
-                                        int columns, Accumulators& acc) {
-    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset);
+__device__ __forceinline__ void compute(Shared& sm, RowOf row_of, int slices, ColumnLimbs limbs, int columns,
+                                        Accumulators& acc) {
+    const LimbCopies<Threads> copies = limb_copies<F, Threads, false>(limbs, 0);
     issue_unit<F, Threads>(sm, 0, 0, slices, row_of);
     issue_limbs<F>(sm, 0, 0, copies);
     cp_async_commit();

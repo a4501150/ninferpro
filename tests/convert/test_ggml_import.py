@@ -67,7 +67,7 @@ def test_terms_reconstruct_the_values():
         k = fmt.block_elems * 2
         raw = _random_blocks(fmt, 2 * 2, rng)
         t = ggml.decode_terms(fmt, raw, 2, k)
-        assert t.code.dtype == np.int32 and np.abs(t.code).max() <= 127
+        assert t.code.dtype == np.int32 and np.abs(t.code).max() <= (128 if fmt is ggml.Q8_0 else 127)
         value = t.d * t.sub * t.code - (0 if t.min_sub is None else t.dmin * t.min_sub)
         assert np.array_equal(value * fmt.kappa, ggml.decode_values(fmt, raw, 2, k))
 
@@ -219,7 +219,8 @@ def test_mmproj_vision_tower_is_exact(tmp_path):
             vision_source(mmproj, _VISION).read_flat("model.visual.blocks.0.norm1.bias")
 
 
-def test_expert_bank_import_is_verbatim(tmp_path):
+@pytest.mark.parametrize("pair", [("ggml_iq3_s", "ggml_iq4_nl"), ("ggml_q8_0", "ggml_q8_0")])
+def test_expert_bank_import_is_verbatim(tmp_path, pair):
     """Each record is the expert's gate rows, up rows and down rows, as stored, padded to 4 KiB."""
 
     from tools.convert.sources.ggml_sources import GgmlExpertBank, import_ggml_expert_bank
@@ -228,17 +229,19 @@ def test_expert_bank_import_is_verbatim(tmp_path):
 
     rng = np.random.default_rng(11)
     experts, hidden, inter = 3, 256, 64
-    gate = _random_blocks(ggml.IQ3_S, experts * inter * 1, rng)
-    up = _random_blocks(ggml.IQ3_S, experts * inter * 1, rng)
-    down = _random_blocks(ggml.IQ4_NL, experts * hidden * 2, rng)
+    gu, dn = ggml.GGML_TYPES[pair[0]], ggml.GGML_TYPES[pair[1]]
+    gate = _random_blocks(gu, experts * inter * hidden // gu.block_elems, rng)
+    up = _random_blocks(gu, experts * inter * hidden // gu.block_elems, rng)
+    down = _random_blocks(dn, experts * hidden * inter // dn.block_elems, rng)
     path = tmp_path / "experts.gguf"
     writer = gguf.GGUFWriter(str(path), "test")
-    writer.add_tensor("blk.0.ffn_gate_exps.weight", gate.reshape(experts, inter, 110),
-                      raw_dtype=gguf.GGMLQuantizationType.IQ3_S)
-    writer.add_tensor("blk.0.ffn_up_exps.weight", up.reshape(experts, inter, 110),
-                      raw_dtype=gguf.GGMLQuantizationType.IQ3_S)
-    writer.add_tensor("blk.0.ffn_down_exps.weight", down.reshape(experts, hidden, 36),
-                      raw_dtype=gguf.GGMLQuantizationType.IQ4_NL)
+    gu_row, dn_row = hidden // gu.block_elems * gu.block_bytes, inter // dn.block_elems * dn.block_bytes
+    writer.add_tensor("blk.0.ffn_gate_exps.weight", gate.reshape(experts, inter, gu_row),
+                      raw_dtype=gguf.GGMLQuantizationType(gu.ggml_id))
+    writer.add_tensor("blk.0.ffn_up_exps.weight", up.reshape(experts, inter, gu_row),
+                      raw_dtype=gguf.GGMLQuantizationType(gu.ggml_id))
+    writer.add_tensor("blk.0.ffn_down_exps.weight", down.reshape(experts, hidden, dn_row),
+                      raw_dtype=gguf.GGMLQuantizationType(dn.ggml_id))
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -253,7 +256,7 @@ def test_expert_bank_import_is_verbatim(tmp_path):
 
     with GgufStore([path]) as store:
         bank = GgmlExpertBank(store, 0, (experts, hidden, inter))
-        assert bank.layout == "ggml_expert_iq4_nl_v1" and bank.gate_up_format == "ggml_iq3_s"
+        assert bank.layout == "ggml_expert_" + dn.name.removeprefix("ggml_") + "_v1" and bank.gate_up_format == gu.name
         g = ggml_expert_geometry(bank.layout, bank.gate_up_format, bank.shape)
         spec = TensorSpec("weight/0", bank.shape, bank.gate_up_format, bank.layout)
         request = PrepareRequest(spec, (MethodInput("experts", bank, ()),), {}, {})

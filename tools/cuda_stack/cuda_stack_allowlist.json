@@ -2176,26 +2176,6 @@
             "stack": 32,
             "local": 0
         },
-    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE14EEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS5_S7_S7_iiPt":
-        {
-            "stack": 48,
-            "local": 0
-        },
-    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE15EEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS5_S7_S7_iiPt":
-        {
-            "stack": 40,
-            "local": 0
-        },
-    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE16EEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS5_S7_S7_iiPt":
-        {
-            "stack": 40,
-            "local": 0
-        },
-    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE17EEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS5_S7_S7_iiPt":
-        {
-            "stack": 40,
-            "local": 0
-        },
     "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17ggml_gate_up_bf16ILNS_4ggml4bf167ScalingE1EEEvPKtNS0_11MoeDispatchEiPKiSA_iiiPKhPti":
         {
             "stack": 40,
@@ -2410,6 +2390,56 @@
     "__nv_static__sparse_moe_small_t_kernels_cu__ZN8infernix3ops6detail_GLOBAL__N__sparse_moe_small_t_kernels_cu28sparse_moe_small_t_s2_kernelEPKfPiPfS6_":
         {
             "stack": 64,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu14down_tile_ggmlILNS_5QTypeE21ENS0_13offloaded_moe13Nvfp4GeometryILi4096ELi2048EEEEEvNS0_11MoeDispatchENS0_15MoeExpertSourceEPKPKhPKiSE_iiPKtSE_P13__nv_bfloat16":
+        {
+            "stack": 40,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu14down_tile_ggmlILNS_5QTypeE22ENS0_13offloaded_moe13Nvfp4GeometryILi4096ELi2048EEEEEvNS0_11MoeDispatchENS0_15MoeExpertSourceEPKPKhPKiSE_iiPKtSE_P13__nv_bfloat16":
+        {
+            "stack": 40,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE11ENS0_13offloaded_moe13Nvfp4GeometryILi4096ELi2048EEEEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS8_SA_SA_iiPt":
+        {
+            "stack": 64,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE14ENS0_13offloaded_moe13Nvfp4GeometryILi2560ELi640EEEEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS8_SA_SA_iiPt":
+        {
+            "stack": 48,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE15ENS0_13offloaded_moe13Nvfp4GeometryILi2560ELi640EEEEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS8_SA_SA_iiPt":
+        {
+            "stack": 40,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE16ENS0_13offloaded_moe13Nvfp4GeometryILi2560ELi640EEEEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS8_SA_SA_iiPt":
+        {
+            "stack": 40,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE17ENS0_13offloaded_moe13Nvfp4GeometryILi2560ELi640EEEEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS8_SA_SA_iiPt":
+        {
+            "stack": 40,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE21ENS0_13offloaded_moe13Nvfp4GeometryILi4096ELi2048EEEEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS8_SA_SA_iiPt":
+        {
+            "stack": 48,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE22ENS0_13offloaded_moe13Nvfp4GeometryILi4096ELi2048EEEEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS8_SA_SA_iiPt":
+        {
+            "stack": 40,
+            "local": 0
+        },
+    "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE23ENS0_13offloaded_moe13Nvfp4GeometryILi4096ELi2048EEEEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS8_SA_SA_iiPt":
+        {
+            "stack": 8,
             "local": 0
         }
 }

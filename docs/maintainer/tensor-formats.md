@@ -52,6 +52,7 @@ The GGUF (ggml) block formats store llama.cpp's blocks verbatim (Section 3.6):
 | `ggml_q4_k` | `Q4_K` (12) | 256 | 144 | 4.50 |
 | `ggml_q5_k` | `Q5_K` (13) | 256 | 176 | 5.50 |
 | `ggml_q6_k` | `Q6_K` (14) | 256 | 210 | 6.5625 |
+| `ggml_q8_0` | `Q8_0` (8) | 32 | 34 | 8.50 |
 | `ggml_iq2_s` | `IQ2_S` (22) | 256 | 82 | 2.5625 |
 | `ggml_iq3_xxs` | `IQ3_XXS` (18) | 256 | 98 | 3.0625 |
 | `ggml_iq3_s` | `IQ3_S` (21) | 256 | 110 | 3.4375 |
@@ -348,7 +349,7 @@ multiple of the block size. Every element of every type decodes to
 W = kappa * (d * sub * code - dmin * min_sub)
 ```
 
-with an integer code (|code| <= 127; IQ2_S/IQ3_* codes come from the grid tables with their sign
+with an integer code (|code| <= 127, but `Q8_0`'s int8 codes reach -128; IQ2_S/IQ3_* codes come from the grid tables with their sign
 bits; `Q3_K` codes are the 2-bit value less 4 where the high-mask bit is clear), an integer
 sub-scale (`Q3_K`'s 6-bit sub-scale less 32), the block's binary16 `d` (and `dmin` with an integer
 `min_sub` for `Q4_K`/`Q5_K`, one per 32 elements, and `Q2_K`, one per 16; zero otherwise) and the power-of-two constant kappa: 1/8 for `IQ2_S`, 1/4 for
@@ -361,9 +362,10 @@ writes the C++ and CUDA copies under `src/ops/ggml/`.
 The only producers are `import_ggml_rows`, which copies the GGUF rows, and
 `import_ggml_expert_bank`. The layouts are `ggml_rows_v1` (verbatim rows), its tiled form
 `ggml_tiles16_v1`, and the expert-bank records `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1`,
-`ggml_expert_q3_k_v1` and `ggml_expert_q2_k_v1`
-([storage layouts §7, §8](storage-layouts.md#7-ggml_rows_v1)). `ggml_q2_k` and `ggml_q3_k` are
-expert-bank formats only (no dense matrix kernel reads them).
+`ggml_expert_q3_k_v1`, `ggml_expert_q2_k_v1` and `ggml_expert_q8_0_v1`
+([storage layouts §7, §8](storage-layouts.md#7-ggml_rows_v1)). `ggml_q2_k`, `ggml_q3_k` and
+`ggml_q8_0` are expert-bank formats only (no dense matrix kernel reads them; a dense Q8_0 matrix
+imports as `q8_g32_fp16`).
 In these records the format names the gate/up type and the layout names the down type.
 Consumers compute with BF16 activations in the exact arithmetic of
 [`src/ops/ggml/ggml_exact.h`](../../src/ops/ggml/ggml_exact.h) (A16 activations, an exact int128

@@ -548,6 +548,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
     placement.expert_ram_bytes        = options_.expert_ram_bytes;
     placement.expert_unpinned_bytes   = options_.expert_unpinned_bytes;
     placement.later_pinned_bytes      = options_.later_pinned_bytes;
+    placement.ram_headroom_bytes      = options_.ram_headroom_bytes;
     placement.expert_stripe           = options_.expert_stripe;
     placement.stripe_artifact_id      = parameters_.model.info().artifact_id;
     placement.prefill_stream          = options_.prefill_stream;

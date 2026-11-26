@@ -59,6 +59,7 @@ enum SlotPin : std::uint8_t {
     kPinUse      = 1U << 3, // a landing read by the current round
     kPinPrefetch = 1U << 4, // a prefetch read in flight
     kPinStream   = 1U << 5, // a prefill expert stream copies its record
+    kPinRebuild  = 1U << 6, // a tier rebuild copies its record into the new tier
 };
 
 // The list a non-resident slot belongs to.
@@ -179,6 +180,13 @@ public:
     void stream_pin(std::uint32_t key);
     void release_stream_pins();
 
+    // ---- tier rebuild
+    // A rebuild copies `key`'s host record (resident or shadow) into its new tier off the engine
+    // thread while this tier keeps serving: the slot is neither evicted nor rewritten until
+    // release_rebuild_pins. A key without a host copy is ignored.
+    void rebuild_pin(std::uint32_t key);
+    void release_rebuild_pins();
+
     // ---- VRAM interplay (design §4.8)
     void queued(std::uint32_t key);             // T8
     void unqueued(std::uint32_t key);           // T9
@@ -252,6 +260,7 @@ private:
     std::vector<std::uint32_t> lent_; // lend(): free slots out of the resident partition
     std::vector<std::uint32_t> used_; // slots holding a Use pin
     std::vector<std::uint32_t> streamed_; // slots holding a Stream pin
+    std::vector<std::uint32_t> rebuilt_;  // slots holding a Rebuild pin
     std::vector<HeapEntry> heap_[2];
     std::vector<std::int32_t> heap_pos_[2]; // per kind and slot: its index in its victim heap, or -1
     std::vector<std::uint8_t> dirty_mark_;
