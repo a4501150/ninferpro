@@ -60,8 +60,9 @@ Modifications made in this product (summary; see README.md for details):
   stream now shared with Qwen3.8-Flash-Next (src/models/common/vision/); and the
   bit-exact import of GGUF K-quant builds (tools/convert/glm5_next_gguf.py), with Q2_K,
   Q3_K and Q8_0 expert banks and exact A16 GPU (narrow and tensor-core) and CPU expert
-  kernels at its geometry. The shared placement runtime rebuilds the RAM tier off the
-  engine thread.
+  kernels at its geometry, and the ggml-bf16-prefill fast path for those banks (BF16
+  tensor-core tiles that decode in the K loop). The shared placement runtime rebuilds
+  the RAM tier off the engine thread.
 - The fast-path quality gate runs its default role on the fast run's kernel set (the
   exact route on the width-routed kernels, EngineOptions::width_routed_kernels, where
   it would run column-invariant ones), decides that kernel switch by a control against

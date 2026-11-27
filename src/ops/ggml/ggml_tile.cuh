@@ -303,7 +303,7 @@ __device__ __forceinline__ void issue_limbs(Sm& sm, int buf, int s0, const LimbC
 // One 8-element chunk of a block as the stage stores it: two code words (byte j of word h is element
 // 4h + j), its sub-scale and scale words. The integers of chunk<F> (ggml_exact.h), decoded with
 // word operations (ggml_dp4a.cuh's byte tricks) for every ggml format. `b` is the block in the
-// stage's raw copy (shared memory at any byte alignment, so words are read byte by byte).
+// stage's raw copy (shared memory at any byte alignment, so words are read by words2_at or byte by byte).
 struct TileChunk {
     int w[2];
     int sub;
@@ -311,6 +311,18 @@ struct TileChunk {
     int min_sub;
     std::uint16_t dmin;
 };
+
+// The two little-endian words at p..p + 7 (any alignment): aligned word loads and funnel shifts, so
+// two to three loads instead of eight byte loads. Reads nothing past the 4-byte word holding p + 7.
+// Q3_K and Q2_K read their codes so; the other formats keep byte loads (word loads made some of
+// their kernels spill).
+__device__ __forceinline__ uint2 words2_at(const std::uint8_t* p) {
+    const auto a     = reinterpret_cast<std::uintptr_t>(p);
+    const auto* w    = reinterpret_cast<const std::uint32_t*>(a & ~std::uintptr_t{3});
+    const unsigned s = static_cast<unsigned>(a & 3) * 8;
+    const std::uint32_t w0 = w[0], w1 = w[1], w2 = s != 0 ? w[2] : 0;
+    return make_uint2(__funnelshift_r(w0, w1, s), __funnelshift_r(w1, w2, s));
+}
 
 template <QType F>
 __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part) {
@@ -401,19 +413,20 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part)
         if constexpr (F == QType::GGML_Q3_K) {
             const std::uint8_t* qs = b + 32 + 32 * half + l;
             const int bit = 4 * half + plane;
+            const uint2 qw = words2_at(qs), mw = words2_at(b + l);
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                const std::uint32_t q = (u32_at(qs + 4 * h) >> (2 * plane)) & 0x03030303U;
-                const std::uint32_t m = (u32_at(b + l + 4 * h) >> bit) & 0x01010101U;
+                const std::uint32_t q = ((h == 0 ? qw.x : qw.y) >> (2 * plane)) & 0x03030303U;
+                const std::uint32_t m = ((h == 0 ? mw.x : mw.y) >> bit) & 0x01010101U;
                 o.w[h] = fast::sub_bytes4(q | (m << 2), 0x04040404U);
             }
             const int i = is + l / 16;
             o.sub = (((b[96 + i % 8] >> (4 * (i / 8))) & 0xF) | (((b[104 + i % 4] >> (2 * (i / 4))) & 3) << 4)) - 32;
             o.d   = u16_at(b + 108);
         } else {
-            const std::uint8_t* qs = b + 16 + 32 * half + l;
+            const uint2 qw = words2_at(b + 16 + 32 * half + l);
 #pragma unroll
-            for (int h = 0; h < 2; ++h) { o.w[h] = static_cast<int>((u32_at(qs + 4 * h) >> (2 * plane)) & 0x03030303U); }
+            for (int h = 0; h < 2; ++h) { o.w[h] = static_cast<int>(((h == 0 ? qw.x : qw.y) >> (2 * plane)) & 0x03030303U); }
             o.sub     = b[is + l / 16] & 0xF;
             o.min_sub = (b[is] >> 4) | ((b[is + 1] >> 4) << 8);
             o.d       = u16_at(b + 80);

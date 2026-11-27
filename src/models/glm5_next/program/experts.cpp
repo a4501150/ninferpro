@@ -169,6 +169,7 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
     experts.landing_slots = static_cast<std::int32_t>(offload::ExpertResidency::kLandingSlots);
     experts.error         = static_cast<std::uint32_t*>(device_error_.data());
     experts.resident      = residency_->resident();
+    experts.ggml_bf16_prefill = options_.ggml_bf16_prefill;
 
     // The saved state's experts (or, without one, the tier's spread fill) before the first request.
     placement_->warm_start_experts();

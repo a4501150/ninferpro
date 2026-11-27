@@ -9,7 +9,8 @@
 // columns the wide route (jobs of more than 8 columns run the tensor-core tiles, the others the
 // narrow kernels; at 300 columns two favoured experts take several 64-column tiles each). GLM-5.3-Flash's
 // K-quant and Q8_0 pairs run at its geometry (4096 x 2048, SwiGLU clamped at 10) through the same routes
-// (its down tiles decode in the K loop instead of keeping their rows resident). Oracle:
+// (its down tiles decode in the K loop instead of keeping their rows resident), and its ggml-bf16-prefill
+// route at 600 columns. Oracle:
 // each routed (column, expert) pair computed on the host by
 // the exact arithmetic (ops/ggml/ggml_exact.h, whose decode, sums and rounding
 // infernix_ggml_linear_test qualifies against an independent bignum oracle): x and h A16-encoded,
@@ -336,7 +337,8 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
     for (auto e : fork_events) { cudaEventDestroy(e); }
 }
 
-// One block's exact values in binary64 (llama.cpp's dequantize_row_* through ggml_exact.h's chunks):
+// One block's exact values in binary64 (llama.cpp's dequantize_row_* through ggml_exact.h's chunks,
+// the K-quants' min terms included):
 // every element of a row of `k` elements.
 void decode_row(QType q, const std::uint8_t* row, int k, double* out) {
     for (int i = 0; i < k / 8; ++i) {
@@ -348,14 +350,21 @@ void decode_row(QType q, const std::uint8_t* row, int k, double* out) {
         case QType::GGML_IQ4_XS: c = ggml::row_chunk<QType::GGML_IQ4_XS>(row, i); break;
         case QType::GGML_IQ4_NL: c = ggml::row_chunk<QType::GGML_IQ4_NL>(row, i); break;
         case QType::GGML_Q2_0: c = ggml::row_chunk<QType::GGML_Q2_0>(row, i); break;
+        case QType::GGML_Q4_K: c = ggml::row_chunk<QType::GGML_Q4_K>(row, i); break;
+        case QType::GGML_Q3_K: c = ggml::row_chunk<QType::GGML_Q3_K>(row, i); break;
+        case QType::GGML_Q2_K: c = ggml::row_chunk<QType::GGML_Q2_K>(row, i); break;
+        case QType::GGML_Q8_0: c = ggml::row_chunk<QType::GGML_Q8_0>(row, i); break;
         default: throw std::logic_error("format");
         }
-        std::int64_t mant;
-        int shift;
-        bool negative;
-        ggml::f16_parts(c.d, mant, shift, negative);
-        const double d = std::ldexp(static_cast<double>(negative ? -mant : mant), shift - 24 + ggml::kappa_log2(q));
-        for (int j = 0; j < 8; ++j) { out[8 * i + j] = d * c.sub * c.code[j]; }
+        const auto half = [q](std::uint16_t word) {
+            std::int64_t mant;
+            int shift;
+            bool negative;
+            ggml::f16_parts(word, mant, shift, negative);
+            return std::ldexp(static_cast<double>(negative ? -mant : mant), shift - 24 + ggml::kappa_log2(q));
+        };
+        const double d = half(c.d), m = c.min_sub != 0 ? half(c.dmin) * c.min_sub : 0.0;
+        for (int j = 0; j < 8; ++j) { out[8 * i + j] = d * c.sub * c.code[j] - m; }
     }
 }
 
@@ -374,17 +383,19 @@ std::uint16_t bf16_round(double v) {
 }
 
 // The ggml-bf16-prefill route (WideA16::kGgmlBf16) of a call wide enough for its planes
-// (kGgmlBf16MinColumns): 64 experts, top-4, some resident, the rest read zero-copy in one pass or staged
-// through 24 slots (passes of 24 jobs, each one sub-batch), a few rarely routed experts left to
-// the narrow kernels. Its arithmetic is not the exact route's (x and h as stored, FP32 sums), so the
-// exact route of the same call (bit-equal to the host oracle at the other widths) is the control: per
-// output column the normwise difference must stay within 2^-6 and at least 90 % of the outputs must
-// be equal. A sample of 48 (token, slot) pairs is checked against a binary64 chain with the route's
-// semantic boundaries (gate and up rounded to BF16, swiglu_bf16, BF16 h, the down rows): within
-// 2^-7 of sum |w h| plus half a BF16 ulp per output.
-void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
+// (kGgmlBf16MinColumns) at the default geometry, or of any wide call at another (GLM-5.3-Flash's, whose
+// tiles decode their rows in the K loop): 64 experts, top-4, some resident, the rest read zero-copy
+// in one pass or staged through 24 slots (passes of 24 jobs), a few rarely routed experts left to
+// the narrow kernels (and, at the other geometry, every job of 8 or fewer entries). Its arithmetic is
+// not the exact route's (x and h as stored, FP32 sums), so the exact route of the same call (bit-equal
+// to the host oracle at the other widths) is the control: per output column the normwise difference
+// must stay within 2^-6 and at least 90 % of the outputs must be equal. A sample of 48 (token, slot)
+// pairs (16 at the other geometry) is checked against a binary64 chain with the route's
+// semantic boundaries (gate and up rounded to BF16, swiglu_bf16 (clamped at the geometry's limit), BF16
+// h, the down rows): within 2^-7 of sum |w h| plus half a BF16 ulp per output.
+void run_bf16(QType gu, QType down, int columns, std::mt19937& rng, const moe::Geometry& geometry = moe::kDefaultGeometry) {
     constexpr int experts = 64, top_k = 4;
-    const int H = moe::kHidden, I = moe::kIntermediate;
+    const int H = geometry.hidden, I = geometry.intermediate;
     const std::uint32_t gr = row_bytes(gu, H), dr = row_bytes(down, I);
     const std::uint64_t record = 2ULL * I * gr + static_cast<std::uint64_t>(H) * dr;
     const std::uint64_t stride = (record + 4095) / 4096 * 4096;
@@ -440,7 +451,7 @@ void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
     void* d_workspace = nullptr;
     cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns,
                                                                                   moe::ExpertActivation::kA16,
-                                                                                  moe::WideA16::kGgmlBf16)),
+                                                                                  moe::WideA16::kGgmlBf16, geometry)),
                "cudaMalloc");
     std::vector<moe::ExpertScales> scales(experts);
     auto* d_scales = device_copy(scales);
@@ -455,6 +466,7 @@ void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
         source.activation   = moe::ExpertActivation::kA16;
         source.wide_a16     = route;
         source.frame_stride = stride;
+        source.geometry     = geometry;
         source.ggml         = {.gate_up_format = gu, .down_format = down, .gate_row_bytes = gr, .down_row_bytes = dr,
                                .record_bytes = record};
         Tensor tx(d_x, DType::BF16, {H, columns});
@@ -496,7 +508,8 @@ void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
         // The binary64 chain on a sample of (token, slot) pairs.
         std::vector<double> wg(static_cast<std::size_t>(H)), wu(static_cast<std::size_t>(H)), wd(static_cast<std::size_t>(I));
         std::size_t sample_bad = 0;
-        for (int s = 0; s < 48; ++s) {
+        const int samples = geometry.hidden == moe::kHidden ? 48 : 16;
+        for (int s = 0; s < samples; ++s) {
             const int pair = static_cast<int>(rng() % static_cast<unsigned>(top_k * columns));
             const int t = pair / top_k, e = ids[static_cast<std::size_t>(pair)];
             const std::uint8_t* rec = host + e * stride;
@@ -510,7 +523,9 @@ void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
                     g += wg[static_cast<std::size_t>(j)] * xv;
                     u += wu[static_cast<std::size_t>(j)] * xv;
                 }
-                h[static_cast<std::size_t>(i)] = canon::swiglu_bf16(bf16_round(g), bf16_round(u));
+                h[static_cast<std::size_t>(i)] = geometry.swiglu_limit > 0.0F
+                                                     ? canon::swiglu_bf16_clamped(bf16_round(g), bf16_round(u), geometry.swiglu_limit)
+                                                     : canon::swiglu_bf16(bf16_round(g), bf16_round(u));
             }
             for (int r = 0; r < H; ++r) {
                 decode_row(down, rec + 2ULL * I * gr + static_cast<std::size_t>(r) * dr, I, wd.data());
@@ -660,13 +675,16 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc > 1 && std::strcmp(argv[1], "--bench-glm") == 0) {
-        // --bench-glm [tokens]: GLM-5.3-Flash's pairs at its geometry (288 experts, top-8).
+        // --bench-glm [tokens] [bf16]: GLM-5.3-Flash's pairs at its geometry (288 experts, top-8), the
+        // exact route and, with bf16, the ggml-bf16-prefill route too.
         const int columns = argc > 2 ? std::atoi(argv[2]) : 4096;
+        const bool bf16   = argc > 3 && std::strcmp(argv[3], "bf16") == 0;
         for (const auto& [gu, down] : {std::pair{QType::GGML_Q4_K, QType::GGML_Q3_K}, std::pair{QType::GGML_Q3_K, QType::GGML_Q3_K},
                                        std::pair{QType::GGML_Q3_K, QType::GGML_Q2_K}, std::pair{QType::GGML_Q2_K, QType::GGML_Q2_K},
                                        std::pair{QType::GGML_Q8_0, QType::GGML_Q8_0}}) {
             try {
                 bench(gu, down, columns, rng, moe::WideA16::kExact, moe::kGeometries[1], 288, 8);
+                if (bf16) { bench(gu, down, columns, rng, moe::WideA16::kGgmlBf16, moe::kGeometries[1], 288, 8); }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "bench: %s\n", e.what());
                 return 1;
@@ -704,6 +722,8 @@ int main(int argc, char** argv) {
         run(gu, down, 40, rng, Spread::kModel, glm);
         run(gu, down, 40, rng, Spread::kEdge, glm);
         run(gu, down, 40, rng, Spread::kWide, glm);
+        // The ggml-bf16-prefill route: jobs of about 37 entries on average, one of many 128-column tiles.
+        run_bf16(gu, down, 600, rng, glm);
     }
     if (g_failures != 0) {
         std::fprintf(stderr, "%d ggml expert checks failed\n", g_failures);

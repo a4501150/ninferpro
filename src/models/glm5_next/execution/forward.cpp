@@ -116,9 +116,12 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     const std::size_t moe =
         aligned(e * t * f32) + aligned(k * t * 4) + aligned(k * t * f32) + aligned(t * f32) +
         aligned(ops::moe_dispatch_bytes(static_cast<std::int32_t>(e), entries)) + aligned(h * k * t * bf) +
-        aligned(ops::moe_experts_workspace_bytes(max_jobs, entries, static_cast<std::int32_t>(t),
-                                                 ops::offloaded_moe::ExpertActivation::kA16,
-                                                 ops::offloaded_moe::WideA16::kExact, expert_geometry(c))) +
+        aligned(std::max(ops::moe_experts_workspace_bytes(max_jobs, entries, static_cast<std::int32_t>(t),
+                                                          ops::offloaded_moe::ExpertActivation::kA16,
+                                                          ops::offloaded_moe::WideA16::kExact, expert_geometry(c)),
+                         ops::moe_experts_workspace_bytes(max_jobs, entries, static_cast<std::int32_t>(t),
+                                                          ops::offloaded_moe::ExpertActivation::kA16,
+                                                          ops::offloaded_moe::WideA16::kGgmlBf16, expert_geometry(c)))) +
         mlp_bytes(c.moe.shared_intermediate) + y;
     const std::size_t head = aligned(s * h * t * bf) + 2 * aligned(h * t * bf);
 
@@ -521,8 +524,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
     Tensor outputs                  = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs     = std::min(E, K * T);
     const auto geometry             = expert_geometry(config_);
-    const DeviceSpan expert_ws      = work_.alloc_bytes(ops::moe_experts_workspace_bytes(
-        max_jobs, K * T, T, ops::offloaded_moe::ExpertActivation::kA16, ops::offloaded_moe::WideA16::kExact, geometry));
+    const auto& planes              = p.bank->planes;
+    const bool ggml_bank            = planes.gate_up_format != QType::NVFP4_MUL;
+    const auto wide_a16 = ggml_bank && experts_.ggml_bf16_prefill ? ops::offloaded_moe::WideA16::kGgmlBf16
+                                                                  : ops::offloaded_moe::WideA16::kExact;
+    const DeviceSpan expert_ws = work_.alloc_bytes(ops::moe_experts_workspace_bytes(
+        max_jobs, K * T, T, ops::offloaded_moe::ExpertActivation::kA16, wide_a16, geometry));
 
     std::int32_t* route_log = nullptr;
     if (experts_.route_log != nullptr) {
@@ -531,7 +538,6 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
         }
         route_log = experts_.route_log + moe_layer * experts_.route_stride;
     }
-    const auto& planes   = p.bank->planes;
     const std::uint64_t pitch = experts_.frame_pitches.empty() ? 0 : experts_.frame_pitches.at(moe_layer);
     if (pitch != 0 && pitch != planes.record_stride) {
         throw std::invalid_argument("Glm5Next MoE: the layer's frame pitch differs from its bank's record stride");
@@ -552,11 +558,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
     }
     source.error        = experts_.error;
     source.geometry     = geometry;
+    source.wide_a16     = wide_a16;
     source.frame_stride = pitch;
-    if (planes.gate_up_format != QType::NVFP4_MUL) {
+    if (ggml_bank) {
         // A GGUF import's bank: its own record size in frames of its pool's pitch, the exact A16
-        // kernels at every width and the exact CPU route for misses. Stages copy the record
-        // rounded up to 16 bytes (the stride's zero padding).
+        // kernels (or, under ggml-bf16-prefill, the BF16 tiles for wide jobs) and the exact CPU
+        // route for misses. Stages copy the record rounded up to 16 bytes (the stride's zero padding).
         source.ggml = ops::MoeGgmlBank{.gate_up_format = planes.gate_up_format,
                                        .down_format    = planes.down_format,
                                        .gate_row_bytes = static_cast<std::uint32_t>(planes.gate_row_bytes),

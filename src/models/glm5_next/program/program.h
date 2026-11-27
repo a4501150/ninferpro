@@ -344,6 +344,8 @@ struct ProgramOptions {
     // Consecutive streamed calls of a prompt run layer-major (prefill_walk.cpp): each expert
     // crosses the link once per span instead of once per call, with the same bits.
     bool prefill_walk = true;
+    // FastPath::GgmlBf16Prefill (GGUF expert banks only): wide expert jobs run the BF16 tiles.
+    bool ggml_bf16_prefill = false;
     // CPU-served misses of decode and verification calls: host expert-engine workers (0
     // disables), the most of a layer call's misses they take, and the link's share of a call's
     // host-memory misses in 256ths (the rest go to the CPU).

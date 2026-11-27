@@ -2687,9 +2687,10 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             "experts geometry differs from the nvfp4_expert_rg16_v1 record (see "
             "offloaded_moe::kGeometries)");
     require(geometry.hidden == moe::kDefaultGeometry.hidden ||
-                (source.activation == moe::ExpertActivation::kA16 && source.wide_a16 == moe::WideA16::kExact &&
-                 source.ggml.gate_up_format != QType::FP8_E4M3FN_B128),
-            "a non-default record geometry serves exact NVFP4 or GGUF A16 routes only");
+                (source.activation == moe::ExpertActivation::kA16 && source.ggml.gate_up_format != QType::FP8_E4M3FN_B128 &&
+                 (source.wide_a16 == moe::WideA16::kExact ||
+                  (source.wide_a16 == moe::WideA16::kGgmlBf16 && ggml_bank(source)))),
+            "a non-default record geometry serves exact NVFP4 A16 or GGUF A16 (exact or BF16) routes only");
     require(x.ne[0] == geometry.hidden && outputs.ne[0] == geometry.hidden &&
                 outputs.ne[1] == x.ne[1] * top_k,
             "experts geometry differs from the x and outputs' hidden size");

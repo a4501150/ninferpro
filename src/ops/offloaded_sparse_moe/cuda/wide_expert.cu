@@ -214,7 +214,8 @@ Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t column
         o.x_emax   = take(t * sizeof(std::int32_t));
         o.h_emax   = take(e * sizeof(std::int32_t));
         o.job_ctas = take(j * sizeof(std::uint32_t));
-        if (wide_a16 == WideA16::kGgmlBf16 && columns >= kGgmlBf16MinColumns) {
+        // Only the default geometry's BF16 route decodes planes; the others decode in their K loops.
+        if (wide_a16 == WideA16::kGgmlBf16 && columns >= kGgmlBf16MinColumns && geometry.hidden == kDefaultGeometry.hidden) {
             o.ggml_planes     = take(kGgmlBf16PlaneBytes);
             o.has_ggml_planes = true;
         }

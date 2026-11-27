@@ -99,7 +99,8 @@ inline constexpr int kResidualTerms  = 3;
 inline constexpr int kXTermsRowBytes = kResidualTerms * kXRowBytes;
 inline constexpr int kHTermsRowBytes = kResidualTerms * kHRowStride;
 
-// GGUF banks' kGgmlBf16 route (ggml_expert.cuh): every wide job's records decoded into planes
+// GGUF banks' kGgmlBf16 route at the default geometry (ggml_expert.cuh; other geometries' tiles
+// decode their rows in the K loop and carve nothing): every wide job's records decoded into planes
 // (ggml_tile.cuh CodeStage images: kGgmlCodeStageBytes per 64 rows x 64 elements), its gate and up
 // rows (2 kIntermediate x kHidden) then its down rows (kHidden x kIntermediate), kGgmlBf16Experts
 // jobs at a time. Calls of fewer than kGgmlBf16MinColumns columns carve no planes and keep the exact
@@ -141,7 +142,8 @@ struct ExpertsWorkspace {
     float* x_row_scale;           // [columns]
     std::uint8_t* h_terms_plane;  // [entries][kHTermsRowBytes]
     float* h_row_scale;           // [entries]
-    // GGUF banks, kGgmlBf16 in calls of kGgmlBf16MinColumns or more (else null): kGgmlBf16PlaneBytes
+    // GGUF banks of the default geometry, kGgmlBf16 in calls of kGgmlBf16MinColumns or more (else
+    // null): kGgmlBf16PlaneBytes
     std::uint8_t* ggml_planes;
 };
 

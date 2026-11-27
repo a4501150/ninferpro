@@ -329,7 +329,14 @@ A16 ggml arithmetic (`src/ops/ggml/ggml_exact.h`; Q2_K's per-16 minimum term rea
 Up to 32 columns run the narrow dp4a kernels; wider calls (prefill) run the same arithmetic on
 tensor cores (`ggml_tile.cuh` decode-in-loop tiles, which form the X sums from the activation
 limbs, at this family's H4096 x I2048 geometry with the clamped SwiGLU), bit-equal to the narrow
-route. The record strides differ by layer, so the expert cache keeps one
+route. That is the exact route; by default the `ggml-bf16-prefill` fast path (§14) runs a wide
+call's jobs of more than 8 entries (the narrow kernels' bound) on BF16 tensor cores instead (`ggml_bf16_tile.cuh` `compute_decode`, one CTA
+per SM over (tile, row block) work items): each 128 x 128 tile copies its rows' raw 256-element
+units by cp.async one unit ahead and decodes them in the K loop, x and h stay as stored, and the
+sums are FP32. Q3_K's and Q2_K's code times sub-scale fits 8 bits, so it is stored exact in BF16
+and the MMAs sum a whole block before one multiply by d; Q4_K and Q8_0 scale per slice. A
+4,096-token chunk gives an expert about 114 entries, one tile, so a decoded plane (the default
+geometry's form) would be used once. The record strides differ by layer, so the expert cache keeps one
 frame pool per stride and gives every layer the same frame count (a switch target rounds down to a
 multiple of 42). The RAM tier sizes every slot at the largest stride (layer 3's 13.0 MB), so it
 holds about 20 % fewer records than its bytes would at the mean stride.
@@ -344,7 +351,7 @@ stride 4096, INT8 KV, 252,823 positions):
 | Decode, one request, greedy | 48.0 (43.9-52.5) tok/s | 82.8 (80.1-86.9) tok/s, sets 4-10 |
 | Decode, one request, temperature 1 | 47.0 (42.3-48.0), four sets | 75.1 (72.7-80.7), sets 4-10 |
 | Same split for both, `vram=40%`, greedy (four sets) | 46.0 (41.7-47.7) | 49.7 (42.5-50.2) |
-| Prefill, fresh 12.9K and 52.6K-token prompts | 2.46k, 2.45k tok/s | 1.52k-1.56k tok/s on 11.2K-60.7K-token prompts (the tensor-core wide route; the narrow kernels alone gave 475 and 455) |
+| Prefill, fresh 12.9K and 52.6K-token prompts | 2.46k, 2.45k tok/s | 2.24k-2.33k tok/s on 15.2K-61.8K-token prompts under `ggml-bf16-prefill`; the exact route 1.56k-1.59k on 15.2K-59.0K (2026-11-26, one boot each; the narrow kernels alone gave 475 and 455) |
 | Serving process, production flags, three 1,024-token decodes beside a 15.7K prompt and its cached repeat | peak 92,680 MiB | peak 91,984 MiB (91,156 at `vram=58%`); 91,990 with the wide route (a 15.3K prompt) |
 | Perplexity (different abliterations: not a measure of the quantization) | 3.1489 | 3.2541 |
 
@@ -875,12 +882,12 @@ ring returns before decode).
 | Part | Route |
 |---|---|
 | Dense GEMMs and head | BF16 tensor cores (the existing dense kernels), bit-identical to the decode route; shapes at H = 4,096 registered in `src/models/shapes.cpp` |
-| Routed experts | W4A16 wide route, grouped by expert |
+| Routed experts | W4A16 wide route, grouped by expert (NVFP4); exact A16 tiles, or the BF16 tiles of `ggml-bf16-prefill` for a wide call's jobs of more than 8 entries (GGUF, §3.3) |
 | MLA, indexer | §7.2-§7.3 |
 | KDA | chunked route |
 
-No activation permissions apply: the experts run the exact W4A16 wide route, and the dense
-classes are BF16 already.
+No activation permissions apply: the NVFP4 experts run the exact W4A16 wide route, and the dense
+classes are BF16 already (the GGUF recipe binds its Q8_0 dense classes `A16Only`).
 
 ### 11.4 Prefill beside decode
 
@@ -948,9 +955,19 @@ process; the rest of the 182 GiB stays with the OS, the page cache and other pro
 
 The engine's three-layer contract — the canonical arithmetic, the exact route, fast paths under
 the [acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-paths) — applies
-in a reduced form here. This family has no fast paths (fast-path candidates are refused) and no
-separate exact route: its one route is canonical, and its prefill bits do not depend on the chunk
-size (§7.2).
+in a reduced form here. The exact route (`--disable-fast-paths`; `--a16-activations` selects it too,
+as the quality gate's reference) is canonical, and its prefill bits do not depend on the chunk size
+(§7.2). The family's one fast path, `ggml-bf16-prefill`, applies to the GGUF artifact (§3.3) only
+and is on by default there with INT8 KV (its qualified configuration): a wide call's expert jobs of
+more than 8 entries run BF16 tiles, so a prompt's bits depend on its call widths (the chunk size,
+and the 1,024-token calls beside another lane's decode), and the GGUF artifact is not
+request-invariant under it. Decode and verification calls are never wide, so the path changes no
+decode arithmetic. Qualified 2026-11-26 ([model quality §6.7](model-quality.md#67-fast-path-registry)).
+One layer's expert call at 4,096 tokens (288 experts, top-8, every record resident;
+`infernix_offloaded_moe_ggml_test --bench-glm 4096 bf16`) takes 11.5-14.8 ms against the exact
+tiles' 30-37 ms. The tiles stay decode-bound (about 40 % of issue slots used); a warp-staggered
+decode/MMA order measured no faster and was removed. The NVFP4 artifact has no fast
+path: candidates and exclusions are refused there.
 
 ### 14.1 Op oracles
 
@@ -1095,7 +1112,9 @@ sizing headrooms (`--vram-headroom-mib`, `--ram-headroom-mib`) are shared. This 
 
 Refused at startup, each naming the reason: `--spec` other than `dflash2`, n-gram drafting
 (`--ngram-draft-tokens`, `--ngram-archive-mib`, `--ngram-volume`), draft trees, `--spec-min-p`,
-`--a16-activations`, fast-path candidates, `--expert-tail-skip`, `--route-trace`, and for the
+fast-path candidates and exclusions other than `ggml-bf16-prefill` (and that one on the NVFP4
+artifact),
+`--expert-tail-skip`, `--route-trace`, and for the
 prefix cache the Disk tier, persistence, Device snapshot slots, packed Host state and tool-call
 holds.
 

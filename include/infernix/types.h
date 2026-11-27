@@ -172,13 +172,14 @@ enum class FastPath : std::uint8_t {
     // Prefill steps take a wider chunk while no request is waiting to decode (the chunk boundaries,
     // and with them the prefill arithmetic, depend on load).
     IdleWidePrefill,
-    // Qwen3.8-Flash-Next GGUF imports: dense projections of prefill calls of 32 or more columns run on
+    // GGUF imports. Qwen3.8-Flash-Next: dense projections of prefill calls of 32 or more columns run on
     // BF16 tensor cores (each code exact in BF16, x as stored, FP32 sums of each sub-block scaled by
     // d * sub; ops::LinearRoutes::GgmlBf16Wide) instead of the exact A16 integer tiles, and the GGUF
     // expert banks' MoE calls of 14,336 or more columns run the same tiles over decoded expert planes.
-    // A prompt's arithmetic then depends on where its calls start and how the layer walk groups them
-    // (a narrower tail call stays exact), which prefix-cache resumes share between requests. Without
-    // it every GGUF projection and expert is exact.
+    // GLM-5.3-Flash: the GGUF expert banks' jobs of more than 8 entries in wide calls run BF16 tiles
+    // that decode their rows in the K loop. A prompt's arithmetic then depends on where its calls
+    // start and how the layer walk groups them (a narrower tail call stays exact), which prefix-cache
+    // resumes share between requests. Without it every GGUF projection and expert is exact.
     GgmlBf16Prefill,
     // Qwen3.8-Flash-Next where the exact route is construction-exact (its GDN prefill runs the
     // recurrent arithmetic at every width): GDN calls of 16 or more tokens run the compensated chunked

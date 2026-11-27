@@ -750,6 +750,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
+| GLM-5.3-Flash: `ggml-bf16-prefill` | GGUF expert jobs of more than 8 entries in wide (prefill) calls | the GSQ-Q4 GGUF artifact with INT8 KV (BF16 KV not gated) |
 | Qwen3.8-Flash-Next: `gdn-compensated` | GDN calls of 16+ tokens in the construction-exact configurations (recipe C with BF16, INT8 or FP8 KV) | recipe C with INT8 or FP8 KV (BF16 KV is the reference's own exact route, not gated; 6.8) |
 | Qwen3.8-Flash-Next: `hc-sliced-k` | the Q8 hyper-connection mix ([324, 10240], [320, 10240]) of recipe C at 29-2,048 columns | recipe C with FP8 KV (INT8 fails its decode tail, below; other formats not gated) |
 | Qwen3.8-Flash-Next: `bf16-index-mma` | the BF16 QSA index projection ([640, 2560]) of recipe C at 9 or more columns | recipe C with FP8 KV (other formats not gated) |
@@ -2010,6 +2011,18 @@ with the Tensor Core pipe) — so the scales were made powers of two instead.
 
 **`ggml-bf16-prefill`: BF16 tensor-core tiles in Flash-Next's GGUF prefill (IQ3_S with INT8, FP8,
 NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
+
+**`ggml-bf16-prefill` on GLM-5.3-Flash (the GSQ-Q4 GGUF artifact with INT8 KV, qualified
+2026-11-26).** The family's exact route is its 16-bit-activation route, so the reference is that
+route with BF16 KV in one 8,192-token pass (`--a16-activations`). Prefill gate
+(`fast_path_gate.py prefill --quick --context 8192 --stride 4096 --kv int8 --chunk 1024 2048 4096
+8192`, 60 windows, 1,011,292 positions per route, RTX PRO 6000): mean KL excess -1.4e-4 (bound
+3.0e-5 of 1.5e-3; floor 4.8e-3), top-1 excess -0.06 points (bound 0.004), corpus NLL excess
+-1.6e-4 (perplexity ratio 0.99984), p99.9 KL ratio 0.98, both context buckets within budget: the
+fast route sits slightly closer to the reference than the exact route with INT8 KV. No decode gate:
+decode and verification calls are never wide, so the path changes no decode arithmetic; decode reads
+a prompt's KV computed under it, which the gate's later-window positions cover. BF16 KV is not gated
+(its exact route is the reference itself, floor 0), so the path stays off there.
 
 ### 7.4 A UD-Q4_K_XL artifact for Qwen3.8-Flash-Next (not built)
 

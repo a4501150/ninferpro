@@ -85,11 +85,16 @@ void validate(const EngineOptions& options) {
         throw std::invalid_argument(
             "GLM-5.3-Flash keeps its KV cache in BF16 or INT8 (--kv-dtype bf16|int8)");
     }
-    if (options.a16_activations) {
-        throw std::invalid_argument("GLM-5.3-Flash runs its experts W4A16 already: --a16-activations does not apply");
+    for (const auto* paths : {&options.fast_path_candidates, &options.fast_path_exclusions}) {
+        for (const FastPath path : *paths) {
+            if (path != FastPath::GgmlBf16Prefill) {
+                throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +
+                                            " does not apply to GLM-5.3-Flash (its one fast path is ggml-bf16-prefill)");
+            }
+        }
     }
-    if (!options.fast_path_candidates.empty()) {
-        throw std::invalid_argument("GLM-5.3-Flash has no fast paths to select");
+    if (!options.fast_path_candidates.empty() && !options.fast_path_exclusions.empty()) {
+        throw std::invalid_argument("fast path ggml-bf16-prefill is both a candidate and an exclusion");
     }
     if (options.expert_tail_skip != 0) {
         throw std::invalid_argument("GLM-5.3-Flash computes every routed expert: --expert-tail-skip does not apply");
@@ -323,6 +328,17 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
     }
     const std::uint64_t after_weights = vram->query().device_free;
 
+    // The family's one fast path (glm5_3-flash-design.md §14): it applies to GGUF expert banks and is
+    // qualified with INT8 KV (model-quality.md §6.7).
+    const bool ggml_experts = model->expert_banks().front().planes.gate_up_format != QType::NVFP4_MUL;
+    if (!ggml_experts && !(options.fast_path_candidates.empty() && options.fast_path_exclusions.empty())) {
+        throw std::invalid_argument("fast path ggml-bf16-prefill does not apply to NVFP4 expert banks");
+    }
+    const bool qualified = options.kv_cache == KvCacheStorage::Int8Group64;
+    const bool ggml_bf16_prefill = ggml_experts && options.fast_path_exclusions.empty() &&
+                                   (!options.fast_path_candidates.empty() || (options.fast_paths && qualified));
+    program_options.ggml_bf16_prefill = ggml_bf16_prefill;
+
     StartupPhaseScope frontend_phase(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<Glm5NextInstance>(std::move(model), options);
     frontend_phase.complete();
@@ -377,6 +393,9 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
     summary.host_object_count    = stats.host_object_count;
     summary.weight_formats       = {"bf16", "fp32", "nvfp4_mul"};
     summary.fast_paths_disabled  = !options.fast_paths;
+    summary.fast_path_configuration = std::string(ggml_experts ? "GGUF" : "NVFP4") + " expert banks, " +
+                                      (options.kv_cache == KvCacheStorage::Int8Group64 ? "int8" : "bf16") + " KV";
+    if (ggml_bf16_prefill) { summary.fast_paths = {fast_path_name(FastPath::GgmlBf16Prefill)}; }
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;
