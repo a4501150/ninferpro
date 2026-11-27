@@ -7,6 +7,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "ops/offloaded_sparse_moe/cpu/x86_mad.h"
@@ -393,22 +394,87 @@ void row_sums_avx512_n(const std::uint8_t* matrix, int row_bytes, int slices, in
             __m512i lo[NC], hi[NC];
             for (int k = 0; k < NC; ++k) { lo[k] = hi[k] = _mm512_setzero_si512(); }
             std::uint16_t d = 0;
-            for (int j = 0; j < kUnit; ++j) {
-                const int s      = u * kUnit + j;
-                const Decoded dw = decode<F>(w, s);
-                __m512i sub;
-                if constexpr (kHalfSubs<F>) { // elements 0-15 and 16-31 have their own sub-scales
-                    sub = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16(static_cast<short>(dw.sub0))),
-                                             _mm256_set1_epi16(static_cast<short>(dw.sub1)), 1);
-                } else {
-                    sub = _mm512_set1_epi16(static_cast<short>(dw.sub0));
-                }
-                const __m512i sw = _mm512_mullo_epi16(_mm512_cvtepi8_epi16(dw.q), sub);
-                d                = dw.d;
-                for (int k = 0; k < NC; ++k) {
-                    const CpuLimbSlice& l = columns[k][s];
-                    lo[k] = _mm512_dpwssd_epi32(lo[k], sw, _mm512_loadu_si512(l.lo));
-                    hi[k] = _mm512_dpwssd_epi32(hi[k], sw, _mm512_loadu_si512(l.hi));
+            if constexpr (F == QType::GGML_Q3_K) {
+                const std::uint8_t* b = w + static_cast<std::size_t>(u / 2) * 110;
+                const int half        = u & 1;
+                d                     = u16(b + 108);
+                const __m256i q       = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 32 + 32 * half));
+                const __m256i hm_raw  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
+                const __m256i hm      = half != 0 ? _mm256_srli_epi16(hm_raw, 4) : hm_raw;
+                const __m256i mask3   = _mm256_set1_epi8(3);
+                const __m256i mask1   = _mm256_set1_epi8(1);
+                const __m256i bias4   = _mm256_set1_epi8(4);
+#define INFERNIX_Q3K_SUB(idx)                                                                                          \
+    ((((b[96 + (idx) % 8] >> (4 * ((idx) / 8))) & 0xF) | (((b[104 + (idx) % 4] >> (2 * ((idx) / 4))) & 3) << 4)) - 32)
+#define INFERNIX_Q3K_STEP(P)                                                                                           \
+    do {                                                                                                               \
+        const int s       = u * 4 + (P);                                                                               \
+        const __m256i ql  = (P) == 0 ? q : _mm256_srli_epi16(q, 2 * (P));                                              \
+        const __m256i qh  = (P) == 0 ? hm : _mm256_srli_epi16(hm, (P));                                                \
+        const __m256i q8  = _mm256_sub_epi8(                                                                           \
+            _mm256_or_si256(_mm256_and_si256(ql, mask3), _mm256_slli_epi16(_mm256_and_si256(qh, mask1), 2)), bias4);   \
+        const int s0      = INFERNIX_Q3K_SUB(8 * half + 2 * (P));                                                      \
+        const int s1      = INFERNIX_Q3K_SUB(8 * half + 2 * (P) + 1);                                                  \
+        const __m512i sub = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16(static_cast<short>(s0))),      \
+                                               _mm256_set1_epi16(static_cast<short>(s1)), 1);                          \
+        const __m512i sw  = _mm512_mullo_epi16(_mm512_cvtepi8_epi16(q8), sub);                                         \
+        for (int k = 0; k < NC; ++k) {                                                                                 \
+            const CpuLimbSlice& l = columns[k][s];                                                                     \
+            lo[k]                 = _mm512_dpwssd_epi32(lo[k], sw, _mm512_loadu_si512(l.lo));                          \
+            hi[k]                 = _mm512_dpwssd_epi32(hi[k], sw, _mm512_loadu_si512(l.hi));                          \
+        }                                                                                                              \
+    } while (false)
+                INFERNIX_Q3K_STEP(0);
+                INFERNIX_Q3K_STEP(1);
+                INFERNIX_Q3K_STEP(2);
+                INFERNIX_Q3K_STEP(3);
+#undef INFERNIX_Q3K_STEP
+#undef INFERNIX_Q3K_SUB
+            } else if constexpr (F == QType::GGML_Q2_K) {
+                const std::uint8_t* b = w + static_cast<std::size_t>(u / 2) * 84;
+                const int half        = u & 1;
+                d                     = u16(b + 80);
+                const __m256i q       = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 16 + 32 * half));
+                const __m256i mask3   = _mm256_set1_epi8(3);
+#define INFERNIX_Q2K_STEP(P)                                                                                           \
+    do {                                                                                                               \
+        const int s       = u * 4 + (P);                                                                               \
+        const __m256i ql  = (P) == 0 ? q : _mm256_srli_epi16(q, 2 * (P));                                              \
+        const __m256i q8  = _mm256_and_si256(ql, mask3);                                                               \
+        const int s0      = b[8 * half + 2 * (P)] & 0xF;                                                               \
+        const int s1      = b[8 * half + 2 * (P) + 1] & 0xF;                                                           \
+        const __m512i sub = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16(static_cast<short>(s0))),      \
+                                               _mm256_set1_epi16(static_cast<short>(s1)), 1);                          \
+        const __m512i sw  = _mm512_mullo_epi16(_mm512_cvtepi8_epi16(q8), sub);                                         \
+        for (int k = 0; k < NC; ++k) {                                                                                 \
+            const CpuLimbSlice& l = columns[k][s];                                                                     \
+            lo[k]                 = _mm512_dpwssd_epi32(lo[k], sw, _mm512_loadu_si512(l.lo));                          \
+            hi[k]                 = _mm512_dpwssd_epi32(hi[k], sw, _mm512_loadu_si512(l.hi));                          \
+        }                                                                                                              \
+    } while (false)
+                INFERNIX_Q2K_STEP(0);
+                INFERNIX_Q2K_STEP(1);
+                INFERNIX_Q2K_STEP(2);
+                INFERNIX_Q2K_STEP(3);
+#undef INFERNIX_Q2K_STEP
+            } else {
+                for (int j = 0; j < kUnit; ++j) {
+                    const int s      = u * kUnit + j;
+                    const Decoded dw = decode<F>(w, s);
+                    __m512i sub;
+                    if constexpr (kHalfSubs<F>) { // elements 0-15 and 16-31 have their own sub-scales
+                        sub = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16(static_cast<short>(dw.sub0))),
+                                                 _mm256_set1_epi16(static_cast<short>(dw.sub1)), 1);
+                    } else {
+                        sub = _mm512_set1_epi16(static_cast<short>(dw.sub0));
+                    }
+                    const __m512i sw = _mm512_mullo_epi16(_mm512_cvtepi8_epi16(dw.q), sub);
+                    d                = dw.d;
+                    for (int k = 0; k < NC; ++k) {
+                        const CpuLimbSlice& l = columns[k][s];
+                        lo[k] = _mm512_dpwssd_epi32(lo[k], sw, _mm512_loadu_si512(l.lo));
+                        hi[k] = _mm512_dpwssd_epi32(hi[k], sw, _mm512_loadu_si512(l.hi));
+                    }
                 }
             }
             for (int k = 0; k < NC; ++k) {

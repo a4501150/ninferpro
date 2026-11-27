@@ -326,34 +326,41 @@ matrices (`attn_output`, `ffn_down`, the shared expert's down) and the embedding
 The routed experts take 118.1 GiB against the NVFP4 artifact's 159.5 GiB. The experts run the exact
 A16 ggml arithmetic (`src/ops/ggml/ggml_exact.h`; Q2_K's per-16 minimum term reads each column's
 16-element X sums) on the GPU and on the CPU miss lane, so a miss's route never changes the bits.
-Up to 32 columns run the narrow dp4a kernels; wider calls (prefill) run the same arithmetic on
-tensor cores (`ggml_tile.cuh` decode-in-loop tiles, which form the X sums from the activation
-limbs, at this family's H4096 x I2048 geometry with the clamped SwiGLU), bit-equal to the narrow
-route. That is the exact route; by default the `ggml-bf16-prefill` fast path (§14) runs a wide
-call's jobs of more than 8 entries (the narrow kernels' bound) on BF16 tensor cores instead (`ggml_bf16_tile.cuh` `compute_decode`, one CTA
-per SM over (tile, row block) work items): each 128 x 128 tile copies its rows' raw 256-element
-units by cp.async one unit ahead and decodes them in the K loop, x and h stay as stored, and the
-sums are FP32. Q3_K's and Q2_K's code times sub-scale fits 8 bits, so it is stored exact in BF16
-and the MMAs sum a whole block before one multiply by d; Q4_K and Q8_0 scale per slice. A
-4,096-token chunk gives an expert about 114 entries, one tile, so a decoded plane (the default
-geometry's form) would be used once. The record strides differ by layer, so the expert cache keeps one
-frame pool per stride and gives every layer the same frame count (a switch target rounds down to a
-multiple of 42). The RAM tier sizes every slot at the largest stride (layer 3's 13.0 MB), so it
-holds about 20 % fewer records than its bytes would at the mean stride.
+Up to 8 columns (`moe::kMaxColumns`) run the exact narrow dp4a kernels (`ggml_dp4a.cuh`, block-level
+4-lane cooperative `add_block_quad` with `cp.async` row/block staging); wider calls (prefill) on the
+exact route run the same arithmetic on tensor cores (`ggml_tile.cuh` decode-in-loop tiles, which form
+the X sums from the activation limbs, at this family's H4096 x I2048 geometry with the clamped
+SwiGLU), bit-equal to the narrow route. By default the `ggml-bf16-prefill` fast path (§14) runs
+BF16 tensor-core tiles (`ggml_bf16_tile.cuh` `compute_decode`, one CTA per SM over (tile, row block)
+work items with templated 128/64/32/16-column warp layouts, conflict-free shared-memory staging and
+`__byte_perm` unsigned BF16 decode): calls of 64 or more columns (`kGgmlBf16AllJobsMinColumns`) route
+every active non-CPU job through the BF16 tiles directly from BF16 x (skipping limb encoding, the
+exact-tile plan and the narrow dp4a pass), while calls of 9-63 columns keep narrow dp4a for jobs of
+at most 8 entries. Each 128 x 128 tile copies its rows' raw 256-element units by cp.async one unit
+ahead and decodes them in the K loop, x and h stay as stored, and the sums are FP32. Q3_K's and
+Q2_K's code times sub-scale fits 8 bits, so it is stored exact in BF16 and the MMAs sum a whole block
+before one multiply by d; Q4_K and Q8_0 scale per slice. A 4,096-token chunk gives an expert about
+114 entries, one tile, so a decoded plane (the default geometry's form) would be used once. The
+record strides differ by layer, so the expert cache keeps one frame pool per stride and gives every
+layer the same frame count (a switch target rounds down to a multiple of 42). The RAM tier sizes
+every slot at the largest stride (layer 3's 13.0 MB), so it holds about 20 % fewer records than its
+bytes would at the mean stride.
 
-Measured against the NVFP4 artifact (2026-11-26; `infernix_glm5_next_engine_bench --concurrency 1
---tokens 512 --draft-tokens auto`, ten sets, the GGUF's at the plateau after its cache warms over
-three sets; fresh prompts on `infernix-serve`; `infernix-perplexity` quick corpus, context 8192,
-stride 4096, INT8 KV, 252,823 positions):
+Measured against the NVFP4 artifact (2026-11-26 baseline and 2026-11-27 optimized build;
+`infernix_glm5_next_engine_bench --concurrency 1 --tokens 512 --draft-tokens auto`, ten sets, the
+GGUF's at the plateau sets 4-10; `infernix_bench` / fresh prompts on `infernix-serve`;
+`infernix-perplexity` quick corpus, context 8192, stride 4096, INT8 KV, 252,823 positions):
 
-| Measurement | NVFP4, `vram=40%` (4,838 experts in VRAM) | GGUF, `vram=59%` (7,098) |
+| Measurement | NVFP4, `vram=40%` (4,838 experts in VRAM) | GGUF, `vram=59%` (7,098 VRAM / 4,998 RAM / 0 SSD) |
 |---|---|---|
-| Decode, one request, greedy | 48.0 (43.9-52.5) tok/s | 82.8 (80.1-86.9) tok/s, sets 4-10 |
-| Decode, one request, temperature 1 | 47.0 (42.3-48.0), four sets | 75.1 (72.7-80.7), sets 4-10 |
-| Same split for both, `vram=40%`, greedy (four sets) | 46.0 (41.7-47.7) | 49.7 (42.5-50.2) |
-| Prefill, fresh 12.9K and 52.6K-token prompts | 2.46k, 2.45k tok/s | 2.24k-2.33k tok/s on 15.2K-61.8K-token prompts under `ggml-bf16-prefill`; the exact route 1.56k-1.59k on 15.2K-59.0K (2026-11-26, one boot each; the narrow kernels alone gave 475 and 455) |
-| Serving process, production flags, three 1,024-token decodes beside a 15.7K prompt and its cached repeat | peak 92,680 MiB | peak 91,984 MiB (91,156 at `vram=58%`); 91,990 with the wide route (a 15.3K prompt) |
-| Perplexity (different abliterations: not a measure of the quantization) | 3.1489 | 3.2541 |
+| Decode, one request, `auto`, greedy | 48.0 (43.9-52.5) tok/s | 85.3 (83.0-91.1) tok/s, sets 4-10 (2026-11-27; 2026-11-26: 82.8, 80.1-86.9) |
+| Decode, one request, `auto`, temperature 1 | 47.0 (42.3-48.0), four sets | 73.6 median, 54.2-77.2 across sets 1-4 (2026-11-27; 2026-11-26 sets 4-10: 75.1, 72.7-80.7) |
+| Decode, one request, plain (four sets, 512 tok) | — | 56.2 (47.0-60.6) tok/s (2026-11-27) |
+| Decode, four requests, plain (four sets, 256 tok) | — | 81.2 (65.8-88.7) tok/s aggregate (2026-11-27) |
+| Same split for both, `vram=40%`, T1 `round_bench` (`1x1` / `4x1` / `1x4`, 2026-11-27) | 27.8 / 70.0 / 47.9 tok/s | 34.2 / 85.0 / 62.0 tok/s (after per-pool landing; before: 27.9 / 45.3 / 50.5) |
+| Prefill (`infernix_bench` `pp4096` / `pp16384` / `pp32768`, INT8 KV, 2026-11-27) | 2.46k, 2.45k tok/s (12.9K, 52.6K fresh) | 4.21k / 4.05k / 3.92k tok/s (`pp256`: 305.0 tok/s; live serving 16.1K beside 3 decodes: 3.95k tok/s; 2026-11-26: 2.24k-2.33k tok/s, exact route 1.56k-1.59k) |
+| Serving process, production flags, three decodes beside a 16.1K prompt and its cached repeat | peak 92,680 MiB | peak 91,986 MiB (cap 92,993, headroom 1,007 MiB; 2026-11-26: 91,984 MiB) |
+| Perplexity (different abliterations: not a measure of the quantization) | 3.1489 | 3.2546 (2026-11-27; 2026-11-26: 3.2541) |
 
 No published reference shares this artifact's abliteration, so its quantization loss is not
 measured. GCSA's Q8_0 build of the same repository is not one: against the Q4 build, `attn_output`
@@ -498,14 +505,16 @@ need, and did not raise the hit rate (§6.3). No promotions follow a walked pref
 
 ### 6.3 Miss service
 
-CPU-served misses run on 8 workers (`cpu_expert_workers`), and half of every decode call's
-host-memory misses stay on the link (`cpu_link_share256` = 128/256; MoE §5.6 states the shared
-share forms). The CPU computes any column count without changing a bit, since every W4A16 route is
-exact. While the host computes a call's misses the device runs the shared expert and warms the next
-layer's attention mix and first input projections into L2 (40 MiB at one column, 16 MiB wider: FN
-§8.6's budgets); the bits are unchanged and the one-row round median fell 21.6 → 20.3 ms
-(`vram=44%`, Q8-dense artifact). Measured plain decode, `vram=42%,ram=58%`, INT8 KV, 256-token
-answers, two runs each:
+CPU-served misses default to 14 workers (`cpu_expert_workers`), up to 16 jobs per layer call
+(`cpu_expert_jobs`), and `cpu_link_share256` = 104/256 (~40.6 % on the PCIe link, ~59.4 % on the
+CPU; raised from 8 / 4 / 128 on 2026-11-27 alongside AVX-512 VNNI block-half unrolling in
+`cpu/ggml_expert.cpp` and a 32-CTA × 32 KiB staging window in `moe_layer.cu` saturating PCIe Gen5
+x16 at ~55 GB/s; MoE §5.6 states the shared share forms). The CPU computes any column count without
+changing a bit, since every W4A16 and exact ggml route is bit-exact. While the host computes a
+call's misses the device runs the shared expert and warms the next layer's attention mix and first
+input projections into L2 (40 MiB at one column, 16 MiB wider: FN §8.6's budgets); the bits are
+unchanged and the one-row round median fell 21.6 → 20.3 ms (`vram=44%`, Q8-dense artifact). Earlier
+NVFP4 sweep (`vram=42%,ram=58%`, INT8 KV, 256-token answers, two runs each):
 
 | Configuration | One request, tok/s | Four requests, aggregate tok/s | Decode hits |
 |---|---:|---:|---:|
@@ -552,12 +561,19 @@ At one request (`vram=42%,ram=58%`) a plain round spends 8.1 ms of 21.3 ms per t
 dense GEMVs (at the read rate), 4.3 ms in hit experts (≈ 54 % of the read rate), 4.2 ms staging
 misses beside them and 2.7 ms waiting for the CPU lane; the GPU idles 0.5 ms.
 
-### 6.6 RAM tier and warm start
+### 6.6 RAM tier, warm start and multi-pool landing
 
 The RAM tier, its ranking and the host RAM ledger are MoE §4.6 and §4.10. At the serving split
-the RAM tier holds every expert outside VRAM (7,258 records, ≈ 96 GiB). The shared expert state
-file (`--expert-state`) warm-starts the tiers from the saved ranking; no calibrated order ships
-for this family, so a cold start spreads the seed across the layers (MoE §4.3).
+the RAM tier holds every expert outside VRAM (7,258 NVFP4 records, ≈ 96 GiB; 4,998 GGUF records at
+`vram=59%,ram=41%`, 63.4 GiB, 0 on SSD). The shared expert state file (`--expert-state`) warm-starts
+the tiers from the saved ranking; without one, auto placement seeds `kSeedShare` (90 %) of frames in
+layer-spread order (`pp4096` rose from 1,856 to 4,206 tok/s and `pp256` from 117 to 305 tok/s on
+2026-11-27), and explicit placements walk the tier fill in windows so every VRAM frame fills even
+when VRAM frames exceed the RAM tier's slot count (eliminating unintended SSD spill on GGUF
+`vram=59%,ram=41%`). Decode landing frames are reserved independently per frame pool
+(`ExpertResidency::before_round`), so multi-pool GGUF banks land misses into frames freed by a
+prefill lease in the Q3_K pool even when the other pools are full (raising GGUF `vram=40%` T1
+`4x1` from 45.3 to 85.0 tok/s and `1x1` from 27.9 to 34.2 tok/s on 2026-11-27).
 
 ## 7. Sparse MLA attention and the pooled indexer
 
@@ -582,24 +598,24 @@ qualified against an FP64 oracle of the reference formula.
 
 ### 7.2 Attention (`mla_sparse_attention`)
 
-- **Decode:** per layer and sequence, Q' is 64 × 512 and the selected latents ≤ 2,051 × 512. Two
-  BF16 `mma.sync` GEMMs with FP32 accumulation (S = Q'Cᵀ, then U = P C) with an online softmax
-  between them, split over token blocks and merged in fixed block order. A CTA gathers whole
-  4-token pools through the block table plus the tail tokens.
+- **Decode and short prompts (< 64 columns):** per layer and sequence, Q' is 64 × 512 and the
+  selected latents ≤ 2,051 × 512. Eight-warp (256-thread) `mma.sync` tiles (`kSplitMmaTokens = 16`)
+  over 16-head groups run S = Q'Cᵀ (BF16 MMA, FP32 acc) and U = P C with online softmax between
+  them, split over 32-token blocks and merged in fixed block order. A CTA gathers whole 4-token
+  pools through the block table plus the tail tokens.
 - **Prompt calls of 64 or more columns** take the tensor-core envelope: one CTA per column with
   all 64 heads sharing its tokens, 16-token tiles of latent rows staged as BF16 (INT8 codes
-  exactly), scores and value sums on BF16 MMAs with FP32 accumulation, each probability entering
-  the value MMA as a BF16 high and low pair. One route serves both regimes (dense below 2,051
-  visible tokens and sparse above), in the absorbed form throughout. Against the FP64 oracle it
-  stays within the split route's criterion (worst 0.735 of the limit; the split route 0.699). On a
-  10,092-token prompt attention took 0.27 s against 2.17 s on the split route (TTFT 6.3 against
-  7.6 s). On an 18,842-token perplexity run (context 8192, stride 4096) the two routes differ by
-  KL 0.0125 (PPL 7.035 against 7.041), while two FP32 orders of the split route differ by KL
-  0.0128: the difference is the model's own rounding sensitivity (expert routing flips). The
-  prefill is bit-identical across chunks of 1,024, 4,096 and 8,192.
+  exactly), scores on BF16 MMAs with FP32 accumulation. One route serves both regimes (dense below
+  2,051 visible tokens and sparse above), in the absorbed form throughout. Against the FP64 oracle
+  both routes pass the `2.8e-3` relative-L2 / `5.0e-3` gross-relative criterion and strict bitwise
+  column invariance. The prefill is bit-identical across chunks of 1,024, 4,096 and 8,192.
 - **INT8-G64 latents** are staged as stored (codes and FP16 group scales) and decoded in the score
   and value folds: a lane's 16 dimensions lie in one group of 64, so the group scale multiplies the
-  lane's partial dot once and the probability once per token.
+  lane's partial dot once. For `kInt8 = true`, both `attention_split_kernel` and
+  `attention_mma_kernel` run the Value phase with a single `mma_f16` (per-group `s_max`
+  normalization, `w = p · scale / s_max`, rescaled into FP32 `acc`), halving Value MMAs and
+  cutting `pp16384` attention time from ~720 ms to 456.6 ms (2026-11-27); BF16 latents keep the
+  BF16 high/low probability pair.
 
 ### 7.3 The indexer (`dsa_indexer`)
 
@@ -613,10 +629,12 @@ Every step follows the reference (§2.2) at its precision:
 | score_p = Σ_h w_h relu(q_h · key_p / √128) | FP32 accumulation over BF16 keys | — |
 | Top-min(512, P) pools + tail | Exact radix select, lower pool id on ties | Pool ids for the attention |
 
-Decode scans every complete pool (8 MB per layer and token at 128K context). Prompt scores are a
-register-tiled FP32 GEMM over queries × pools per head followed by the weighted relu sum, in query
-sub-chunks so the score tile stays bounded at long contexts. Pooled keys and selection never depend
-on `--kv-dtype`, so changing the latent format never changes which tokens a query attends to.
+Decode scans every complete pool (8 MB per layer and token at 128K context). Prompt scores run a
+column-invariant `mma_bf16` Tensor Core GEMM (FP32 accumulation) over queries × pools per head
+followed by the weighted relu sum, in query sub-chunks so the score tile stays bounded at long
+contexts (16.6× faster than the earlier register-tiled FP32 GEMM: 40.6 ms on `pp16384`,
+2026-11-27). Pooled keys and selection never depend on `--kv-dtype`, so changing the latent format
+never changes which tokens a query attends to.
 
 ### 7.4 KV formats
 
@@ -855,9 +873,9 @@ a 7,741-token prompt). The serving split leaves no SSD-only expert.
 A prefill chunk of at least 256 columns streams its non-resident experts by copy-engine DMA two
 layers ahead of compute, the Flash-Next form (FN §13.3, MoE §7.1). `ExpertStream`
 (`src/models/glm5_next/execution/expert_stream.{h,cpp}`, specialized from Qwen3.8-Flash-Next's
-without its gated CPU split, ggml banks or host record strides) copies each MoE layer's
-non-resident experts with a pinned host record, in ascending id, into half l % 2 of a ring of
-frames the expert cache lends for the prompt; runs of adjacent records of one bank coalesce into
+with per-layer record strides for GGUF banks and one-pass tier-mode streaming) copies each MoE
+layer's non-resident experts with a pinned host record, in ascending id, into half l % 2 of a ring
+of frames the expert cache lends for the prompt; runs of adjacent records of one bank coalesce into
 one copy, and a layer's copies enqueue as one `CopyBatch`. The MoE reads a streamed record like a
 resident one (`MoeExpertSource::prefetched`). An expert beyond the ring's half, or without a host
 copy, stages or fetches as before; within a walk span the tier's stream slots read SSD-only
@@ -882,7 +900,7 @@ ring returns before decode).
 | Part | Route |
 |---|---|
 | Dense GEMMs and head | BF16 tensor cores (the existing dense kernels), bit-identical to the decode route; shapes at H = 4,096 registered in `src/models/shapes.cpp` |
-| Routed experts | W4A16 wide route, grouped by expert (NVFP4); exact A16 tiles, or the BF16 tiles of `ggml-bf16-prefill` for a wide call's jobs of more than 8 entries (GGUF, §3.3) |
+| Routed experts | W4A16 wide route, grouped by expert (NVFP4); exact A16 tiles, or the BF16 tiles of `ggml-bf16-prefill` for all active non-CPU jobs at 64+ columns and > 8-entry jobs at 9-63 columns (GGUF, §3.3) |
 | MLA, indexer | §7.2-§7.3 |
 | KDA | chunked route |
 
@@ -958,16 +976,18 @@ the [acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-
 in a reduced form here. The exact route (`--disable-fast-paths`; `--a16-activations` selects it too,
 as the quality gate's reference) is canonical, and its prefill bits do not depend on the chunk size
 (§7.2). The family's one fast path, `ggml-bf16-prefill`, applies to the GGUF artifact (§3.3) only
-and is on by default there with INT8 KV (its qualified configuration): a wide call's expert jobs of
-more than 8 entries run BF16 tiles, so a prompt's bits depend on its call widths (the chunk size,
-and the 1,024-token calls beside another lane's decode), and the GGUF artifact is not
-request-invariant under it. Decode and verification calls are never wide, so the path changes no
-decode arithmetic. Qualified 2026-11-26 ([model quality §6.7](model-quality.md#67-fast-path-registry)).
+and is on by default there with INT8 KV (its qualified configuration): calls of 64 or more columns
+run every active non-CPU expert job on BF16 tiles directly from BF16 x (skipping limb encoding and
+narrow dp4a), while calls of 9-63 columns route jobs of more than 8 entries to BF16 tiles, so a
+prompt's bits depend on its call widths (the chunk size, and the 1,024-token calls beside another
+lane's decode), and the GGUF artifact is not request-invariant under it. Decode and verification
+calls (≤ 8 columns, or narrow jobs up to 63 columns) keep the exact narrow dp4a route, so the path
+changes no decode arithmetic. Qualified 2026-11-26 ([model quality §6.7](model-quality.md#67-fast-path-registry)).
 One layer's expert call at 4,096 tokens (288 experts, top-8, every record resident;
-`infernix_offloaded_moe_ggml_test --bench-glm 4096 bf16`) takes 11.5-14.8 ms against the exact
-tiles' 30-37 ms. The tiles stay decode-bound (about 40 % of issue slots used); a warp-staggered
-decode/MMA order measured no faster and was removed. The NVFP4 artifact has no fast
-path: candidates and exclusions are refused there.
+`infernix_offloaded_moe_ggml_test --bench-glm 4096 bf16`, 2026-11-27) takes 10.27-14.09 ms
+(117.1-160.5 effective TOPS, down from 11.5-14.8 ms after eliminating shared-memory bank conflicts
+and adding `__byte_perm` unsigned BF16 decode) against the exact tiles' 27.99-36.81 ms. The NVFP4
+artifact has no fast path: candidates and exclusions are refused there.
 
 ### 14.1 Op oracles
 
@@ -1101,7 +1121,7 @@ sizing headrooms (`--vram-headroom-mib`, `--ram-headroom-mib`) are shared. This 
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--spec dflash2 --draft-model FILE --draft-tokens N` | off | DFlash2, the only drafter; N in 1-7, fixed (§10.2) |
+| `--spec dflash2 --draft-model FILE --draft-tokens N|auto` | off | DFlash2, the only drafter; N in 1-7 or `auto` (calibrated 0-5, §10.2) |
 | `--kv-dtype bf16\|int8` | `bf16` | **Changes output**; every other profile is refused |
 | `--max-context N` | the Engine's | Up to 1,048,576, from the device cache |
 | `--prefill-chunk N`, `--prefill-chunk-beside-decode N` | 4,096, 1,024 | Chunking (§11) |

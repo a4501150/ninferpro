@@ -8,12 +8,18 @@
 
 namespace infernix::models::glm5_next::execution {
 
-ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uint64_t record_stride, RecordOf record_of,
-                           bool one_allocation, Hold hold, SsdReads ssd)
-    : experts_(experts), layers_(layers), stride_(record_stride), record_of_(std::move(record_of)),
+ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::vector<std::uint64_t> layer_strides,
+                           RecordOf record_of, bool one_allocation, Hold hold, SsdReads ssd)
+    : experts_(experts), layers_(layers), strides_(std::move(layer_strides)), record_of_(std::move(record_of)),
       hold_(std::move(hold)), one_allocation_(one_allocation), ssd_(std::move(ssd)) {
-    if (experts_ == 0 || layers_ == 0 || stride_ == 0 || stride_ % 16 != 0 || !record_of_) {
-        throw std::invalid_argument("expert stream: empty geometry or unaligned records");
+    if (experts_ == 0 || layers_ == 0 || strides_.size() != layers_ || !record_of_) {
+        throw std::invalid_argument("expert stream: empty geometry or mismatched layer strides");
+    }
+    for (const std::uint64_t s : strides_) {
+        if (s == 0 || s % 16 != 0) {
+            throw std::invalid_argument("expert stream: empty or unaligned layer record stride");
+        }
+        max_stride_ = std::max(max_stride_, s);
     }
     if (ssd_.slots && (!ssd_.read || !ssd_.wait || !ssd_.release)) {
         throw std::invalid_argument("expert stream: stream slots without their reads");
@@ -67,8 +73,9 @@ void ExpertStream::retarget(RecordOf record_of, bool one_allocation, Hold hold, 
     set_staging(std::move(staging));
 }
 
-bool ExpertStream::takes(std::uint32_t layer, std::uint32_t e, std::uint32_t taken, std::uint32_t& staged) const {
-    if (taken >= half_) { return false; }
+bool ExpertStream::takes(std::uint32_t layer, std::uint32_t e, std::uint32_t taken, std::uint32_t cap,
+                         std::uint32_t& staged) const {
+    if (taken >= cap) { return false; }
     if (record_of_(layer, e) != nullptr) { return true; }
     if (staged < staging_.per_part && staging_.unpinned && staging_.unpinned(layer, e) != nullptr) {
         ++staged;
@@ -80,17 +87,20 @@ bool ExpertStream::takes(std::uint32_t layer, std::uint32_t e, std::uint32_t tak
 std::uint32_t ExpertStream::slots_in(std::size_t bytes) const noexcept {
     const std::size_t tables = (static_cast<std::size_t>(layers_) * experts_ * sizeof(std::int32_t) + 255) / 256 * 256;
     if (bytes <= tables) { return 0; }
-    return static_cast<std::uint32_t>((bytes - tables) / stride_) & ~1U;
+    const std::size_t half_bytes = ((bytes - tables) / 2) & ~std::size_t{255};
+    return static_cast<std::uint32_t>(half_bytes / max_stride_) * 2U;
 }
 
 void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool ssd) {
     if (active_) { throw std::logic_error("expert stream: a chunk is already streaming"); }
+    const std::size_t tables_bytes =
+        (static_cast<std::size_t>(layers_) * experts_ * sizeof(std::int32_t) + 255) / 256 * 256;
     const std::uint32_t slots = slots_in(ring.bytes);
     if (slots < 2 || ring.data == nullptr) { throw std::invalid_argument("expert stream: the ring holds no slots"); }
-    half_    = slots / 2;
-    tables_  = static_cast<std::int32_t*>(ring.data);
-    records_ = static_cast<std::uint8_t*>(ring.data) +
-               (static_cast<std::size_t>(layers_) * experts_ * sizeof(std::int32_t) + 255) / 256 * 256;
+    half_bytes_ = ((ring.bytes - tables_bytes) / 2) & ~std::size_t{255};
+    half_       = slots / 2;
+    tables_     = static_cast<std::int32_t*>(ring.data);
+    records_    = static_cast<std::uint8_t*>(ring.data) + tables_bytes;
     // The previous chunk's table upload may still be pending: its pinned source is rewritten now.
     if (uploading_) { CUDA_CHECK(cudaEventSynchronize(uploaded_)); }
     residency_ = residency;
@@ -104,24 +114,25 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
     // layers' worth at once, so each layer takes at most that share.
     const std::uint32_t ssd_cap = ssd && ssd_.slots ? ssd_.slots() / (kReadAhead + 2) : 0;
     for (std::uint32_t l = 0; l < layers_; ++l) {
-        std::int32_t* row         = tables + static_cast<std::size_t>(l) * experts_;
+        std::int32_t* row          = tables + static_cast<std::size_t>(l) * experts_;
         const std::int32_t* frames = residency + static_cast<std::size_t>(l) * experts_;
+        const auto layer_cap       = static_cast<std::uint32_t>(half_bytes_ / strides_[l]);
         std::uint32_t taken = 0, staged = 0;
         bool complete = true;
         for (std::uint32_t e = 0; e < experts_; ++e) {
             row[e] = -1;
             if (frames[e] >= 0) { continue; }
-            if (taken >= half_) {
+            if (taken >= layer_cap) {
                 complete = false;
                 continue;
             }
-            if (takes(l, e, taken, staged)) { // a pinned record, or an unpinned one while staging has room
-                row[e] = static_cast<std::int32_t>((l % 2) * half_ + taken++);
+            if (takes(l, e, taken, layer_cap, staged)) { // a pinned record, or an unpinned one while staging has room
+                row[e] = static_cast<std::int32_t>(taken++);
                 if (hold_) { hold_(l, e); }
             } else if (record_of_(l, e) == nullptr &&
                        (!staging_.unpinned || staging_.unpinned(l, e) == nullptr) &&
                        ssd_planned_[l].size() < ssd_cap) { // SSD-only: a stream read
-                row[e] = static_cast<std::int32_t>((l % 2) * half_ + taken++);
+                row[e] = static_cast<std::int32_t>(taken++);
                 ssd_planned_[l].emplace_back(e, row[e]);
             } else {
                 complete = false;
@@ -193,6 +204,8 @@ void ExpertStream::enqueue(std::uint32_t layer) {
     CopyBatch copies(stream_);
     std::size_t next_ssd = 0; // ssd_planned_[layer] is in ascending expert order, as `row`
     staged_.clear();
+    const std::uint64_t layer_stride = strides_[layer];
+    std::uint8_t* const dst_base     = half_base(layer);
     for (std::uint32_t e = 0; e < experts_;) {
         if (row[e] < 0) {
             ++e;
@@ -202,10 +215,10 @@ void ExpertStream::enqueue(std::uint32_t layer) {
             // A stream read: its record once landed (the host waits for the drive here).
             const std::uint8_t* source = ssd_.wait(ssd_slots_[layer][next_ssd]);
             if (source == nullptr) { throw std::runtime_error("expert stream: an SSD-only expert's record could not be read"); }
-            copies.add(records_ + static_cast<std::size_t>(row[e]) * stride_, source, stride_);
+            copies.add(dst_base + static_cast<std::size_t>(row[e]) * layer_stride, source, layer_stride);
             stats_.streamed += 1;
             stats_.ssd += 1;
-            stats_.bytes += stride_;
+            stats_.bytes += layer_stride;
             ++stats_.copies;
             ++next_ssd;
             ++e;
@@ -213,17 +226,17 @@ void ExpertStream::enqueue(std::uint32_t layer) {
         }
         const std::uint8_t* source = record_of_(layer, e);
         if (source == nullptr) { // an unpinned record: bounced below
-            staged_.emplace_back(records_ + static_cast<std::size_t>(row[e]) * stride_, staging_.unpinned(layer, e));
+            staged_.emplace_back(dst_base + static_cast<std::size_t>(row[e]) * layer_stride, staging_.unpinned(layer, e));
             ++e;
             continue;
         }
         std::uint32_t end = e + 1;
         while (one_allocation_ && end < experts_ && row[end] == row[end - 1] + 1 &&
-               record_of_(layer, end) == source + static_cast<std::size_t>(end - e) * stride_) {
+               record_of_(layer, end) == source + static_cast<std::size_t>(end - e) * layer_stride) {
             ++end;
         }
-        const std::size_t bytes = static_cast<std::size_t>(end - e) * stride_;
-        copies.add(records_ + static_cast<std::size_t>(row[e]) * stride_, source, bytes);
+        const std::size_t bytes = static_cast<std::size_t>(end - e) * layer_stride;
+        copies.add(dst_base + static_cast<std::size_t>(row[e]) * layer_stride, source, bytes);
         stats_.streamed += end - e;
         stats_.bytes += bytes;
         ++stats_.copies;
@@ -239,9 +252,9 @@ void ExpertStream::enqueue(std::uint32_t layer) {
             fill_.emplace_back(staging_.slot(h * staging_.per_part + static_cast<std::uint32_t>(i)), staged_[i].second);
         }
         staging_.copy(fill_);
-        for (std::size_t i = 0; i < staged_.size(); ++i) { copies.add(staged_[i].first, fill_[i].first, stride_); }
+        for (std::size_t i = 0; i < staged_.size(); ++i) { copies.add(staged_[i].first, fill_[i].first, layer_stride); }
         stats_.streamed += staged_.size();
-        stats_.bytes += staged_.size() * stride_;
+        stats_.bytes += staged_.size() * layer_stride;
         stats_.staged += staged_.size();
         stats_.copies += staged_.size();
     }

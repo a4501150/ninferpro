@@ -169,27 +169,50 @@ bool ProgramImpl::stream_chunk(std::int32_t width) {
         const std::int32_t* table = residency_->host_table();
         const std::uint32_t E     = c_.moe.experts;
         const std::uint32_t L     = c_.moe_layers();
-        std::uint32_t most        = 0;
+        const std::uint64_t slot  = residency_->lend_pitch();
+        const std::uint64_t tables_bytes =
+            (static_cast<std::size_t>(L) * E * sizeof(std::int32_t) + 255) / 256 * 256;
+        std::uint64_t half_bytes = 0;
         for (std::uint32_t l = 0; l < L; ++l) {
             std::uint32_t absent = 0;
             for (std::uint32_t e = 0; e < E; ++e) {
                 absent += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U;
             }
-            most = std::max(most, absent);
+            half_bytes = std::max(half_bytes, static_cast<std::uint64_t>(absent) * expert_stream_->pitch(l));
         }
-        // The ring: two halves of the layer with the most non-resident experts, in frames of the
-        // pool with the most room, plus one frame for the slot tables. The frames it takes evict
-        // the pool's layers' cheapest experts; their share per layer stays within the half the
-        // absent count leaves spare, and a layer beyond the half's capacity stages the rest.
-        const std::uint64_t slot     = residency_->lend_pitch();
+        // Lending the ring (and a layer walk's area) evicts victims from the lend pool's layers.
+        // Skip streaming when few experts are non-resident (staging fits in one pass without
+        // evicting frames); otherwise add headroom for the lend's evictions so every layer stays
+        // complete inside its ring half and avoids multi-pass SM staging.
+        if (half_bytes < static_cast<std::uint64_t>(kStreamHalfMin) * slot) { return false; }
+        const std::uint32_t lend_layers = std::max<std::uint32_t>(1U, residency_->lend_layers());
+        const std::uint64_t est_frames  = (2ULL * half_bytes + tables_bytes + slot - 1) / slot;
+        const std::uint32_t evict_margin = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(E, std::max<std::uint64_t>(
+                                           16ULL, 3ULL * ((est_frames + 128ULL) / lend_layers + 1ULL))));
+        for (std::uint32_t l = 0; l < L; ++l) {
+            if (expert_stream_->pitch(l) != slot) { continue; }
+            std::uint32_t absent = 0;
+            for (std::uint32_t e = 0; e < E; ++e) {
+                absent += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U;
+            }
+            const std::uint32_t cap = std::min(E, absent + evict_margin);
+            half_bytes = std::max(half_bytes, static_cast<std::uint64_t>(cap) * slot);
+        }
+        // Align half_bytes up to 256 B, then clamp to what the lend pool can lend.
+        const std::uint64_t aligned_half = (half_bytes + 255ULL) & ~std::uint64_t{255};
+        const std::uint64_t lendable     = residency_->lendable_bytes();
+        const std::uint64_t want_bytes = std::min<std::uint64_t>(
+            lendable, ((2ULL * aligned_half + tables_bytes + slot - 1) / slot) * slot);
+        if (want_bytes <= tables_bytes ||
+            (want_bytes - tables_bytes) / (2ULL * slot) < kStreamHalfMin ||
+            expert_stream_->slots_in(want_bytes) < 2U) {
+            return false;
+        }
         const cudaStream_t writers[] = {expert_stream_->stream()};
-        const auto room_slots = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
-        const std::uint32_t half =
-            std::min(std::min(most, E), room_slots > 1 ? (room_slots - 1) / 2 : 0U);
-        if (half < kStreamHalfMin) { return false; }
-        stream_lease_      = residency_->lend((2ULL * half + 1) * slot, device_.stream, writers);
-        stream_ring_bytes_ = stream_lease_.memory.bytes;
-        stream_at_lease_   = expert_stream_->stats();
+        stream_lease_                = residency_->lend(want_bytes, device_.stream, writers);
+        stream_ring_bytes_           = stream_lease_.memory.bytes;
+        stream_at_lease_             = expert_stream_->stats();
     }
     return true;
 }

@@ -64,8 +64,11 @@ public:
 
     // `one_allocation`: a layer's records are one pinned allocation (the banks), so adjacent
     // records copy as one run; otherwise (the SSD tier's slots, pinned in chunks) one copy each.
-    ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uint64_t record_stride, RecordOf record_of,
-                 bool one_allocation, Hold hold = {}, SsdReads ssd = {});
+    // `layer_strides`: each layer's record stride in bytes (aligned to 16 B); each half of the ring
+    // packs layer l's streamed records at layer_strides[l] so narrower layers neither waste ring
+    // capacity nor copy trailing padding over PCIe.
+    ExpertStream(std::uint32_t layers, std::uint32_t experts, std::vector<std::uint64_t> layer_strides,
+                 RecordOf record_of, bool one_allocation, Hold hold = {}, SsdReads ssd = {});
     ~ExpertStream();
     ExpertStream(const ExpertStream&)            = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;
@@ -100,14 +103,16 @@ public:
     // Whether the active chunk copies every expert of `layer` that was not resident when it began:
     // its MoE then has nothing to stage.
     [[nodiscard]] bool complete(std::uint32_t layer) const noexcept { return active_ && complete_[layer] != 0; }
-    // Records per half of the active ring.
+    // Records per half of the active ring for the widest layer.
     [[nodiscard]] std::uint32_t half() const noexcept { return half_; }
     [[nodiscard]] bool active() const noexcept { return active_; }
-    // Layer `layer`'s slot table (device I32 [experts]) and the records' base.
+    // Layer `layer`'s slot table (device I32 [experts]), its half's base, and its slot pitch.
     [[nodiscard]] const std::int32_t* slots(std::uint32_t layer) const noexcept;
-    [[nodiscard]] const std::uint8_t* base() const noexcept { return records_; }
-    // The slot pitch (MoeExpertSource::prefetch_stride).
-    [[nodiscard]] std::uint64_t pitch() const noexcept { return stride_; }
+    [[nodiscard]] const std::uint8_t* base(std::uint32_t layer) const noexcept {
+        return records_ + static_cast<std::size_t>(layer % 2) * half_bytes_;
+    }
+    [[nodiscard]] std::uint64_t pitch(std::uint32_t layer) const noexcept { return strides_[layer]; }
+    [[nodiscard]] std::uint64_t max_pitch() const noexcept { return max_stride_; }
     // Before layer `layer`'s experts: `compute` waits for the layer's copies.
     void before_experts(std::uint32_t layer, cudaStream_t compute);
     // After the layer's experts are enqueued on `compute`: the half is free once they finish; the
@@ -135,10 +140,15 @@ private:
     bool release_landed(bool wait);
     // Whether expert e of layer l is streamed: not resident, room in the half, and a pinned record
     // (or an unpinned one while the layer's staging has room, counted in `staged`).
-    bool takes(std::uint32_t layer, std::uint32_t e, std::uint32_t taken, std::uint32_t& staged) const;
+    bool takes(std::uint32_t layer, std::uint32_t e, std::uint32_t taken, std::uint32_t cap,
+               std::uint32_t& staged) const;
+    [[nodiscard]] std::uint8_t* half_base(std::uint32_t layer) const noexcept {
+        return records_ + static_cast<std::size_t>(layer % 2) * half_bytes_;
+    }
 
     std::uint32_t experts_ = 0, layers_ = 0;
-    std::uint64_t stride_ = 0;
+    std::vector<std::uint64_t> strides_;
+    std::uint64_t max_stride_ = 0;
     RecordOf record_of_;
     Hold hold_;
     bool one_allocation_ = true;
@@ -149,7 +159,8 @@ private:
     PinnedHostBuffer tables_host_{1};
     std::int32_t* tables_     = nullptr; // device, at the ring's start
     std::uint8_t* records_    = nullptr; // device, after the tables
-    std::uint32_t half_       = 0;       // slots per half
+    std::size_t half_bytes_   = 0;       // bytes per half of the active ring (256-byte aligned)
+    std::uint32_t half_       = 0;       // slots per half for the widest layer
     std::vector<std::uint8_t> streams_;  // per layer: whether it has copies
     std::vector<std::uint8_t> complete_; // per layer: every non-resident expert copied (complete())
     bool active_    = false;

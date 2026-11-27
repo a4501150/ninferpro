@@ -100,11 +100,14 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
         fetch_channel_ = placement_->fetch_channel();
     }
 
-    // The prefill stream copies records into ring slots of the record stride.
+    // The prefill stream packs each layer's ring half at that layer's own record stride.
     if (options_.prefill_stream) {
+        std::vector<std::uint64_t> stream_strides;
+        stream_strides.reserve(banks.size());
+        for (const auto& bank : banks) { stream_strides.push_back(bank.planes.record_stride); }
         StreamBindings bindings = stream_bindings();
         expert_stream_          = std::make_unique<execution::ExpertStream>(
-            c_.moe_layers(), c_.moe.experts, record_stride, std::move(bindings.record_of),
+            c_.moe_layers(), c_.moe.experts, std::move(stream_strides), std::move(bindings.record_of),
             bindings.one_allocation, std::move(bindings.hold), std::move(bindings.ssd));
         expert_stream_->set_staging(std::move(bindings.staging));
         experts.stream = expert_stream_.get();

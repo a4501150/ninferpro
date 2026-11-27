@@ -349,8 +349,8 @@ __device__ __forceinline__ const std::uint8_t* in_place_record(const MoeExpertSo
                               source.prefetched != nullptr ? source.prefetched[expert] : -1, miss);
 }
 
-constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
-constexpr int kStageChunk = 16384;
+constexpr int kStageCtas  = 32;    // with 32 KiB chunks, a 1 MiB window of host reads in flight
+constexpr int kStageChunk = 32768;
 constexpr int kMaxPassJobs = 512;
 
 // Resolves the record of every job in [job_base, job_base + pass_jobs) and copies the pass's
@@ -2483,15 +2483,24 @@ bool in_place_call(const Tensor& x, const MoeExpertSource& source) {
            source.activation == moe::ExpertActivation::kA16;
 }
 
+// A non-default ggml bank on WideA16::kGgmlBf16 runs every active non-CPU job of a wide call
+// (at least kGgmlBf16AllJobsMinColumns columns) through its BF16 decode tiles directly from BF16 x
+// (no limb encoding, no narrow dp4a pass, no exact-tile plan).
+bool ggml_bf16_all_jobs(std::int64_t columns, const MoeExpertSource& source) {
+    return ggml_bank(source) && source.geometry.hidden != moe::kDefaultGeometry.hidden &&
+           columns >= kGgmlBf16AllJobsMinColumns && source.wide_a16 == moe::WideA16::kGgmlBf16;
+}
+
 // The call's routing-independent preparation (its activation encoding), which needs neither the
 // dispatch nor the CPU plan: every token's x encoded once per call - an NVFP4 A16 call of at most
 // kA16RowsMaxColumns columns as the dp4a rows kernels' A16Act rows, a wider one as the wide route's
 // limb rows with the jobs' gate/up CTA counts (the tensor-core narrow kernels), a ggml bank's call
 // in its limb layout. Every A16 call needs one except the in-place route plan's (a call of the
 // fused route's width whose source stages nothing and serves no miss: its fused kernel is the
-// encoding).
+// encoding) and non-default ggml BF16 wide calls.
 bool needs_prepare(const Tensor& x, const MoeExpertSource& source, std::int32_t top_k) {
     if (source.activation != moe::ExpertActivation::kA16) { return false; }
+    if (ggml_bf16_all_jobs(x.ne[1], source)) { return false; }
     const std::int64_t columns = x.ne[1];
     const bool fused = columns <= kRouteDispatchColumns && columns * top_k <= kDispatchThreads;
     return !fused || !in_place_call(x, source);
@@ -2746,11 +2755,12 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     // by the in-place route plan's fused kernel (in_place). Any A16 call the plan did not encode
     // itself encodes here, whatever its source: a call that stages nothing and serves no miss at
     // more than the fused route's width takes no plan and is one of these.
-    if (!x_prepared && !in_place && source.activation == moe::ExpertActivation::kA16) {
+    const bool bf16_all = ggml_bf16_all_jobs(x.ne[1], source);
+    if (!x_prepared && !in_place && !bf16_all && source.activation == moe::ExpertActivation::kA16) {
         prepare_x(x, source, max_jobs, layout, stream);
     }
     // A ggml bank's wide jobs' work tiles, planned once the dispatch is known.
-    if (ggml && x.ne[1] > moe::kMaxColumns) {
+    if (ggml && x.ne[1] > moe::kMaxColumns && !bf16_all) {
         launch_plan_ggml(dispatch, max_jobs, layout, stream);
     }
     // Passes of at most staging_slots jobs (one pass covering every job without staging).

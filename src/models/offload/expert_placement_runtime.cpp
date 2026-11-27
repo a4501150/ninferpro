@@ -213,81 +213,133 @@ void ExpertPlacementRuntime::warm_start_experts() {
     const auto total = keys();
     expert_cache::ExpertStateLoad load;
     SeedSource source = SeedSource::None;
-    if (!options_.expert_state.empty() && options_.expert_cache) {
-        load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, total);
-        if (load.state) {
-            source = SeedSource::Saved;
-        } else if (auto fallback = hooks_.fallback_seed_order ? hooks_.fallback_seed_order() : std::nullopt) {
-            diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
-            load.state = std::move(fallback);
-            source     = SeedSource::Calibrated;
+    if (options_.expert_cache) {
+        if (!options_.expert_state.empty()) {
+            load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, total);
+            if (load.state) { source = SeedSource::Saved; }
+        }
+        if (!load.state) {
+            if (auto fallback = hooks_.fallback_seed_order ? hooks_.fallback_seed_order() : std::nullopt) {
+                if (!load.message.empty()) {
+                    diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
+                }
+                load.state = std::move(fallback);
+                source     = SeedSource::Calibrated;
+            }
         }
     }
     // An explicit placement's order (its vram set first, then its ram set) overrides the
-    // saved ranking for the seed and the tier fill; the counts stay the session's.
-    if (load.state && !options_.expert_tier_order.empty()) {
-        load.state = expert_cache::SavedState{load.state->counts, options_.expert_tier_order};
+    // saved ranking for the seed and the tier fill (and seeds even without a saved state);
+    // the counts stay the session's when present.
+    if (!options_.expert_tier_order.empty()) {
+        std::vector<std::uint32_t> counts = load.state ? std::move(load.state->counts) : std::vector<std::uint32_t>{};
+        load.state                        = expert_cache::SavedState{std::move(counts), options_.expert_tier_order};
+    } else if (options_.expert_cache && !load.state && residency_->frames() > 0) {
+        // Auto placement without a saved state or calibrated order: seed in the layer-interleaved
+        // spread order so the VRAM cache starts warm (leaving 1 - kSeedShare free for landings).
+        const std::uint32_t layers = options_.geometry.banks, experts = options_.geometry.experts_per_bank;
+        std::vector<std::uint32_t> ranked;
+        ranked.reserve(total);
+        for (std::uint32_t i = 0; i < total; ++i) { ranked.push_back((i % layers) * experts + i / layers); }
+        load.state = expert_cache::SavedState{{}, std::move(ranked)};
     }
     const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
     TierFill fill;
     if (tier_) { fill = prefill_tier(state, source); }
-    if (options_.resident_experts && tier_ && residency_->frames() > 0) {
-        // A resident placement holds only the tier's floor in RAM, so the one-pass warm start
-        // would seed little: walk the fill order through the tier's free slots in windows
-        // instead -- each window reads from the artifact, seeds into frames, and its slots
-        // (then shadows) free for the next. One pass of the artifact at startup, every expert
-        // resident before the first request.
-        const auto begin    = std::chrono::steady_clock::now();
+    if (tier_ && residency_->frames() > 0 && (options_.resident_experts || !options_.expert_tier_order.empty())) {
+        // Walk the fill order through the tier's RAM slots in windows until the VRAM frames are
+        // filled: each window seeds into VRAM frames, releases its shadow RAM slots, and reads
+        // the next window from the artifact. Needed both for resident placements (which hold
+        // only the tier's floor in RAM) and for explicit placements whose VRAM frame count
+        // exceeds the RAM tier's resident slot count (e.g. vram=59%,ram=41% on GGUF experts),
+        // so that all VRAM frames fill and all remaining RAM-tier experts land in RAM with zero
+        // unintended experts left on the SSD.
+        const auto begin              = std::chrono::steady_clock::now();
         const std::uint32_t tier_keys = tier_->keys();
+        const std::uint32_t target    = residency_->frames();
         expert_cache::SavedState window;
         if (state != nullptr && state->counts.size() == tier_keys) { window.counts = state->counts; }
-        std::uint32_t seeded = 0;
+        std::uint32_t seeded = 0, released_total = 0, refilled_total = 0;
         // The cursor's first un-read key: prefill_tier already read the order's top
         // fill.filled keys into the tier's slots. Advancing past what each window really
-        // landed (not a fixed span) keeps a window from re-reading keys an earlier window
-        // seeded -- a re-read key would rank again, seed nothing (it is already in a
-        // frame) and stall the walk after one window.
+        // landed keeps a window from re-reading keys an earlier window already seeded.
         std::size_t at = fill.filled;
         for (;;) {
-            // Seed every key the tier's slots hold (the first window is prefill_tier's, the
-            // later ones its leftovers -- a pool's share can fall short -- plus the keys the
-            // last prefill landed), then free their slots and read the next window of the
-            // order from the artifact. The seed ranks only the keys with a host copy: the
-            // policy seeds what it is given, so ranking the whole order would mark every
-            // key resident and leave no room.
             window.ranked.clear();
             for (const std::uint32_t key : fill.order) {
                 if (tier_->record(key) != nullptr) { window.ranked.push_back(key); }
             }
             if (window.ranked.empty()) { break; }
-            const std::uint32_t loaded = residency_->warm_start(
-                window, kSeedCountCap, static_cast<std::uint32_t>(window.ranked.size()), device_.stream);
+            const std::uint32_t loaded = residency_->warm_start(window, kSeedCountCap, target, device_.stream);
             device_.synchronize();
             seeded += loaded;
             const std::uint32_t released = tier_->controller().release_shadows();
-            diagnostic("resident warm fill: seeded " + std::to_string(loaded) + ", released " +
+            released_total += released;
+            diagnostic("warm fill window: seeded " + std::to_string(loaded) + ", released " +
                            std::to_string(released) + " slots, free resident slots " +
                            (tier_->controller().has_free_resident() ? "yes" : "no"),
                        DiagnosticLevel::Debug);
-            if (loaded == 0 || at >= fill.order.size() || !tier_->controller().has_free_resident()) {
+            if (loaded == 0 || seeded >= target || at >= fill.order.size() || !tier_->controller().has_free_resident()) {
                 break;
             }
-            const std::size_t end = std::min(fill.order.size(), at + 4096);
+            const std::size_t end = options_.resident_experts ? std::min(fill.order.size(), at + 4096) : fill.order.size();
             const std::uint32_t landed =
                 tier_->prefill(std::span<const std::uint32_t>(fill.order.data() + at, end - at));
             at += landed;
+            refilled_total += landed;
             if (landed == 0) { break; }
         }
-        const double seconds =
+        const double vram_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-        diagnostic("expert cache: resident warm fill loaded " + std::to_string(seeded) + " of " +
-                       std::to_string(total) + " experts from the artifact in " + std::to_string(seconds) +
+        if (options_.resident_experts) {
+            diagnostic("expert cache: resident warm fill loaded " + std::to_string(seeded) + " of " +
+                           std::to_string(total) + " experts from the artifact in " + std::to_string(vram_seconds) +
                            " s (" + std::to_string(residency_->frames()) + " frames)");
-        // The resident placement holds every expert in VRAM: the tier only read the fill.
-        // Nothing can be evicted, so no demotion or fetch can arrive; its pinned slots
-        // release and the process's host expert bytes drop to zero. A placement switch
-        // that names a RAM tier rebuilds it on demand.
-        shrink_tier_to_reader("the resident placement holds every expert; the fill's reader releases");
+            shrink_tier_to_reader("the resident placement holds every expert; the fill's reader releases");
+            expert_state_saved_ = std::chrono::steady_clock::now();
+            return;
+        }
+        const double loaded_gib =
+            static_cast<double>(seeded) * static_cast<double>(residency_->frame_bytes()) / (1ULL << 30);
+        char vram_line[256];
+        std::snprintf(vram_line, sizeof(vram_line),
+                      "expert cache: warm start loaded %u of %u VRAM frames (%.1f GiB in %.2f s)", seeded, target,
+                      loaded_gib, vram_seconds);
+        diagnostic(vram_line);
+        if (at < fill.order.size() && tier_->controller().has_free_resident()) {
+            const std::uint32_t landed =
+                tier_->prefill(std::span<const std::uint32_t>(fill.order.data() + at, fill.order.size() - at));
+            at += landed;
+            refilled_total += landed;
+        }
+        const std::int32_t* in_vram = residency_->host_table();
+        const std::uint32_t unpinned = tier_->fill_unpinned(
+            fill.order, [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; });
+        const double seconds =
+            fill.seconds + std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+        const std::uint32_t in_ram = fill.filled + refilled_total - released_total;
+        const std::uint32_t slots  = tier_->pinned_slots();
+        const double gib           = static_cast<double>(tier_->record_bytes()) / (1ULL << 30);
+        char split[160]            = "";
+        if (tier_->unpinned_records() > 0) {
+            std::snprintf(split, sizeof(split), " and %u unpinned records (%.1f GiB, served by the CPU) hold %u more",
+                          tier_->unpinned_records(), gib * tier_->unpinned_records(), unpinned);
+        }
+        const std::uint32_t on_ssd =
+            tier_keys > in_ram + released_total + unpinned ? tier_keys - in_ram - released_total - unpinned : 0U;
+        char line[560];
+        std::snprintf(line, sizeof(line),
+                      "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s%s, read in %.1f s; %u of %u "
+                      "experts are read from the artifact when used",
+                      slots, gib * slots, in_ram,
+                      fill.source == SeedSource::Saved        ? "the saved ranking, then the last session's use counts"
+                      : fill.source == SeedSource::Calibrated ? "the calibrated expert order"
+                                                              : "spread across the layers",
+                      released_total > 0 ? (", none of them among the " + std::to_string(released_total) + " in VRAM").c_str()
+                                         : "",
+                      split, seconds, on_ssd, tier_keys);
+        diagnostic(line);
+        expert_state_saved_ = std::chrono::steady_clock::now();
         return;
     }
     const std::uint32_t seeded = warm_start_frames(load, source);
@@ -398,8 +450,8 @@ void ExpertPlacementRuntime::finish_tier_fill(const TierFill& fill, std::uint32_
 }
 
 std::uint32_t ExpertPlacementRuntime::warm_start_frames(const expert_cache::ExpertStateLoad& load, SeedSource source) {
-    if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
-    if (source == SeedSource::None) {
+    if (!options_.expert_cache || residency_->frames() == 0) { return 0; }
+    if (!load.state) {
         diagnostic("expert cache: no saved state yet, so it starts empty and fills as requests arrive");
         diagnostic("expert cache starts empty: " + load.message, DiagnosticLevel::Debug);
         expert_state_saved_ = std::chrono::steady_clock::now();
@@ -407,7 +459,7 @@ std::uint32_t ExpertPlacementRuntime::warm_start_frames(const expert_cache::Expe
     }
     const auto start           = std::chrono::steady_clock::now();
     // An explicit placement seeds the whole pool: its vram set is the seed order, and the
-    // target holds exactly it. Auto keeps half the frames free for the fill phase's landing.
+    // target holds exactly it. Auto leaves (1 - kSeedShare) free for the fill phase's landing.
     const auto max_keys = static_cast<std::uint32_t>(
         options_.expert_tier_order.empty() ? kSeedShare * residency_->frames() : residency_->frames());
     const std::uint32_t loaded = residency_->warm_start(*load.state, kSeedCountCap, max_keys, device_.stream);
@@ -420,16 +472,22 @@ std::uint32_t ExpertPlacementRuntime::warm_start_frames(const expert_cache::Expe
         std::snprintf(line, sizeof(line),
                       "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
                       loaded, loaded_gib, seconds);
-    } else {
+    } else if (source == SeedSource::Calibrated) {
         std::snprintf(line, sizeof(line),
                       "expert cache: no saved state yet, so it starts with the %u highest-ranked experts of "
                       "the calibrated order (%.1f GiB in %.2f s)",
+                      loaded, loaded_gib, seconds);
+    } else {
+        std::snprintf(line, sizeof(line),
+                      "expert cache: warm start seeded %u experts spread across the layers (%.1f GiB in %.2f s)",
                       loaded, loaded_gib, seconds);
     }
     diagnostic(line);
     std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s", loaded,
                   residency_->frames(),
-                  source == SeedSource::Saved ? options_.expert_state.string().c_str() : "the calibrated order");
+                  source == SeedSource::Saved        ? options_.expert_state.string().c_str()
+                  : source == SeedSource::Calibrated ? "the calibrated order"
+                                                     : "the layer-spread order");
     diagnostic(line, DiagnosticLevel::Debug);
     expert_state_saved_  = std::chrono::steady_clock::now();
     expert_state_routed_ = residency_->stats().routed;

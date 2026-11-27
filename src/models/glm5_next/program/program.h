@@ -349,9 +349,9 @@ struct ProgramOptions {
     // CPU-served misses of decode and verification calls: host expert-engine workers (0
     // disables), the most of a layer call's misses they take, and the link's share of a call's
     // host-memory misses in 256ths (the rest go to the CPU).
-    std::uint32_t cpu_expert_workers = 8;
-    std::uint32_t cpu_expert_jobs    = 4;
-    std::int32_t cpu_link_share256   = 128;
+    std::uint32_t cpu_expert_workers = 14;
+    std::uint32_t cpu_expert_jobs    = 16;
+    std::int32_t cpu_link_share256   = 104;
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
     // The MLA latent's storage: BF16 (1024 B a token and layer) or Int8Group64 (528 B; the

@@ -354,9 +354,11 @@ private:
     PinnedHostBuffer landing_host_{1};
     DeviceBuffer landed_device_;
     PinnedHostBuffer landed_host_{1};
-    std::vector<std::uint32_t> reserved_; // [layer][landing_per_layer_] reserved frames (in the layer's pool)
-    std::uint32_t landing_per_layer_ = 0;
-    bool landing_uploaded_           = false; // the device landing table holds frames
+    std::vector<std::uint32_t> reserved_;       // [layers_ * kLandingSlots] reserved frames (in the layer's pool)
+    std::vector<std::uint32_t> landing_counts_; // per-layer reserved landing count (0..kLandingSlots)
+    std::vector<std::uint32_t> landing_scratch_;
+    bool any_landing_      = false;
+    bool landing_uploaded_ = false; // the device landing table holds frames
     bool decode_round_               = false; // the round's before_round had `landing`
 
     std::vector<Command> load_commands_; // kCopy commands of every pool, issued together

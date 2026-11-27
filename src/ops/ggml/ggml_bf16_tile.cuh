@@ -278,6 +278,11 @@ inline constexpr bool kUnitFits = 12 + 3 + kUnitBytes<F> + 3 <= kUnitChunks<F> *
 template <QType F>
 inline constexpr bool kFold = F == QType::GGML_Q3_K || F == QType::GGML_Q2_K;
 
+// Word stride of a kFold row in sm.raw: odd (>= words needed for any alignment) so gcd(stride, 32)
+// == 1 gives 16 consecutive rows 16 distinct shared-memory banks with zero bank conflicts.
+template <QType F>
+inline constexpr int kFoldRowWords = ((3 + kUnitBytes<F> + 3) / 4) | 1;
+
 // The four little-endian words at p..p + 15 (any alignment), as tile::words2_at.
 __device__ __forceinline__ uint4 words4_at(const std::uint8_t* p) {
     const auto a     = reinterpret_cast<std::uintptr_t>(p);
@@ -288,10 +293,10 @@ __device__ __forceinline__ uint4 words4_at(const std::uint8_t* p) {
                       __funnelshift_r(w3, w4, s));
 }
 
-// Half h16 of slice sb of a kFold block b: its 16 codes (byte j of word w is element 4w + j), its
-// sub-scale and (Q2_K) its min sub-scale; the integers of tile::tile_chunk.
+// Half h16 of slice sb of a kFold block b: its 16 unsigned codes (Q3_K: 0..7 representing code + 4;
+// Q2_K: 0..3; byte j of word w is element 4w + j), its sub-scale and (Q2_K) its min sub-scale.
 template <QType F>
-__device__ __forceinline__ void fold_half(const std::uint8_t* b, int sb, int h16, int (&code)[4], int& sub, int& mn) {
+__device__ __forceinline__ void fold_half(const std::uint8_t* b, int sb, int h16, unsigned (&code)[4], int& sub, int& mn) {
     const int half = sb / 4, plane = sb % 4, l = 16 * h16;
     if constexpr (F == QType::GGML_Q3_K) {
         const uint4 q = words4_at(b + 32 + 32 * half + l), m = words4_at(b + l);
@@ -299,8 +304,7 @@ __device__ __forceinline__ void fold_half(const std::uint8_t* b, int sb, int h16
         const int bit = 4 * half + plane;
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
-            code[w] = fast::sub_bytes4(((qw[w] >> (2 * plane)) & 0x03030303U) | (((mw[w] >> bit) & 0x01010101U) << 2),
-                                       0x04040404U);
+            code[w] = ((qw[w] >> (2 * plane)) & 0x03030303U) | (((mw[w] >> bit) & 0x01010101U) << 2);
         }
         const int i = 8 * half + 2 * plane + h16;
         sub = (((b[96 + i % 8] >> (4 * (i / 8))) & 0xF) | (((b[104 + i % 4] >> (2 * (i / 4))) & 3) << 4)) - 32;
@@ -309,7 +313,7 @@ __device__ __forceinline__ void fold_half(const std::uint8_t* b, int sb, int h16
         const uint4 q = words4_at(b + 16 + 32 * half + l);
         const unsigned qw[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
-        for (int w = 0; w < 4; ++w) { code[w] = static_cast<int>((qw[w] >> (2 * plane)) & 0x03030303U); }
+        for (int w = 0; w < 4; ++w) { code[w] = (qw[w] >> (2 * plane)) & 0x03030303U; }
         const int s = b[8 * half + 2 * plane + h16];
         sub = s & 0xF;
         mn  = s >> 4;
@@ -340,10 +344,11 @@ struct FoldMinStage : FoldStage {
 // (the one the MMAs read, the next being decoded), two stages of x units, two raw units.
 template <class Stage, QType F>
 struct DecodeSharedOf {
+    static constexpr int kRawRowBytes = kFold<F> ? (kFoldRowWords<F> * 4) : (kUnitChunks<F> * 16);
     alignas(16) Stage code[2][2];
     alignas(16) std::uint16_t x[2][kSlices][kColumns][32]; // BF16 bits, 8-byte units permuted
-    alignas(16) std::uint8_t raw[2][kRows][kUnitChunks<F> * 16];
-    std::uint8_t raw_offset[2][kRows]; // where row r's unit bytes start in raw[.][r]
+    alignas(16) std::uint8_t raw[2][kRows * kRawRowBytes];
+    std::uint8_t raw_offset[2][kRows]; // where row r's unit bytes start in raw[.][r * kRawRowBytes]
     const std::uint16_t* column[kColumns]; // the tile's columns (Columns::column, null past them)
 };
 template <QType F>
@@ -351,20 +356,44 @@ using DecodeShared = DecodeSharedOf<std::conditional_t<kFold<F>, std::conditiona
                                                        tile::CodeStage>,
                                     F>;
 
-// compute_decode's CTA: 16 warps of 32 rows x 32 columns (twice compute's warps, for its decode's
-// latency), each with two m16 by four n8 accumulator tiles.
+// compute_decode's CTA: 16 warps (4x4 for >64 live columns, 8x2 for <=64 live columns so partial
+// and narrow expert tiles avoid zero-padded MMAs while preserving warp < 8 for gate and >= 8 for up).
 constexpr int kDecodeThreads = 512;
 constexpr int kDecodeMTiles  = 2;
 static_assert(kDecodeThreads / 32 == (kRows / 32) * (kColumns / kWarpColumns));
+
+struct DecodeWarpLayout {
+    int tile_h;      // 0 (rows 0..63) or 1 (rows 64..127)
+    int m0;          // first m16 tile in tile_h (0..3)
+    int mtiles;      // 1 or 2
+    int col_base;    // first column within the CTA's 128
+    int ntiles;      // 1, 2 or 4
+    int x_cols;      // active column window: 16, 32, 64 or 128
+    int x_cols_log2; // 4, 5, 6 or 7
+};
+
+__device__ __forceinline__ DecodeWarpLayout decode_warp_layout(int warp, int live_cols) {
+    if (live_cols > 64) {
+        const int wr = warp >> 2, wc = warp & 3;
+        return {wr >> 1, 2 * (wr & 1), 2, wc << 5, 4, 128, 7};
+    }
+    const int wr = warp >> 1, wc = warp & 1;
+    const int tile_h = wr >> 2, m0 = wr & 3;
+    if (live_cols > 32) { return {tile_h, m0, 1, wc << 5, 4, 64, 6}; }
+    if (live_cols > 16) { return {tile_h, m0, 1, wc << 4, 2, 32, 5}; }
+    return {tile_h, m0, 1, wc << 3, 1, 16, 4};
+}
 
 struct DecodeAccumulators {
     float r[kDecodeMTiles][kNTiles][4];
 };
 
-// Output row (within the CTA's 128) of compute_decode's accumulator (mi, nt, q); its column is
-// out_column's.
-__device__ __forceinline__ int decode_out_row(int warp, int lane, int mi, int q) {
-    return (warp / (kColumns / kWarpColumns)) * 32 + 16 * mi + lane / 4 + 8 * (q >> 1);
+// Output row and column (within the CTA's 128 x 128) of compute_decode's accumulator (mi, nt, q).
+__device__ __forceinline__ int decode_out_row(const DecodeWarpLayout& wl, int lane, int mi, int q) {
+    return wl.tile_h * tile::kTileRows + 16 * (wl.m0 + mi) + (lane >> 2) + 8 * (q >> 1);
+}
+__device__ __forceinline__ int decode_out_column(const DecodeWarpLayout& wl, int lane, int nt, int q) {
+    return wl.col_base + 8 * nt + 2 * (lane & 3) + (q & 1);
 }
 
 // compute's K loop over raw GGUF rows instead of decoded planes (the expert banks whose jobs are too
@@ -376,32 +405,33 @@ __device__ __forceinline__ int decode_out_row(int warp, int lane, int mi, int q)
 // (tile_chunk). The min formats' X sums (each
 // 16-element half of a column's slice, FP32 in a fixed order) are formed from the B registers the
 // MMAs read, so Columns supplies no slice sums.
-template <QType F, class RowOf, class Columns>
-__device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of, int stages, const Columns& cols,
-                                               DecodeAccumulators& acc) {
+template <QType F, int kMT, int kNT, int kXCols, class RowOf, class Columns>
+__device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf row_of, int stages, const Columns& cols,
+                                                    int tile_h, int m0, int col_base, DecodeAccumulators& acc) {
     constexpr Scaling S = kScaling<F>;
     constexpr bool kSums = S == Scaling::kMin || S == Scaling::kHalfMin;
     constexpr int kBlockElems = static_cast<int>(ggml_block_elems(F));
     constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
     constexpr int kUnitStages = kUnitElems<F> / (kSlices * 32);
     constexpr int kDecodeChunks = kRows * kSlices * 4 / kDecodeThreads; // 8-element chunks per thread and stage
+    constexpr int kRawRowBytes = DecodeShared<F>::kRawRowBytes;
     static_assert(kUnitStages >= 2 && kDecodeChunks * kDecodeThreads == kRows * kSlices * 4);
-    static_assert(!kFold<F> || (kUnitFits<F> && kUnitElems<F> == static_cast<int>(ggml_block_elems(F)) && kRows * kSlices * 2 == kDecodeThreads));
+    static_assert(!kFold<F> || (kUnitElems<F> == static_cast<int>(ggml_block_elems(F)) && kRows * kSlices * 2 == kDecodeThreads));
     const int units = stages / kUnitStages;
     // The columns once per tile (a gathered column's token is a division by top_k).
-    if (threadIdx.x < kColumns) { sm.column[threadIdx.x] = cols.column(static_cast<int>(threadIdx.x)); }
+    if (static_cast<int>(threadIdx.x) < kXCols) { sm.column[threadIdx.x] = cols.column(static_cast<int>(threadIdx.x)); }
     const auto issue_x = [&](int st, int buf) {
-        for (int i = static_cast<int>(threadIdx.x); i < kSlices * kColumns * 8; i += kDecodeThreads) {
-            const int j = i / (kColumns * 8), c = (i / 8) % kColumns, u = i % 8;
+        for (int i = static_cast<int>(threadIdx.x); i < kSlices * kXCols * 8; i += kDecodeThreads) {
+            const int j = i / (kXCols * 8), c = (i / 8) % kXCols, u = i % 8;
             const std::uint16_t* column = sm.column[c];
             const std::uint16_t* from   = column != nullptr ? column + cols.element((st * kSlices + j) * 32 + 4 * u)
                                                             : sm.column[0];
             ops::cp_async_zfill<8>(&sm.x[buf][j][c][4 * (2 * (u % 4) + u / 4)], from, column != nullptr ? 8 : 0);
         }
     };
-    // A row's unit: a kFold format's by 4-byte copies from its aligned-down start, placed 4 (r % 4)
-    // bytes into its raw row (every row's unit starts at the same alignment, so this spreads the rows
-    // a warp decodes, eight at a time, over four banks); the others' by 16-byte copies.
+    // A row's unit: a kFold format's by 4-byte copies into a flat odd-word-strided buffer (32
+    // consecutive words per warp -> zero write bank conflicts, and odd word stride -> zero read
+    // bank conflicts across 16 rows); the others' by 16-byte copies.
     const auto issue_raw = [&](int buf, int unit) {
         const std::size_t begin = static_cast<std::size_t>(unit) * kUnitBytes<F>;
         if constexpr (!kFold<F>) {
@@ -413,47 +443,66 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
                 const int offset = static_cast<int>(src - aligned);
                 const int need   = offset + kUnitBytes<F> - 16 * chunk;
                 if (chunk == 0) { sm.raw_offset[buf][r] = static_cast<std::uint8_t>(offset); }
-                if (need > 0) { tile::cp_async16(&sm.raw[buf][r][16 * chunk], aligned + 16 * chunk, need < 16 ? need : 16); }
+                if (need > 0) {
+                    tile::cp_async16(&sm.raw[buf][r * kRawRowBytes + 16 * chunk], aligned + 16 * chunk, need < 16 ? need : 16);
+                }
             }
             return;
         }
-        constexpr int kWords = (3 + kUnitBytes<F> + 3) / 4;
+        constexpr int kWords = kFoldRowWords<F>;
         for (int i = static_cast<int>(threadIdx.x); i < kRows * kWords; i += kDecodeThreads) {
             const int r = i / kWords, w = i % kWords;
             const std::uint8_t* src = row_of(r / tile::kTileRows, r % tile::kTileRows) + begin;
             const auto* aligned = reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t{3});
-            const int offset    = static_cast<int>(src - aligned), shift = 4 * (r % 4);
-            if (w == 0) { sm.raw_offset[buf][r] = static_cast<std::uint8_t>(shift + offset); }
-            if (4 * w < offset + kUnitBytes<F>) { tile::cp_async4(&sm.raw[buf][r][shift + 4 * w], aligned + 4 * w); }
+            const int offset    = static_cast<int>(src - aligned);
+            if (w == 0) { sm.raw_offset[buf][r] = static_cast<std::uint8_t>(offset); }
+            if (4 * w < offset + kUnitBytes<F>) { tile::cp_async4(&sm.raw[buf][4 * i], aligned + 4 * w); }
         }
     };
+    const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
     const auto decode = [&](int st) {
         const int unit = st / kUnitStages, ubuf = unit & 1;
         if constexpr (kFold<F>) {
-            // Thread (row, h16, dj): the 16 elements of half h16 of slice dj (one sub-scale); the lanes
-            // of dj 0 and 1 read the same code bytes (other bit planes).
-            const int i = static_cast<int>(threadIdx.x);
-            const int row = i / 4, h16 = (i / 2) % 2, dj = i % 2;
-            const int sb = (st - unit * kUnitStages) * kSlices + dj; // slice of the block
-            const std::uint8_t* b = &sm.raw[ubuf][row][sm.raw_offset[ubuf][row]];
-            int code[4], sc = 0, mn = 0;
+            // Warp (h16, tile_grp), lane (dj, hr, g): h16 is warp-uniform so half-warps dj=0,1
+            // broadcast the same 16 raw rows (odd word stride -> 0 load conflicts) and each
+            // 16-lane half-warp stores uint2 to all 32 banks of FoldStage::a (0 store conflicts).
+            const int h16      = warp >> 3;
+            const int tile_grp = warp & 7;
+            const int dj       = lane >> 4;
+            const int hr       = (lane >> 3) & 1;
+            const int g        = lane & 7;
+            const int row      = tile_grp * 16 + hr * 8 + g;
+            const int sb       = (st - unit * kUnitStages) * kSlices + dj;
+            const std::uint8_t* b = &sm.raw[ubuf][row * kRawRowBytes + sm.raw_offset[ubuf][row]];
+            unsigned code[4];
+            int sc = 0, mn = 0;
             fold_half<F>(b, sb, h16, code, sc, mn);
-            auto& image = sm.code[st & 1][row / tile::kTileRows];
-            const int r = row % tile::kTileRows, grp = r / 16, g = r % 8, hr = (r % 16) / 8;
+            auto& image = sm.code[st & 1][tile_grp >> 2];
+            const int grp = tile_grp & 3;
+            const int r   = grp * 16 + hr * 8 + g;
             const __nv_bfloat162 scale = __bfloat162bfloat162(__int2bfloat16_rn(sc));
+            const __nv_bfloat162 neg_128_scale =
+                F == QType::GGML_Q2_K ? __bfloat162bfloat162(__int2bfloat16_rn(-128 * sc)) : scale;
             const auto scaled = [&](unsigned bytes) {
                 union Bits {
                     __nv_bfloat162 pair;
                     unsigned bits;
-                } v;
-                v.bits = bf16_pair(bytes);
-                v.pair = __hmul2(v.pair, scale);
+                } v, bias;
+                v.bits = __byte_perm(bytes, 0x43004300U, 0x7150);
+                if constexpr (F == QType::GGML_Q2_K) {
+                    // (128 + u) * sc + (-128 * sc) == u * sc exactly in BF16 (u in 0..3, sc in 0..15).
+                    v.pair = __hfma2(v.pair, scale, neg_128_scale);
+                } else {
+                    // (128 + u) - 132 == u - 4 in -4..3, exact in BF16; * sc in -128..128 exact in BF16.
+                    bias.bits = 0x43044304U;
+                    v.pair    = __hmul2(__hsub2_rn(v.pair, bias.pair), scale);
+                }
                 return v.bits;
             };
 #pragma unroll
             for (int w = 0; w < 4; ++w) { // elements 4w .. 4w + 3 of the half: lane t = w
                 *reinterpret_cast<uint2*>(&image.a[dj][grp][g][(2 * w + h16) ^ g][2 * hr]) =
-                    make_uint2(scaled(static_cast<unsigned>(code[w])), scaled(static_cast<unsigned>(code[w]) >> 16));
+                    make_uint2(scaled(code[w]), scaled(code[w] >> 16));
             }
             if (dj == 0 && h16 == 0) { image.d[r] = f16_value(fold_d<F>(b)); }
             if constexpr (fast::kMinHalf<F>) {
@@ -465,7 +514,7 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
             const int c = static_cast<int>(threadIdx.x) + kDecodeThreads * i;
             const int row = c / (4 * kSlices), dj = (c / 4) % kSlices, dp = c % 4;
             const int e = ((st - unit * kUnitStages) * kSlices + dj) * 32 + 8 * dp;
-            const std::uint8_t* block = &sm.raw[ubuf][row][sm.raw_offset[ubuf][row]] + e / kBlockElems * kBlockBytes;
+            const std::uint8_t* block = &sm.raw[ubuf][row * kRawRowBytes + sm.raw_offset[ubuf][row]] + e / kBlockElems * kBlockBytes;
             const tile::TileChunk ch = tile::tile_chunk<F>(block, e % kBlockElems / 8);
             auto& image = sm.code[st & 1][row / tile::kTileRows];
             const int r = row % tile::kTileRows;
@@ -477,20 +526,16 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
     };
     // The sum of a B register's two BF16 elements.
     const auto pair_sum = [](unsigned v) {
-        return __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(v & 0xFFFFU))) +
-               __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(v >> 16)));
+        const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
+        return f.x + f.y;
     };
 
-    const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
-    const int g = lane / 4, t = lane % 4;
-    // Warp (wr, wc): rows 32 wr .. 32 wr + 31 (m16 tiles m0, m0 + 1 of image wr / 2), columns 32 wc ..
-    const int wr = warp / (kColumns / kWarpColumns), wc = warp % (kColumns / kWarpColumns);
-    const int tile_h = wr / 2, m0 = 2 * (wr % 2);
-    float block[kDecodeMTiles][kNTiles][4]; // kFold: the current block's sums of (code * sub) * x
+    const int g = lane >> 2, t = lane & 3;
+    float block[kMT][kNT][4]; // kFold: the current block's sums of (code * sub) * x
 #pragma unroll
-    for (int mi = 0; mi < kDecodeMTiles; ++mi) {
+    for (int mi = 0; mi < kMT; ++mi) {
 #pragma unroll
-        for (int nt = 0; nt < kNTiles; ++nt) {
+        for (int nt = 0; nt < kNT; ++nt) {
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
                 acc.r[mi][nt][q] = 0.0F;
@@ -504,15 +549,15 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
             const auto& fs = sm.code[buf][tile_h];
 #pragma unroll
             for (int j = 0; j < kSlices; ++j) {
-                uint4 b[kNTiles];
+                uint4 b[kNT];
 #pragma unroll
-                for (int nt = 0; nt < kNTiles; ++nt) {
-                    b[nt] = *reinterpret_cast<const uint4*>(&sm.x[buf][j][wc * kWarpColumns + 8 * nt + g][8 * t]);
+                for (int nt = 0; nt < kNT; ++nt) {
+                    b[nt] = *reinterpret_cast<const uint4*>(&sm.x[buf][j][col_base + 8 * nt + g][8 * t]);
                 }
-                float xs[kNTiles][2][2] = {};
+                float xs[kNT][2][2] = {};
                 if constexpr (kSums) {
 #pragma unroll
-                    for (int nt = 0; nt < kNTiles; ++nt) {
+                    for (int nt = 0; nt < kNT; ++nt) {
                         float h0 = pair_sum(b[nt].x) + pair_sum(b[nt].y), h1 = pair_sum(b[nt].z) + pair_sum(b[nt].w);
                         h0 += __shfl_xor_sync(0xFFFFFFFFU, h0, 1);
                         h1 += __shfl_xor_sync(0xFFFFFFFFU, h1, 1);
@@ -526,35 +571,35 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
                     }
                 }
 #pragma unroll
-                for (int mi = 0; mi < kDecodeMTiles; ++mi) {
+                for (int mi = 0; mi < kMT; ++mi) {
                     const uint4 l4 = *reinterpret_cast<const uint4*>(fs.a[j][m0 + mi][g][(2 * t) ^ g]);
                     const uint4 h4 = *reinterpret_cast<const uint4*>(fs.a[j][m0 + mi][g][(2 * t + 1) ^ g]);
                     const unsigned lo[4] = {l4.x, l4.z, l4.y, l4.w}, hi[4] = {h4.x, h4.z, h4.y, h4.w};
 #pragma unroll
-                    for (int nt = 0; nt < kNTiles; ++nt) {
+                    for (int nt = 0; nt < kNT; ++nt) {
                         mma(block[mi][nt], lo, b[nt].x, b[nt].y);
                         mma(block[mi][nt], hi, b[nt].z, b[nt].w);
                     }
                     if constexpr (kSums) {
                         const int r = 16 * (m0 + mi) + g;
-                        const float2 m0 = fs.m[j][r], m1 = fs.m[j][r + 8];
+                        const float2 m0v = fs.m[j][r], m1v = fs.m[j][r + 8];
 #pragma unroll
-                        for (int nt = 0; nt < kNTiles; ++nt) {
+                        for (int nt = 0; nt < kNT; ++nt) {
                             float(&o)[4] = acc.r[mi][nt];
-                            o[0] = fmaf(-m0.y, xs[nt][0][1], fmaf(-m0.x, xs[nt][0][0], o[0]));
-                            o[1] = fmaf(-m0.y, xs[nt][1][1], fmaf(-m0.x, xs[nt][1][0], o[1]));
-                            o[2] = fmaf(-m1.y, xs[nt][0][1], fmaf(-m1.x, xs[nt][0][0], o[2]));
-                            o[3] = fmaf(-m1.y, xs[nt][1][1], fmaf(-m1.x, xs[nt][1][0], o[3]));
+                            o[0] = fmaf(-m0v.y, xs[nt][0][1], fmaf(-m0v.x, xs[nt][0][0], o[0]));
+                            o[1] = fmaf(-m0v.y, xs[nt][1][1], fmaf(-m0v.x, xs[nt][1][0], o[1]));
+                            o[2] = fmaf(-m1v.y, xs[nt][0][1], fmaf(-m1v.x, xs[nt][0][0], o[2]));
+                            o[3] = fmaf(-m1v.y, xs[nt][1][1], fmaf(-m1v.x, xs[nt][1][0], o[3]));
                         }
                     }
                 }
             }
             if ((st + 1) % kUnitStages == 0) { // the block's last stage: its sums times d
 #pragma unroll
-                for (int mi = 0; mi < kDecodeMTiles; ++mi) {
+                for (int mi = 0; mi < kMT; ++mi) {
                     const float d0 = fs.d[16 * (m0 + mi) + g], d1 = fs.d[16 * (m0 + mi) + g + 8];
 #pragma unroll
-                    for (int nt = 0; nt < kNTiles; ++nt) {
+                    for (int nt = 0; nt < kNT; ++nt) {
                         float(&o)[4] = acc.r[mi][nt];
                         float(&p)[4] = block[mi][nt];
                         o[0] = fmaf(d0, p[0], o[0]);
@@ -569,18 +614,15 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
             const tile::CodeStage& cs = sm.code[buf][tile_h];
     #pragma unroll
             for (int j = 0; j < kSlices; ++j) {
-                uint4 b[kNTiles];
+                uint4 b[kNT];
     #pragma unroll
-                for (int nt = 0; nt < kNTiles; ++nt) {
-                    b[nt] = *reinterpret_cast<const uint4*>(&sm.x[buf][j][wc * kWarpColumns + 8 * nt + g][8 * t]);
+                for (int nt = 0; nt < kNT; ++nt) {
+                    b[nt] = *reinterpret_cast<const uint4*>(&sm.x[buf][j][col_base + 8 * nt + g][8 * t]);
                 }
-                // xs[nt][c][h]: half h's X sum of output columns 2t + c of n-tile nt. Lane (g, t) holds column
-                // g's unit t (half 0: b.x, b.y) and unit 4 + t (half 1: b.z, b.w); the 4 lanes of g add
-                // them, then lane (g', t) reads columns 2t and 2t + 1 from lanes 4 (2t) and 4 (2t + 1).
-                float xs[kNTiles][2][2] = {};
+                float xs[kNT][2][2] = {};
                 if constexpr (kSums) {
     #pragma unroll
-                    for (int nt = 0; nt < kNTiles; ++nt) {
+                    for (int nt = 0; nt < kNT; ++nt) {
                         float h0 = pair_sum(b[nt].x) + pair_sum(b[nt].y), h1 = pair_sum(b[nt].z) + pair_sum(b[nt].w);
                         h0 += __shfl_xor_sync(0xFFFFFFFFU, h0, 1);
                         h1 += __shfl_xor_sync(0xFFFFFFFFU, h1, 1);
@@ -594,7 +636,7 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
                     }
                 }
     #pragma unroll
-                for (int mi = 0; mi < kDecodeMTiles; ++mi) {
+                for (int mi = 0; mi < kMT; ++mi) {
                     const int4 a = *reinterpret_cast<const int4*>(cs.a[j][m0 + mi][g][t]);
                     const unsigned lo[4] = {bf16_pair(static_cast<unsigned>(a.x)), bf16_pair(static_cast<unsigned>(a.y)),
                                             bf16_pair(static_cast<unsigned>(a.x) >> 16), bf16_pair(static_cast<unsigned>(a.y) >> 16)};
@@ -610,7 +652,6 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
                         s10 = d1 * static_cast<float>(sc.z);
                         s11 = d1 * static_cast<float>(sc.w);
                     }
-                    // The min terms of rows r and r + 8 (per half for kHalfMin: min0 | min1 << 8).
                     float m00 = 0.0F, m01 = 0.0F, m10 = 0.0F, m11 = 0.0F;
                     if constexpr (S == Scaling::kMin) {
                         m00 = m01 = f16_value(cs.dmin[j][r]) * static_cast<float>(cs.min[j][r]);
@@ -623,7 +664,7 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
                         m11 = dm1 * static_cast<float>(cs.min[j][r + 8] >> 8);
                     }
     #pragma unroll
-                    for (int nt = 0; nt < kNTiles; ++nt) {
+                    for (int nt = 0; nt < kNT; ++nt) {
                         float(&o)[4] = acc.r[mi][nt];
                         if constexpr (S == Scaling::kHalf || S == Scaling::kHalfMin) {
                             float p[4] = {0.0F, 0.0F, 0.0F, 0.0F}, q[4] = {0.0F, 0.0F, 0.0F, 0.0F};
@@ -651,12 +692,8 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
                     }
                 }
             }
-
         }
     };
-    // Every iteration commits two groups (x, then raw; either may be empty), so cp_wait<1> at its top
-    // completes everything but the previous iteration's raw unit, which is first decoded at least one
-    // iteration later.
     issue_raw(0, 0);
     ops::cp_commit();
     ops::cp_wait<0>();
@@ -681,6 +718,20 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
     }
     ops::cp_wait<0>();
     __syncthreads(); // the caller may reuse shared memory
+}
+
+template <QType F, class RowOf, class Columns>
+__device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of, int stages, const Columns& cols,
+                                               const DecodeWarpLayout& wl, DecodeAccumulators& acc) {
+    if (wl.x_cols == 128) {
+        compute_decode_impl<F, 2, 4, 128>(sm, row_of, stages, cols, wl.tile_h, wl.m0, wl.col_base, acc);
+    } else if (wl.x_cols == 64) {
+        compute_decode_impl<F, 1, 4, 64>(sm, row_of, stages, cols, wl.tile_h, wl.m0, wl.col_base, acc);
+    } else if (wl.x_cols == 32) {
+        compute_decode_impl<F, 1, 2, 32>(sm, row_of, stages, cols, wl.tile_h, wl.m0, wl.col_base, acc);
+    } else {
+        compute_decode_impl<F, 1, 1, 16>(sm, row_of, stages, cols, wl.tile_h, wl.m0, wl.col_base, acc);
+    }
 }
 
 // A dense call's tile: rows [kRows bx, + kRows) of a segment (or slab) whose plane holds `tiles` row

@@ -98,13 +98,17 @@ __device__ __forceinline__ void ggml_shfl_add(ggml::I128& r, int offset) {
 }
 
 template <QType GU, class G>
-__global__ void __launch_bounds__(kGgmlThreads)
+__global__ void __launch_bounds__(kGgmlThreads, 4)
     gate_up_kernel_ggml(const std::uint8_t* __restrict__ x_limbs, const std::int32_t* __restrict__ x_emax,
                         const std::int32_t* __restrict__ x_sums, MoeDispatch dispatch, MoeExpertSource source, int top_k,
                         const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                         int job_base, std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
-    using Dm        = GgmlDims<G>;
-    constexpr int C = kGgmlColumns;
+    using Dm             = GgmlDims<G>;
+    constexpr bool kFast = ggml::fast::kFastBlock<GU> && (Dm::kXSlices == 128);
+    constexpr int C      = kFast ? 2 : kGgmlColumns;
+    constexpr int kBlkB  = kFast ? static_cast<int>(ggml_block_bytes(GU)) : 1;
+    constexpr int kRowB  = kFast ? (16 * kBlkB) : 16;
+    __shared__ __align__(16) std::uint8_t sh_rows[kGgmlWarps][2][kRowB];
     const int job   = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
     const int expert = dispatch.jobs[job];
@@ -118,28 +122,50 @@ __global__ void __launch_bounds__(kGgmlThreads)
     const int row_bytes = static_cast<int>(source.ggml.gate_row_bytes);
     const std::uint8_t* row = record + (static_cast<std::size_t>(up) * Dm::kIntermediate + i) * row_bytes;
     pdl::trigger_dependents();
+    if constexpr (kFast) {
+        // Stage the entire 16-block row once with asynchronous 16-byte copies, reused across passes.
+        std::uint8_t* dst = sh_rows[warp][up];
+        if ((reinterpret_cast<std::uintptr_t>(row) & 15U) == 0U) {
+            constexpr int kVec = kRowB / 16;
+#pragma unroll
+            for (int v = part; v < kVec; v += 16) {
+                ggml::tile::cp_async16(dst + 16 * v, row + 16 * v, 16);
+            }
+            ops::cp_commit();
+            ops::cp_wait<0>();
+        } else {
+            for (int b = part; b < kRowB; b += 16) { dst[b] = row[b]; }
+        }
+        __syncwarp();
+    }
     for (int pass = 0; pass < count; pass += C) {
         const int n = min(C, count - pass);
         const std::int32_t* xs[C];
+        const std::int32_t* x_sums_p[C];
         int tokens[C];
 #pragma unroll
         for (int c = 0; c < C; ++c) {
             tokens[c] = c < n ? dispatch.entries[first + pass + c] / top_k : 0;
             xs[c]     = reinterpret_cast<const std::int32_t*>(x_limbs + static_cast<std::size_t>(tokens[c]) *
                                                                        Dm::kXRowBytes);
+            x_sums_p[c] = kGgmlSums<GU> ? (x_sums + static_cast<std::size_t>(tokens[c]) * (Dm::kHidden / 16)) : nullptr;
         }
         ggml::I128 acc[C];
-        for (int s = part; s < Dm::kXSlices; s += 16) {
-            const ggml::fast::Slice w      = ggml::fast::slice<GU>(row, s);
-            const ggml::fast::SliceScale sc = ggml::fast::slice_scale(w);
+        if constexpr (kFast) {
+            ggml::fast::add_block<GU, C>(acc, sh_rows[warp][up] + part * kBlkB, xs, x_sums_p, part, n);
+        } else {
+            for (int s = part; s < Dm::kXSlices; s += 16) {
+                const ggml::fast::Slice w      = ggml::fast::slice<GU>(row, s);
+                const ggml::fast::SliceScale sc = ggml::fast::slice_scale(w);
 #pragma unroll
-            for (int c = 0; c < C; ++c) {
-                if (c < n) {
-                    if constexpr (kGgmlSums<GU>) {
-                        const std::int32_t* sum = x_sums + static_cast<std::size_t>(tokens[c]) * (Dm::kHidden / 16) + 2 * s;
-                        ggml::fast::add_slice_halves(acc[c], w, sc, xs[c] + s * ggml::fast::kSliceWords, sum[0], sum[1]);
-                    } else {
-                        ggml::fast::add_slice(acc[c], w, sc, xs[c] + s * ggml::fast::kSliceWords, 0);
+                for (int c = 0; c < C; ++c) {
+                    if (c < n) {
+                        if constexpr (kGgmlSums<GU>) {
+                            const std::int32_t* sum = x_sums_p[c] + 2 * s;
+                            ggml::fast::add_slice_halves(acc[c], w, sc, xs[c] + s * ggml::fast::kSliceWords, sum[0], sum[1]);
+                        } else {
+                            ggml::fast::add_slice(acc[c], w, sc, xs[c] + s * ggml::fast::kSliceWords, 0);
+                        }
                     }
                 }
             }
@@ -161,17 +187,21 @@ __global__ void __launch_bounds__(kGgmlThreads)
 }
 
 template <QType D, class G>
-__global__ void __launch_bounds__(kGgmlThreads)
+__global__ void __launch_bounds__(kGgmlThreads, 4)
     down_kernel_ggml(MoeDispatch dispatch, MoeExpertSource source, int hidden,
                      const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                      int job_base, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs, PassPhase phase,
                      int narrow_max) {
-    using Dm        = GgmlDims<G>;
-    constexpr int C = kGgmlColumns;
+    using Dm             = GgmlDims<G>;
     constexpr bool kSums = kGgmlSums<D>;
+    constexpr bool kFast = ggml::fast::kFastBlock<D> && (Dm::kHSlices % 8 == 0);
+    constexpr int C      = kFast ? 2 : kGgmlColumns;
+    constexpr int kBlkB  = kFast ? static_cast<int>(ggml_block_bytes(D)) : 1;
+    constexpr int kStgW  = kFast ? (((3 + kBlkB + 3) / 4) | 1) : 1;
     static_assert(!kSums || (Dm::kIntermediate / 4) % 32 == 0, "every lane quad encodes one 16-element run");
     __shared__ __align__(16) std::int32_t limbs[C][Dm::kHSlices * ggml::fast::kSliceWords];
     __shared__ std::int32_t sums[C][kSums ? Dm::kIntermediate / 16 : 1];
+    __shared__ std::uint32_t blk_stage[kFast ? 2 : 1][kGgmlDownRows][kStgW];
     __shared__ int emax[C];
     const int job = job_base + static_cast<int>(blockIdx.y);
     // A programmatic dependent of the gate/up pass (down_kernel's PDL contract): only h_plane is read
@@ -188,9 +218,10 @@ __global__ void __launch_bounds__(kGgmlThreads)
     }
     pdl::wait_for_dependencies();
     if (record == nullptr || count > narrow_max) { return; }
-    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int part = lane % kGgmlDownLanes;
-    const int row  = blockIdx.x * kGgmlDownRows + threadIdx.x / kGgmlDownLanes;
+    const int lane      = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int part      = lane % kGgmlDownLanes;
+    const int row_local = static_cast<int>(threadIdx.x) / kGgmlDownLanes;
+    const int row       = blockIdx.x * kGgmlDownRows + row_local;
     const int row_bytes = static_cast<int>(source.ggml.down_row_bytes);
     const std::uint8_t* w = record + 2 * static_cast<std::size_t>(Dm::kIntermediate) * source.ggml.gate_row_bytes +
                             static_cast<std::size_t>(row) * row_bytes;
@@ -217,17 +248,54 @@ __global__ void __launch_bounds__(kGgmlThreads)
         }
         __syncthreads();
         ggml::I128 acc[C];
-        for (int s = part; s < Dm::kHSlices; s += kGgmlDownLanes) {
-            const ggml::fast::Slice ws      = ggml::fast::slice<D>(w, s);
-            const ggml::fast::SliceScale sc = ggml::fast::slice_scale(ws);
+        if constexpr (kFast) {
+            const std::int32_t* xs_h[C];
+            const std::int32_t* x_sums_h[C];
 #pragma unroll
             for (int c = 0; c < C; ++c) {
-                if (c < n) {
-                    if constexpr (kSums) {
-                        ggml::fast::add_slice_halves(acc[c], ws, sc, limbs[c] + s * ggml::fast::kSliceWords, sums[c][2 * s],
-                                                     sums[c][2 * s + 1]);
-                    } else {
-                        ggml::fast::add_slice(acc[c], ws, sc, limbs[c] + s * ggml::fast::kSliceWords, 0);
+                xs_h[c]     = limbs[c];
+                x_sums_h[c] = sums[c];
+            }
+            constexpr int kBlocks = Dm::kHSlices / 8;
+            const auto issue_blk  = [&](int blk, int buf) {
+                const std::uint8_t* src = w + static_cast<std::size_t>(blk) * kBlkB;
+                const auto aligned      = reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t{3};
+                const int off           = static_cast<int>(reinterpret_cast<std::uintptr_t>(src) - aligned);
+                const auto* sw          = reinterpret_cast<const std::uint32_t*>(aligned);
+                const int copy_words    = (off + kBlkB + 3) >> 2;
+                for (int wi = part; wi < copy_words; wi += kGgmlDownLanes) {
+                    ggml::tile::cp_async4(&blk_stage[buf][row_local][wi], sw + wi);
+                }
+                return off;
+            };
+            int cur_off = issue_blk(0, 0);
+            ops::cp_commit();
+#pragma unroll 1
+            for (int blk = 0; blk < kBlocks; ++blk) {
+                int next_off = 0;
+                if (blk + 1 < kBlocks) { next_off = issue_blk(blk + 1, (blk + 1) & 1); }
+                ops::cp_commit();
+                ops::cp_wait<1>();
+                __syncwarp();
+                const auto* b = reinterpret_cast<const std::uint8_t*>(blk_stage[blk & 1][row_local]) + cur_off;
+                ggml::fast::add_block_quad<D, C>(acc, b, part, xs_h, x_sums_h, blk, n);
+                __syncwarp();
+                cur_off = next_off;
+            }
+            ops::cp_wait<0>();
+        } else {
+            for (int s = part; s < Dm::kHSlices; s += kGgmlDownLanes) {
+                const ggml::fast::Slice ws      = ggml::fast::slice<D>(w, s);
+                const ggml::fast::SliceScale sc = ggml::fast::slice_scale(ws);
+#pragma unroll
+                for (int c = 0; c < C; ++c) {
+                    if (c < n) {
+                        if constexpr (kSums) {
+                            ggml::fast::add_slice_halves(acc[c], ws, sc, limbs[c] + s * ggml::fast::kSliceWords, sums[c][2 * s],
+                                                         sums[c][2 * s + 1]);
+                        } else {
+                            ggml::fast::add_slice(acc[c], ws, sc, limbs[c] + s * ggml::fast::kSliceWords, 0);
+                        }
                     }
                 }
             }
@@ -235,8 +303,10 @@ __global__ void __launch_bounds__(kGgmlThreads)
 #pragma unroll
         for (int c = 0; c < C; ++c) {
             if (c < n) {
+                if constexpr (!kFast) {
 #pragma unroll
-                for (int offset = kGgmlDownLanes / 2; offset >= 1; offset >>= 1) { ggml_shfl_add(acc[c], offset); }
+                    for (int offset = kGgmlDownLanes / 2; offset >= 1; offset >>= 1) { ggml_shfl_add(acc[c], offset); }
+                }
                 if (part == 0) {
                     const int column = dispatch.entries[first + pass + c];
                     reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * hidden + row] =
@@ -589,7 +659,8 @@ void launch_encode_x_ggml(const Tensor& x, const MoeExpertSource& source, const 
 // round, so an output depends only on its expert, its entry's x and the K order, not on the call.
 // Jobs of at most kMaxColumns columns keep the narrow kernels.
 
-constexpr int kBf16PlanThreads = 512;
+constexpr int kBf16PlanThreads           = 512;
+constexpr int kGgmlBf16AllJobsMinColumns = 64; // non-default ggml BF16 tiles beat narrow dp4a for all jobs from 64 columns up
 constexpr int kBf16GateUpPairs = moe::kIntermediate / ggml::tile::kTileRows; // row-tile pairs (gate, up)
 constexpr int kBf16DownTiles   = moe::kHidden / ggml::bf16::kRows;
 constexpr int kBf16XStages     = moe::kHidden / (ggml::tile::kStageSlices * 32);
@@ -598,26 +669,28 @@ static_assert(moe::wide::kGgmlCodeStageBytes == sizeof(ggml::tile::CodeStage), "
 static_assert(moe::wide::kGgmlBf16GateUpImages == static_cast<std::size_t>(2 * kBf16GateUpPairs) * kBf16XStages);
 static_assert(moe::kHidden % ggml::bf16::kRows == 0 && moe::kIntermediate % ggml::tile::kTileRows == 0);
 
-// Whether job `job` of the call takes the BF16 tiles: wide, not CPU-served, with a record.
+// Whether job `job` of the call takes the BF16 tiles: more than `min_cols` entries, not CPU-served,
+// with a record.
 __device__ __forceinline__ bool bf16_job(const MoeDispatch& dispatch, const std::int32_t* cpu_flags,
-                                         const std::uint8_t* const* job_records, int job) {
+                                         const std::uint8_t* const* job_records, int job, int min_cols) {
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return false; }
     const int expert = dispatch.jobs[job];
-    return dispatch.offsets[expert + 1] - dispatch.offsets[expert] > moe::kMaxColumns && job_records[job] != nullptr;
+    return dispatch.offsets[expert + 1] - dispatch.offsets[expert] > min_cols && job_records[job] != nullptr;
 }
 
 // The 128-entry tiles of the BF16 jobs among [base, base + jobs) (1 <= jobs <= kBf16PlanThreads):
 // tiles[2 i] the tile's job, tiles[2 i + 1] its first entry within the job; first_tile[j] (j = 0 ..
 // jobs) the first tile of job base + j.
 __global__ void __launch_bounds__(kBf16PlanThreads)
-    ggml_bf16_plan_kernel(MoeDispatch dispatch, int base, int jobs, const std::int32_t* __restrict__ cpu_flags,
+    ggml_bf16_plan_kernel(MoeDispatch dispatch, int base, int jobs, int min_cols,
+                          const std::int32_t* __restrict__ cpu_flags,
                           const std::uint8_t* const* __restrict__ job_records, std::int32_t* __restrict__ tiles,
                           std::int32_t* __restrict__ first_tile) {
     __shared__ int scan[kBf16PlanThreads];
     const int tid = static_cast<int>(threadIdx.x);
     const int job = base + tid;
     int n         = 0;
-    if (tid < jobs && bf16_job(dispatch, cpu_flags, job_records, job)) {
+    if (tid < jobs && bf16_job(dispatch, cpu_flags, job_records, job, min_cols)) {
         const int expert  = dispatch.jobs[job];
         const int columns = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
         n = (columns + ggml::bf16::kColumns - 1) / ggml::bf16::kColumns;
@@ -648,7 +721,7 @@ __global__ void __launch_bounds__(ggml::tile::kThreads)
                              const std::int32_t* __restrict__ cpu_flags, int sub, int down, std::uint8_t* __restrict__ planes) {
     __shared__ ggml::tile::CodeStage cs;
     const int job = sub + static_cast<int>(blockIdx.z);
-    if (!bf16_job(dispatch, cpu_flags, job_records, job)) { return; }
+    if (!bf16_job(dispatch, cpu_flags, job_records, job, moe::kMaxColumns)) { return; }
     const int tile = static_cast<int>(blockIdx.x), st = static_cast<int>(blockIdx.y), stages = static_cast<int>(gridDim.y);
     const std::size_t row_bytes = down != 0 ? source.ggml.down_row_bytes : source.ggml.gate_row_bytes;
     const std::uint8_t* rows    = job_records[job] + (down != 0 ? 2 * static_cast<std::size_t>(moe::kIntermediate) *
@@ -825,16 +898,20 @@ __global__ void __launch_bounds__(ggml::bf16::kDecodeThreads, 1)
             return record + static_cast<std::size_t>(h * Dm::kIntermediate + pair * ggml::tile::kTileRows + r) * row_bytes;
         };
         const GatherColumns cols{x, static_cast<std::size_t>(Dm::kHidden), dispatch.entries, first, col0, count, top_k};
+        const b::DecodeWarpLayout wl = b::decode_warp_layout(warp, min(b::kColumns, count - col0));
         b::DecodeAccumulators acc;
-        b::compute_decode<GU>(sm, row_of, Dm::kHidden / (ggml::tile::kStageSlices * 32), cols, acc);
+        b::compute_decode<GU>(sm, row_of, Dm::kHidden / (ggml::tile::kStageSlices * 32), cols, wl, acc);
         if (warp >= 8) { // rows 64 .. 127: the up rows
 #pragma unroll
             for (int mi = 0; mi < b::kDecodeMTiles; ++mi) {
+                if (mi >= wl.mtiles) { break; }
 #pragma unroll
                 for (int nt = 0; nt < b::kNTiles; ++nt) {
+                    if (nt >= wl.ntiles) { break; }
 #pragma unroll
                     for (int q = 0; q < 4; ++q) {
-                        const int r = b::decode_out_row(warp, lane, mi, q) - ggml::tile::kTileRows, c = b::out_column(warp, lane, nt, q);
+                        const int r = b::decode_out_row(wl, lane, mi, q) - ggml::tile::kTileRows;
+                        const int c = b::decode_out_column(wl, lane, nt, q);
                         up[r * b::kColumns + c] = bf16_bits(ldexpf(acc.r[mi][nt][q], kappa_log2));
                     }
                 }
@@ -844,11 +921,14 @@ __global__ void __launch_bounds__(ggml::bf16::kDecodeThreads, 1)
         if (warp < 8) {
 #pragma unroll
             for (int mi = 0; mi < b::kDecodeMTiles; ++mi) {
+                if (mi >= wl.mtiles) { break; }
 #pragma unroll
                 for (int nt = 0; nt < b::kNTiles; ++nt) {
+                    if (nt >= wl.ntiles) { break; }
 #pragma unroll
                     for (int q = 0; q < 4; ++q) {
-                        const int r = b::decode_out_row(warp, lane, mi, q), c = b::out_column(warp, lane, nt, q);
+                        const int r = b::decode_out_row(wl, lane, mi, q);
+                        const int c = b::decode_out_column(wl, lane, nt, q);
                         if (col0 + c < count) {
                             const std::uint16_t y = bf16_bits(ldexpf(acc.r[mi][nt][q], kappa_log2));
                             const std::uint16_t u = up[r * b::kColumns + c];
@@ -886,17 +966,20 @@ __global__ void __launch_bounds__(ggml::bf16::kDecodeThreads, 1)
             return down + static_cast<std::size_t>(q * b::kRows + h * ggml::tile::kTileRows + r) * source.ggml.down_row_bytes;
         };
         const GatherColumns cols{h_plane, static_cast<std::size_t>(Dm::kHRowElements), dispatch.entries, first, col0, count, 0};
+        const b::DecodeWarpLayout wl = b::decode_warp_layout(warp, min(b::kColumns, count - col0));
         b::DecodeAccumulators acc;
-        b::compute_decode<D>(sm, row_of, Dm::kIntermediate / (ggml::tile::kStageSlices * 32), cols, acc);
+        b::compute_decode<D>(sm, row_of, Dm::kIntermediate / (ggml::tile::kStageSlices * 32), cols, wl, acc);
 #pragma unroll
         for (int mi = 0; mi < b::kDecodeMTiles; ++mi) {
+            if (mi >= wl.mtiles) { break; }
 #pragma unroll
             for (int nt = 0; nt < b::kNTiles; ++nt) {
+                if (nt >= wl.ntiles) { break; }
 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
-                    const int c = b::out_column(warp, lane, nt, k);
+                    const int c = b::decode_out_column(wl, lane, nt, k);
                     if (col0 + c < count) {
-                        const int row = q * b::kRows + b::decode_out_row(warp, lane, mi, k);
+                        const int row = q * b::kRows + b::decode_out_row(wl, lane, mi, k);
                         outputs[static_cast<std::size_t>(dispatch.entries[first + col0 + c]) * Dm::kHidden + row] =
                             bf16_bits(ldexpf(acc.r[mi][nt][k], kappa_log2));
                     }
@@ -933,8 +1016,8 @@ void launch_bf16_pass_ggml(const std::uint16_t* x, const MoeDispatch& dispatch, 
     }();
     if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the BF16 tiles' shared memory exceeds the device's"); }
     auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.h_rows);
-    ggml_bf16_plan_kernel<<<1, kBf16PlanThreads, 0, stream>>>(dispatch, base, jobs, flags, job_records, layout.tiles,
-                                                               layout.pass_tiles);
+    ggml_bf16_plan_kernel<<<1, kBf16PlanThreads, 0, stream>>>(dispatch, base, jobs, moe::kMaxColumns, flags,
+                                                              job_records, layout.tiles, layout.pass_tiles);
     check_launch("ggml bf16 plan");
     const int batch = moe::wide::kGgmlBf16Experts, sms = bf16_expert_sms();
     for (int sub = base; sub < base + jobs; sub += batch) {
@@ -958,11 +1041,12 @@ void launch_bf16_pass_ggml(const std::uint16_t* x, const MoeDispatch& dispatch, 
     }
 }
 
-// The BF16 route's wide jobs of a pass of geometry G (no planes; after its narrow kernels).
+// The BF16 route's jobs of a pass of geometry G (no planes; jobs with more than `min_cols` entries).
 template <QType GU, QType D, class G>
 void launch_bf16_decode_pass_ggml(const std::uint16_t* x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                                   int top_k, const std::uint8_t* const* job_records, const std::int32_t* flags, int base,
-                                  int jobs, const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream) {
+                                  int jobs, int min_cols, const moe::wide::ExpertsWorkspace& layout, bf16* outputs,
+                                  cudaStream_t stream) {
     namespace b = ggml::bf16;
     using Dm = GgmlDims<G>;
     static_assert(Dm::kIntermediate % ggml::tile::kTileRows == 0 && Dm::kHidden % b::kRows == 0);
@@ -977,8 +1061,8 @@ void launch_bf16_decode_pass_ggml(const std::uint16_t* x, const MoeDispatch& dis
     }();
     if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the BF16 tiles' shared memory exceeds the device's"); }
     auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.h_rows);
-    ggml_bf16_plan_kernel<<<1, kBf16PlanThreads, 0, stream>>>(dispatch, base, jobs, flags, job_records, layout.tiles,
-                                                               layout.pass_tiles);
+    ggml_bf16_plan_kernel<<<1, kBf16PlanThreads, 0, stream>>>(dispatch, base, jobs, min_cols, flags, job_records,
+                                                              layout.tiles, layout.pass_tiles);
     check_launch("ggml bf16 plan");
     const int sms = bf16_expert_sms();
     gate_up_bf16_ggml<GU, G><<<sms, b::kDecodeThreads, kGateUpShared, stream>>>(
@@ -1013,8 +1097,15 @@ void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const M
                              const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                              const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream,
                              PassPhase phase, int entries) {
-    using Dm             = GgmlDims<G>;
+    using Dm                = GgmlDims<G>;
     constexpr bool kDefault = std::is_same_v<G, GgmlDefault>;
+    if constexpr (!kDefault) {
+        if (entries >= kGgmlBf16AllJobsMinColumns * top_k && source.wide_a16 == moe::WideA16::kGgmlBf16) {
+            launch_bf16_decode_pass_ggml<GU, D, G>(reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k,
+                                                   job_records, flags, base, jobs, 0, layout, outputs, stream);
+            return;
+        }
+    }
     auto* h_plane        = reinterpret_cast<std::uint16_t*>(layout.h_rows);
     const int narrow_max = entries > 0 ? moe::kMaxColumns : std::numeric_limits<int>::max();
     launch_narrow_pass_ggml<GU, D, G>(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream,
@@ -1029,7 +1120,8 @@ void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const M
     } else {
         if (source.wide_a16 == moe::WideA16::kGgmlBf16) {
             launch_bf16_decode_pass_ggml<GU, D, G>(reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k,
-                                                   job_records, flags, base, jobs, layout, outputs, stream);
+                                                   job_records, flags, base, jobs, moe::kMaxColumns, layout, outputs,
+                                                   stream);
             return;
         }
     }

@@ -510,4 +510,334 @@ __device__ __forceinline__ void add_slice_halves(I128& r, const Slice& w, const 
     }
 }
 
+// --------------------------------------------------------------------------- block-level K-quants
+//
+// Exact block-level accumulation for 256-element K-quant blocks staged in shared memory: decodes
+// shared block bytes once (no redundant hmask/qs loads), accumulates the three limb planes across
+// the block in int32 (|limb_sum| < 2^25 even for Q4_K), and runs f16_parts + add_shifted once
+// per block. Bit-identical to eight per-slice add_slice/add_slice_halves calls.
+
+template <QType F>
+inline constexpr bool kFastBlock = F == QType::GGML_Q3_K || F == QType::GGML_Q2_K || F == QType::GGML_Q4_K;
+
+__device__ __forceinline__ std::uint16_t sm_ld_u16(const std::uint8_t* p) {
+    return static_cast<std::uint16_t>(p[0]) | (static_cast<std::uint16_t>(p[1]) << 8);
+}
+
+template <int N>
+__device__ __forceinline__ void sm_ld_words_a2(const std::uint8_t* p, std::uint32_t (&out)[N]) {
+    const auto at        = reinterpret_cast<std::uintptr_t>(p);
+    const unsigned shift = static_cast<unsigned>(at & 3U) * 8U;
+    const auto* w        = reinterpret_cast<const std::uint32_t*>(at & ~std::uintptr_t{3});
+    std::uint32_t v[N + 1];
+#pragma unroll
+    for (int i = 0; i < N; ++i) { v[i] = w[i]; }
+    v[N] = shift != 0 ? w[N] : 0U;
+#pragma unroll
+    for (int i = 0; i < N; ++i) { out[i] = __funnelshift_r(v[i], v[i + 1], shift); }
+}
+
+__device__ __forceinline__ int limb_dot_q(const int (&q)[8], int sub0, int sub1, const int4& l0, const int4& l1) {
+    const int p0 = __dp4a(q[3], l0.w, __dp4a(q[2], l0.z, __dp4a(q[1], l0.y, __dp4a(q[0], l0.x, 0))));
+    const int p1 = __dp4a(q[7], l1.w, __dp4a(q[6], l1.z, __dp4a(q[5], l1.y, __dp4a(q[4], l1.x, 0))));
+    return sub0 * p0 + sub1 * p1;
+}
+
+__device__ __forceinline__ int q3k_sub_from_words(const std::uint32_t (&sw)[3], int i) {
+    const std::uint32_t lo_w = ((i & 7) < 4) ? sw[0] : sw[1];
+    const std::uint32_t lo_b = (lo_w >> (8 * (i & 3))) & 0xFFU;
+    const std::uint32_t hi_b = (sw[2] >> (8 * (i & 3))) & 0xFFU;
+    return static_cast<int>(((lo_b >> (4 * (i >> 3))) & 0xFU) | (((hi_b >> (2 * (i >> 2))) & 3U) << 4)) - 32;
+}
+
+// Single-lane whole-block accumulation (gate/up narrow path: 16 lanes = 16 blocks per 4096 row).
+template <QType F, int C>
+__device__ __forceinline__ void add_block(I128 (&acc)[C], const std::uint8_t* b, const std::int32_t* const (&xs)[C],
+                                          const std::int32_t* const (&x_sums)[C], int blk, int n) {
+    static_assert(kFastBlock<F>);
+    int acc_a[C], acc_b[C], acc_c[C];
+    long long m_blk[C];
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+        acc_a[c] = acc_b[c] = acc_c[c] = 0;
+        m_blk[c]                       = 0;
+    }
+    std::uint16_t d = 0, dmin = 0;
+    if constexpr (F == QType::GGML_Q3_K) {
+        d = sm_ld_u16(b + 108);
+        std::uint32_t hw[8], sw[3];
+        sm_ld_words_a2<8>(b, hw);
+        sm_ld_words_a2<3>(b + 96, sw);
+#pragma unroll 1
+        for (int half = 0; half < 2; ++half) {
+            std::uint32_t qw[8];
+            sm_ld_words_a2<8>(b + 32 + 32 * half, qw);
+#pragma unroll 1
+            for (int plane = 0; plane < 4; ++plane) {
+                const int sb   = 4 * half + plane;
+                const int s    = 8 * blk + sb;
+                const int sub0 = q3k_sub_from_words(sw, 2 * sb);
+                const int sub1 = q3k_sub_from_words(sw, 2 * sb + 1);
+                int q[8];
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    const std::uint32_t ql = (qw[w] >> (2 * plane)) & 0x03030303U;
+                    const std::uint32_t qh = (hw[w] >> sb) & 0x01010101U;
+                    q[w]                   = sub_bytes4(ql | (qh << 2), 0x04040404U);
+                }
+#pragma unroll
+                for (int c = 0; c < C; ++c) {
+                    if (c < n) {
+                        const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
+                        acc_c[c] += limb_dot_q(q, sub0, sub1, l4[4], l4[5]);
+                        acc_b[c] += limb_dot_q(q, sub0, sub1, l4[2], l4[3]);
+                        acc_a[c] += limb_dot_q(q, sub0, sub1, l4[0], l4[1]);
+                    }
+                }
+            }
+        }
+    } else if constexpr (F == QType::GGML_Q2_K) {
+        d    = sm_ld_u16(b + 80);
+        dmin = sm_ld_u16(b + 82);
+        std::uint32_t sc_w[4];
+        sm_ld_words_a2<4>(b, sc_w);
+#pragma unroll 1
+        for (int half = 0; half < 2; ++half) {
+            std::uint32_t qw[8];
+            sm_ld_words_a2<8>(b + 16 + 32 * half, qw);
+#pragma unroll 1
+            for (int plane = 0; plane < 4; ++plane) {
+                const int sb            = 4 * half + plane;
+                const int s             = 8 * blk + sb;
+                const std::uint32_t sc2 = (sc_w[2 * half + (plane >> 1)] >> (16 * (plane & 1))) & 0xFFFFU;
+                const int sub0          = static_cast<int>(sc2 & 0xFU);
+                const int min0          = static_cast<int>((sc2 >> 4) & 0xFU);
+                const int sub1          = static_cast<int>((sc2 >> 8) & 0xFU);
+                const int min1          = static_cast<int>(sc2 >> 12);
+                int q[8];
+#pragma unroll
+                for (int w = 0; w < 8; ++w) { q[w] = static_cast<int>((qw[w] >> (2 * plane)) & 0x03030303U); }
+#pragma unroll
+                for (int c = 0; c < C; ++c) {
+                    if (c < n) {
+                        const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
+                        acc_c[c] += limb_dot_q(q, sub0, sub1, l4[4], l4[5]);
+                        acc_b[c] += limb_dot_q(q, sub0, sub1, l4[2], l4[3]);
+                        acc_a[c] += limb_dot_q(q, sub0, sub1, l4[0], l4[1]);
+                        m_blk[c] += static_cast<long long>(min0) * x_sums[c][2 * s] +
+                                    static_cast<long long>(min1) * x_sums[c][2 * s + 1];
+                    }
+                }
+            }
+        }
+    } else {
+        static_assert(F == QType::GGML_Q4_K);
+        d    = sm_ld_u16(b);
+        dmin = sm_ld_u16(b + 2);
+#pragma unroll 1
+        for (int ch = 0; ch < 4; ++ch) {
+            std::uint32_t qw[8];
+            sm_ld_words_a2<8>(b + 16 + 32 * ch, qw);
+#pragma unroll 1
+            for (int hi = 0; hi < 2; ++hi) {
+                const int sb = 2 * ch + hi;
+                const int s  = 8 * blk + sb;
+                int sc, mn;
+                scale_min_k4(sb, b + 4, sc, mn);
+                int q[8];
+#pragma unroll
+                for (int w = 0; w < 8; ++w) { q[w] = static_cast<int>((qw[w] >> (4 * hi)) & 0x0F0F0F0FU); }
+#pragma unroll
+                for (int c = 0; c < C; ++c) {
+                    if (c < n) {
+                        const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
+                        acc_c[c] += limb_dot_q(q, sc, sc, l4[4], l4[5]);
+                        acc_b[c] += limb_dot_q(q, sc, sc, l4[2], l4[3]);
+                        acc_a[c] += limb_dot_q(q, sc, sc, l4[0], l4[1]);
+                        m_blk[c] += static_cast<long long>(mn) *
+                                    (static_cast<long long>(x_sums[c][2 * s]) + static_cast<long long>(x_sums[c][2 * s + 1]));
+                    }
+                }
+            }
+        }
+    }
+    std::int64_t mant_u;
+    int shift;
+    bool neg;
+    f16_parts(d, mant_u, shift, neg);
+    const long long mant = neg ? -mant_u : mant_u;
+    long long min_mant = 0;
+    int min_shift      = 0;
+    if constexpr (kMin<F> || kMinHalf<F>) {
+        std::int64_t mm;
+        bool mneg;
+        f16_parts(dmin, mm, min_shift, mneg);
+        min_mant = mneg ? mm : -mm;
+    }
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+        if (c < n) {
+            const long long p = static_cast<long long>(acc_c[c]) + (static_cast<long long>(acc_b[c]) << 8) +
+                                (static_cast<long long>(acc_a[c]) << 16);
+            add_shifted(acc[c], mant * p, shift);
+            if constexpr (kMin<F> || kMinHalf<F>) {
+                if (m_blk[c] != 0) { add_shifted(acc[c], min_mant * m_blk[c], min_shift); }
+            }
+        }
+    }
+}
+
+// 4-lane cooperative whole-block accumulation (down narrow path): lanes part = 0..3 each compute
+// two slices of block `b` in shared memory, reduce int32 limb sums across the quad, and only
+// part == 0 runs f16_parts + add_shifted once per block into acc[c].
+template <QType F, int C>
+__device__ __forceinline__ void add_block_quad(I128 (&acc)[C], const std::uint8_t* b, int part,
+                                               const std::int32_t* const (&xs)[C],
+                                               const std::int32_t* const (&x_sums)[C], int blk, int n) {
+    static_assert(kFastBlock<F>);
+    int acc_a[C], acc_b[C], acc_c[C];
+    long long m_blk[C];
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+        acc_a[c] = acc_b[c] = acc_c[c] = 0;
+        m_blk[c]                       = 0;
+    }
+    if constexpr (F == QType::GGML_Q3_K) {
+        std::uint32_t hw[8], sw[3];
+        sm_ld_words_a2<8>(b, hw);
+        sm_ld_words_a2<3>(b + 96, sw);
+        const int plane = part;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            std::uint32_t qw[8];
+            sm_ld_words_a2<8>(b + 32 + 32 * half, qw);
+            const int sb   = 4 * half + plane;
+            const int s    = 8 * blk + sb;
+            const int sub0 = q3k_sub_from_words(sw, 2 * sb);
+            const int sub1 = q3k_sub_from_words(sw, 2 * sb + 1);
+            int q[8];
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const std::uint32_t ql = (qw[w] >> (2 * plane)) & 0x03030303U;
+                const std::uint32_t qh = (hw[w] >> sb) & 0x01010101U;
+                q[w]                   = sub_bytes4(ql | (qh << 2), 0x04040404U);
+            }
+#pragma unroll
+            for (int c = 0; c < C; ++c) {
+                if (c < n) {
+                    const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
+                    acc_c[c] += limb_dot_q(q, sub0, sub1, l4[4], l4[5]);
+                    acc_b[c] += limb_dot_q(q, sub0, sub1, l4[2], l4[3]);
+                    acc_a[c] += limb_dot_q(q, sub0, sub1, l4[0], l4[1]);
+                }
+            }
+        }
+    } else if constexpr (F == QType::GGML_Q2_K) {
+        const int plane = part;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            std::uint32_t qw[8];
+            sm_ld_words_a2<8>(b + 16 + 32 * half, qw);
+            const int sb            = 4 * half + plane;
+            const int s             = 8 * blk + sb;
+            const std::uint32_t sc2 = sm_ld_u16(b + 8 * half + 2 * plane);
+            const int sub0          = static_cast<int>(sc2 & 0xFU);
+            const int min0          = static_cast<int>((sc2 >> 4) & 0xFU);
+            const int sub1          = static_cast<int>((sc2 >> 8) & 0xFU);
+            const int min1          = static_cast<int>(sc2 >> 12);
+            int q[8];
+#pragma unroll
+            for (int w = 0; w < 8; ++w) { q[w] = static_cast<int>((qw[w] >> (2 * plane)) & 0x03030303U); }
+#pragma unroll
+            for (int c = 0; c < C; ++c) {
+                if (c < n) {
+                    const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
+                    acc_c[c] += limb_dot_q(q, sub0, sub1, l4[4], l4[5]);
+                    acc_b[c] += limb_dot_q(q, sub0, sub1, l4[2], l4[3]);
+                    acc_a[c] += limb_dot_q(q, sub0, sub1, l4[0], l4[1]);
+                    m_blk[c] += static_cast<long long>(min0) * x_sums[c][2 * s] +
+                                static_cast<long long>(min1) * x_sums[c][2 * s + 1];
+                }
+            }
+        }
+    } else {
+        static_assert(F == QType::GGML_Q4_K);
+        const int ch = part;
+        std::uint32_t qw[8];
+        sm_ld_words_a2<8>(b + 16 + 32 * ch, qw);
+#pragma unroll
+        for (int hi = 0; hi < 2; ++hi) {
+            const int sb = 2 * ch + hi;
+            const int s  = 8 * blk + sb;
+            int sc, mn;
+            scale_min_k4(sb, b + 4, sc, mn);
+            int q[8];
+#pragma unroll
+            for (int w = 0; w < 8; ++w) { q[w] = static_cast<int>((qw[w] >> (4 * hi)) & 0x0F0F0F0FU); }
+#pragma unroll
+            for (int c = 0; c < C; ++c) {
+                if (c < n) {
+                    const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
+                    acc_c[c] += limb_dot_q(q, sc, sc, l4[4], l4[5]);
+                    acc_b[c] += limb_dot_q(q, sc, sc, l4[2], l4[3]);
+                    acc_a[c] += limb_dot_q(q, sc, sc, l4[0], l4[1]);
+                    m_blk[c] += static_cast<long long>(mn) *
+                                (static_cast<long long>(x_sums[c][2 * s]) + static_cast<long long>(x_sums[c][2 * s + 1]));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+        if (c < n) {
+            acc_a[c] += __shfl_xor_sync(0xFFFFFFFFU, acc_a[c], 2);
+            acc_a[c] += __shfl_xor_sync(0xFFFFFFFFU, acc_a[c], 1);
+            acc_b[c] += __shfl_xor_sync(0xFFFFFFFFU, acc_b[c], 2);
+            acc_b[c] += __shfl_xor_sync(0xFFFFFFFFU, acc_b[c], 1);
+            acc_c[c] += __shfl_xor_sync(0xFFFFFFFFU, acc_c[c], 2);
+            acc_c[c] += __shfl_xor_sync(0xFFFFFFFFU, acc_c[c], 1);
+            if constexpr (kMin<F> || kMinHalf<F>) {
+                m_blk[c] += __shfl_xor_sync(0xFFFFFFFFU, m_blk[c], 2);
+                m_blk[c] += __shfl_xor_sync(0xFFFFFFFFU, m_blk[c], 1);
+            }
+        }
+    }
+    if (part == 0) {
+        std::uint16_t d = 0, dmin = 0;
+        if constexpr (F == QType::GGML_Q3_K) {
+            d = sm_ld_u16(b + 108);
+        } else if constexpr (F == QType::GGML_Q2_K) {
+            d    = sm_ld_u16(b + 80);
+            dmin = sm_ld_u16(b + 82);
+        } else {
+            d    = sm_ld_u16(b);
+            dmin = sm_ld_u16(b + 2);
+        }
+        std::int64_t mant_u;
+        int shift;
+        bool neg;
+        f16_parts(d, mant_u, shift, neg);
+        const long long mant = neg ? -mant_u : mant_u;
+        long long min_mant = 0;
+        int min_shift      = 0;
+        if constexpr (kMin<F> || kMinHalf<F>) {
+            std::int64_t mm;
+            bool mneg;
+            f16_parts(dmin, mm, min_shift, mneg);
+            min_mant = mneg ? mm : -mm;
+        }
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            if (c < n) {
+                const long long p = static_cast<long long>(acc_c[c]) + (static_cast<long long>(acc_b[c]) << 8) +
+                                    (static_cast<long long>(acc_a[c]) << 16);
+                add_shifted(acc[c], mant * p, shift);
+                if constexpr (kMin<F> || kMinHalf<F>) {
+                    if (m_blk[c] != 0) { add_shifted(acc[c], min_mant * m_blk[c], min_shift); }
+                }
+            }
+        }
+    }
+}
+
 } // namespace infernix::ggml::fast

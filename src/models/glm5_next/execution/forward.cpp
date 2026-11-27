@@ -638,14 +638,16 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
     if (streaming != nullptr) {
         if (stream_.first) { streaming->before_experts(moe_layer, s); }
         source.prefetched      = streaming->slots(moe_layer);
-        source.prefetch_base   = streaming->base();
-        source.prefetch_stride = streaming->pitch(); // the ring's slots: the largest record
-        // Every expert not resident when the chunk began has a ring slot and every record is in
-        // RAM: the call stages nothing, so it runs as one pass over every job instead of staging
-        // passes of half the slots.
-        if (streaming->complete(moe_layer) && experts_.host_tables.empty()) {
+        source.prefetch_base   = streaming->base(moe_layer);
+        source.prefetch_stride = streaming->pitch(moe_layer);
+        // Every non-resident expert at chunk/walk start has a ring slot, and residency does not
+        // evict frames while a stream is active: nothing needs staging, fetching, or CPU service,
+        // so the layer runs in one pass over every job instead of staging passes of half the slots.
+        if (streaming->complete(moe_layer)) {
             source.staging_slots  = 0;
             source.overlap_stream = nullptr;
+            source.fetch          = ops::MoeFetchChannel{};
+            source.cpu            = ops::MoeCpuChannel{};
         }
     }
     const Tensor* rows[] = {&p.router};

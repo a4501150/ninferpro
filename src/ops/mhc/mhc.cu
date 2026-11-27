@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace infernix::ops {
 namespace {
@@ -21,10 +22,11 @@ using bf16 = __nv_bfloat16;
 
 constexpr int kThreads = 256;
 // The mixer's split-K shape, fixed for every T so a column's bits never depend on the call's width:
-// one CTA of kChunkD threads reduces kChunkD features across every stream, then walks kCols columns
-// in sequence; the epilogue sums the chunks in ascending order.
+// each chunk covers kChunkD features across every stream (warp 0 / lower 32 and warp 1 / upper 32
+// reduced in identical butterfly order, then added); the epilogue sums the chunks in ascending
+// order.
 constexpr int kChunkD = 64;
-constexpr int kCols   = 8;
+constexpr int kCols   = 64;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("mhc: ") + message); }
@@ -61,6 +63,18 @@ __device__ __forceinline__ float bf16_value(bf16 v) { return __bfloat162float(v)
 
 __device__ __forceinline__ bf16 rounded_bf16(float v) { return __float2bfloat16_rn(v); }
 
+bool aligned_bytes(const void* p, std::size_t align) {
+    return (reinterpret_cast<std::uintptr_t>(p) & (align - 1)) == 0;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float x) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x += __shfl_xor_sync(0xFFFFFFFFU, x, offset);
+    }
+    return x;
+}
+
 // One output stream's update contribution: post_s * y + sum_j comb[j][s] * R[j], in ascending
 // stream order. Shared verbatim by mhc_update's kernel and the fused mixer's first stage, so both
 // routes round the same FP32 arithmetic to the same bits; the explicit fmaf pins the contraction
@@ -77,213 +91,311 @@ __device__ __forceinline__ float update_stream(const float* post_column, const f
     return acc;
 }
 
-// The mixer's first stage: per column and chunk (kChunkD features across every stream), the
+// The mixer's first stage: per column and chunk (kChunkD = 64 features across every stream), the
 // fixed-order partials of f = fn . R and of the squared RMS, from the rounded BF16 values of the
 // (updated) residual. With kUpdate the stage first applies the residual update elementwise (the
 // same shared arithmetic as mhc_update's kernel, so the fused call keeps the separate calls' bits).
 //
-// The block's kThreads threads split into kRowGroups groups of kChunkD threads, one feature d each;
-// group g reduces gate rows [g * rows_per_group, ...) of its chunk, so a thread holds only a few
-// fn rows' accumulators and the chunk streams its fn slice in one memory wave. Group 0's slot
-// rows_per_group carries the chunk's squared sum (the other groups contribute zeros there), so the
-// reduced layout matches the epilogue's: value v of column t, chunk c at
-// partials[(v * columns + t) * chunks + c], v < gate rows naming f's rows and v == gate rows the
-// squared sum.
+// Each CTA (8 warps = 256 threads) owns one feature chunk across up to kCols columns:
+// 1. Each warp loads its gate rows' fn weights for this chunk once into registers (lane l holds
+//    features l and l + 32, preserving the exact 32+32 butterfly reduction order).
+// 2. Columns advance in batches of kTileT = 8: warp ii cooperatively loads (and, with kUpdate,
+//    updates and stores once) column ii's 64 features using coalesced bfloat162 accesses into
+//    shared memory sh_r[ii][s][64], and writes column ii's squared-sum partial.
+// 3. Every warp accumulates its gate rows across the batch's live columns from sh_r and writes
+//    partials[(t * (kRows + 1) + row) * chunks + chunk], contiguous per column for the epilogue.
 template <int kStreams, bool kUpdate>
 __global__ __launch_bounds__(kThreads) void mhc_partial_kernel(
     const bf16* __restrict__ fn, const bf16* __restrict__ residual_in,
     bf16* __restrict__ residual_out, const bf16* __restrict__ y, const float* __restrict__ post,
-    const float* __restrict__ comb, int hidden, int chunks, int columns,
+    const float* __restrict__ comb, int hidden, int chunks, int columns, bool vec2_ok,
     float* __restrict__ partials) {
     pdl::enter();
-    constexpr int kRows       = (2 + kStreams) * kStreams;
-    constexpr int kRowGroups  = kThreads / kChunkD;
-    constexpr int kRowsGroup  = (kRows + kRowGroups - 1) / kRowGroups;
-    constexpr int kWarpsGroup = kChunkD / 32;
-    constexpr int kVals       = kRowsGroup + 1;
-    constexpr int kInner      = 4; // columns reduced per barrier pair
-    __shared__ float red[kInner * kVals * kRowGroups * kWarpsGroup];
-    const int tid     = static_cast<int>(threadIdx.x);
-    const int group   = tid / kChunkD;
-    const int d       = static_cast<int>(blockIdx.x) * kChunkD + (tid % kChunkD);
-    const bool active = d < hidden;
-    const int row_lo  = group * kRowsGroup;
-    const int row_hi  = min(kRows, row_lo + kRowsGroup);
-    float values[kVals][kInner];
-    for (int base = 0; base < kCols; base += kInner) {
-        // Column base's group starts at or before the last live column, so the batch is not empty.
-        if (static_cast<int>(blockIdx.y) * kCols + base >= columns) { break; }
-        float r[kInner][kStreams];
+    constexpr int kRows        = (2 + kStreams) * kStreams;
+    constexpr int kWarps       = kThreads / 32; // 8
+    constexpr int kRowsPerWarp = (kRows + kWarps - 1) / kWarps;
+    constexpr int kTileT       = kWarps; // 8 columns per shared-memory batch
+
+    __shared__ float sh_r[kTileT][kStreams][kChunkD];
+
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int chunk  = static_cast<int>(blockIdx.x);
+    const int d_base = chunk * kChunkD;
+    const int d0     = d_base + lane;
+    const int d1     = d_base + 32 + lane;
+    const bool act0  = d0 < hidden;
+    const bool act1  = d1 < hidden;
+    const bool full  = (d_base + kChunkD <= hidden);
+
+    // Load this warp's gate rows of fn once for all kCols columns.
+    float fn0[kRowsPerWarp][kStreams];
+    float fn1[kRowsPerWarp][kStreams];
+    const int row_lo = warp * kRowsPerWarp;
 #pragma unroll
-        for (int ii = 0; ii < kInner; ++ii) {
-            const int t              = static_cast<int>(blockIdx.y) * kCols + base + ii;
-            const bool live          = t < columns;
+    for (int v = 0; v < kRowsPerWarp; ++v) {
+        const int i = row_lo + v;
+        if (i < kRows) {
+            const bf16* row = fn + static_cast<std::size_t>(i) * (kStreams * hidden);
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) {
+                const bf16* sp = row + static_cast<std::size_t>(s) * hidden;
+                fn0[v][s]      = act0 ? bf16_value(sp[d0]) : 0.0F;
+                fn1[v][s]      = act1 ? bf16_value(sp[d1]) : 0.0F;
+            }
+        } else {
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) {
+                fn0[v][s] = 0.0F;
+                fn1[v][s] = 0.0F;
+            }
+        }
+    }
+
+    const int col_start = static_cast<int>(blockIdx.y) * kCols;
+    const int col_end   = min(columns, col_start + kCols);
+
+    for (int col_base = col_start; col_base < col_end; col_base += kTileT) {
+        const int live_cols = min(kTileT, col_end - col_base);
+        // Step 1: warp `warp` loads (and optionally updates + stores once) column `col_base + warp`.
+        if (warp < live_cols) {
+            const int t              = col_base + warp;
             const std::size_t column = static_cast<std::size_t>(t) * (kStreams * hidden);
-            if (kUpdate) {
-                float residual_old[kStreams];
+            if (full && vec2_ok) {
+                const int d2 = d_base + 2 * lane;
+                if constexpr (kUpdate) {
+                    float old0[kStreams], old1[kStreams];
 #pragma unroll
-                for (int j = 0; j < kStreams; ++j) {
-                    residual_old[j] =
-                        live && active
-                            ? bf16_value(
-                                  residual_in[column + static_cast<std::size_t>(j) * hidden + d])
-                            : 0.0F;
-                }
-                const float y_value =
-                    live && active ? bf16_value(y[static_cast<std::size_t>(t) * hidden + d]) : 0.0F;
-                const float* post_column = post + static_cast<std::size_t>(t) * kStreams;
-                const float* comb_column = comb + static_cast<std::size_t>(t) * kStreams * kStreams;
-#pragma unroll
-                for (int s = 0; s < kStreams; ++s) {
-                    const bf16 updated = rounded_bf16(update_stream<kStreams>(
-                        post_column, comb_column, y_value, residual_old, s));
-                    if (live && active && group == 0) {
-                        residual_out[column + static_cast<std::size_t>(s) * hidden + d] = updated;
+                    for (int j = 0; j < kStreams; ++j) {
+                        const __nv_bfloat162 pair = *reinterpret_cast<const __nv_bfloat162*>(
+                            residual_in + column + static_cast<std::size_t>(j) * hidden + d2);
+                        const float2 f = __bfloat1622float2(pair);
+                        old0[j]        = f.x;
+                        old1[j]        = f.y;
                     }
-                    r[ii][s] = bf16_value(updated);
+                    const __nv_bfloat162 ypair = *reinterpret_cast<const __nv_bfloat162*>(
+                        y + static_cast<std::size_t>(t) * hidden + d2);
+                    const float2 yf          = __bfloat1622float2(ypair);
+                    const float* post_column = post + static_cast<std::size_t>(t) * kStreams;
+                    const float* comb_column =
+                        comb + static_cast<std::size_t>(t) * kStreams * kStreams;
+                    float post_r[kStreams];
+                    float comb_r[kStreams * kStreams];
+#pragma unroll
+                    for (int s = 0; s < kStreams; ++s) { post_r[s] = post_column[s]; }
+#pragma unroll
+                    for (int k = 0; k < kStreams * kStreams; ++k) { comb_r[k] = comb_column[k]; }
+#pragma unroll
+                    for (int s = 0; s < kStreams; ++s) {
+                        const bf16 u0 = rounded_bf16(
+                            update_stream<kStreams>(post_r, comb_r, yf.x, old0, s));
+                        const bf16 u1 = rounded_bf16(
+                            update_stream<kStreams>(post_r, comb_r, yf.y, old1, s));
+                        *reinterpret_cast<__nv_bfloat162*>(
+                            residual_out + column + static_cast<std::size_t>(s) * hidden + d2) =
+                            __halves2bfloat162(u0, u1);
+                        sh_r[warp][s][2 * lane]     = bf16_value(u0);
+                        sh_r[warp][s][2 * lane + 1] = bf16_value(u1);
+                    }
+                } else {
+#pragma unroll
+                    for (int s = 0; s < kStreams; ++s) {
+                        const __nv_bfloat162 pair = *reinterpret_cast<const __nv_bfloat162*>(
+                            residual_in + column + static_cast<std::size_t>(s) * hidden + d2);
+                        const float2 f              = __bfloat1622float2(pair);
+                        sh_r[warp][s][2 * lane]     = f.x;
+                        sh_r[warp][s][2 * lane + 1] = f.y;
+                    }
                 }
             } else {
+                const float* post_column =
+                    kUpdate ? post + static_cast<std::size_t>(t) * kStreams : nullptr;
+                const float* comb_column =
+                    kUpdate ? comb + static_cast<std::size_t>(t) * kStreams * kStreams : nullptr;
 #pragma unroll
-                for (int s = 0; s < kStreams; ++s) {
-                    r[ii][s] =
-                        live && active
-                            ? bf16_value(
-                                  residual_in[column + static_cast<std::size_t>(s) * hidden + d])
-                            : 0.0F;
+                for (int k = 0; k < 2; ++k) {
+                    const int idx  = 2 * lane + k;
+                    const int d    = d_base + idx;
+                    const bool act = d < hidden;
+                    if constexpr (kUpdate) {
+                        float old_r[kStreams];
+#pragma unroll
+                        for (int j = 0; j < kStreams; ++j) {
+                            old_r[j] = act ? bf16_value(residual_in[column +
+                                                                    static_cast<std::size_t>(j) *
+                                                                        hidden +
+                                                                    d])
+                                           : 0.0F;
+                        }
+                        const float yv =
+                            act ? bf16_value(y[static_cast<std::size_t>(t) * hidden + d]) : 0.0F;
+#pragma unroll
+                        for (int s = 0; s < kStreams; ++s) {
+                            const bf16 u = rounded_bf16(
+                                update_stream<kStreams>(post_column, comb_column, yv, old_r, s));
+                            if (act) {
+                                residual_out[column + static_cast<std::size_t>(s) * hidden + d] = u;
+                            }
+                            sh_r[warp][s][idx] = act ? bf16_value(u) : 0.0F;
+                        }
+                    } else {
+#pragma unroll
+                        for (int s = 0; s < kStreams; ++s) {
+                            sh_r[warp][s][idx] =
+                                act ? bf16_value(residual_in[column +
+                                                             static_cast<std::size_t>(s) * hidden +
+                                                             d])
+                                    : 0.0F;
+                        }
+                    }
                 }
             }
-        }
-        // One fn read per (row, stream) serves every column of the batch; each column's partial
-        // accumulates its kStreams products in ascending stream order, then the batch's
-        // kInner * kVals values reduce through shared memory in one barrier pair.
+            __syncwarp();
+            float sq0 = 0.0F, sq1 = 0.0F;
 #pragma unroll
-        for (int v = 0; v < kRowsGroup; ++v) {
-            const int i = row_lo + v;
-            float acc[kInner];
-#pragma unroll
-            for (int ii = 0; ii < kInner; ++ii) { acc[ii] = 0.0F; }
-            if (i < row_hi) {
-                const bf16* row = fn + static_cast<std::size_t>(i) * (kStreams * hidden);
-#pragma unroll
-                for (int s = 0; s < kStreams; ++s) {
-                    const float fnv =
-                        active ? bf16_value(row[static_cast<std::size_t>(s) * hidden + d]) : 0.0F;
-#pragma unroll
-                    for (int ii = 0; ii < kInner; ++ii) { acc[ii] += fnv * r[ii][s]; }
-                }
+            for (int s = 0; s < kStreams; ++s) {
+                const float v0 = sh_r[warp][s][lane];
+                const float v1 = sh_r[warp][s][32 + lane];
+                sq0 += v0 * v0;
+                sq1 += v1 * v1;
             }
-#pragma unroll
-            for (int ii = 0; ii < kInner; ++ii) { values[v][ii] = acc[ii]; }
-        }
-#pragma unroll
-        for (int ii = 0; ii < kInner; ++ii) {
-            float squared = 0.0F;
-#pragma unroll
-            for (int s = 0; s < kStreams; ++s) { squared += r[ii][s] * r[ii][s]; }
-            values[kRowsGroup][ii] = group == 0 ? squared : 0.0F;
-        }
-        const int lane          = tid & 31;
-        const int warp_in_group = (tid % kChunkD) / 32;
-#pragma unroll
-        for (int v = 0; v < kVals; ++v) {
-#pragma unroll
-            for (int ii = 0; ii < kInner; ++ii) {
-                float x = values[v][ii];
-#pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    x += __shfl_xor_sync(0xFFFFFFFFU, x, offset);
-                }
-                if (lane == 0) {
-                    red[((v * kInner + ii) * kRowGroups + group) * kWarpsGroup + warp_in_group] = x;
-                }
+            sq0 = warp_reduce_sum(sq0);
+            sq1 = warp_reduce_sum(sq1);
+            if (lane == 0) {
+                partials[(static_cast<std::size_t>(col_base) * (kRows + 1) +
+                          static_cast<std::size_t>(kRows) * live_cols) *
+                             chunks +
+                         static_cast<std::size_t>(chunk) * live_cols + warp] = sq0 + sq1;
             }
         }
         __syncthreads();
-        if (tid % kChunkD < kInner * kVals) {
-            const int local      = tid % kChunkD;
-            const int v          = local / kInner;
-            const int ii         = local % kInner;
-            const bool is_square = v == kRowsGroup;
-            const int global_row = group * kRowsGroup + v;
-            const int t_i        = static_cast<int>(blockIdx.y) * kCols + base + ii;
-            const bool writes    = t_i < columns && (is_square ? group == 0 : global_row < kRows);
-            if (writes) {
-                const int row = is_square ? kRows : global_row;
-                float x       = 0.0F;
+
+        // Step 2: every warp reduces its gate rows across the live columns of this batch.
+        const std::size_t group_base =
+            static_cast<std::size_t>(col_base) * (kRows + 1) * chunks;
+        const auto reduce_cols = [&](auto count_tag, int v, int i) {
+            constexpr int kN = decltype(count_tag)::value;
+            float acc0[kN], acc1[kN];
 #pragma unroll
-                for (int w = 0; w < kWarpsGroup; ++w) {
-                    x += red[((v * kInner + ii) * kRowGroups + group) * kWarpsGroup + w];
+            for (int ii = 0; ii < kN; ++ii) {
+                acc0[ii] = 0.0F;
+                acc1[ii] = 0.0F;
+            }
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) {
+                const float w0 = fn0[v][s];
+                const float w1 = fn1[v][s];
+#pragma unroll
+                for (int ii = 0; ii < kN; ++ii) {
+                    acc0[ii] += w0 * sh_r[ii][s][lane];
+                    acc1[ii] += w1 * sh_r[ii][s][32 + lane];
                 }
-                partials[(static_cast<std::size_t>(row) * columns + t_i) * chunks +
-                         static_cast<int>(blockIdx.x)] = x;
+            }
+            float* const dst =
+                partials + group_base + (static_cast<std::size_t>(i) * chunks + chunk) * kN;
+#pragma unroll
+            for (int ii = 0; ii < kN; ++ii) {
+                const float s0 = warp_reduce_sum(acc0[ii]);
+                const float s1 = warp_reduce_sum(acc1[ii]);
+                if (lane == 0) { dst[ii] = s0 + s1; }
+            }
+        };
+#pragma unroll
+        for (int v = 0; v < kRowsPerWarp; ++v) {
+            const int i = row_lo + v;
+            if (i >= kRows) { break; }
+            if (live_cols == kTileT) {
+                reduce_cols(std::integral_constant<int, kTileT>{}, v, i);
+            } else if (live_cols == 4) {
+                reduce_cols(std::integral_constant<int, 4>{}, v, i);
+            } else if (live_cols == 2) {
+                reduce_cols(std::integral_constant<int, 2>{}, v, i);
+            } else if (live_cols == 1) {
+                reduce_cols(std::integral_constant<int, 1>{}, v, i);
+            } else {
+                float* const dst = partials + group_base +
+                                   (static_cast<std::size_t>(i) * chunks + chunk) * live_cols;
+                for (int ii = 0; ii < live_cols; ++ii) {
+                    float acc0 = 0.0F, acc1 = 0.0F;
+#pragma unroll
+                    for (int s = 0; s < kStreams; ++s) {
+                        acc0 += fn0[v][s] * sh_r[ii][s][lane];
+                        acc1 += fn1[v][s] * sh_r[ii][s][32 + lane];
+                    }
+                    const float s0 = warp_reduce_sum(acc0);
+                    const float s1 = warp_reduce_sum(acc1);
+                    if (lane == 0) { dst[ii] = s0 + s1; }
+                }
             }
         }
-        // The next batch's warp partials overwrite red.
         __syncthreads();
     }
 }
 
-// The mixer's second stage: per column, the fixed-order sum of the chunks gives f and the squared
-// RMS; warp 0 turns them into pre, post and the Sinkhorn-normalized comb (the S x S matrix lives on
-// one warp's lanes: lane = i * S + j, input i, output j), and every CTA writes its feature slice of
-// x = bf16(sum_s pre_s * R[s*H + d]) from the (updated) residual.
+// The mixer's second stage: one CTA per column sums the column's partials in ascending chunk order
+// once, computes pre/post/Sinkhorn comb on warp 0, and streams vectorized uint4 residual loads to
+// write x = bf16(sum_s pre_s * R[s*H + d]) across all 256 threads.
 template <int kStreams>
 __global__ __launch_bounds__(kThreads) void mhc_epilogue_kernel(
     const float* __restrict__ partials, const bf16* __restrict__ residual,
     const float* __restrict__ base, const float* __restrict__ scale, int hidden, int chunks,
-    int columns, int sinkhorn_iters, float eps_norm, float eps, bf16* __restrict__ x,
+    int columns, int sinkhorn_iters, float eps_norm, float eps, bool vec8_ok, bf16* __restrict__ x,
     float* __restrict__ post, float* __restrict__ comb) {
     pdl::enter();
-    constexpr int kRows = (2 + kStreams) * kStreams;
-    constexpr int kS2   = kStreams * kStreams;
-    const int kWidth    = kStreams * hidden;
+    constexpr int kRows  = (2 + kStreams) * kStreams;
+    constexpr int kS2    = kStreams * kStreams;
+    constexpr int kTileT = kThreads / 32;
+    const int kWidth     = kStreams * hidden;
     __shared__ float sh_f[kRows + 1];
     __shared__ float sh_pre[kStreams];
-    const int t    = static_cast<int>(blockIdx.y);
+    const int t    = static_cast<int>(blockIdx.x);
     const int tid  = static_cast<int>(threadIdx.x);
     const int lane = tid & 31;
     if (tid < 32) {
-        // f and the RMS: one lane per gate row, one lane for the squared sum, chunks in ascending
-        // order. f = (fn . R) * rsqrt(mean(R^2) + eps_norm).
-        if (lane < kRows) {
-            const float* row_partial = partials +
-                                       static_cast<std::size_t>(lane) * columns * chunks +
-                                       static_cast<std::size_t>(t) * chunks;
-            float sum                = 0.0F;
-            for (int c = 0; c < chunks; ++c) { sum += row_partial[c]; }
+        const int col_base = (t / kTileT) * kTileT;
+        const int w        = min(kTileT, columns - col_base);
+        const int off      = t - col_base;
+        const std::size_t group_base =
+            static_cast<std::size_t>(col_base) * (kRows + 1) * chunks;
+        if (lane <= kRows) {
+            const float* row_partial =
+                partials + group_base + static_cast<std::size_t>(lane) * chunks * w + off;
+            float sum = 0.0F;
+            if (w == 1 && (chunks & 3) == 0) {
+                const auto* p4 = reinterpret_cast<const float4*>(row_partial);
+                const int n4   = chunks >> 2;
+                for (int c = 0; c < n4; ++c) {
+                    const float4 v = p4[c];
+                    sum += v.x;
+                    sum += v.y;
+                    sum += v.z;
+                    sum += v.w;
+                }
+            } else {
+                for (int c = 0; c < chunks; ++c) {
+                    sum += row_partial[static_cast<std::size_t>(c) * w];
+                }
+            }
             sh_f[lane] = sum;
-        }
-        if (lane == kRows) {
-            const float* sq_partial = partials +
-                                      static_cast<std::size_t>(kRows) * columns * chunks +
-                                      static_cast<std::size_t>(t) * chunks;
-            float sum               = 0.0F;
-            for (int c = 0; c < chunks; ++c) { sum += sq_partial[c]; }
-            sh_f[kRows] = sum;
         }
         __syncwarp();
         const float inverse_rms = rsqrtf(sh_f[kRows] / static_cast<float>(kWidth) + eps_norm);
         if (lane < kRows) { sh_f[lane] *= inverse_rms; }
         __syncwarp();
-        // pre and post (independent of the Sinkhorn below); the first CTA of the column publishes
-        // post, so the other warps can compute x while warp 0 normalizes comb.
         if (lane < kStreams) {
             sh_pre[lane] = sigmoid(sh_f[lane] * scale[0] + base[lane]) + eps;
-            if (blockIdx.x == 0 && post != nullptr) {
+            if (post != nullptr) {
                 post[static_cast<std::size_t>(t) * kStreams + lane] =
                     2.0F * sigmoid(sh_f[kStreams + lane] * scale[1] + base[kStreams + lane]);
             }
         }
     }
     __syncthreads();
-    if (tid < 32 && blockIdx.x == 0) {
-        // comb: row-softmax over the output index (only the publishing CTA runs it; the others go
-        // straight to x, which needs only pre), + eps, then Sinkhorn's alternating
-        // column/row normalizations; lanes >= S*S carry lane & (S*S - 1)'s value so the full-warp
-        // butterflies stay consistent.
+    if (tid < 32) {
         float logit = 0.0F;
         if (lane < kS2) {
-            const int f_at = 2 * kStreams + lane; // row i = lane / S, column j = lane % S
+            const int f_at = 2 * kStreams + lane;
             logit          = sh_f[f_at] * scale[2] + base[f_at];
         }
         float m = logit;
@@ -315,52 +427,137 @@ __global__ __launch_bounds__(kThreads) void mhc_epilogue_kernel(
             }
             v /= (column_sum + eps);
         }
-        if (blockIdx.x == 0 && comb != nullptr && lane < kS2) {
+        if (comb != nullptr && lane < kS2) {
             comb[(static_cast<std::size_t>(t) * kStreams + (lane % kStreams)) * kStreams +
                  (lane / kStreams)] = v;
         }
     }
-    // x from the (updated) residual and the published pre; warp 0 joins once its Sinkhorn is done.
-    const int d = static_cast<int>(blockIdx.x) * kThreads + tid;
-    if (d < hidden) {
-        const std::size_t column = static_cast<std::size_t>(t) * kWidth;
-        float acc                = 0.0F;
+    // All warps stream x from the (updated) residual; warps 1..7 overlap warp 0's Sinkhorn.
+    float pre_r[kStreams];
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) {
-            acc +=
-                sh_pre[s] * bf16_value(residual[column + static_cast<std::size_t>(s) * hidden + d]);
+    for (int s = 0; s < kStreams; ++s) { pre_r[s] = sh_pre[s]; }
+    const std::size_t column = static_cast<std::size_t>(t) * kWidth;
+    if (vec8_ok) {
+        const int hidden_vec = hidden >> 3;
+        auto* x_vec          = reinterpret_cast<uint4*>(x + static_cast<std::size_t>(t) * hidden);
+        for (int v = tid; v < hidden_vec; v += kThreads) {
+            float acc[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) {
+                const uint4 raw = *reinterpret_cast<const uint4*>(
+                    residual + column + static_cast<std::size_t>(s) * hidden +
+                    static_cast<std::size_t>(v) * 8);
+                const auto* p2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+                const float ps = pre_r[s];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float2 f = __bfloat1622float2(p2[k]);
+                    acc[2 * k] += ps * f.x;
+                    acc[2 * k + 1] += ps * f.y;
+                }
+            }
+            uint4 out_v;
+            auto* out_p2 = reinterpret_cast<__nv_bfloat162*>(&out_v);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                out_p2[k] = __halves2bfloat162(rounded_bf16(acc[2 * k]),
+                                               rounded_bf16(acc[2 * k + 1]));
+            }
+            x_vec[v] = out_v;
         }
-        x[static_cast<std::size_t>(t) * hidden + d] = rounded_bf16(acc);
+    } else {
+        for (int d = tid; d < hidden; d += kThreads) {
+            float acc = 0.0F;
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) {
+                acc += pre_r[s] *
+                       bf16_value(residual[column + static_cast<std::size_t>(s) * hidden + d]);
+            }
+            x[static_cast<std::size_t>(t) * hidden + d] = rounded_bf16(acc);
+        }
     }
 }
 
-// mhc_update's kernel: one feature d of every stream per thread, the old streams read before any
-// write so residual_out may alias residual_in.
+// mhc_update's kernel: vectorized uint4 over hidden when 8-element aligned, with an elementwise
+// fallback for arbitrary hidden sizes. Old streams are read before any write so residual_out may
+// alias residual_in.
 template <int kStreams>
-__global__ __launch_bounds__(kChunkD) void mhc_update_kernel(const bf16* __restrict__ y,
-                                                             const float* __restrict__ post,
-                                                             const float* __restrict__ comb,
-                                                             const bf16* __restrict__ residual_in,
-                                                             bf16* __restrict__ residual_out,
-                                                             int hidden, int columns) {
+__global__ __launch_bounds__(kThreads) void mhc_update_kernel(const bf16* __restrict__ y,
+                                                              const float* __restrict__ post,
+                                                              const float* __restrict__ comb,
+                                                              const bf16* __restrict__ residual_in,
+                                                              bf16* __restrict__ residual_out,
+                                                              int hidden, bool vec8_ok) {
     pdl::enter();
-    const int d = static_cast<int>(blockIdx.x) * kChunkD + static_cast<int>(threadIdx.x);
-    const int t = static_cast<int>(blockIdx.y);
-    if (d >= hidden) { return; }
+    const int t              = static_cast<int>(blockIdx.y);
     const std::size_t column = static_cast<std::size_t>(t) * (kStreams * hidden);
+    const float* post_column = post + static_cast<std::size_t>(t) * kStreams;
+    const float* comb_column = comb + static_cast<std::size_t>(t) * kStreams * kStreams;
+    float post_r[kStreams];
+    float comb_r[kStreams * kStreams];
+#pragma unroll
+    for (int s = 0; s < kStreams; ++s) { post_r[s] = post_column[s]; }
+#pragma unroll
+    for (int k = 0; k < kStreams * kStreams; ++k) { comb_r[k] = comb_column[k]; }
+
+    if (vec8_ok) {
+        const int v = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
+        if (v >= (hidden >> 3)) { return; }
+        const std::size_t off = static_cast<std::size_t>(v) * 8;
+        float old_r[8][kStreams];
+#pragma unroll
+        for (int j = 0; j < kStreams; ++j) {
+            const uint4 raw = *reinterpret_cast<const uint4*>(
+                residual_in + column + static_cast<std::size_t>(j) * hidden + off);
+            const auto* p2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float2 f        = __bfloat1622float2(p2[k]);
+                old_r[2 * k][j]       = f.x;
+                old_r[2 * k + 1][j]   = f.y;
+            }
+        }
+        const uint4 y_raw = *reinterpret_cast<const uint4*>(
+            y + static_cast<std::size_t>(t) * hidden + off);
+        const auto* yp2 = reinterpret_cast<const __nv_bfloat162*>(&y_raw);
+        float yv[8];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 f = __bfloat1622float2(yp2[k]);
+            yv[2 * k]      = f.x;
+            yv[2 * k + 1]  = f.y;
+        }
+#pragma unroll
+        for (int s = 0; s < kStreams; ++s) {
+            uint4 out_v;
+            auto* out_p2 = reinterpret_cast<__nv_bfloat162*>(&out_v);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const bf16 u0 =
+                    rounded_bf16(update_stream<kStreams>(post_r, comb_r, yv[2 * k], old_r[2 * k], s));
+                const bf16 u1 = rounded_bf16(
+                    update_stream<kStreams>(post_r, comb_r, yv[2 * k + 1], old_r[2 * k + 1], s));
+                out_p2[k] = __halves2bfloat162(u0, u1);
+            }
+            *reinterpret_cast<uint4*>(residual_out + column +
+                                      static_cast<std::size_t>(s) * hidden + off) = out_v;
+        }
+        return;
+    }
+
+    const int d = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
+    if (d >= hidden) { return; }
     float residual_old[kStreams];
 #pragma unroll
     for (int j = 0; j < kStreams; ++j) {
         residual_old[j] =
             bf16_value(residual_in[column + static_cast<std::size_t>(j) * hidden + d]);
     }
-    const float y_value      = bf16_value(y[static_cast<std::size_t>(t) * hidden + d]);
-    const float* post_column = post + static_cast<std::size_t>(t) * kStreams;
-    const float* comb_column = comb + static_cast<std::size_t>(t) * kStreams * kStreams;
+    const float y_value = bf16_value(y[static_cast<std::size_t>(t) * hidden + d]);
 #pragma unroll
     for (int s = 0; s < kStreams; ++s) {
         residual_out[column + static_cast<std::size_t>(s) * hidden + d] = rounded_bf16(
-            update_stream<kStreams>(post_column, comb_column, y_value, residual_old, s));
+            update_stream<kStreams>(post_r, comb_r, y_value, residual_old, s));
     }
 }
 
@@ -383,13 +580,17 @@ void run_mix(const Tensor& residual_in, const Tensor* residual_out, const Tensor
     const auto* residual_p = static_cast<const bf16*>(residual_in.data);
     auto* out_p      = residual_out != nullptr ? static_cast<bf16*>(residual_out->data) : nullptr;
     const int groups = (columns + kCols - 1) / kCols;
+    const bool vec2_ok =
+        (hidden & 1) == 0 && aligned_bytes(residual_p, 4) &&
+        (out_p == nullptr || aligned_bytes(out_p, 4)) &&
+        (y == nullptr || aligned_bytes(y->data, 4));
     if (residual_out != nullptr) {
         if (pdl::launch_consumer({dim3(chunks, groups), dim3(kThreads), 0, stream},
                                  mhc_partial_kernel<kStreams, true>, fn_p, residual_p, out_p,
                                  static_cast<const bf16*>(y->data),
                                  static_cast<const float*>(post_in->data),
                                  static_cast<const float*>(comb_in->data), hidden, chunks, columns,
-                                 static_cast<float*>(partials.data)) != cudaSuccess) {
+                                 vec2_ok, static_cast<float*>(partials.data)) != cudaSuccess) {
             check_launch("update mix partial");
         }
     } else {
@@ -398,16 +599,18 @@ void run_mix(const Tensor& residual_in, const Tensor* residual_out, const Tensor
                                  static_cast<bf16*>(nullptr), static_cast<const bf16*>(nullptr),
                                  static_cast<const float*>(nullptr),
                                  static_cast<const float*>(nullptr), hidden, chunks, columns,
-                                 static_cast<float*>(partials.data)) != cudaSuccess) {
+                                 vec2_ok, static_cast<float*>(partials.data)) != cudaSuccess) {
             check_launch("mix partial");
         }
     }
     const bf16* mix_residual = residual_out != nullptr ? out_p : residual_p;
+    const bool vec8_ok =
+        (hidden & 7) == 0 && aligned_bytes(mix_residual, 16) && aligned_bytes(x.data, 16);
     if (pdl::launch_consumer(
-            {dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
-            mhc_epilogue_kernel<kStreams>, static_cast<const float*>(partials.data), mix_residual,
+            {dim3(columns), dim3(kThreads), 0, stream}, mhc_epilogue_kernel<kStreams>,
+            static_cast<const float*>(partials.data), mix_residual,
             static_cast<const float*>(base.data), static_cast<const float*>(scale.data), hidden,
-            chunks, columns, sinkhorn_iters, eps_norm, eps, static_cast<bf16*>(x.data),
+            chunks, columns, sinkhorn_iters, eps_norm, eps, vec8_ok, static_cast<bf16*>(x.data),
             post_out != nullptr ? static_cast<float*>(post_out->data) : nullptr,
             comb_out != nullptr ? static_cast<float*>(comb_out->data) : nullptr) != cudaSuccess) {
         check_launch("mix epilogue");
@@ -506,37 +709,45 @@ std::size_t mhc_mix_workspace_capacity_bytes(std::int32_t streams, std::int32_t 
 void mhc_update(const Tensor& y, const Tensor& post, const Tensor& comb, const Tensor& residual_in,
                 Tensor& residual_out, cudaStream_t stream) {
     validate_update(y, post, comb, residual_in, residual_out);
-    const int streams = post.ne[0];
-    const int hidden  = y.ne[0];
-    const int columns = y.ne[1];
+    const int streams  = post.ne[0];
+    const int hidden   = y.ne[0];
+    const int columns  = y.ne[1];
+    const bool vec8_ok = (hidden & 7) == 0 && aligned_bytes(y.data, 16) &&
+                         aligned_bytes(residual_in.data, 16) &&
+                         aligned_bytes(residual_out.data, 16);
+    const int work_x = vec8_ok ? (hidden >> 3) : hidden;
+    const dim3 grid((work_x + kThreads - 1) / kThreads, columns);
     switch (streams) {
     case 1:
-        if (pdl::launch_consumer(
-                {dim3((hidden + kChunkD - 1) / kChunkD, columns), dim3(kChunkD), 0, stream},
-                mhc_update_kernel<1>, static_cast<const bf16*>(y.data),
-                static_cast<const float*>(post.data), static_cast<const float*>(comb.data),
-                static_cast<const bf16*>(residual_in.data), static_cast<bf16*>(residual_out.data),
-                hidden, columns) != cudaSuccess) {
+        if (pdl::launch_consumer({grid, dim3(kThreads), 0, stream}, mhc_update_kernel<1>,
+                                 static_cast<const bf16*>(y.data),
+                                 static_cast<const float*>(post.data),
+                                 static_cast<const float*>(comb.data),
+                                 static_cast<const bf16*>(residual_in.data),
+                                 static_cast<bf16*>(residual_out.data), hidden,
+                                 vec8_ok) != cudaSuccess) {
             check_launch("update");
         }
         break;
     case 2:
-        if (pdl::launch_consumer(
-                {dim3((hidden + kChunkD - 1) / kChunkD, columns), dim3(kChunkD), 0, stream},
-                mhc_update_kernel<2>, static_cast<const bf16*>(y.data),
-                static_cast<const float*>(post.data), static_cast<const float*>(comb.data),
-                static_cast<const bf16*>(residual_in.data), static_cast<bf16*>(residual_out.data),
-                hidden, columns) != cudaSuccess) {
+        if (pdl::launch_consumer({grid, dim3(kThreads), 0, stream}, mhc_update_kernel<2>,
+                                 static_cast<const bf16*>(y.data),
+                                 static_cast<const float*>(post.data),
+                                 static_cast<const float*>(comb.data),
+                                 static_cast<const bf16*>(residual_in.data),
+                                 static_cast<bf16*>(residual_out.data), hidden,
+                                 vec8_ok) != cudaSuccess) {
             check_launch("update");
         }
         break;
     default:
-        if (pdl::launch_consumer(
-                {dim3((hidden + kChunkD - 1) / kChunkD, columns), dim3(kChunkD), 0, stream},
-                mhc_update_kernel<4>, static_cast<const bf16*>(y.data),
-                static_cast<const float*>(post.data), static_cast<const float*>(comb.data),
-                static_cast<const bf16*>(residual_in.data), static_cast<bf16*>(residual_out.data),
-                hidden, columns) != cudaSuccess) {
+        if (pdl::launch_consumer({grid, dim3(kThreads), 0, stream}, mhc_update_kernel<4>,
+                                 static_cast<const bf16*>(y.data),
+                                 static_cast<const float*>(post.data),
+                                 static_cast<const float*>(comb.data),
+                                 static_cast<const bf16*>(residual_in.data),
+                                 static_cast<bf16*>(residual_out.data), hidden,
+                                 vec8_ok) != cudaSuccess) {
             check_launch("update");
         }
         break;

@@ -750,7 +750,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
-| GLM-5.3-Flash: `ggml-bf16-prefill` | GGUF expert jobs of more than 8 entries in wide (prefill) calls | the GSQ-Q4 GGUF artifact with INT8 KV (BF16 KV not gated) |
+| GLM-5.3-Flash: `ggml-bf16-prefill` | GGUF expert jobs in wide calls (all active non-CPU jobs at 64+ columns; > 8 entries at 9-63 columns) | the GSQ-Q4 GGUF artifact with INT8 KV (BF16 KV not gated) |
 | Qwen3.8-Flash-Next: `gdn-compensated` | GDN calls of 16+ tokens in the construction-exact configurations (recipe C with BF16, INT8 or FP8 KV) | recipe C with INT8 or FP8 KV (BF16 KV is the reference's own exact route, not gated; 6.8) |
 | Qwen3.8-Flash-Next: `hc-sliced-k` | the Q8 hyper-connection mix ([324, 10240], [320, 10240]) of recipe C at 29-2,048 columns | recipe C with FP8 KV (INT8 fails its decode tail, below; other formats not gated) |
 | Qwen3.8-Flash-Next: `bf16-index-mma` | the BF16 QSA index projection ([640, 2560]) of recipe C at 9 or more columns | recipe C with FP8 KV (other formats not gated) |

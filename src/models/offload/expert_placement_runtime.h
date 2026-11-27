@@ -301,7 +301,7 @@ private:
     static constexpr std::uint32_t kSeedCountCap = 16;
     // The share of the frames a warm start fills (the best-ranked experts); the rest stay free
     // for the fill phase's landing, so a workload unlike the saved state still fills quickly.
-    static constexpr double kSeedShare = 0.5;
+    static constexpr double kSeedShare = 0.90;
     static constexpr std::chrono::minutes kExpertStateInterval{10};
     std::chrono::steady_clock::time_point expert_state_saved_{};
     std::uint64_t expert_state_routed_ = 0;

@@ -2,8 +2,10 @@
 
 // Implements: include/infernix/ops/top_logprobs.h
 // Match: contiguous BF16 or FP32 [physical_rows,C], I32 [K,C], and FP32 [K,C].
-// Algorithm assumptions: one 256-thread CTA per column computes the column's logsumexp, then each
-// of K passes selects the largest (value, -row) key below the previous pass's.
+// Algorithm assumptions: one 1024-thread CTA per column fuses single-pass online logsumexp with a
+// per-thread top-4 buffer and tracks the maximum dropped key; ranks strictly above that floor are
+// extracted directly from registers with exact tie-breaking, and any remaining ranks fall back to
+// exact column scans.
 
 #include "ops/kernel/target_logprobs.cuh"
 
@@ -13,7 +15,7 @@
 
 namespace infernix::ops {
 
-inline constexpr int kTopLogprobsBlock = 256;
+inline constexpr int kTopLogprobsBlock = 1024;
 
 // Larger keys rank first: descending value, then ascending row. Equal values share their high
 // half (zero of either sign included), and every valid row's key is nonzero.
@@ -60,11 +62,74 @@ __launch_bounds__(BlockSize) __global__
                              std::int32_t count) {
     const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
     const Logit* values       = logits + static_cast<std::int64_t>(column) * physical_rows;
-    const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows);
 
-    unsigned long long previous = ~0ULL;
-    for (std::int32_t rank = 0; rank < count; ++rank) {
-        unsigned long long best = 0;
+    // Single pass: online logsumexp + per-thread top-4 keys + max dropped key.
+    float local_max              = -CUDART_INF_F;
+    float local_sum              = 0.0f;
+    unsigned long long top[4]    = {0ULL, 0ULL, 0ULL, 0ULL};
+    unsigned long long dropped   = 0ULL;
+    for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
+         row += BlockSize) {
+        const float value   = logprob_logit(values[row]);
+        const float new_max = fmaxf(local_max, value);
+        if (new_max > local_max) { local_sum *= expf(local_max - new_max); }
+        local_max = new_max;
+        local_sum += expf(value - local_max);
+
+        const unsigned long long key = top_logprobs_key(value, row);
+        if (key > top[3]) {
+            if (top[3] > dropped) { dropped = top[3]; }
+            if (key > top[0]) {
+                top[3] = top[2];
+                top[2] = top[1];
+                top[1] = top[0];
+                top[0] = key;
+            } else if (key > top[1]) {
+                top[3] = top[2];
+                top[2] = top[1];
+                top[1] = key;
+            } else if (key > top[2]) {
+                top[3] = top[2];
+                top[2] = key;
+            } else {
+                top[3] = key;
+            }
+        } else if (key > dropped) {
+            dropped = key;
+        }
+    }
+
+    const float maximum = target_logprobs_block_max<BlockSize>(local_max);
+    local_sum *= expf(local_max - maximum);
+    __shared__ float warp_sums[BlockSize / kWarpSize];
+    __shared__ float log_sum_s;
+    const float sum = block_reduce_sum<BlockSize>(local_sum, warp_sums);
+    if (threadIdx.x == 0) { log_sum_s = logf(sum); }
+    __syncthreads();
+    const float log_sum = log_sum_s;
+
+    // Every unretained key in the column is <= global_floor, so any best > global_floor is exact.
+    const unsigned long long global_floor = top_logprobs_block_max<BlockSize>(dropped);
+    unsigned long long previous           = ~0ULL;
+    int top_idx                           = 0;
+    std::int32_t rank                     = 0;
+    for (; rank < count; ++rank) {
+        const unsigned long long cand = top_idx < 4 ? top[top_idx] : 0ULL;
+        const unsigned long long best = top_logprobs_block_max<BlockSize>(cand);
+        if (best <= global_floor) { break; }
+        if (threadIdx.x == 0) {
+            const auto row           = static_cast<std::int32_t>(0xffffffffu - static_cast<unsigned>(best));
+            const std::int64_t index = static_cast<std::int64_t>(column) * count + rank;
+            ids[index]               = row;
+            output[index]            = logprob_logit(values[row]) - maximum - log_sum;
+        }
+        if (top_idx < 4 && top[top_idx] == best) { ++top_idx; }
+        previous = best;
+    }
+
+    // Exact fallback for any ranks <= global_floor.
+    for (; rank < count; ++rank) {
+        unsigned long long best = 0ULL;
         for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
              row += BlockSize) {
             const unsigned long long key = top_logprobs_key(logprob_logit(values[row]), row);
@@ -72,10 +137,10 @@ __launch_bounds__(BlockSize) __global__
         }
         best = top_logprobs_block_max<BlockSize>(best);
         if (threadIdx.x == 0) {
-            const auto row = static_cast<std::int32_t>(0xffffffffu - static_cast<unsigned>(best));
+            const auto row           = static_cast<std::int32_t>(0xffffffffu - static_cast<unsigned>(best));
             const std::int64_t index = static_cast<std::int64_t>(column) * count + rank;
             ids[index]               = row;
-            output[index] = logprob_logit(values[row]) - lse.maximum - lse.log_sum;
+            output[index]            = logprob_logit(values[row]) - maximum - log_sum;
         }
         previous = best;
     }

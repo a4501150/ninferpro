@@ -7,6 +7,7 @@
 #include "core/device.h"
 #include "ops/common/exact_topk_select.h"
 #include "ops/common/memory.cuh"
+#include "ops/common/mma.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
@@ -26,17 +27,17 @@ using bf16 = __nv_bfloat16;
 // The registered geometry: 32 index heads of 128 channels, pools of 4 tokens, a 512-pool budget.
 constexpr int kIdxHeadDim = 128;
 
-// Scoring: a warp step reads 8 pooled keys and, per column, reduce-scatters the 32 lane partials
-// of its dots (8 pools x 4 heads) once per head group of 4.
-constexpr int kScoreThreads     = 256;
+// Scoring: four warps per CTA, each warp owns one page (16 pools) per step, scoring up to
+// kScoreTileColumns query columns with m16n8k16 BF16 Tensor Core MMAs (FP32 accumulation).
+constexpr int kScoreThreads     = 128;
 constexpr int kScoreWarps       = kScoreThreads / 32;
-constexpr int kScoreStepPools   = 8;
-constexpr int kScoreHeadSlots   = 4; // heads per reduce-scatter round
-constexpr int kScoreTileColumns = 4; // columns of one row per CTA tile
-constexpr int kScoreMaxSlices   = 128;
+constexpr int kScoreWarpPools   = 16; // one KV page (64 tokens / pool 4) per warp
+constexpr int kScoreStepPools   = kScoreWarps * kScoreWarpPools; // 64 pools per CTA step
+constexpr int kScoreTileColumns = 4;                             // columns of one row per CTA tile
+constexpr int kScoreMaxSlices   = 256;
 constexpr int kScoreGroupCols   = 64; // columns per select pass
 
-static_assert(kScoreStepPools * kScoreHeadSlots == 32);
+static_assert(kScoreWarpPools * 4 == kPagedKVPageSize);
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("dsa indexer: ") + message); }
@@ -55,39 +56,12 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-// One stage of the reduce-scatter: lanes whose `Half` bit is clear keep values [0, Half), the
-// others [Half, 2 Half); each kept value adds its partner lane's copy (own + partner, as
-// warp_sum's `v += __shfl_xor_sync(v, Half)`).
-template <int Half>
-__device__ __forceinline__ void reduce_scatter_stage(float (&v)[32], int lane) {
-    const bool upper = (lane & Half) != 0;
-#pragma unroll
-    for (int i = 0; i < Half; ++i) {
-        const float keep = upper ? v[i + Half] : v[i];
-        const float send = upper ? v[i] : v[i + Half];
-        v[i]             = keep + __shfl_xor_sync(0xFFFFFFFFU, send, Half);
-    }
+__device__ __forceinline__ int swizzled_128(int row, int chunk) {
+    return row * kIdxHeadDim + ((chunk ^ (row & 7)) << 3);
 }
 
-// Lane l returns the 32-lane sum of its value l, bitwise equal to warp_sum's result for that
-// value (31 shuffles for 32 sums instead of 160).
-__device__ __forceinline__ float reduce_scatter_32(float (&v)[32], int lane) {
-    reduce_scatter_stage<16>(v, lane);
-    reduce_scatter_stage<8>(v, lane);
-    reduce_scatter_stage<4>(v, lane);
-    reduce_scatter_stage<2>(v, lane);
-    reduce_scatter_stage<1>(v, lane);
-    return v[0];
-}
-
-// The pooled key's element for token slot `token` (of pool `token / pool`), lane coordinate
-// `lane`: channel `token_in_pool * slot_width + lane` of the key.
-__device__ __forceinline__ const bf16* pooled_element_const(const bf16* pooled,
-                                                            const std::int32_t* table, int token,
-                                                            int slot_width, int lane) {
-    const int page = table[token >> kPagedKVPageShift];
-    return pooled + static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * page +
-           static_cast<std::int64_t>(slot_width) * (token & kPagedKVPageMask) + lane;
+__device__ __forceinline__ unsigned smem_address(const void* p) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(p));
 }
 
 __device__ __forceinline__ bf16* pooled_element(bf16* pooled, const std::int32_t* table, int token,
@@ -206,11 +180,12 @@ __global__ void indexer_append_kernel(const bf16* __restrict__ raw_k, const bf16
 
 // ------------------------------------------------------------------------------------- scoring
 
-// Grid (slices, row tiles of up to 4 columns). A warp step reads 8 pooled keys once and scores
-// them for every column of its tile; the heads run in groups of 4, one reduce-scatter each, and
-// the four lane totals of a pool add by two xor shuffles. A column's scores are bitwise
-// independent of the slicing. The score of pool b of column c is
-//   scale * sum_h w[h, c] * relu(<q[:, h, c], key_b>)   (FP32; heads added in head order).
+// Grid (slices, row tiles of up to 4 columns). Each CTA stages its tile's queries in swizzled
+// BF16 shared memory. Each warp independently loads one KV page (16 contiguous pooled keys of
+// 128 BF16 channels) into its private shared-memory slab and computes Q_c * K_page^T using
+// m16n8k16 BF16 MMAs with FP32 accumulation, then applies ReLU, multiplies by w[h, c], and reduces
+// across heads in fixed group order. A column's score for any pool b uses identical MMA K-steps
+// and head-reduction order at every call width and batch layout (strict bitwise column invariance).
 __global__ void __launch_bounds__(kScoreThreads)
     indexer_score_kernel(const bf16* __restrict__ q, const bf16* __restrict__ w, int heads,
                          const bf16* __restrict__ pooled, const std::int32_t* __restrict__ tables,
@@ -218,104 +193,194 @@ __global__ void __launch_bounds__(kScoreThreads)
                          const std::int32_t* __restrict__ positions, int width, int pool, int top,
                          float scale, int group_begin, int group_columns, int tile_base,
                          float* __restrict__ scores, int score_stride) {
+    constexpr int kChunks128 = kIdxHeadDim / 8; // 16 uint4 chunks per 128-BF16 row
     extern __shared__ __align__(16) unsigned char smem[];
-    auto* qs = reinterpret_cast<float4*>(smem); // [tile columns][heads][32]: lane l, q[h][l + 32 j]
-    float* w_s =
-        reinterpret_cast<float*>(qs + kScoreTileColumns * heads * 32); // [tile columns][heads]
-    int* column_pools = reinterpret_cast<int*>(w_s + kScoreTileColumns * heads); // [tile columns]
+    auto* q_s = reinterpret_cast<bf16*>(smem); // [kScoreTileColumns][heads][128] swizzled
+    auto* k_s = q_s + static_cast<std::size_t>(kScoreTileColumns) * heads * kIdxHeadDim; // [64][128]
+    auto* w_s = reinterpret_cast<float*>(k_s + kScoreStepPools * kIdxHeadDim); // [4][heads]
+    auto* column_pools = reinterpret_cast<int*>(w_s + kScoreTileColumns * heads); // [4]
 
     const int tiles_per_row = (width + kScoreTileColumns - 1) / kScoreTileColumns;
     const int tile          = tile_base + static_cast<int>(blockIdx.y);
     const int row = tile / tiles_per_row, col_in = (tile % tiles_per_row) * kScoreTileColumns;
-    // The tile's first flat column; a pass that begins inside the tile skips its earlier columns.
     const int c0   = row * width + col_in;
     const int nc   = min(min(kScoreTileColumns, width - col_in), group_begin + group_columns - c0);
     const int skip = max(0, group_begin - c0);
     if (nc <= skip) { return; }
-    const int slot_width = kIdxHeadDim / pool;
 
-    for (int i = static_cast<int>(threadIdx.x); i < nc * heads * kIdxHeadDim; i += kScoreThreads) {
-        const int c = i / (heads * kIdxHeadDim), r = i % (heads * kIdxHeadDim), h = r / kIdxHeadDim;
-        const int d = r % kIdxHeadDim;
-        const float value =
-            __bfloat162float(q[d + static_cast<std::int64_t>(h) * kIdxHeadDim +
-                               static_cast<std::int64_t>(c0 + c) * kIdxHeadDim * heads]);
-        reinterpret_cast<float*>(&qs[(c * heads + h) * 32 + d % slot_width])[d / slot_width] =
-            value;
-    }
-    for (int i = static_cast<int>(threadIdx.x); i < nc * heads; i += kScoreThreads) {
-        const int c = i / heads, h = i % heads;
-        w_s[c * heads + h] = __bfloat162float(w[h + static_cast<std::int64_t>(c0 + c) * heads]);
-    }
-    if (static_cast<int>(threadIdx.x) < nc) {
-        column_pools[threadIdx.x] = (positions[c0 + static_cast<int>(threadIdx.x)] + 1) / pool;
-    }
+    const int tid = static_cast<int>(threadIdx.x);
+    if (tid < nc) { column_pools[tid] = (positions[c0 + tid] + 1) / pool; }
     __syncthreads();
+
     int tile_pools = 0;
     for (int c = skip; c < nc; ++c) { tile_pools = max(tile_pools, column_pools[c]); }
+    const int warp = tid >> 5, lane = tid & 31;
+    if (tile_pools <= top) { return; }
     const int steps = (tile_pools + kScoreStepPools - 1) / kScoreStepPools;
-    const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
-    const int first_step = static_cast<int>(blockIdx.x) * kScoreWarps + warp;
-    if (tile_pools <= top || first_step >= steps) { return; }
-    const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[row]) * table_stride;
+    if (static_cast<int>(blockIdx.x) >= steps) { return; }
 
-    for (int step = first_step; step < steps; step += static_cast<int>(gridDim.x) * kScoreWarps) {
-        const int b0 = step * kScoreStepPools;
-        float key[kScoreStepPools][kScoreHeadSlots];
+    // Stage only the active columns [skip, nc) of Q (swizzled BF16) and w (FP32).
+    const int live_cols    = nc - skip;
+    const int total_q_vecs = live_cols * heads * kChunks128;
+    for (int i = tid; i < total_q_vecs; i += kScoreThreads) {
+        const int ch = i & (kChunks128 - 1);
+        const int hr = i >> 4;
+        const int c  = skip + hr / heads;
+        const int h  = hr % heads;
+        const bf16* src = q + static_cast<std::int64_t>(c0 + c) * heads * kIdxHeadDim +
+                          static_cast<std::int64_t>(h) * kIdxHeadDim + ch * 8;
+        *reinterpret_cast<uint4*>(q_s + static_cast<std::size_t>(c) * heads * kIdxHeadDim +
+                                  swizzled_128(h, ch)) = *reinterpret_cast<const uint4*>(src);
+    }
+    for (int i = tid; i < live_cols * heads; i += kScoreThreads) {
+        const int c = skip + i / heads, h = i % heads;
+        w_s[c * heads + h] = __bfloat162float(w[h + static_cast<std::int64_t>(c0 + c) * heads]);
+    }
+    __syncthreads();
+
+    const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[row]) * table_stride;
+    bf16* const warp_k_s      = k_s + static_cast<std::size_t>(warp) * kScoreWarpPools * kIdxHeadDim;
+    const int grp             = lane >> 2; // 0..7 -> rows grp and grp + 8
+    const int tid4            = lane & 3;  // 0..3 -> pools 2*tid4 and 2*tid4 + 1
+    const int b_row_local     = 8 * (lane >> 4) + (lane & 7);
+    const int b_ch_off        = (lane >> 3) & 1;
+    const int a_row_off       = lane & 15;
+    const int a_ch_off        = lane >> 4;
+    const bool full_tile      = (skip == 0 && nc == kScoreTileColumns);
+
+    for (int step = static_cast<int>(blockIdx.x); step < steps;
+         step += static_cast<int>(gridDim.x)) {
+        const int page_pool_base = step * kScoreStepPools + warp * kScoreWarpPools;
+        if (page_pool_base >= tile_pools) { continue; }
+        const int page_pools = min(kScoreWarpPools, tile_pools - page_pool_base);
+        const int page       = table[page_pool_base >> 4];
+        const bf16* page_ptr =
+            pooled + static_cast<std::int64_t>(page) * (kScoreWarpPools * kIdxHeadDim);
+
+        // Warp-private coalesced load of 16 pooled keys (1 KV page) into swizzled shared memory.
 #pragma unroll
-        for (int bb = 0; bb < kScoreStepPools; ++bb) {
-            const int b = b0 + bb;
-            if (b >= tile_pools) {
-#pragma unroll
-                for (int j = 0; j < kScoreHeadSlots; ++j) { key[bb][j] = 0.0F; }
-                continue;
-            }
-#pragma unroll
-            for (int j = 0; j < kScoreHeadSlots; ++j) {
-                // The key's channels this lane owns: slot j of the pool's token run.
-                key[bb][j] = __bfloat162float(
-                    *pooled_element_const(pooled, table, pool * b + j, slot_width, lane));
-            }
+        for (int i = lane; i < kScoreWarpPools * kChunks128; i += 32) {
+            const int lp = i >> 4;
+            const int ch = i & 15;
+            *reinterpret_cast<uint4*>(warp_k_s + swizzled_128(lp, ch)) =
+                lp < page_pools ? *reinterpret_cast<const uint4*>(page_ptr + lp * kIdxHeadDim + ch * 8)
+                                : make_uint4(0, 0, 0, 0);
         }
-        for (int c = skip; c < nc; ++c) {
-            const int blocks = column_pools[c];
-            if (b0 >= blocks) { continue; } // warp-uniform: this column sees none of the step
-            float total = 0.0F;
-            // Head groups of 4; lane 4 bb + h ends each round with pool b0 + bb's head dot.
+        __syncwarp();
+
+        if (full_tile) {
+            float sum0[kScoreTileColumns][2] = {};
+            float sum1[kScoreTileColumns][2] = {};
+            for (int hg = 0; hg < heads; hg += 16) {
+                float acc[kScoreTileColumns][2][4] = {};
 #pragma unroll
-            for (int g = 0; g < heads / kScoreHeadSlots; ++g) {
-                float4 qv[kScoreHeadSlots];
+                for (int ks = 0; ks < 8; ++ks) {
+                    unsigned b0, b1, b2, b3;
+                    ldmatrix_x4(b0, b1, b2, b3,
+                                smem_address(warp_k_s + swizzled_128(b_row_local, 2 * ks + b_ch_off)));
 #pragma unroll
-                for (int h = 0; h < kScoreHeadSlots; ++h) {
-                    qv[h] = qs[(c * heads + 4 * g + h) * 32 + lane];
-                }
-                float v[32];
-#pragma unroll
-                for (int bb = 0; bb < kScoreStepPools; ++bb) {
-#pragma unroll
-                    for (int h = 0; h < kScoreHeadSlots; ++h) {
-                        float dot = 0.0F;
-                        dot += qv[h].x * key[bb][0];
-                        dot += qv[h].y * key[bb][1];
-                        dot += qv[h].z * key[bb][2];
-                        dot += qv[h].w * key[bb][3];
-                        v[bb * kScoreHeadSlots + h] = dot;
+                    for (int c = 0; c < kScoreTileColumns; ++c) {
+                        unsigned a0, a1, a2, a3;
+                        ldmatrix_x4(a0, a1, a2, a3,
+                                    smem_address(q_s + static_cast<std::size_t>(c) * heads * kIdxHeadDim +
+                                                 swizzled_128(hg + a_row_off, 2 * ks + a_ch_off)));
+                        mma_bf16(acc[c][0][0], acc[c][0][1], acc[c][0][2], acc[c][0][3], a0, a1, a2,
+                                 a3, b0, b1);
+                        mma_bf16(acc[c][1][0], acc[c][1][1], acc[c][1][2], acc[c][1][3], a0, a1, a2,
+                                 a3, b2, b3);
                     }
                 }
-                const float relu = fmaxf(reduce_scatter_32(v, lane), 0.0F);
-                total += w_s[c * heads + 4 * g + lane % kScoreHeadSlots] * relu;
+#pragma unroll
+                for (int c = 0; c < kScoreTileColumns; ++c) {
+                    const float w0 = w_s[c * heads + hg + grp];
+                    const float w1 = w_s[c * heads + hg + grp + 8];
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) {
+                        sum0[c][nt] += w0 * fmaxf(acc[c][nt][0], 0.0F);
+                        sum0[c][nt] += w1 * fmaxf(acc[c][nt][2], 0.0F);
+                        sum1[c][nt] += w0 * fmaxf(acc[c][nt][1], 0.0F);
+                        sum1[c][nt] += w1 * fmaxf(acc[c][nt][3], 0.0F);
+                    }
+                }
             }
-            // The pool's four lane totals (one per head residue) add; lane 4 bb writes pool b0 +
-            // bb.
-            total += __shfl_xor_sync(0xFFFFFFFFU, total, 1);
-            total += __shfl_xor_sync(0xFFFFFFFFU, total, 2);
-            const int b = b0 + lane / kScoreHeadSlots;
-            if (lane % kScoreHeadSlots == 0 && b < blocks) {
-                // The pass-relative column of this tile entry.
-                scores[static_cast<std::size_t>(c0 + c - group_begin) * score_stride + b] =
-                    total * scale;
+#pragma unroll
+            for (int c = 0; c < kScoreTileColumns; ++c) {
+                const int blocks = column_pools[c];
+                if (page_pool_base >= blocks) { continue; }
+                float* const out_row =
+                    scores + static_cast<std::size_t>(c0 + c - group_begin) * score_stride;
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    float s0 = sum0[c][nt];
+                    float s1 = sum1[c][nt];
+                    s0 += __shfl_xor_sync(0xFFFFFFFFU, s0, 4);
+                    s0 += __shfl_xor_sync(0xFFFFFFFFU, s0, 8);
+                    s0 += __shfl_xor_sync(0xFFFFFFFFU, s0, 16);
+                    s1 += __shfl_xor_sync(0xFFFFFFFFU, s1, 4);
+                    s1 += __shfl_xor_sync(0xFFFFFFFFU, s1, 8);
+                    s1 += __shfl_xor_sync(0xFFFFFFFFU, s1, 16);
+                    if (grp == 0) {
+                        const int p0 = page_pool_base + 8 * nt + 2 * tid4;
+                        if (p0 < blocks) { out_row[p0] = s0 * scale; }
+                        if (p0 + 1 < blocks) { out_row[p0 + 1] = s1 * scale; }
+                    }
+                }
+            }
+        } else {
+            for (int c = skip; c < nc; ++c) {
+                const int blocks = column_pools[c];
+                if (page_pool_base >= blocks) { continue; }
+                float sum0[2] = {0.0F, 0.0F};
+                float sum1[2] = {0.0F, 0.0F};
+                for (int hg = 0; hg < heads; hg += 16) {
+                    float acc[2][4] = {};
+#pragma unroll
+                    for (int ks = 0; ks < 8; ++ks) {
+                        unsigned b0, b1, b2, b3;
+                        ldmatrix_x4(b0, b1, b2, b3,
+                                    smem_address(warp_k_s +
+                                                 swizzled_128(b_row_local, 2 * ks + b_ch_off)));
+                        unsigned a0, a1, a2, a3;
+                        ldmatrix_x4(a0, a1, a2, a3,
+                                    smem_address(q_s +
+                                                 static_cast<std::size_t>(c) * heads * kIdxHeadDim +
+                                                 swizzled_128(hg + a_row_off, 2 * ks + a_ch_off)));
+                        mma_bf16(acc[0][0], acc[0][1], acc[0][2], acc[0][3], a0, a1, a2, a3, b0,
+                                 b1);
+                        mma_bf16(acc[1][0], acc[1][1], acc[1][2], acc[1][3], a0, a1, a2, a3, b2,
+                                 b3);
+                    }
+                    const float w0 = w_s[c * heads + hg + grp];
+                    const float w1 = w_s[c * heads + hg + grp + 8];
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) {
+                        sum0[nt] += w0 * fmaxf(acc[nt][0], 0.0F);
+                        sum0[nt] += w1 * fmaxf(acc[nt][2], 0.0F);
+                        sum1[nt] += w0 * fmaxf(acc[nt][1], 0.0F);
+                        sum1[nt] += w1 * fmaxf(acc[nt][3], 0.0F);
+                    }
+                }
+                float* const out_row =
+                    scores + static_cast<std::size_t>(c0 + c - group_begin) * score_stride;
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    float s0 = sum0[nt];
+                    float s1 = sum1[nt];
+                    s0 += __shfl_xor_sync(0xFFFFFFFFU, s0, 4);
+                    s0 += __shfl_xor_sync(0xFFFFFFFFU, s0, 8);
+                    s0 += __shfl_xor_sync(0xFFFFFFFFU, s0, 16);
+                    s1 += __shfl_xor_sync(0xFFFFFFFFU, s1, 4);
+                    s1 += __shfl_xor_sync(0xFFFFFFFFU, s1, 8);
+                    s1 += __shfl_xor_sync(0xFFFFFFFFU, s1, 16);
+                    if (grp == 0) {
+                        const int p0 = page_pool_base + 8 * nt + 2 * tid4;
+                        if (p0 < blocks) { out_row[p0] = s0 * scale; }
+                        if (p0 + 1 < blocks) { out_row[p0 + 1] = s1 * scale; }
+                    }
+                }
             }
         }
+        __syncwarp();
     }
 }
 
@@ -453,9 +518,10 @@ void dsa_indexer_select(const Tensor& q, const Tensor& w, const DsaIndexerCacheV
     auto* state =
         reinterpret_cast<std::uint32_t*>(static_cast<unsigned char*>(workspace) + l.scores);
 
-    // Dynamic shared memory of the score kernel: the staged queries, the weights, the column
-    // pool counts.
-    const std::size_t smem = sizeof(float4) * kScoreTileColumns * geometry.heads * 32 +
+    // Dynamic shared memory of the score kernel: swizzled BF16 queries, per-warp pooled-key slabs,
+    // head weights, and column pool counts.
+    const std::size_t smem = sizeof(bf16) * kScoreTileColumns * geometry.heads * kIdxHeadDim +
+                             sizeof(bf16) * kScoreStepPools * kIdxHeadDim +
                              sizeof(float) * kScoreTileColumns * geometry.heads +
                              sizeof(int) * kScoreTileColumns;
     static std::atomic<std::size_t> reserved{0};
@@ -483,7 +549,7 @@ void dsa_indexer_select(const Tensor& q, const Tensor& w, const DsaIndexerCacheV
     const int max_pools     = max_context / geometry.pool;
     const int tiles_per_row = ceil_div(batch.width, kScoreTileColumns);
     const int slices =
-        std::clamp(ceil_div(static_cast<std::int64_t>(max_pools), kScoreWarps * kScoreStepPools), 1,
+        std::clamp(ceil_div(static_cast<std::int64_t>(max_pools), kScoreStepPools), 1,
                    kScoreMaxSlices);
     auto* pools_out  = reinterpret_cast<std::int32_t*>(pools.data);
     auto* counts_out = reinterpret_cast<std::int32_t*>(counts.data);

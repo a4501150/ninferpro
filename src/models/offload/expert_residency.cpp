@@ -113,6 +113,8 @@ ExpertResidency::ExpertResidency(const ExpertBankGeometry& geometry, std::vector
     landed_device_  = DeviceBuffer(landing_bytes);
     landing_device_.copy_from_host(landing_host_.data(), landing_bytes);
     landed_device_.copy_from_host(landed_host_.data(), landing_bytes);
+    reserved_.assign(static_cast<std::size_t>(layers_) * kLandingSlots, 0);
+    landing_counts_.assign(layers_, 0);
     seen_.assign(experts_, 0);
     group_.reserve(experts_);
     routed_by_layer_.assign(layers_, 0);
@@ -558,56 +560,60 @@ void ExpertResidency::before_round(cudaStream_t compute, bool landing, bool walk
         }
     }
     release_reservations(); // a discarded round's
-    std::uint32_t per_layer = 0;
+    bool any_landing = false;
     if (landing && frames() > 0) {
-        // The same count for every layer: what the scarcest pool allows.
-        std::uint32_t want = kLandingSlots;
-        for (const auto& pool : pools_) {
-            want = std::min<std::uint32_t>(want, pool.controller->free_frames() / static_cast<std::uint32_t>(pool.layers.size()));
-        }
-        if (want > 0) {
-            std::vector<std::vector<std::uint32_t>> got(pools_.size());
-            per_layer = want;
-            for (std::size_t p = 0; p < pools_.size(); ++p) {
-                const auto n = static_cast<std::uint32_t>(pools_[p].layers.size());
-                pools_[p].controller->reserve_free(want * n, got[p]);
-                per_layer = std::min<std::uint32_t>(per_layer, static_cast<std::uint32_t>(got[p].size()) / n);
-            }
-            reserved_.assign(static_cast<std::size_t>(per_layer) * layers_, 0);
-            for (std::size_t p = 0; p < pools_.size(); ++p) {
-                std::size_t next = 0;
+        // Reserve landing frames independently per pool: stage_kernel reads each layer's own
+        // kLandingSlots row (-1 = unused), so free frames in one pool (e.g. after a prefill lease)
+        // land misses even while another pool is full.
+        for (std::size_t p = 0; p < pools_.size(); ++p) {
+            const auto n = static_cast<std::uint32_t>(pools_[p].layers.size());
+            if (n == 0) { continue; }
+            const std::uint32_t want =
+                std::min<std::uint32_t>(kLandingSlots, pools_[p].controller->free_frames() / n);
+            if (want == 0) { continue; }
+            landing_scratch_.clear();
+            pools_[p].controller->reserve_free(want * n, landing_scratch_);
+            const std::uint32_t per = static_cast<std::uint32_t>(landing_scratch_.size()) / n;
+            std::size_t next        = 0;
+            if (per > 0) {
+                any_landing = true;
                 for (const std::uint32_t layer : pools_[p].layers) {
-                    for (std::uint32_t n = 0; n < per_layer; ++n) { reserved_[layer * per_layer + n] = got[p][next++]; }
+                    landing_counts_[layer] = per;
+                    for (std::uint32_t k = 0; k < per; ++k) {
+                        reserved_[layer * kLandingSlots + k] = landing_scratch_[next++];
+                    }
                 }
-                for (; next < got[p].size(); ++next) { pools_[p].controller->release(got[p][next]); }
             }
+            for (; next < landing_scratch_.size(); ++next) { pools_[p].controller->release(landing_scratch_[next]); }
         }
     }
-    landing_per_layer_ = per_layer;
+    any_landing_ = any_landing;
     const std::size_t landing_bytes = static_cast<std::size_t>(layers_) * kLandingSlots * sizeof(std::int32_t);
-    if (per_layer > 0 || landing_uploaded_) {
+    if (any_landing || landing_uploaded_) {
         auto* table = static_cast<std::int32_t*>(landing_host_.data());
         std::fill_n(table, static_cast<std::size_t>(layers_) * kLandingSlots, -1);
         for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-            for (std::uint32_t n = 0; n < per_layer; ++n) {
-                table[layer * kLandingSlots + n] = static_cast<std::int32_t>(reserved_[layer * per_layer + n]);
+            for (std::uint32_t n = 0; n < landing_counts_[layer]; ++n) {
+                table[layer * kLandingSlots + n] = static_cast<std::int32_t>(reserved_[layer * kLandingSlots + n]);
             }
         }
         upload_pinned(landing_device_.p, landing_host_.data(), landing_bytes, compute);
-        landing_uploaded_ = per_layer > 0;
+        landing_uploaded_ = any_landing;
     }
-    if (per_layer > 0) { CUDA_CHECK(cudaMemsetAsync(landed_device_.p, 0xFF, landing_bytes, compute)); }
+    if (any_landing) { CUDA_CHECK(cudaMemsetAsync(landed_device_.p, 0xFF, landing_bytes, compute)); }
     if (table_dirty_) { upload_table(compute); }
 }
 
 void ExpertResidency::release_reservations() {
-    for (std::uint32_t layer = 0; layer < layers_ && landing_per_layer_ > 0; ++layer) {
-        for (std::uint32_t n = 0; n < landing_per_layer_; ++n) {
-            pools_[pool_of_layer_[layer]].controller->release(reserved_[layer * landing_per_layer_ + n]);
+    if (!any_landing_) { return; }
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        const std::uint32_t count = landing_counts_[layer];
+        for (std::uint32_t n = 0; n < count; ++n) {
+            pools_[pool_of_layer_[layer]].controller->release(reserved_[layer * kLandingSlots + n]);
         }
+        landing_counts_[layer] = 0;
     }
-    reserved_.clear();
-    landing_per_layer_ = 0;
+    any_landing_ = false;
 }
 
 void ExpertResidency::publish_landed() {
@@ -644,7 +650,7 @@ void ExpertResidency::enqueue_route_download(cudaStream_t compute, std::int32_t 
     const std::size_t pitch = route_stride_ * sizeof(std::int32_t);
     CUDA_CHECK(cudaMemcpy2DAsync(route_host_.data(), pitch, route_device_.p, pitch, used * sizeof(std::int32_t),
                                  layers_, cudaMemcpyDeviceToHost, compute));
-    if (landing_per_layer_ > 0) {
+    if (any_landing_) {
         CUDA_CHECK(cudaMemcpyAsync(landed_host_.data(), landed_device_.p,
                                    static_cast<std::size_t>(layers_) * kLandingSlots * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, compute));
@@ -691,11 +697,12 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         // frames return to the pool. --expert-swap off freezes the content: nothing is adopted
         // and the policy gets no promotion budget, so the pools keep what the seeds placed.
         std::size_t budget = swap_enabled_ ? per_layer_budget : 0;
-        if (landing_per_layer_ > 0) {
+        const std::uint32_t count = landing_counts_[layer];
+        if (count > 0) {
             const auto* landed = static_cast<const std::int32_t*>(landed_host_.data()) + layer * kLandingSlots;
             std::size_t adopted = 0;
-            for (std::uint32_t n = 0; n < landing_per_layer_; ++n) {
-                const std::uint32_t frame = reserved_[layer * landing_per_layer_ + n];
+            for (std::uint32_t n = 0; n < count; ++n) {
+                const std::uint32_t frame = reserved_[layer * kLandingSlots + n];
                 const std::int32_t expert = landed[n];
                 const std::uint32_t key   = layer * experts_ + static_cast<std::uint32_t>(expert);
                 if (swap_enabled_ && expert >= 0 && static_cast<std::uint32_t>(expert) < experts_ &&
@@ -707,6 +714,7 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
                     pool.controller->release(frame);
                 }
             }
+            landing_counts_[layer] = 0;
             stats_.landed += adopted;
             budget = budget > adopted ? budget - adopted : 0;
         }
@@ -719,8 +727,7 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         if (!live.empty()) { live_columns = static_cast<std::size_t>(std::count(live.begin(), live.end(), std::uint8_t{1})); }
         tier_->record_uses(static_cast<double>(std::min<std::size_t>(live_columns, 16)), uses_, 1.0);
     }
-    reserved_.clear();
-    landing_per_layer_ = 0;
+    any_landing_ = false;
     if (frames() == 0) { return; }
     load_commands_.clear();
     for (auto& pool : pools_) {
@@ -945,16 +952,13 @@ void ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute) {
     if (!lease.valid()) { return; }
     Pool& pool = pools_[lease.pool];
     pool.commands.clear();
-    // Decode rounds reserve landing frames for every layer from the scarcest pool (before_round). With
-    // every expert in RAM, when the returned run lets them, the frames stay free and decode's misses
-    // land in them; when another pool has none to spare (a GGUF import's record sizes), landing
-    // reserves nothing and the loans' victims reload instead. The SSD tier reloads only victims
-    // with a RAM copy (`admissible_`) and still lands (the per-artifact measurements are design §9.3).
-    std::uint32_t landing = kLandingSlots;
-    for (std::size_t p = 0; p < pools_.size(); ++p) {
-        const std::uint32_t free = pools_[p].controller->free_frames() + (p == lease.pool ? lease.count : 0U);
-        landing = std::min<std::uint32_t>(landing, free / static_cast<std::uint32_t>(pools_[p].layers.size()));
-    }
+    // Decode rounds reserve landing frames independently per pool (before_round). With every expert
+    // in RAM, when the returned run gives this pool at least one landing frame per layer, the frames
+    // stay free so decode's misses land in them; otherwise the loans' victims reload. The SSD tier
+    // reloads only victims with a RAM copy (`admissible_`) and still lands.
+    const std::uint32_t free = pool.controller->free_frames() + lease.count;
+    const std::uint32_t landing =
+        pool.layers.empty() ? 0U : std::min<std::uint32_t>(kLandingSlots, free / static_cast<std::uint32_t>(pool.layers.size()));
     pool.controller->give_back(lease.first, lease.count, pool.commands, landing == 0 || tier_ != nullptr,
                                tier_ != nullptr ? &admissible_ : nullptr);
     stats_.lent_frames -= lease.count;
