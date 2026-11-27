@@ -9,19 +9,22 @@ constants, memory and measurements, and cites [Qwen3.8-Flash-Next's
 design](qwen3_8-flash-next-design.md) as **FN §x** for that family's measurements. Commands and
 flags are in [CLI](../cli.md) and [serving](../serving.md).
 
-Built: the Engine, `infernix`, `infernix-serve`, `infernix_bench` and causal scoring; routed
-experts in any VRAM : RAM : SSD ratio; BF16 and INT8-G64 latent caches; DFlash2 speculation for
-one-row rounds; prefill by streamed experts and layer-major walk spans; the prefix cache; image
-and video prompts. Qwen3.8-Flash-Next stays the production default; this family serves with
+Built: the Engine, `infernix`, `infernix-serve`, `infernix_bench` and causal scoring; NVFP4
+W4A16 and GGUF K-quant (Q4_K/Q3_K/Q2_K) routed experts in any VRAM : RAM : SSD ratio; BF16 and
+INT8-G64 latent caches; DFlash2 speculation (`--draft-tokens auto`) for one-row rounds; prefill by
+streamed experts, layer-major walk spans and qualified fast paths (`expert-a4-residual`,
+`ggml-bf16-prefill`); the prefix cache; image and video prompts. Qwen3.8-Flash-Next stays the
+production default; this family serves with
 `MODEL_DIR=GLM-5.3-Flash make -C ~/src/super-quant serve-infernix`
-(`~/src/super-quant/configs/GLM-5.3-Flash/model.env`). Every option designed but not built, and
-every rejected option, is in §17 with its reason.
+(`~/src/super-quant/configs/GLM-5.3-Flash/model.env`) or
+`MODEL_DIR=GLM-5.3-Flash-GSQ` (`configs/GLM-5.3-Flash-GSQ/model.env` for the GGUF K-quant build).
+Every rejected option and open/not-built item is in §17 with its reason.
 
 Every number is labelled **measured** (date, machine and placement named), **upstream** (the
 model card, reference code or artifact metadata, §19) or **model** (computed from stated inputs).
-Every measurement ran on the production machine — one RTX PRO 6000 Blackwell (96 GB, `sm_120a`,
+Measurements ran on the production machine — one RTX PRO 6000 Blackwell (96 GB, `sm_120a`,
 188 SMs, 1.79 TB/s), PCIe Gen5 x16, a Ryzen 9 9950X3D2 with 182 GiB of usable RAM, one Gen5 NVMe
-(T710) — on 2026-11-23 to 11-24, unless it says otherwise.
+(T710) — on 2026-11-27 unless an earlier date is stated.
 
 ---
 
@@ -51,66 +54,58 @@ Every measurement ran on the production machine — one RTX PRO 6000 Blackwell (
 
 ## 1. Status and measured performance
 
-**Serving configuration** (`configs/GLM-5.3-Flash/model.env`): the BF16-dense artifact,
-`--experts vram=40%,ram=60%`,
-INT8 latents, `--max-context 262144`, four lanes, DFlash2 `--draft-tokens auto` on one-row rounds
-(§10.2), the prefix cache with a 2 GiB Host tier, and `--vision` with
-the tower streamed from pinned RAM. The placement puts
-4,838 experts in VRAM, 7,258 in RAM and none on the SSD. The whole process stays under the 95 %
-VRAM cap (92,993 MiB). KV is allocated for every lane at the full context at startup, and with the
-prefix cache on, its KV holds every lane's full context (6.36 GiB INT8 at 4 × 262,144).
+**Serving configurations:**
 
-The serving build (2026-11-27: LRFU-Blend shared offload cache policy with adaptive decode
+- **NVFP4 (default)** (`configs/GLM-5.3-Flash/model.env`): `orcarouter/GLM-5.3-Flash-Uncensored-NVFP4`
+  (BF16 dense 15.44 GiB, NVFP4 experts 159.5 GiB), `--experts vram=40%,ram=60%` (4,838 VRAM /
+  7,258 RAM / 0 SSD), INT8 latents, `--max-context 262144`, four lanes, DFlash2 `--draft-tokens
+  auto` on one-row rounds (§10.2), the prefix cache with a 2 GiB Host tier, and `--vision` with
+  the tower streamed from pinned RAM.
+- **GSQ-Q4 GGUF (optional)** (`configs/GLM-5.3-Flash-GSQ/model.env`): `GCSA-AiLab` RCO-GSQ Q4
+  GGUF (Q8 dense 9.25 GiB, Q4_K/Q3_K/Q2_K experts 118.1 GiB, §3.3), `--experts vram=59%,ram=41%`
+  (7,098 VRAM / 4,998 RAM / 0 SSD), same serving flags (`--vision` imports the tower from the
+  orcarouter checkpoint).
+
+Both configurations stay under the 95 % VRAM cap (92,993 MiB). KV is allocated for every lane at
+the full context at startup (6.36 GiB INT8 at 4 × 262,144 with the prefix cache on; 1.59 GiB at
+one lane).
+
+Measured on the 2026-11-27 build (LRFU-Blend shared offload cache policy with adaptive decode
 admissions, conditional CPU-plan `x` copy, online DFlash2 `RoundCostModel`, 3-term
-`expert-a4-residual` wide prefill, 16-warp `64h × 16t` sparse MLA prefill, double-buffered `mhc`,
-4-column weight-reusing narrow A16 rows, and 14/16/120 miss split, §6.3, §7.2, §10.2 and §14),
-`infernix_glm5_next_engine_bench --tokens 512 --repeat 4` at the serving split (model 15.44 GiB,
-16.70 with the drafter; KV 1.59 GiB at one lane, 6.36 at four; experts 63.8 GiB, 4,838 VRAM /
-7,258 RAM / 0 SSD), median and range:
+`expert-a4-residual` and `ggml-bf16-prefill` wide prefill, 16-warp `64h × 16t` sparse MLA
+prefill, double-buffered `mhc`, 4-column weight-reusing narrow A16 rows, `MmaR128T128` Q8 dense
+prefill, and 14-worker / 16-job miss splits; `infernix_glm5_next_engine_bench` 512 tokens, median
+and range of four sets after warm-up; `infernix_bench` INT8 KV chunk 4,096; `infernix-perplexity`
+quick corpus, context 8192, stride 4096, INT8 KV, 252,823 positions):
 
-| Requests | Plain | DFlash2 `auto` (greedy) | DFlash2 `auto` (T = 1.0) |
-|---|---|---|---|
-| 1 | 42.3 (41.5-43.4) | 55.0 (52.0-57.3) | 54.1 (47.2-56.2) |
-| 4 | 75.8 (74.1-76.2) | | |
-
-Prior 2026-11-24 baseline at the same split (512 tokens, 4 sets): 1-request plain 36.9 (33.2-38.0),
-K = 2 44.4 (40.8-46.4), K = 3 45.8 (34.6-45.8), 4-request plain 69.5 (60.2-70.8), 4-request with
-drafter loaded 64.8 (60.0-65.5). Prefill (`infernix_bench`, INT8 KV, chunk 4,096, `max-ctx 65536`,
-`work peak 1.16 GiB`, 2026-11-27): `pp4096` 2.37k (PCIe DMA-bound), `pp16384` 5.75k (+65.6 % over
-exact 3.47k), `pp32768` 5.68k (+67.1 % over exact 3.40k); live serving 17.6K fresh prompt beside
-three concurrent decodes measured 5.68k tok/s at peak process VRAM 92,666 MiB (cap 92,993).
-
-The Q8-dense artifact (§17.2; not served: it misses the KL gate) against the BF16-dense one at the same split (`vram=40%,ram=60%`, 4,838 / 7,258 / 0
-experts, plain decode, `infernix_glm5_next_engine_bench` 512 tokens, median and range of four sets;
-fresh prompts on `infernix-serve`, 2026-11-24):
-
-| Measurement | BF16 dense (model 15.44 GiB) | Q8 dense (model 9.17 GiB) |
+| Measurement | NVFP4, `vram=40%,ram=60%` (4,838 / 7,258 / 0) | GSQ-Q4, `vram=59%,ram=41%` (7,098 / 4,998 / 0) |
 |---|---|---|
-| Decode, one request | 35.4 (30.9-36.5) tok/s | 38.6 (36.1-41.2) tok/s |
-| Decode, four requests, aggregate | 64.6 (58.6-67.5) tok/s | 67.6 (64.1-69.9) tok/s |
-| Prefill, 10K and 40K-token prompts | 2.51-2.58k tok/s | 2.42-2.46k tok/s (≈ 4 % slower: the MMA routes dequantize in the loop) |
-| Serving process at `vram=44%` with the drafter, the 9.4K-prompt load below | — | peak 92,516 MiB (model 10.43 GiB with the drafter) |
-| Teacher-forced KL against BF16 dense, quick corpus, context 8192, stride 4096, INT8 KV | — | mean 0.0058, p99 0.066, top-1 97.3 %, PPL 3.1515 against 3.1489 |
+| Decode, 1 request, plain | 42.3 (41.5-43.4) tok/s | 69.1 (65.6-69.3) tok/s |
+| Decode, 1 request, DFlash2 `auto` (greedy) | 55.0 (52.0-57.3) tok/s | 97.7 (84.3-100.7) tok/s |
+| Decode, 1 request, DFlash2 `auto` (T = 1.0) | 54.1 (47.2-56.2) tok/s | 96.4 (87.4-97.0) tok/s |
+| Decode, 4 requests, plain (aggregate) | 75.8 (74.1-76.2) tok/s | 147.8 (144.3-150.5) tok/s |
+| T1 `round_bench` at equal `vram=40%` (`1x1` / `4x1` / `1x4`) | 35.9 / 120.0 / 100.5 tok/s | 44.8 / 142.7 / 103.8 tok/s |
+| Prefill (`infernix_bench` `pp4096` / `pp16384` / `pp32768`) | 2.37k / 5.75k / 5.68k tok/s (exact: 2.38k / 3.47k / 3.40k) | 4.48k / 4.46k / 4.32k tok/s (exact: 1.56k-1.59k) |
+| Live serving prefill, 17.6K prompt beside 3 decodes | 5.68k tok/s | 4.40k tok/s |
+| Live serving peak VRAM (3 × 1K decodes + 17.6K prompt + repeat, `--vision`) | 92,666 MiB (headroom 327 MiB) | 91,986 MiB (headroom 1,007 MiB) |
+| Quick-corpus perplexity (different abliterations; not a quant comparison) | 3.1496 (`mean_nll` 1.1473) | 3.2526 (`mean_nll` 1.1794) |
 
-The tuned Q8 shapes (`src/models/glm5_next/shapes/q8/`) did not move one-request decode against
-the generic routes (38.7 tok/s). The rows below are the BF16-dense artifact's.
+Long-context and vision checks (NVFP4, 2026-11-24): a 255,771-token prompt prefills and decodes
+without error; one-lane decode after a 130,164-token prompt retains 97 % of its 3,964-token speed
+(36.8 vs 38.1 tok/s on the 2026-11-24 build); adding image (551 tokens) and video (1,544 tokens)
+requests under `--vision` stays within the text-serving VRAM peak.
 
-| Measurement (serving split unless named) | Result |
-|---|---|
-| Decode, one request, DFlash2 K = 3 (`infernix_glm5_next_engine_bench`, 512 tokens, four sets after a warm-up) | median 41.1 tok/s, sets 37.1-42.7 |
-| Decode, four requests of 256 tokens (rounds of several rows decode plainly) | median 59.9 tok/s aggregate, sets 56.5-62.0 |
-| Same bench at `vram=42%,ram=58%` (5,080 / 7,016 / 0 experts), one request, by draft length | K = 0 35.0, K = 1 40.9, K = 2 44.4, K = 3 47.8, K = 4 43.2, K = 5 37.7 tok/s (§10.3) |
-| Process VRAM while serving: four 1,024-token decodes beside a 9.4K prompt and its cached repeat | peak 92,412 MiB; at vram=42 % it sat at 95,672 MiB |
-| Same with `--draft-tokens auto` (48 staging slots against 32) and `--vision`: three 1,024-token decodes beside a 17.6K fresh prompt (5.68k tok/s) and its cached repeat, 2026-11-27 | peak 92,666 MiB (cap 92,993; headroom 327 MiB; prior: 92,670 MiB) |
-| Same with `--vision`: two decodes, the 9.4K prompt and an image (551-token prompt), then a video (1,544 tokens) | peak 92,412 MiB; the image answer reads the chart's title |
-| Prefill, fresh prompts of 10K-38K tokens, walk spans, `vram=42%,ram=58%` | 2.35-2.43k tok/s, compute-bound (§11.1) |
-| One 255,771-token prompt, INT8 KV, `vram=42%,ram=58%` | prefill 2.09k tok/s (TTFT 2 min 2 s), then 256 tokens at 33.3 tok/s |
-| Decode after a 130,164-token prompt against after a 3,964-token one (one lane, 256 tokens) | 36.8 against 38.1 tok/s (97 %) |
+At the serving splits the engine's VRAM ledgers read: NVFP4 model 16.70 GiB (with drafter), KV
+6.36 GiB (four lanes), expert cache 63.8 GiB (4,838 frames); GSQ-Q4 model 10.51 GiB (with
+drafter), KV 6.36 GiB, expert cache 69.3 GiB (7,098 frames). Speeds sit below Flash-Next's
+(384 tok/s at `vram=100%`, FN §1.3) because routed experts exceed VRAM (159.5 / 118.1 GiB),
+each miss moves 8.26-14.16 MB (3-5× Flash-Next's 2.76 MB), dense reads per token are large
+(≈ 16.7 GB BF16 on NVFP4; ≈ 9.3 GB Q8 on GSQ-Q4), and routing locality is flatter (§18).
 
-At the serving split the engine's VRAM ledger reads: model 16.70 GiB, KV 1.59 GiB at one lane and
-6.36 GiB at four, expert cache 63.8 GiB (4,838 frames). These speeds sit far below Flash-Next's
-(380 tok/s at `vram=100%`, FN §1.3), because this model reads ≈ 16.7 GB of BF16 dense weights per
-token (§2.3), moves 14.16 MB per miss, and misses far more often at an equal cache share (§18.1).
+An opt-in blanket Q8-dense NVFP4 recipe (`glm5_3_flash_nvfp4_orcarouter_q8dense`, model 9.17 GiB,
+fitting `vram=44%`) is built but not served: against BF16 dense (quick corpus, context 8192,
+stride 4096, INT8 KV) it measured mean KL 0.0058, p99 0.066, top-1 97.3 % (PPL 3.1515 vs 3.1489),
+above the 0.002 KL gate; selective per-class Q8 dense remains untested (§17.2).
 
 ## 2. Model facts
 
@@ -238,9 +233,11 @@ engine computes more precisely and how that is bounded.
 What follows from these bytes (model, at the card's 1.79 TB/s):
 
 - **The dense BF16 reads rival the experts.** ≈ 16.7 GB of dense weights (including `lm_head`)
-  per token against 4.76 GB of all-hit routed weights: an all-hit token reads ≈ 21.8 GB, ≈ 12.2 ms,
-  a ceiling of ≈ 82 tok/s. The measured round profiles spend 8.1-8.4 ms in the dense GEMVs (§6.5,
-  §10.3). An 8-bit dense recipe is the largest single lever and is not built (§17.2).
+  per token against 4.76 GB of all-hit routed weights: an all-hit NVFP4 token reads ≈ 21.8 GB
+  (≈ 12.2 ms, ceiling ≈ 82 tok/s). The dense GEMVs take ≈ 8.1-8.4 ms per round (§6.5). An opt-in
+  Q8-dense NVFP4 recipe cuts model bytes to 9.17 GiB (not default: blanket Q8 misses the 0.002 KL
+  gate; selective per-class Q8 is untested, §17.2), while the GSQ-Q4 GGUF artifact (§3.3) uses
+  Q8_0 dense projections (model 9.25 GiB).
 - **A miss moves 14.16 MB**, 5.1× Flash-Next's 2.76 MB record.
 - **The KV cache is small.** One MLA latent is 512 values per token and layer: 11 MLA layers ×
   1 KiB = 11 KiB per token in BF16, plus 64 B of pooled index key per layer.
@@ -312,11 +309,13 @@ converter transposes it once.
 ### 3.3 The GGUF artifact
 
 [GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF](https://huggingface.co/GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF)
-`Q4/GLM-5.3-Flash-Uncensored-GSQ-RCO-Q4.gguf` (llama.cpp arch `glm5-next`, 1,383 tensors) imports
+`Q4/GLM-5.3-Flash-Uncensored-GSQ-RCO-Q4.gguf` (llama.cpp arch `glm5-next`, 1,383 tensors;
+served via `configs/GLM-5.3-Flash-GSQ/model.env` at `vram=59%,ram=41%`) imports
 bit-exactly: `tools.convert --model <orcarouter snapshot> --gguf <file> --recipe
-glm5_3_flash_gcsa_gguf` (`tools/convert/glm5_next_gguf.py`). Its abliteration is GCSA's, not
-orcarouter's: the plain tensors equal the orcarouter checkpoint's, but the residual-writing
-matrices (`attn_output`, `ffn_down`, the shared expert's down) and the embedding differ.
+glm5_3_flash_gcsa_gguf` (`tools/convert/glm5_next_gguf.py`). It reuses the 3.5-bit mixed
+tensor-type allocation of `pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF` (`2 Q4_K / 105 Q3_K / 19 Q2_K`)
+on top of GCSA's merged LoRA v2 abliteration (distinct from orcarouter's: the plain tensors equal
+the orcarouter checkpoint's, while the residual-writing matrices and embedding differ).
 
 | Tensor class | GGUF | Artifact |
 |---|---|---|
@@ -359,27 +358,13 @@ cache keeps one frame pool per stride and gives every layer the same frame count
 rounds down to a multiple of 42). The RAM tier sizes every slot at the largest stride (layer 3's
 13.0 MB), so it holds about 20 % fewer records than its bytes would at the mean stride.
 
-Measured against the NVFP4 artifact (2026-11-27 build; `infernix_glm5_next_engine_bench`, 512
-tokens, four sets after warm-up; `infernix_bench` INT8 KV chunk 4,096; `infernix-perplexity` quick
-corpus, context 8192, stride 4096, INT8 KV, 252,823 positions):
-
-| Measurement | NVFP4, `vram=40%` (4,838 VRAM / 7,258 RAM / 0 SSD) | GGUF, `vram=59%` (7,098 VRAM / 4,998 RAM / 0 SSD) |
-|---|---|---|
-| Decode, one request, `auto`, greedy (512 tok, 4 sets) | 55.0 (52.0-57.3) tok/s (prior: 54.5, 48.0) | 97.7 (84.3-100.7) tok/s (prior: 87.8) |
-| Decode, one request, `auto`, temperature 1 (512 tok, 4 sets) | 54.1 (47.2-56.2) tok/s (prior: 55.4, 47.0) | 96.4 (87.4-97.0) tok/s (prior: 73.6) |
-| Decode, one request, plain (512 tok, 4 sets) | 42.3 (41.5-43.4) tok/s (prior: 42.0, 36.9) | 69.1 (65.6-69.3) tok/s (prior: 56.2) |
-| Decode, four requests, plain (512 tok, 4 sets) | 75.8 (74.1-76.2) tok/s aggregate (prior: 72.0, 69.5) | 147.8 (144.3-150.5) tok/s aggregate (prior 256 tok: 118.1, 81.2) |
-| Same split for both, `vram=40%`, T1 `round_bench` (`1x1` / `4x1` / `1x4`, 2026-11-27) | 35.9 / 120.0 / 100.5 tok/s (prior: 38.1 / 93.5 / 82.8) | 44.8 / 142.7 / 103.8 tok/s (prior: 45.7 / 117.0 / 100.0) |
-| Prefill (`infernix_bench` `pp4096` / `pp16384` / `pp32768`, INT8 KV, 2026-11-27) | 2.37k / 5.75k / 5.68k tok/s (prior: 2.40k / 5.56k / 5.41k; exact: 2.38k / 3.47k / 3.40k; live 17.6K beside 3 decodes: 5.68k) | 4.48k / 4.46k / 4.32k tok/s (prior: 4.21k / 4.05k / 3.92k; live 17.6K beside 3 decodes: 4.40k; exact route 1.56k-1.59k) |
-| Serving process, production flags, three 1K decodes beside a 17.6K prompt and its cached repeat | peak 92,666 MiB (cap 92,993, headroom 327 MiB) | peak 91,986 MiB (cap 92,993, headroom 1,007 MiB) |
-| Perplexity (different abliterations: not a measure of the quantization) | 3.1496 (`mean_nll` 1.1473, `expert-a4-residual`; 2443ee471 gate: 1.1471) | 3.2526 (`mean_nll` 1.1794; prior: 3.2546) |
-
-No published reference shares this artifact's abliteration, so its quantization loss is not
-measured. GCSA's Q8_0 build of the same repository is not one: against the Q4 build, `attn_output`
-of layers 15-44 (the 30 layers its adapter targets) differs by a rank-1 term beyond any rounding,
-and layer 20's routed experts differ 4-6 times more along that direction than along a random
-one, while layers 0-14 match byte for byte or as another rounding (2026-11-26, the converter's
-`require_shared_tensors` refuses it for `--gguf-experts`).
+Performance against the NVFP4 artifact is in §1. No published reference shares this artifact's
+abliteration, so its quantization loss is not measured. GCSA's Q8_0 build of the same repository
+is not one: against the Q4 build, `attn_output` of layers 15-44 (the 30 layers its adapter
+targets) differs by a rank-1 term beyond any rounding, and layer 20's routed experts differ 4-6
+times more along that direction than along a random one, while layers 0-14 match byte for byte or
+as another rounding (2026-11-26, the converter's `require_shared_tensors` refuses it for
+`--gguf-experts`).
 
 A placement switch that rebuilds the RAM tier runs off the engine thread ([MoE offload
 §4.8](moe-offload-design.md#48-placement-forms-and-the-runtime-switch)): switching `ram=41%` to
@@ -419,6 +404,8 @@ Additions to the shared tier and Ops, each costing Qwen3.8-Flash-Next nothing:
   the softmax route, whose kernels are untouched.
 - **The ungated shared expert and the SwiGLU clamp** (limit 10) as semantic inputs on every MLP
   class (`silu_mul_clamped`).
+- **Q2_K/Q3_K GGUF expert banks, per-pool decode landing, and LFRU-Blend adaptive admissions**
+  (MoE §4.3, §4.4, §9).
 
 New Ops: `mhc` (§9), `dsa_indexer` (§7.3, sharing the exact radix select of
 `src/ops/common/exact_topk_select.*` with `qsa`), `mla_sparse_attention` (§7.2) and the KDA calls
@@ -437,14 +424,14 @@ per layer l (45):
   mhc_update_mix → RMSNorm → MLP:
      layers 0-2: dense SwiGLU
      layers 3-44: router (noaux_tc) → residency → GPU jobs | staged misses | CPU misses
-                  shared expert ‖ routed experts (narrow W4A16) ‖ CPU misses → combine
+                  shared expert ‖ routed experts (narrow W4A16 or ggml) ‖ CPU misses → combine
   mhc_update
 head: mean of streams → norm → lm_head (FP32 logits) → sample → DFlash2 proposal (§10)
 ```
 
 One round is captured as a CUDA graph per (batch, width). The Program is synchronous: one round in
-flight. Host time between rounds is small against a ~25 ms round, so chained rounds are not built
-(Flash-Next measured its own and kept the synchronous contract, FN §8.8).
+flight. Host time between rounds is small against 14-24 ms decode rounds, so chained rounds are
+not built (Flash-Next measured its own and kept the synchronous contract, FN §8.8).
 
 ### 5.2 Router and miss classification
 
@@ -476,111 +463,72 @@ Every routed expert, on every route and processor, computes the same bits (MoE �
 
 ## 6. Expert residency, placement and miss service
 
-The tiers, frame pools, LFRU, landing, leases, the RAM tier, the SSD tier, the placement forms,
-the runtime switch and the memory laws are the shared tier's (MoE §4). The subject is the 12,096
-routed keys of the default artifact (42 × 288).
+The tiers, frame pools, LFRU-Blend policy, landing, leases, the RAM tier, the SSD tier, the
+placement forms, the runtime switch and the memory laws are the shared tier's (MoE §4). The
+subject is the 12,096 routed keys (42 × 288).
 
 ### 6.1 Placement
 
-The serving split is `vram=40%,ram=60%` (§1); the Q8-dense artifact would fit `vram=44%`. Each is
-the largest VRAM share that keeps the process under the 95 % cap with the prefix cache on at
-4 × 262,144 tokens, and puts no expert on the SSD, which measured faster than any SSD share at
-production's settings:
+The serving splits are `vram=40%,ram=60%` for NVFP4 (4,838 / 7,258 / 0) and `vram=59%,ram=41%`
+for GSQ-Q4 (7,098 / 4,998 / 0); the opt-in Q8-dense NVFP4 artifact fits `vram=44%`. Each is the
+largest VRAM share that stays under the 95 % cap (92,993 MiB) with the prefix cache on at
+4 × 262,144 INT8 tokens and puts no expert on the SSD. Adding an SSD share measured slower under
+production's DFlash2 and prefix-cache settings (NVFP4, `infernix_glm5_next_engine_bench`, K = 3,
+4 sets, 2026-11-24):
 
-| Split | VRAM / RAM / SSD experts | One request, K = 3, tok/s | Four requests, aggregate tok/s |
+| Split | VRAM / RAM / SSD experts | One request, tok/s | Four requests, aggregate tok/s |
 |---|---|---|---|
 | `vram=40%,ram=60%` | 4,838 / 7,258 / 0 | 41.1 (37.1-42.7) | 59.9 (56.5-62.0) |
 | `vram=40%,ram=50%,ssd=10%` | 4,838 / 6,048 / 1,210 | 37.9 (34.0-38.5) | 54.7 (52.2-57.7) |
 | `vram=40%,ram=40%,ssd=20%` | 4,839 / 4,838 / 2,419 | 34.2 (32.6-36.3) | 54.5 (50.9-57.2) |
 
-(`infernix_glm5_next_engine_bench`, INT8 KV, the prefix cache on, DFlash2 K = 3: median and range
-of four sets after a warm-up; model 16.70 GiB, KV 1.59 GiB at one lane and 6.36 GiB at four, expert
-cache 63.8 GiB.)
-
-An earlier measurement found a 20 % SSD share free at plain decode: one boot each,
-`--no-prefix-reuse`, four lanes, 65,536 tokens of context, 256 greedy tokens without a drafter,
-VRAM fixed at 42 % (5,080 experts; model 15.44 GiB, KV 0.40 GiB, experts 67.0 GiB):
-
-| RAM / SSD | RAM slots (residents + 1,536 stream slots) | One request, tok/s | Four requests, tok/s each |
-|---|---|---|---|
-| 58 % / 0 % | 8,552 | 41.6, 41.9 | 19.4 |
-| 38 % / 20 % | 6,132 | 42.4, 44.1 | 20.1 |
-| 28 % / 30 % | 4,922 | 34.9, 38.2 | 16.9 |
-
-The two measurements disagree at 20 % on the SSD. Their conditions differ: the first runs DFlash2
-(every verify column routes its own experts, so a one-request round misses more) and the prefix
-cache's larger KV, with four sets a point; the second ran plain decode with two runs a point. The
-cause of the difference is not isolated. The serving split follows the first, which measured
-production's settings.
-
 ### 6.2 VRAM policy and promotions
 
-The policy is the shared LFRU (MoE §4.3). Promotions run at one per layer every 32 decode tokens
-(`kDecodePromotionInterval`). Every expert lives in one tier, so a 13.5 MiB promotion also demotes
-one; a promotion every token copied ≈ 15 records each way per token across the link the misses
-need, and did not raise the hit rate (§6.3). No promotions follow a walked prefill (MoE §7.3).
+Decode and verification rounds use the shared **LFRU-Blend** adaptive decode policy
+(`ExpertResidency::after_round`, MoE §4.3-§4.4): landed misses settle into per-pool reserved
+landing frames (`kLandingSlots = 16` per layer) gated by copy-cost score margins (`1.0×` against
+a shadowed RAM victim, `1.10×` when eviction needs D2H); Phase A asynchronously pre-demotes
+unranked `count == 0` startup placeholders into spare/shadow RAM slots so active misses land
+immediately; Phase B promotes top-scoring non-landed misses (e.g. CPU-served misses) via explicit
+H2D up to `kDecodeAdaptiveH2DCap = 6` total admissions per round (`1.05×` shadow / `1.15×` D2H
+margin); Phase C maintains a steady-state landing frontier (~1 free frame per layer) bounded by
+RAM headroom so no RAM-only expert spills to SSD. Unconditional per-token promotion saturated PCIe
+and lost ≈ 25 % decode speed (§17.1). `kDecodePromotionInterval = 32` (`decode_budget`) applies
+only to non-decode served calls (small prefill chunks of at most 8 columns); wide prefill calls
+and layer walks promote nothing (MoE §7.3).
 
 ### 6.3 Miss service
 
 CPU-served misses default to 14 workers (`cpu_expert_workers`), up to 16 jobs per layer call
 (`cpu_expert_jobs`), and per-format PCIe link shares: `cpu_link_share256` = 120/256 (~46.9 % on
-the PCIe link, ~53.1 % on the CPU) for NVFP4 banks, and `cpu_ggml_link_share256` = 104/256
-(~40.6 % on the PCIe link, ~59.4 % on the CPU) for GGUF K-quant banks (tuned 2026-11-27 alongside
-AVX-512 VNNI block-half unrolling in `cpu/ggml_expert.cpp`, a 32-CTA × 32 KiB staging window in
-`moe_layer.cu`, and cold-placeholder pre-demotion in `ExpertResidency` that asynchronously demotes
-unranked `count == 0` startup seeds into free/shadow RAM slots on `d2h_stream_` so decode misses
-land directly via `stage_kernel` without extra H2D traffic or SSD spill; MoE §5.6 states the
-shared share forms). The CPU computes any column count without
-changing a bit, since every W4A16 and exact ggml route is bit-exact. While the host computes a
-call's misses the device runs the shared expert and warms the next layer's attention mix and first
-input projections into L2 (40 MiB at one column, 16 MiB wider: FN §8.6's budgets); the bits are
-unchanged and the one-row round median fell 21.6 → 20.3 ms (`vram=44%`, Q8-dense artifact). Earlier
-NVFP4 sweep (`vram=42%,ram=58%`, INT8 KV, 256-token answers, two runs each):
-
-| Configuration | One request, tok/s | Four requests, aggregate tok/s | Decode hits |
-|---|---:|---:|---:|
-| A promotion every token, no CPU lane | 30.7-31.7 | ≈ 45 | 86 % |
-| No promotions, no CPU lane | 42.2-42.3 | | 88.9 % |
-| A promotion every 8 / 32 tokens, no CPU lane | 37.9-39.2 / 41.2-41.3 | | 87 / 88.5 % |
-| No promotions, CPU lane 8 workers, link share 1/2 | 47.1-47.5 | 75.4 | 88.9 / 80.1 % |
-| Same, 12 workers | 47.8-47.9 | 78.7 | 88.9 / 80.9 % |
-| Same, 8 workers, link share 1/3 | 46.5-48.0 | 75.0 | 88.9 / 80.8 % |
-
-Twelve workers measured 1-4 % faster, inside the spread their higher hit rate explains; eight leave
-the host cores to other work.
-
-The one-row verify round spends more on staging than on the CPU wait (27.9 against 13.9 ms at
-K = 3, §10.3), so calls of two or more columns were given their own link share (the shared
-`wide_share` / `wide_share_from` mechanism). It did not pay: serving split, DFlash2 `auto`,
-temperature 1.0, one request, 1,024-token essays, four sets, 2026-11-26:
-
-| Calls of ≥ 2 columns | Median tok/s (range) |
-|---|---:|
-| link 1/2, 4 CPU jobs, 8 workers (served) | 49.2 (44.6-51.0) |
-| link 1/3 | 48.4 (45.9-48.7) |
-| link 1/4 | 47.2 (41.8-47.3) |
-| link 2/3 | 46.3 (42.6-47.0) |
-| link 1/3, 8 CPU jobs | 46.9 (43.6-48.2) |
-| link 1/2, 12 workers | 47.5 (46.6-52.3) |
-
-Moving misses either way made the round slower, so the single half share stays.
+PCIe, ~53.1 % on CPU) for NVFP4 banks, and `cpu_ggml_link_share256` = 104/256 (~40.6 % on PCIe,
+~59.4 % on CPU) for GGUF K-quant banks (tuned 2026-11-27 alongside AVX-512 VNNI block-half
+unrolling in `cpu/ggml_expert.cpp`, a 32-CTA × 32 KiB staging window in `moe_layer.cu`, and
+conditional CPU-plan `x` column publishing, MoE §5.4-§5.6). The CPU computes any column count
+without changing a bit, since every W4A16 and exact ggml route is bit-exact. While the host
+computes a call's misses the device runs the shared expert and warms the next layer's attention
+mix and first input projections into L2 (40 MiB at one column, 16 MiB wider: FN §8.6's budgets;
+one-row round median fell 21.6 → 20.3 ms on the 2026-11-24 Q8-dense check, bits unchanged).
 
 ### 6.4 Staging slots
 
-Staging slots are frames with a staging role: top_k × the widest decode or verify call's columns
-(at most 8), and at least 32 (0.42 GiB), since a slot costs as much VRAM as a cached expert. A call
-keeps the expert Op's fork route (staging beside the resident experts, staged misses landing in the
-cache) only while its jobs fit the slots; past them it stages in serial passes and lands nothing.
-With 32 slots a five-column call cost 35 ms of staging more per round than with slots sized to it
-(§10.3). Serving's widest call (four lanes, or one row of K = 3) is 4 columns, 32 slots; one row of
-K = 7 takes 64 (0.85 GiB). The prefill ring and walk span and the vision encode borrow frames
-through leases (MoE §4.5).
+Staging slots are sized in `plan_device` (`program/construct.cpp`) to
+`max(32, top_k × min(max(lanes, width), 8))`: each slot costs as much VRAM as one max-stride
+expert record. A call keeps the expert Op's fork route (staging beside resident experts, staged
+misses landing in reserved frames) only while its jobs fit the slots; past them it stages in
+serial passes and lands nothing. Serving (`--max-concurrency 4`, `--draft-tokens auto` → width 6)
+allocates **48 staging slots** (0.63 GiB NVFP4; 0.59 GiB GGUF at layer 3's 13.0 MB stride); plain
+four-lane decode or fixed K ≤ 3 takes 32 slots (0.42 GiB), and fixed K = 7 takes 64 slots
+(0.85 GiB). The prefill ring, walk span and vision encode borrow frames through leases (MoE §4.5).
 
-### 6.5 Plain decode profile
+### 6.5 Decode round attribution
 
-At one request (`vram=42%,ram=58%`) a plain round spends 8.1 ms of 21.3 ms per token in the BF16
-dense GEMVs (at the read rate), 4.3 ms in hit experts (≈ 54 % of the read rate), 4.2 ms staging
-misses beside them and 2.7 ms waiting for the CPU lane; the GPU idles 0.5 ms.
+Nsight round attribution (`make t2-bench FAMILY=glm5_next PROFILE=1`, NVFP4, 2026-11-24):
+one-row rounds are ≥ 98 % GPU-busy; the DFlash2 drafter's own kernels take ≤ 2 ms per round and
+80-84 % of a verify round is target expert service. At plain one-row decode (`vram=42%`, 21.3 ms
+round), time split into BF16 dense GEMVs 8.1 ms (at DRAM roofline), hit experts 4.3 ms, miss
+staging 4.2 ms, CPU wait 2.7 ms, and 0.5 ms GPU idle. Current plain one-row decode rounds average
+≈ 23.6 ms on NVFP4 (`vram=40%`, 42.3 tok/s) and ≈ 14.5 ms on GSQ-Q4 (`vram=59%`, 69.1 tok/s).
 
 ### 6.6 RAM tier, warm start and multi-pool landing
 
@@ -767,103 +715,37 @@ decode).
 
 ### 10.3 Measurements
 
-Draft length at one request on the Q8-dense artifact (not served, §17.2), `vram=44%,ram=56%`
-(5,322 / 6,774 / 0 experts; model 10.43 GiB with the drafter, KV 1.59 GiB, experts 70.2 GiB),
-`infernix_glm5_next_engine_bench --concurrency 1 --tokens 512 --repeat 4`, 2026-11-24:
-
-| K | Median tok/s | Range | Accepted, last two sets |
-|---|---|---|---|
-| 0 (plain) | 40.7 | 38.1-41.9 | – |
-| 2 | **52.1** | 43.9-52.8 | 62 %, 64 % |
-| 3 | 47.1 | 44.7-56.0 | 51 %, 60 % |
-| 4 | 46.9 | 42.6-48.6 | 50 %, 43 % |
-
-K = 2 has the best median; K = 3's acceptance varies more between sets (its best set, 56.0, is
-the fastest single set). On these essays acceptance sits below DFlash2's published 80-85 % a
-position for Qwen3.8-27B (no GLM numbers are published), while a greedy chat continuation accepts
-5.27 of 7 (below); the drafter was trained against the official checkpoint, not the uncensored
-edit served here. The BF16-dense measurements below set serving's K = 3.
-
-Rounds of several rows, `vram=45%,ram=55%` (5,443 / 6,621 / 32 experts), INT8 KV, 600-token essay
-continuations, two runs a level, aggregate output tok/s:
-
-| Decode | 1 request | 2 requests | 4 requests | Process VRAM |
-|---|---|---|---|---|
-| plain | 29.7, 33.5 | 43.2, 39.0 | 46.8, 45.2 | 90.1 GiB |
-| DFlash2 K = 3, every round | 31.5, 37.2 | 34.4, 35.2 | 39.3, 40.7 | 91.7 GiB |
-| DFlash2 K = 7, every round | 25.0, 26.8 | 24.6, 24.1 | 27.8, 29.7 | 91.8 GiB |
-| DFlash2 K = 2, one-row rounds only | 37.2, 33.6 | 42.9, 40.9 | 47.3, 52.4 | 91.6 GiB |
-| DFlash2 K = 3, one-row rounds only | 34.9, 33.6 | 47.7, 39.2 | 54.4, 53.0 | 91.6 GiB |
-
-Acceptance on these prompts is 49-58 % at K = 3; the expert cache's hit rate falls from 84-86 % to
-76-77 %, since every verify column routes its own experts. A greedy chat continuation accepts 5.27
-of 7 drafts a round; a sampled one (temperature 0.8) 60 of 236 at K = 7. Drafting every round loses
-at two and four requests, and drafting one-row rounds only is no slower than plain there, which
-decided the policy. The drafter adds 1.6 GiB of VRAM (weights, context ring, verify records).
-
-Draft length at one request, `vram=42%,ram=58%` (5,080 / 7,016 / 0 experts; model 15.44 GiB,
-experts 67.0 GiB), 512-token essays, four sets after a warm-up
-(`infernix_glm5_next_engine_bench --draft-tokens K`; speeds climb over an Engine's first sets as
-the cache warms, so the last two sets compare):
-
-| K | Median tok/s | Last two sets | Accepted | ms a round |
-|---|---|---|---|---|
-| 0 (plain) | 35.0 | 35.0, 35.3 | – | 28 |
-| 1 | 40.9 | 40.9, 42.1 | 74-82 % | 42 |
-| 2 | 44.4 | 44.4, 44.5 | 56-65 % | 50 |
-| 3 | **47.8** | 47.8, 48.1 | 50-57 % | 55 |
-| 4 | 43.2 | 43.0, 46.5 | 41-52 % | 64 |
-| 5 | 37.7 | 35.3, 41.6 | 35-43 % | 75 |
-
-K = 3 measured fastest, which set serving's length. Under Nsight
-(`make t2-bench FAMILY=glm5_next PROFILE=1`) a one-row round is GPU-bound (≥ 98 % busy) and the
-drafter's own kernels are ≤ 2 ms of it; 80-84 % of the round is the target's expert service. At
-K = 3, of 58.6 ms: miss staging 27.9, the CPU team's wait 13.9, GPU experts 11.7, dense BF16
-weights 8.4 (the plain round: 27.7 ms, of which staging 5.6, CPU 9.2, dense 8.1). The second to
-fifth verify columns cost 14, 8, 5 and 9 ms each, as every column routes its own experts.
-
-The calibrated length against K = 3, serving split (`vram=40%,ram=60%`, 4,838 / 7,258 / 0 experts;
-model 15.44 GiB, 16.70 with the drafter), one request, 512-token essays, four sets after a warm-up,
-`infernix_glm5_next_engine_bench --concurrency 1 --tokens 512 --repeat 4`, 2026-11-26:
-
-| Sampling | K = 3 | `auto` | `auto`: drafts verified a drafting round, accepted, plain rounds |
-|---|---|---|---|
-| greedy | 46.0 (39.1-48.5) | 45.9 (44.2-49.5) | 3.0, 58-63 %, 9-17 % |
-| temperature 1.0, top-p 0.95 | 43.0 (41.9-43.2) | 48.2 (41.2-50.1) | 3.4, 63-69 %, 17-20 % |
-
-On greedy essays the calibrated length commits 2.88 tokens a round against K = 3's 2.65, but its
-rounds took ≈ 63 ms against ≈ 57.5, more than T(k) predicts for its mix of lengths; the two are
-equal within the sets' spread. Sampled, where the selector's probabilities separate good drafts from
-bad ones, it is 12 % faster at the median.
+- **Why only one-row rounds draft:** every verify column routes its own experts, cutting the
+  expert cache hit rate (≈ 84-86 % → 76-77 % on 2026-11-24 multi-row checks). Drafting every round
+  slowed 2- and 4-request aggregate decode by 15-25 % at K = 3 and > 40 % at K = 7; restricting
+  drafting to one-row rounds keeps multi-request throughput equal to plain decode. The drafter
+  adds 1.6 GiB of VRAM (weights, context ring, verify records) and ≤ 2 ms per round.
+- **Why `--draft-tokens auto` replaced fixed lengths:** on fixed sweeps (`vram=42%`, 2026-11-24),
+  fixed K = 4 and K = 5 lost to K = 3 because each verify column adds miss staging and CPU wait
+  time even when draft confidence is low. With `auto` (0..5) and the online `RoundCostModel`
+  (§10.2), one-request decode gains +28-30 % on NVFP4 (42.3 → 55.0 greedy / 54.1 T = 1.0) and
+  +40-41 % on GSQ-Q4 (69.1 → 97.7 greedy / 96.4 T = 1.0; §1). Acceptance on essays sits around
+  58-69 % across verified drafts (greedy chat continuations reach ≈ 5.3 of 7); the incoai drafter
+  was trained on the official checkpoint, not the uncensored edit served here.
 
 ### 10.4 Fine-tuning the drafter on the served target
 
-The incoai drafter was trained against the official checkpoint. `tools/drafter/` (README.md) fine-tunes
-it on this engine's features of the served uncensored target: the target's own answers through the
-public Engine (`infernix_glm5_next_drafter_generate`), each record's teacher-forced tap features and
-final stream mean through the causal-scoring Program (`infernix_glm5_next_drafter_capture`,
-`Program::enable_feature_capture`), then speculators' `DFlash2DraftModel` objective warm-started from
-the incoai body. The capture is checked by the target head's agreement with the next token on the
-target's own sampled answers (94-98 %), and an untrained round trip reproduces the incoai tensors
-bit for bit.
+The incoai drafter was trained against the official checkpoint. `tools/drafter/` (`README.md`)
+fine-tunes it on this engine's features of the served uncensored target: the target's own answers
+through the public Engine (`infernix_glm5_next_drafter_generate`), each record's teacher-forced
+tap features and final stream mean through the causal-scoring Program
+(`infernix_glm5_next_drafter_capture`, `Program::enable_feature_capture`), then speculators'
+`DFlash2DraftModel` objective warm-started from the incoai body. The capture is checked by the
+target head's agreement with the next token on the target's own sampled answers (94-98 %), and an
+untrained round trip reproduces the incoai tensors bit for bit.
 
-The first run, 2026-11-26: 210 answers (298k tokens, temperature 1.0; generation ran at 39 tok/s
-with eight requests, the corpus's limit) and 400 UltraChat conversations (458k tokens), weights 3 : 1,
-lr 3e-5, 8,192-token rows of 512 anchors, four rows a step. The held-out sum of the selector's
-teacher-forced accuracy at draft positions 1-5 rose 2.415 → 2.468 by step 400 and then fell (2.343
-at step 3,993): the answers overfit. The step-400 drafter
-(`GLM-5.3-Flash-DFlash2-FT-Infernix.infernix`, not served) against incoai, `auto`, one request,
-512-token essays, four sets:
-
-| Sampling | incoai | fine-tuned |
-|---|---|---|
-| temperature 1.0 | 47.7 (41.1-48.7) tok/s, 2.88 tokens a round | 48.2 (41.5-50.8), 2.87 |
-| greedy | 45.9 (44.2-49.5), 2.88 (§10.3's run) | 49.3 (44.5-50.4), 2.85 |
-
-Tokens a round did not change, so serving keeps the incoai drafter. A gain needs far more of the
-target's own text than the generation rate gave overnight (the Apache-2.0 GLM-5.3-Flash DFlash2
-trainer github.com/Enntity/glm-flash-drafter fine-tuned on ≈ 119M stored tokens of its own traffic
-and reports 115-122 % of the incoai drafter's speed there, 87-95 % on public prompts).
+A single-GPU overnight pilot (2026-11-26: 210 target answers / 298k tokens + 400 UltraChat
+conversations / 458k tokens, weights 3 : 1, lr 3e-5) peaked in held-out teacher-forced accuracy at
+step 400 (2.415 → 2.468 across positions 1-5) and then overfit (2.343 by step 3,993). At serving
+decode it did not increase accepted tokens per round (2.85-2.87 vs incoai's 2.88), so serving
+keeps the incoai drafter. Meaningful acceptance gains require tens of millions of on-policy tokens
+(e.g. `github.com/Enntity/glm-flash-drafter` fine-tuned on ≈ 119M stored tokens and reported
+115-122 % of incoai's speed on matching traffic, 87-95 % on public prompts; §17.2).
 
 ## 11. Prefill
 
@@ -884,19 +766,22 @@ nothing while a span is active. Prefix taps due at an inner chunk end on the blo
 captured in place (§12); only a due tap off the block grid ends the span.
 `ProgramOptions::prefill_walk` turns walks off.
 
-Measured (`vram=42%,ram=58%`, 5,080 / 7,016 / 0 experts; model 15.44 GiB, KV 0.40 GiB, experts
-67.0 GiB; INT8 KV, `--no-prefix-reuse`, chunk 4,096):
+With the qualified prefill fast paths (`expert-a4-residual` on NVFP4, `ggml-bf16-prefill` on
+GSQ-Q4), 16-warp `mla_sparse_attention`, double-buffered `mhc` and `MmaR128T128` Q8 dense
+prefill (§1):
 
-| Prompt tokens | Chunk-major | Walk |
-|---|---|---|
-| 10,092 | 6.3 s TTFT (1.61k tok/s) | 4.3 s (2.35k tok/s) |
-| 12,644 | 8.0 s (1.59k tok/s) | 5.2 s (2.43k tok/s) |
-| 37,805 | 18.5 s (2.04k tok/s) | 15.7 s (2.41k tok/s) |
+- **NVFP4 (`vram=40%,ram=60%`):** a single 4,096-token chunk (`pp4096`, 2.37k tok/s) is PCIe
+  DMA-bound because every non-resident expert (~96 GiB) moves once for one chunk. Multi-chunk
+  walks amortize each streamed expert copy across up to 8 chunks (32,768 tokens), reaching 5.75k
+  tok/s at `pp16384` and 5.68k tok/s at `pp32768` (live 17.6K prompt beside three decodes: 5.68k).
+- **GSQ-Q4 (`vram=59%,ram=41%`):** smaller records and higher VRAM residency (~48 GiB streamed
+  per pass) already keep `pp4096` near the compute envelope (4.48k tok/s), with `pp16384` /
+  `pp32768` at 4.46k / 4.32k tok/s (live 17.6K: 4.40k).
 
-The flat rate says prefill is compute-bound. Under a small RAM tier the walk is no faster than
-chunk-major: the stream's read slots are an eighth of the tier's, so a layer's SSD-only experts
-beyond that share go to the fetch channel once per chunk (`--expert-ram-mib 24576`: about 74 s for
-a 7,741-token prompt). The serving split leaves no SSD-only expert.
+Under a small RAM tier the walk loses its advantage over chunk-major: the stream's read slots are
+an eighth of the tier's, so a layer's SSD-only experts beyond that share go to the fetch channel
+once per chunk (`--expert-ram-mib 24576`: ≈ 74 s for a 7,741-token prompt, 2026-11-24). Both
+serving splits leave zero SSD-only experts.
 
 ### 11.2 The streamed ring
 
@@ -909,21 +794,9 @@ of frames the expert cache lends for the prompt; runs of adjacent records of one
 one copy, and a layer's copies enqueue as one `CopyBatch`. The MoE reads a streamed record like a
 resident one (`MoeExpertSource::prefetched`). An expert beyond the ring's half, or without a host
 copy, stages or fetches as before; within a walk span the tier's stream slots read SSD-only
-experts too. `--prefill-expert-stream off` stages with the MoE's SM kernel as decode does.
-
-Measured (`--kv-dtype int8 --max-concurrency 4 --max-context 65536 --experts vram=45%,ram=55%
---no-prefix-reuse`, chunk 4,096; 5,443 / 6,653 / 0 experts; model 15.44 GiB + KV 0.40 GiB + expert
-cache 71.8 GiB), one boot per build, streaming on and off on the same binary:
-
-| Prompt tokens | Streamed off | Streamed on |
-|---|---|---|
-| 10,092 | 9.8 s TTFT, 1.03k tok/s | 7.1 s, 1.42k tok/s |
-| 20,209 | 18.2 s, 1.11k tok/s | 12.4 s, 1.62k tok/s |
-| 40,380 | 36.5 s, 1.11k tok/s | 24.9 s, 1.62k tok/s |
-
-Greedy tokens, DFlash2 agreement lines and causal-scoring log-probabilities are identical between
-the two, and decode after a long prompt is unchanged (37.5 tok/s after a 10K prompt either way; the
-ring returns before decode).
+experts too. `--prefill-expert-stream off` stages with the MoE's SM kernel as decode does (~31 %
+slower on 10K-40K prompts on 2026-11-24 A/B checks, bits identical, and decode speed after the
+prompt unchanged because the ring returns before decode).
 
 ### 11.3 Compute
 
@@ -986,13 +859,19 @@ The sizing law, the spill guard and the monitor are the shared tier's (MoE §4.9
 embedding stays host-resident (pinned, one row read per token). `vram=100%` is refused: the bank
 (159.4 GiB in frames) exceeds the card.
 
-The serving split's ledger (§1): model 16.70 GiB (the dense BF16 weights, the drafter, workspace),
-KV 6.36 GiB at 4 × 262,144 INT8 tokens with the prefix cache on (1.59 GiB at one lane), and the
-expert cache 63.8 GiB (4,838 frames of 13.5 MiB, staging included). The measured process peak while
-serving is 92,670 MiB with `--draft-tokens auto` and `--vision` (92,412 MiB at fixed K = 3)
-against the 92,993 MiB cap; 42 % VRAM sat at 95,672 MiB. KV is allocated for
-every lane at the full context at startup, so the VRAM share must be re-measured whenever
-`--max-context` or `--max-concurrency` changes. Each lane also holds its KDA state (141 MB).
+The serving splits' ledgers (§1, four lanes × 262,144 INT8 tokens with prefix cache, `--draft-tokens
+auto`, `--vision`, against the 92,993 MiB cap):
+
+- **NVFP4 (`vram=40%,ram=60%`):** model 16.70 GiB (dense BF16, drafter, workspace), KV 6.36 GiB
+  (1.59 GiB at one lane), expert cache 63.8 GiB (4,838 frames of 13.5 MiB, plus 48 staging slots);
+  measured peak **92,666 MiB** (headroom 327 MiB; `vram=42%` exceeded the cap at 95,672 MiB).
+- **GSQ-Q4 (`vram=59%,ram=41%`):** model 10.51 GiB (dense Q8, drafter, workspace), KV 6.36 GiB,
+  expert cache 69.3 GiB (7,098 frames across stride pools, plus 48 staging slots); measured peak
+  **91,986 MiB** (headroom 1,007 MiB).
+
+KV is allocated for every lane at the full context at startup, so the VRAM share must be
+re-measured whenever `--max-context` or `--max-concurrency` changes. Each lane also holds its KDA
+state (141 MB).
 
 ### 13.2 Host RAM
 
@@ -1019,7 +898,8 @@ not gated and stays exact):
   1.16 GiB`); calls of 9-63 columns route jobs of more than 8 entries through it. Qualified
   2026-11-27 ([model quality §6.7](model-quality.md#67-fast-path-registry); mean KL excess
   -1.72e-4, top-1 excess -0.016 pts, PPL ratio 0.99967, p99.9 ratio 0.992), lifting `pp16384`
-  3.47k → 5.56k tok/s (+60.2 %) and `pp32768` 3.40k → 5.41k tok/s (+59.1 %).
+  from 3.47k exact to 5.75k tok/s (+65.6 %) and `pp32768` from 3.40k exact to 5.68k tok/s (+67.1 %
+  with the MLA and `mhc` prefill optimizations, §1).
 - **`ggml-bf16-prefill` (GGUF artifact, §3.3).** Calls of 64 or more columns run every active
   non-CPU expert job on BF16 tiles directly from BF16 x (skipping limb encoding and narrow dp4a),
   while calls of 9-63 columns route jobs of more than 8 entries to BF16 tiles. Qualified 2026-11-26
@@ -1174,12 +1054,13 @@ sizing headrooms (`--vram-headroom-mib`, `--ram-headroom-mib`) are shared. This 
 | `--prefill-expert-stream on\|off` | on | The streamed ring (§11.2) |
 | `--host-context-mib N` | 2048 | The prefix Host tier; must be positive while the cache is on |
 | `--vision`, `--vision-offload auto\|on\|off`, `--vision-max-merged-tokens N` | off, auto (on) | Image and video prompts (§15.2) |
+| `--route-trace FILE` | off | Write per-round expert routing trace for offline policy replay (`src/models/offload/route_trace.h`) |
 | `--reasoning-effort low\|high\|max` | max | Template default; requests may override |
 
 Refused at startup, each naming the reason: `--spec` other than `dflash2`, n-gram drafting
 (`--ngram-draft-tokens`, `--ngram-archive-mib`, `--ngram-volume`), draft trees, fast-path
 candidates and exclusions other than `expert-a4-residual` (NVFP4 artifact) and `ggml-bf16-prefill`
-(GGUF artifact), `--expert-tail-skip`, `--route-trace`, and for the
+(GGUF artifact), `--expert-tail-skip`, and for the
 prefix cache the Disk tier, persistence, Device snapshot slots, packed Host state and tool-call
 holds.
 
@@ -1198,39 +1079,38 @@ decided the shared machinery are in
 
 | Option | Reason |
 |---|---|
-| **The EXL3 3.05 bpw builds as the artifact** (MikeRoz's and turboderp's) | A new codec and kernels, ≈ 7k lines (trellis decode, an `exl3` Linear, an E3A16 canonical arithmetic, a CPU kernel), where the NVFP4 artifact reuses the built W4A16 kernels, the `nvfp4_expert_rg16_v1` layout and the converter's compressed-tensors source. EXL3 3.05 bpw measured mean KL 0.047 against BF16 in alesha-pro's table (§18.3); it stays an option on an owner request |
 | Requantizing the artifact's weights at import | Changes the weights for no speed gain; a lighter format is a recipe decision, not an import transform |
 | Any SSD cache, spill or swap file; memory-mapped experts | The artifact already holds the exact bytes (MoE §10.1); a mapped file's unbuffered reads measured a quarter of the unmapped rate on Flash-Next (FN §12.3) |
 | Zero-copy SM reads of host experts | 10-14 GB/s against 24-27.6 staged (Flash-Next, MoE §5.2) |
-| Expert deferral, dynamic top-k, low-bit miss copies, expert skipping in the default configuration | They change the model; top-k 6 was rejected on quality by ox-boost (§18.1). The family refuses `--expert-tail-skip`; an opt-in approximate mode is not built (§17.2) |
-| A promotion every decode token | 30.7-31.7 against 41.2-41.3 tok/s at one per 32 tokens, with no hit-rate gain (§6.3) |
-| Drafting every round, or a fixed K ≥ 4 | Every-round drafting is slower than plain at two and four requests; fixed K = 4-5 are slower than K = 3 at one request (§10.3); the calibrated length reaches 4-5 only where the drafts' probabilities are high (§10.2) |
-| MTP drafting with the checkpoint's MTP layer | Both public GLM-5.3-Flash MTP experiments measured slower over PCIe-transferred misses, and Project Maya traced why on one GPU: consecutive tokens share ~1 of 8 experts per layer and none of their RAM pulls (§18.2). The layer stays in the artifact, not loaded |
-| A BF16 KDA state | Saves ≈ 0.1 ms of a ~25 ms token for a numerical change |
+| Expert deferral, dynamic top-k, low-bit miss copies, expert skipping in the default configuration | They change the model; top-k 6 was rejected on quality by ox-boost (§18). The family refuses `--expert-tail-skip`; an opt-in approximate mode is not built (§17.2) |
+| Unconditional per-token promotions | Promoting every decode token without cost margins saturated PCIe and lost ≈ 25 % speed (30.7-31.7 vs 41.2-41.3 tok/s); replaced by LFRU-Blend cost-marginal landing + capped adaptive H2D admissions (§6.2, MoE §4.3-§4.4) |
+| Drafting every round, or a fixed K ≥ 4 | Every-round drafting is slower than plain at two and four requests; fixed K = 4-5 are slower than K = 3 at one request (§10.3); `--draft-tokens auto` reaches K = 4-5 only when calibrated draft probabilities and `RoundCostModel` justify it (§10.2) |
+| MTP drafting with the checkpoint's MTP layer | Public GLM-5.3-Flash MTP runs measured slower over PCIe-transferred misses because consecutive tokens share ≈ 1 of 8 experts per layer (§18). The layer stays in the artifact, not loaded |
+| A BF16 KDA state | Saves ≈ 0.1 ms of a 14-24 ms decode round for a numerical change |
 | Folding W_uk into W_qb or W_uv into W_o offline | Changes the stored weights and reads more bytes per token (50 M and 134 M parameters against 33 M and 75 M) |
-| The staged wide prefill pass, and an expert-group pipelining design | The staged pass could not overlap: the MoE's staging-overlap route is refused for wide calls, because overlapped wide passes measured nondeterministic in Flash-Next (FN §13.4). The streamed ring (§11.2) replaced both, reusing the frame pools and the wide route's combine order |
-| An SSD share in the serving split | Slower at the serving settings (§6.1) |
+| The staged wide prefill pass, and an expert-group pipelining design | Overlapped wide staging measured nondeterministic in Flash-Next (FN §13.4); the streamed ring (§11.2) replaced both |
+| An SSD share in the serving split | Slower at serving settings when host RAM holds 100 % of non-VRAM experts (§6.1) |
 
 ### 17.2 Not built
 
+Options that are not implemented or not yet adopted, distinguishing engineering deferrals from
+open research/compute choices:
+
 | Option | State and reason |
 |---|---|
-| **8-bit dense recipe** | Built: the orcarouter recipe stores KDA q/k/v/o, MLA query down/latent/up/output, the dense MLP and the shared expert as `q8_g32_fp16` (grouped MSE scales) from the source's BF16; the embedding, `lm_head`, routers, KDA control projections, key_up/value_up and the indexer stay BF16. Model 15.44 → 9.17 GiB, +9 % one-request decode (§1). strata-glm measured int8-per-32 dense at 0.0105 mean KL against 0.0066 for BF16 dense after a 2,600-token prompt (§18.4). Not served: against the BF16-dense artifact (`infernix-perplexity` quick corpus, context 8192, stride 4096, INT8 KV, 252,823 positions) it measured mean KL 0.0058, p99 0.066, top-1 97.3 % (PPL 3.1515 against 3.1489), against the gate's 0.002 / 0.05 / 99 %; the BF16 artifact's own chunk-order floor is 0.00012 and 99.9 %. The error is spread over every context bucket (0.005-0.007). Untried: which projections carry it (a KDA-BF16 variant keeps most of the bytes) |
-| **A teacher-forced KL gate on frozen texts** (≥ 2,500 positions in the GLM template, with a block past 8K tokens; against the BF16 reference forward: mean KL ≤ 0.002 nats, p99 ≤ 0.05, top-1 ≥ 99 %) | Defined but not run. The current qualification is §14 |
-| **An opt-in approximate expert mode** (Maya's per-layer keep map, strata-glm's weight threshold, `ssd` or `vram` scope, a static reproducible rule) | Not built: it changes the model's outputs and would need its own labelling and KL gates. Maya measured +23 % decode at KL 0.018 to its own model; strata-glm +30 % at KL 0.022 for SSD-only experts below ≈ 3 % weight (§18) |
-| **Expert volumes on several drives: 12-way striped records, per-volume read queues, landed-unit masks** | Designed for the RTX 5090 machine with four NVMe drives, where two drives measured additive on 14.16 MB records (2 × 5.8 → 11.7 GB/s; 12.7 GB/s for a 990 PRO beside an Optane P5800X, 2026-10-10) and a striped record would land in ≈ 1.1-1.3 ms against ≈ 2.3 ms whole (model). The production machine has one drive and serves with no SSD share |
-| **SSD lookahead reads of predicted experts** | Project Maya found only ~40-45 % of disk misses predictable 1-4 layers ahead, and its lookahead was exact but slower on one NVMe (§18.2). No SSD share is served |
-| **Draft-informed SSD prefetch** (SP-MoE, MoE-SpeQ) | Needs measured recall first; no SSD share is served |
-| **An online round-time fit for the calibrated length** | T(k) is a constant table measured at one placement (§10.2); on greedy essays the chosen mix of lengths ran ≈ 10 % slower a round than the table predicts (§10.3). Flash-Next's MTP fit measured 6 % slower than its constant model on code (dflash.md) |
-| **Mixed rounds** (a prefill call inside the decode round's Forward) | A 30,614-token prompt beside a decoding lane prefilled at 2.53k tok/s while that lane's 1,500 tokens took 55.6 s against 42.3 s alone: the lane gets one round per walk step either way. A mixed round would save one decode round (≈ 27 ms) per 1,024-token step of ≈ 430 ms (≈ 6 % of the prefill), give the decoding lane no more rounds, and could not run for a lane that publishes to the prefix cache, since a mixed call's bits differ from its own call's |
-| **The KV host tier** (pooled keys on the device, latent pages in pinned RAM with a device cache of hot pools) | The device cache holds every served context on this card; the tier would trade expert frames for RAM-tier slots and a PCIe read per selected token without a workload that needs it. It stays the design for a smaller card or contexts past the device |
-| **`fp8` and `nvfp4` latents; Hadamard-domain latent profiles** | Refused until qualified; INT8 measured within the BF16 rounding floor (§7.4). Orthogonal rotations commute with the absorbed product, so rotated profiles would apply |
-| **An FP8 pooled-key scan with FP32 rescoring past 256K** | The indexer scan grows linearly (≈ 0.5 ms per token across 11 layers at 1M, model); no served context needs it |
-| **VRAM and RAM policy candidates** (LFRU with near-miss credit from router ranks 9-16, hot-layer reservations, aged LFU, soft per-layer shares, a static hot set with an LRU remainder) | The GLM engines disagree (ox-boost: decayed LFU lost to a router-score cache; Maya: LFU beat LRU by 10 points; strata-glm: a static hot set beat LRU, §18), so a replay on this model's route traces would decide. The family records no route traces yet (`--route-trace` is refused) |
-| **Prefill read-ahead and prestage** (the next layer's SSD-only records in a deep ring; the next layer's most-routed RAM experts during attention), **the last layer's tail for non-final tokens**, **a CPU share of the least-routed prefill experts** | Not built; the walk is compute-bound at the serving split (§11.1) |
-| **Stepping a large vision encode between other lanes' rounds; fused vision Q/K/V GEMMs; a D64 2-D rope** | Not built |
-| **Per-kernel decode budgets under ncu** | Not measured; the Nsight round profiles of §6.5 and §10.3 attribute the round |
-| **The RTX 5090 machine** (32 GB, Windows, PCIe Gen5 x8) | The shared tier's smaller-card path supports it, but this family was never measured there |
+| **Selective Q8-dense NVFP4 recipe** | Blanket `glm5_3_flash_nvfp4_orcarouter_q8dense` IS built (model 15.44 → 9.17 GiB, fitting `vram=44%`) and not default because blanket Q8 missed the 0.002 KL gate (mean KL 0.0058, p99 0.066, top-1 97.3 %, PPL 3.1515 vs 3.1489; §1). **Open:** per-class ablation keeping only the KL-sensitive dense projections in BF16 (e.g. KDA or MLA) while quantizing the bulk to Q8, and re-measuring Q8-dense prefill with `MmaR128T128` (`q8_a16_mma.cuh`) |
+| **Custom RCO-GSQ / mixed K-quant from `orcarouter` FP8** | **Open:** the shipped GGUF artifact (§3.3) uses GCSA's abliteration (no matched full-precision reference) and drops layers 39-44 to Q2_K. Quantizing `orcarouter/GLM-5.3-Flash-Uncensored-FP8` directly with RCO-GSQ (3.5-4.0 bpw, optional BF16 or selective-Q8 dense) would provide a verified KL measurement and an allocation sized specifically for 96 GB VRAM |
+| **Large-scale DFlash2 drafter fine-tuning** | **Open:** the overnight 298k-token pilot overfit after step 400 (§10.4); fine-tuning on 20-100M on-policy tokens from `orcarouter` FP8 or the served artifact remains untried (`tools/drafter/README.md`) |
+| **EXL3 3.05 bpw builds** (MikeRoz's and turboderp's) | Deferred on engineering cost: requires ≈ 7k lines of new trellis codec, E3A16 canonical arithmetic, GPU/CPU kernels and converter plumbing, whereas NVFP4 and GGUF K-quants reuse existing engine formats. External testing measured EXL3 3.05 bpw (122.3 GB) at mean KL 0.047 vs BF16 (§18); remains an option if codec cost is justified |
+| **Further VRAM/RAM cache policies** (router-score / near-miss credit from ranks 9-16, hot-layer reservations, static hot set + adaptive remainder) | LFRU-Blend with cost-marginal landing, cold pre-demotion, adaptive H2D cap and steady landing frontier is shipped (§6.2, MoE §4.3). `--route-trace` IS supported (§16), so `tools/expert_cache_replay/replay.py` can evaluate further policies on recorded `glm5_next` traces |
+| **Prefill read-ahead / prestage / CPU assist for single-chunk prompts** | Single-chunk NVFP4 `pp4096` (2.37k tok/s) is PCIe DMA-bound while 16K-32K walks (5.68-5.75k tok/s) amortize each expert copy across chunks (§11.1). Deeper prestage, last-layer tail pruning for non-final tokens, or CPU assist on least-routed experts could still lift 256-4,096-token prompts |
+| **Mixed rounds** (prefill call inside decode round's Forward) | At current prefill speeds (4.4-5.7k tok/s), a 1,024-token beside-decode step takes ≈ 180-230 ms and a decode round ≈ 15-24 ms; unbuilt because mixed calls change call widths and break chunk-grid prefix-cache tap exactness (§12) |
+| **A teacher-forced KL gate on frozen texts** (≥ 2,500 positions in the GLM template, including a block past 8K; mean KL ≤ 0.002, p99 ≤ 0.05, top-1 ≥ 99 %) | Defined but not run; current qualification is §14 and the quick-corpus KL check |
+| **An opt-in approximate expert mode** (per-layer keep map or routing-weight skip threshold) | Not built: alters model output and would require opt-in flags and KL gates (external engines report +23-30 % decode at KL 0.018-0.022, §18) |
+| **Multi-drive striped expert volumes, SSD lookahead, draft-informed SSD prefetch** | Designed for multi-NVMe machines with SSD-tiered experts; the production machine has one drive and serves 0 % on SSD |
+| **KV host tier; `fp8`/`nvfp4`/rotated latents; FP8 indexer scan past 256K** | Device INT8 KV (1.59 GiB per lane at 262K) fits every served context and sits within BF16 rounding noise (§7.4); deferred until > 262K or smaller-card workloads need them |
+| **Stepped vision encodes; fused vision Q/K/V GEMMs; D64 2-D rope** | Not built; current streamed vision pass hides upload behind compute (411 ms for four images, §15.2) |
+| **Per-kernel ncu budgets; RTX 5090 (32 GB, Windows) measurements** | Shared smaller-card tier supports RTX 5090, but this family has only been measured on RTX PRO 6000 Linux |
 
 ### 17.3 Out of scope
 
@@ -1241,83 +1121,25 @@ decided the shared machinery are in
 
 ## 18. External evidence
 
-Measurements by other GLM-5.3-Flash implementations that this family's decisions lean on. The
-numbers are the sources' own, read 2026-10-10 to 10-12 and not reproduced here ([M] = the source
-reports a run). The shared machinery's evidence is in MoE §2 and §4-§8.
+Third-party GLM-5.3-Flash measurements (read 2026-10-10 to 10-12, not reproduced here) that
+informed architectural trade-offs; shared offload evidence is in MoE §2 and §4-§8.
 
-### 18.1 Other engines
-
-| Engine | Mechanism | GLM-5.3-Flash result |
+| Source | Key findings | Relevance to this family |
 |---|---|---|
-| **ExLlamaV3 offload fork, adrienbrault** (2 × RTX 5090 at x8, Ryzen 7 9800X3D, 64 GB DDR5-6000) | EXL3 2.05 bpw; 96-102 experts per MoE layer computed on the CPU by 8 threads | [M] 64.8 tok/s at one stream, 74-98 total at 2-4 streams; MTP 1.741 tokens per step; prefill ≈ 2,000 tok/s; the CPU worker reads cold EXL3 experts at ≈ 61 GB/s of a 63 GB/s ceiling |
-| **FreeToken port, anoane** (RTX PRO 6000 96 GB, x16, 160 GiB host) | All experts pinned, 17 layers VRAM-resident plus a 576-slot LRU; FP8 non-expert weights | [M] decode 22.2-22.7 tok/s, prefill 703 → 2,853 tok/s (chunk 8192); MTP slower (≈ 12 tok/s) |
-| **FreeToken ox-boost patch set** (RTX PRO 6000, DDR5-3600) | Router-score "soft" cache fed by near-miss experts beat LRU; decayed LFU **lost** ("drift-shaped locality"); hot resident layers; next-layer top-4 prefetch; FP8 non-expert weights | [M] decode 29.2 → ~38 tok/s (36.8 at 128K); soft cache 38.1 → 33.7 misses per token; hot layers +29 %; prefetch P = 4 +8 %, P = 6-8 slower; FP8 dense +28 %; MTP verify −13 % |
-| **strata-glm** (archived) | NVFP4 experts repacked for ggml, int8 dense, static VRAM hot set + LRU, pinned RAM tier, mirrored `experts.bin` on two drives | [M] decode 16-18 tok/s chat, 12.4-12.9 code on an RTX 5090 with 128 GB; ≈ 13 % of experts in VRAM, 58 % in RAM, 22.2 disk reads per token |
-| **KTransformers** (SOSP'25) | Routed experts on the CPU (AMX prefill, AVX-512 decode); "expert deferral" changes the mathematics | Deferral is out of scope |
-| **llama.cpp / ik_llama.cpp** | `--n-cpu-moe` / `-ot exps=CPU`; mmap pages from SSD with 111× read amplification on interleaved GGUF | No 5090 number found |
-| **vLLM `glm53-flash` image, SGLang** | All experts resident; FlashMLA sparse kernels are SM90/SM100 only | Reference logits only |
+| **Project Maya** (`mw00/project-maya`, single GPU) | VRAM hit rate much flatter than Flash-Next (44-65 % at 10.8 %, 74-82 % at 31 %); aged/decayed LFU beat LRU by ≈ 10 pts (Belady 87 %); MTP lost on single GPU (consecutive tokens share ≈ 1 of 8 experts); 1 CPU thread per physical core + dynamic work claiming beat HT/static; mapped files slowed Windows direct I/O; INT8 latents lossless; `TRUNK_KEEP` skipping gave +23 % at KL 0.018 | Informed LFRU-Blend + dynamic CPU workers (MoE §4.3, §5.3), INT8 latents (§7.4), no MTP (§17.1), unmapped `O_DIRECT` reads; opt-in skipping remains unbuilt (§17.2) |
+| **FreeToken / ox-boost** (RTX PRO 6000) | Router-score soft cache with near-miss credit beat LRU (38.1 → 33.7 misses/tok); hot resident layers +29 %; next-layer prefetch +8 % at P = 4, slower at P = 6-8; FP8 dense +28 %; MTP verify −13 % | Motivates testing near-miss credit via `--route-trace` replay (§17.2) and selective 8-bit dense (§17.2); naive next-layer router prefetch measured slower in this engine (MoE §10.3) |
+| **strata-glm** (RTX 5090, 128 GB RAM) | Blanket int8-per-32 dense raised KL (0.0105 vs 0.0066 BF16 at 2.6K context); INT8 latents +0.002 KL; static hot set + LRU helped; skipping SSD experts < 3 % weight +30 % at KL 0.022; NVFP4 code entropy 3.97/4 bits (incompressible) | Consistent with blanket Q8-dense KL (§17.2) and INT8 latent choice (§7.4) |
+| **ExLlamaV3 offload fork** (`adrienbrault`, 2× RTX 5090, EXL3 2.05 bpw) | 64.8 tok/s C1, 74-98 total C2-C4; CPU worker saturated host DDR5 (~61/63 GB/s) | Confirms host DRAM bandwidth bound for CPU expert execution |
+| **Quant quality survey** (`alesha-pro` vs BF16; cards against own refs) | `alesha-pro` vs BF16: EXL3 3.05 bpw (122.3 GB) KL 0.047 / top-1 93.1 %, Maya-M IQ2_S/IQ3_XXS (116 GB) KL 0.093 / 90.7 %, EXL3 2.05 bpw (85 GB) KL 0.121. Cards (separate refs): `orcarouter` NVFP4 (191 GiB) KL 0.073 vs FP8 / 91.7 %; `pfeifferj` GSQ-RCO 3.5-bit (137 GB) KL 0.071 vs Q8_0 / MMLU-Pro −1.40 pp; REAP pruning KL ≥ 0.45 | Explains why pruning is rejected, why NVFP4 and 3.5-bit GSQ-RCO sit near parity in KL while differing in VRAM fit, and why EXL3 3.05 bpw stays a deferred codec option (§17.2) |
 
-GLM-5.3-Flash misses far more often than Flash-Next at the same cache share: Flash-Next's LFRU
-replay misses 18.4 % / 5.2 % / 1.4 % at 16.3 % / 32.6 % / 48.8 % of the bank (MoE §4.3), against
-24 % → 10 % for ox-boost's policies at ≈ 47 %, and 35-56 % / 16-39 % / 18-26 % at 10.8 % / 21 % /
-31 % on Maya's V100 runs. Two causes fit: 8 active of 288 (2.8 %, against 10 of 512) and the
-auxiliary-free bias, which keeps experts near-uniformly loaded.
+Why GLM-5.3-Flash misses more than Flash-Next at an equal VRAM fraction: 8 of 288 active experts
+(2.8 % vs 10 of 512) combined with auxiliary-free router load balancing produces flatter expert
+popularity (Flash-Next LFRU misses 1.4 % at 48.8 % VRAM vs ~10-24 % here).
 
-### 18.2 Project Maya
-
-[Project Maya](https://github.com/mw00/project-maya) (MIT, read 2026-10-11) is Strata rewritten for
-this one model: VRAM, pinned-RAM and SSD expert tiers, a CPU lane, MTP drafting, its own 2-4-bit
-GGUF quants (Maya-M 116 GB: KL 0.093 against BF16 on alesha-pro's table). Its findings and what this
-family did with each:
-
-| Maya finding | This family |
-|---|---|
-| VRAM hit rate 44-65 % at 10.8 % of experts, 61-84 % at 21 %, 74-82 % at 31 %; 98 % at 70 % (two cards) | §18.1's locality comparison |
-| Policy replay: LRU 67 %, aged LFU 77.5 %, decayed frequency 78 %, a learned model 77 %, Belady 87 % | A policy candidate, not built (§17.2) |
-| Disk lookahead: only ~40-45 % of disk misses predictable 1-4 layers ahead; exact but slower on one NVMe | Not built (§17.2) |
-| MTP on one GPU does not pay: consecutive tokens share ~1 of 8 experts per layer and none of their RAM pulls | No MTP drafting (§17.1) |
-| CPU lane: one thread per physical core, never hyperthreads (21.8 → 13.3 tok/s); work in ~48 pieces claimed in turn (14.3 → 17.1 tok/s) | The shared CPU team's dynamic counters (MoE §5.3) |
-| A mapped model file sends every direct read down a slower path on Windows | The shared tier never maps the artifact (MoE §4.7) |
-| A tier-accounting bug left 12 % of experts in no tier; fixing it took real chat 13.2 → 17.0 tok/s | The shared tier's one-tier rule (MoE §4.1) |
-| Keeping a prompt's disk reads in RAM for the answer gave more disk reads, not fewer | No prompt landing reserve |
-| Prefill indexer scores as a register-tiled FP32 GEMM (78.8 → 5.6 ms) | §7.3's prompt scores |
-| INT8 latent cache: no measurable quality change | §7.4: serving uses `int8` |
-| KDA layers as CUDA graphs: +2.35 % | Whole-round graphs (§5.1) |
-| `TRUNK_KEEP` map: skip missing low-ranked experts in late layers, +23 % at KL 0.018 to its own model | The approximate mode, not built (§17.2) |
-
-### 18.3 The quant survey
-
-KL is comparable only within one table, since each card uses its own reference, texts and engine.
-alesha-pro's table measured several formats against the same BF16 teacher logits:
-
-| Quant | Size | KL |
-|---|---:|---|
-| orcarouter NVFP4 (the default) | 191.0 GiB | 0.073 against FP8, perplexity +3.8 %, top-1 91.7 % (its card, not this table) |
-| EXL3 3.05 bpw (turboderp; MikeRoz's uncensored build unmeasured) | 122.3 GB | 0.047 against BF16, top-1 93.1 % |
-| Maya-M GGUF IQ2_S / IQ3_XXS | 116.0 GB | 0.093 against BF16, top-1 90.7 % |
-| EXL3 2.4 bpw mix / 2.05 bpw | 98.1 / 85.1 GB | 0.096 / 0.121 against BF16 |
-
-Other cards, each against its own reference: GSQ-RCO 3.5-bit 137.1 GB 0.071 against Q8_0; AesSedai
-IQ4_XS / Q4_K_M / IQ3_S 0.117 / 0.050 / 0.283; REAP-pruned builds 0.45 and worse (pruning costs far
-more than quantization); GCSA-AiLab RCO-GSQ none published (served as the optional GGUF K-quant
-artifact, §3.3). orcarouter also publishes
-`orcarouter/GLM-5.3-Flash-Uncensored-FP8`, the same refusal edit at source precision.
-`RedHatAI/GLM-5.3-Flash-NVFP4` (the base model, same layout) imports through the same recipe.
-
-### 18.4 strata-glm
-
-[strata-glm](https://github.com/sergqwer/strata-glm) (archived, read 2026-10-12) ports
-GLM-5.3-Flash NVFP4 to Strata on an RTX 5090 with 128 GB of DDR5 and two NVMe drives, measured with a
-teacher-forced KL harness against a BF16-dense reference:
-
-- Quantizing the dense classes costs real KL, more at long context: int8-per-32 dense 0.0105 mean
-  KL against 0.0066 for BF16 dense after a 2,600-token prompt; NVFP4 per class 0.016 (head) to
-  0.028 (MLA).
-- INT8 latents: KL 0.0049 → 0.0069 over 2,600 tokens.
-- A static VRAM hot set + LRU remainder: 15.66 → 17.15-17.31 tok/s; disk reads 30.6 → 22.2 per
-  token.
-- Opt-in skipping by routing weight: +30 % at KL 0.022 (≈ 3 % threshold, SSD-only).
-- NVFP4 codes do not compress: code entropy 3.97 of 4 bits.
+`zai-org/GLM-5.3-Flash` ships natively in block-FP8 (306 GiB; no upstream BF16 release);
+`orcarouter/GLM-5.3-Flash-Uncensored-FP8` is the refusal-ablated block-FP8 source from which
+`orcarouter/GLM-5.3-Flash-Uncensored-NVFP4` was quantized, and `RedHatAI/GLM-5.3-Flash-NVFP4`
+(base model, same layout) imports through the same recipe.
 
 ## 19. Sources
 
@@ -1328,7 +1150,9 @@ teacher-forced KL harness against a BF16-dense reference:
   [RedHatAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4) (same layout);
   [orcarouter/GLM-5.3-Flash-Uncensored-FP8](https://huggingface.co/orcarouter/GLM-5.3-Flash-Uncensored-FP8)
   (the quantization source).
-- GGUF K-quant artifact (§3.3): [GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF](https://huggingface.co/GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF).
+- GGUF K-quant artifact (§3.3): [GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF](https://huggingface.co/GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF)
+  (using the allocation of [pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF](https://huggingface.co/pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF);
+  methods: GSQ arXiv 2604.18556, RCO arXiv 2605.00649).
 - EXL3 builds: [MikeRoz/GLM-5.3-Flash-Uncensored-3.05bpw-h6-exl3](https://huggingface.co/MikeRoz/GLM-5.3-Flash-Uncensored-3.05bpw-h6-exl3)
   and [turboderp/GLM-5.3-Flash-exl3](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3).
 - Drafter: [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2);

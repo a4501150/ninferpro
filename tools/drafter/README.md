@@ -17,14 +17,20 @@ own answers and on features computed by this engine, so training sees the servin
    ```
 
 2. Answers (`infernix_glm5_next_drafter_generate`): the target samples at temperature 1.0, top-p
-   0.95 (the checkpoint's defaults), plain decoding, eight requests at a time; the output ids are the
-   target's own tokens.
+   0.95 (the checkpoint's defaults), plain decoding, up to eight requests at a time (default
+   `--max-context 16384`, `--experts vram=50%,ram=50%`; use `vram=65%,ram=35%` for the GSQ-Q4
+   artifact); the output ids are the target's own tokens.
 
    ```sh
    INFERNIX_GLM_ARTIFACT=~/models/infernix/GLM-5.3-Flash-Uncensored-NVFP4-Infernix.infernix \
      build/bench/infernix_glm5_next_drafter_generate --in prompts.jsonl --out gen.jsonl \
-     --concurrency 8 --max-tokens 2048 --experts vram=44%,ram=56% --minutes 150
+     --concurrency 8 --max-tokens 2048 --experts vram=50%,ram=50% --minutes 150
    ```
+
+   Note: a single-GPU overnight run (~300k tokens) overfit after step 400 and did not raise
+   accepted tokens per round (`glm5_3-flash-design.md` §10.4). Meaningful gains need tens of
+   millions of on-policy tokens (e.g. generated on a multi-GPU node from
+   `orcarouter/GLM-5.3-Flash-Uncensored-FP8` or the target artifact before feature capture).
 
 3. Features (`infernix_glm5_next_drafter_capture`): each record prefilled once through the
    causal-scoring Program; per position the stream mean after layers 5, 14, 24, 33 and 42 and the

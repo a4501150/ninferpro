@@ -239,17 +239,21 @@ options. Hard per-layer quotas lost 3-34 % in replay; per-layer routing entropy 
 static, while the order the cache exploits is temporal, which one global LFRU already tracks.
 Replay stays offline (§10.1).
 
-**Admission budget and margins.** Decode rounds reserve landing frames per pool (`kLandingSlots =
-16` per layer) and settle landed misses ahead of explicit H2D promotions, applying score margins
-that price the copy cost (`kLandingD2HMargin = 1.10` when a landing needs a D2H demotion,
-`kH2DShadowMargin = 1.05` for an H2D swap against a shadowed victim, `kH2DD2HMargin = 1.15` when an
-H2D swap also requires a D2H demotion). When PCIe landing is quiet, decode H2D admissions scale up
-to `kDecodeAdaptiveH2DCap = 6` per round; prefill boundaries refill free frames best-first from the
-non-resident frontier. Until the session has promoted or landed as many experts as there are frames
-(the fill phase), cold unpinned `count == 0` placeholders pre-demote into spare/shadow RAM slots so
-active misses land immediately. In tier mode only keys with a host copy are admitted — SSD-only
-experts reach VRAM through landing (§4.4) — and the RAM tier's eviction gate can refuse a victim,
-which stops that layer's admissions for the round.
+**Admission budget and margins.** Decode and verification rounds run a three-phase adaptive
+admission path (`ExpertResidency::after_round`): landed misses settle into per-pool reserved
+landing frames (`kLandingSlots = 16` per layer) first, gated against the lowest resident by the
+copy cost (`1.0×` when the victim already has a RAM copy, `kLandingD2HMargin = 1.10` when
+eviction needs a D2H demotion). Next, Phase A drains cold unpinned `count == 0` startup
+placeholders into spare/shadow RAM slots so active misses land immediately. Phase B promotes
+top-scoring non-landed misses (such as CPU-served decode misses) by explicit H2D when round
+landings fall below `kDecodeAdaptiveH2DCap = 6`, gated by `kH2DShadowMargin = 1.05` (shadowed
+victim) or `kH2DD2HMargin = 1.15` (D2H victim). Phase C maintains a steady-state landing
+frontier (`steady_landing_target`, ~1 free frame per layer) once placeholders are drained,
+bounded by free/shadow RAM headroom so no RAM-only expert spills to SSD. Non-decode served calls
+use the caller's per-layer promotion budget (`per_layer_budget`). Prefill boundaries refill free
+frames best-first from the non-resident frontier. In tier mode explicit H2D admissions require a
+host copy — SSD-only experts reach VRAM through landing (§4.4) — and the RAM tier's eviction gate
+can refuse a victim, which stops that layer's admissions for the round.
 
 **Pins and seeds.** An explicit placement's VRAM set is pinned: pinned keys are never
 eviction victims, so exactly the placed set stays resident. The cache starts from the saved
@@ -372,8 +376,10 @@ later demands at once and the tier is treated as failed.
 The client owns the tier shares; the engine does not choose them, does not react to other
 programs' memory use, and keeps no headroom heuristics for the placement. Within the client's
 counts, which expert sits in which tier is mechanism and stays in the engine: the per-round
-LFRU swaps hot experts in and cold ones out, and `--expert-swap off` freezes the pools'
-content at what the seeds placed (misses still read and compute).
+LFRU-Blend policy swaps hot experts in and cold ones out, and `--expert-swap off` freezes the
+pools' content at what the seeds placed (misses still read and compute). Explicit placements walk
+the warm-start tier fill in windows so every VRAM frame fills even when VRAM frames exceed the
+RAM tier's slot count.
 
 **Runtime switch** (`POST /admin/expert-placement`): counts or a placement file;
 `dry_run` previews the placement's own numbers without applying. The switch is validated
@@ -534,8 +540,9 @@ polls the word and reads the payload after it matches. Host memory the host rewr
 rounds is read with `.cv` loads so a stale L2 line is never used.
 
 The device publishes a call's CPU plan as one `MissRequest`: jobs, experts, record pointers
-(the tier's host table entries) and per-job columns, the x columns compacted to those the
-chosen jobs read. The host team computes, writes the mapped outputs, answers an errno in the
+(the tier's host table entries) and per-job columns, with the x columns compacted to those the
+chosen jobs read (and skipped when zero CPU jobs are selected). The host team computes, writes
+the mapped outputs, answers an errno in the
 status word for a record it could not read, and publishes the answered sequence. Tiered jobs
 (no host record) are demanded from the tier before the other jobs run and computed after
 them. The device's wait lasts while the service's heartbeat word keeps changing — the service
@@ -840,7 +847,9 @@ Each entry names the option and the reason or measurement that decided it.
 - **`round(1 + C·t)` divisor** — rejected. The switch lands inside the startup noise.
 - **Divisor that follows the expert hit rate over eight-token windows** — rejected. It measured
   below the best fixed divisor at every length.
-- **Cost-based CPU/link split chosen per call** while a cost model says it pays — rejected.
+- **Cost-based dynamic CPU/link split chosen per call** — not adopted in favor of fixed
+  per-format link shares (§5.6), because startup rate noise flipped split boundaries between
+  sessions on `qwen4_exp`. Per-width tuning stays family-configurable via `wide_share`.
 - **Static worker ownership** — rejected. E-cores held P-cores back; dynamic counters measured
   41 against 52 µs per cold expert at 12+ workers, bits unchanged (i9-13900K).
 - **AVX-VNNI-INT8 kernel variant** — not built.
@@ -862,8 +871,9 @@ Each entry names the option and the reason or measurement that decided it.
   never lands in a frame. A layer leaves the link idle for well under one 13.5 MiB record between
   its staging and the next layer's routing, so the copies are not hidden, and two of three move an
   expert no column uses.
-- **Victim landing** — rejected. One-off misses push out residents that still earn hits;
-  promoting less gained more.
+- **Unconditional victim landing** — rejected. Letting every one-off miss evict a warm resident
+  churned frames that still earned hits; replaced by cost-marginal landing gated by LFRU-Blend
+  score margins (`1.0×` shadow / `1.10×` D2H, §4.3).
 - **Per-layer cache quotas** — rejected. They lost 3-34 % in replay (§4.3).
 
 ### 10.4 Tier extensions (§9)

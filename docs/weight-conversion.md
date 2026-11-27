@@ -75,7 +75,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_flash_next_dflash2` | The DFlash2 drafter as a companion artifact (`--components dflash2`): `q8_g32_fp16` projections, BF16 dynamic-convolution kernel projections, selector and norms | `dflash2` |
 | `glm5_3_flash_nvfp4_orcarouter` | GLM-5.3-Flash NVFP4 (default): compressed-tensors `nvfp4_mul` routed experts (W4A16, 4096×2048), BF16 dense projections, embedding, head and vision tower, FP32 routers, norms and mHC scalars ([design](maintainer/glm5_3-flash-design.md)) | None |
 | `glm5_3_flash_nvfp4_orcarouter_q8dense` | Opt-in Q8-dense variant of `glm5_3_flash_nvfp4_orcarouter`: KDA q/k/v/o, MLA query down/latent/up/output, dense MLP and shared experts quantized to `q8_g32_fp16`; embedding, `lm_head`, control projections, `k_b`/`v_b` and indexer stay BF16 | None |
-| `glm5_3_flash_gcsa_gguf` | GCSA-AiLab RCO-GSQ GGUF bit-exact: `ggml_expert_*_v1` banks (Q4_K/Q3_K/Q2_K, A16), Q8_0 dense/embedding/head, BF16 MLA/KDA control tensors, FP32 norms/routers/mHC (no vision or MTP) | `--gguf` |
+| `glm5_3_flash_gcsa_gguf` | GCSA-AiLab RCO-GSQ GGUF bit-exact: `ggml_expert_*_v1` banks (Q4_K/Q3_K/Q2_K, A16), `q8_g32_fp16` dense projections, BF16 embedding (decoded from GGUF Q8_0), BF16 `lm_head`/`query_down` and FP32 `A_log` (verified against the GGUF from `--model`), BF16 MLA/KDA control tensors, FP32 norms/routers/mHC; no MTP; vision tower imported from `--model` when `vision` is selected | `--gguf` |
 | `glm5_3_flash_dflash2` | GLM-5.3-Flash DFlash2 companion drafter (`--components dflash2`): `q8_g32_fp16` projections, BF16 norms/selector/feature fusion | `dflash2` |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
