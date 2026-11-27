@@ -348,6 +348,13 @@ stride 4096, INT8 KV, 252,823 positions):
 | Serving process, production flags, three 1,024-token decodes beside a 15.7K prompt and its cached repeat | peak 92,680 MiB | peak 91,984 MiB (91,156 at `vram=58%`); 91,990 with the wide route (a 15.3K prompt) |
 | Perplexity (different abliterations: not a measure of the quantization) | 3.1489 | 3.2541 |
 
+No published reference shares this artifact's abliteration, so its quantization loss is not
+measured. GCSA's Q8_0 build of the same repository is not one: against the Q4 build, `attn_output`
+of layers 15-44 (the 30 layers its adapter targets) differs by a rank-1 term beyond any rounding,
+and layer 20's routed experts differ 4-6 times more along that direction than along a random
+one, while layers 0-14 match byte for byte or as another rounding (2026-11-26, the converter's
+`require_shared_tensors` refuses it for `--gguf-experts`).
+
 A placement switch that rebuilds the RAM tier runs off the engine thread ([MoE offload
 §4.8](moe-offload-design.md#48-placement-forms-and-the-runtime-switch)): switching `ram=41%` to
 `25%` and back under a streaming decode (2026-11-26, `vram=59%`) left the longest gap between
