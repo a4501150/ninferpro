@@ -198,6 +198,9 @@ public:
     // T2: the promotion's copy completed; when its frame was published the slot becomes the key's
     // shadow, otherwise (evicted from VRAM while loading) it stays resident.
     void promotion_completed(std::uint32_t key, bool published);
+    // A miss that landed directly into a VRAM frame (fill-phase landing) marks its existing RAM
+    // slot as a shadow copy so demotions can reclaim it without evicting a RAM-only expert.
+    void mark_shadow(std::uint32_t key);
     // The eviction gate: may the VRAM policy evict `key` now? Consumes one unit of the demotion
     // allowance when the eviction will be a demotion.
     [[nodiscard]] bool allow_evict(std::uint32_t key);

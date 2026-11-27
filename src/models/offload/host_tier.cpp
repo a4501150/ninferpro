@@ -472,6 +472,17 @@ void HostTier::promotion_completed(std::uint32_t key, bool published) {
     push_victim(static_cast<std::uint32_t>(s));
 }
 
+void HostTier::mark_shadow(std::uint32_t key) {
+    const std::int32_t s = slot_of_[key];
+    if (s < 0) { return; }
+    Slot& slot = slots_[static_cast<std::uint32_t>(s)];
+    if (slot.state == SlotState::kResident) {
+        slot.state = SlotState::kShadow;
+        ++shadow_count_;
+        push_victim(static_cast<std::uint32_t>(s));
+    }
+}
+
 bool HostTier::demotion_worthy(std::uint32_t key) {
     if (!free_resident_.empty() || peek_victim(Victims::kShadow) >= 0) { return true; }
     const std::int32_t victim = peek_victim(Victims::kResident);

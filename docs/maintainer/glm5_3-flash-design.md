@@ -60,17 +60,23 @@ the tower streamed from pinned RAM. The placement puts
 VRAM cap (92,993 MiB). KV is allocated for every lane at the full context at startup, and with the
 prefix cache on, its KV holds every lane's full context (6.36 GiB INT8 at 4 × 262,144).
 
-The serving build (2026-11-24: the shared expert and L2 warming inside the CPU wait, §6.3),
-`infernix_glm5_next_engine_bench --tokens 512 --repeat 4` at the serving split (model 15.44 GiB,
-16.70 with the drafter; KV 1.59 GiB at one lane, 6.36 at four; experts 63.8 GiB), median and range:
+The serving build (2026-11-27: 3-term `expert-a4-residual` wide prefill, 4-column weight-reusing
+narrow A16 rows with pre-wait down-weight preload, cold-placeholder pre-demotion, and 14/16/120
+miss split, §6.3 and §14), `infernix_glm5_next_engine_bench --tokens 512 --repeat 4` at the serving
+split (model 15.44 GiB, 16.70 with the drafter; KV 1.59 GiB at one lane, 6.36 at four; experts
+63.8 GiB, 4,838 VRAM / 7,258 RAM / 0 SSD), median and range:
 
-| Requests | Plain | DFlash2 K = 2 | DFlash2 K = 3 |
+| Requests | Plain | DFlash2 `auto` (greedy) | DFlash2 `auto` (T = 1.0) |
 |---|---|---|---|
-| 1 | 36.9 (33.2-38.0) | 44.4 (40.8-46.4) | 45.8 (34.6-45.8) |
-| 4 | 69.5 (60.2-70.8) | | 64.8 (60.0-65.5) |
+| 1 | 42.0 (39.9-43.5) | 54.5 (49.3-56.1) | 55.4 (47.9-58.5) |
+| 4 | 72.0 (65.2-76.0) | | |
 
-With the drafter loaded, four requests measured 7 % below plain although several-row rounds
-decode plainly (the ranges overlap; §10.3 found them equal on an earlier build).
+Prior 2026-11-24 baseline at the same split (512 tokens, 4 sets): 1-request plain 36.9 (33.2-38.0),
+K = 2 44.4 (40.8-46.4), K = 3 45.8 (34.6-45.8), 4-request plain 69.5 (60.2-70.8), 4-request with
+drafter loaded 64.8 (60.0-65.5). Prefill (`infernix_bench`, INT8 KV, chunk 4,096, `max-ctx 65536`,
+`work peak 1.16 GiB`, 2026-11-27): `pp4096` 2.40k (PCIe DMA-bound), `pp16384` 5.56k (+60.2 % over
+exact 3.47k), `pp32768` 5.41k (+59.1 % over exact 3.40k); live serving 20.5K fresh prompt beside
+three concurrent decodes measured 5.33k tok/s at peak process VRAM 92,670 MiB (cap 92,993).
 
 The Q8-dense artifact (§17.2; not served: it misses the KL gate) against the BF16-dense one at the same split (`vram=40%,ram=60%`, 4,838 / 7,258 / 0
 experts, plain decode, `infernix_glm5_next_engine_bench` 512 tokens, median and range of four sets;
@@ -93,7 +99,7 @@ the generic routes (38.7 tok/s). The rows below are the BF16-dense artifact's.
 | Decode, four requests of 256 tokens (rounds of several rows decode plainly) | median 59.9 tok/s aggregate, sets 56.5-62.0 |
 | Same bench at `vram=42%,ram=58%` (5,080 / 7,016 / 0 experts), one request, by draft length | K = 0 35.0, K = 1 40.9, K = 2 44.4, K = 3 47.8, K = 4 43.2, K = 5 37.7 tok/s (§10.3) |
 | Process VRAM while serving: four 1,024-token decodes beside a 9.4K prompt and its cached repeat | peak 92,412 MiB; at vram=42 % it sat at 95,672 MiB |
-| Same with `--draft-tokens auto` (48 staging slots against 32): three 1,024-token decodes beside a 15.7K prompt and its cached repeat, 2026-11-26 | peak 92,680 MiB (cap 92,993) |
+| Same with `--draft-tokens auto` (48 staging slots against 32) and `--vision`: three 1,024-token decodes beside a 20.5K fresh prompt (5.33k tok/s) and its cached repeat, 2026-11-27 | peak 92,670 MiB (cap 92,993; headroom 323 MiB; 2026-11-26: 92,680 MiB) |
 | Same with `--vision`: two decodes, the 9.4K prompt and an image (551-token prompt), then a video (1,544 tokens) | peak 92,412 MiB; the image answer reads the chart's title |
 | Prefill, fresh prompts of 10K-38K tokens, walk spans, `vram=42%,ram=58%` | 2.35-2.43k tok/s, compute-bound (§11.1) |
 | One 255,771-token prompt, INT8 KV, `vram=42%,ram=58%` | prefill 2.09k tok/s (TTFT 2 min 2 s), then 256 tokens at 33.3 tok/s |
@@ -346,21 +352,20 @@ layer the same frame count (a switch target rounds down to a multiple of 42). Th
 every slot at the largest stride (layer 3's 13.0 MB), so it holds about 20 % fewer records than its
 bytes would at the mean stride.
 
-Measured against the NVFP4 artifact (2026-11-26 baseline and 2026-11-27 optimized build;
-`infernix_glm5_next_engine_bench --concurrency 1 --tokens 512 --draft-tokens auto`, ten sets, the
-GGUF's at the plateau sets 4-10; `infernix_bench` / fresh prompts on `infernix-serve`;
-`infernix-perplexity` quick corpus, context 8192, stride 4096, INT8 KV, 252,823 positions):
+Measured against the NVFP4 artifact (2026-11-27 optimized build; `infernix_glm5_next_engine_bench`,
+four sets after warm-up; `infernix_bench` INT8 KV chunk 4,096; `infernix-perplexity` quick corpus,
+context 8192, stride 4096, INT8 KV, 252,823 positions):
 
-| Measurement | NVFP4, `vram=40%` (4,838 experts in VRAM) | GGUF, `vram=59%` (7,098 VRAM / 4,998 RAM / 0 SSD) |
+| Measurement | NVFP4, `vram=40%` (4,838 VRAM / 7,258 RAM / 0 SSD) | GGUF, `vram=59%` (7,098 VRAM / 4,998 RAM / 0 SSD) |
 |---|---|---|
-| Decode, one request, `auto`, greedy | 48.0 (43.9-52.5) tok/s | 85.3 (83.0-91.1) tok/s, sets 4-10 (2026-11-27; 2026-11-26: 82.8, 80.1-86.9) |
-| Decode, one request, `auto`, temperature 1 | 47.0 (42.3-48.0), four sets | 73.6 median, 54.2-77.2 across sets 1-4 (2026-11-27; 2026-11-26 sets 4-10: 75.1, 72.7-80.7) |
-| Decode, one request, plain (four sets, 512 tok) | — | 56.2 (47.0-60.6) tok/s (2026-11-27) |
-| Decode, four requests, plain (four sets, 256 tok) | — | 81.2 (65.8-88.7) tok/s aggregate (2026-11-27) |
-| Same split for both, `vram=40%`, T1 `round_bench` (`1x1` / `4x1` / `1x4`, 2026-11-27) | 27.8 / 70.0 / 47.9 tok/s | 34.2 / 85.0 / 62.0 tok/s (after per-pool landing; before: 27.9 / 45.3 / 50.5) |
-| Prefill (`infernix_bench` `pp4096` / `pp16384` / `pp32768`, INT8 KV, 2026-11-27) | 2.46k, 2.45k tok/s (12.9K, 52.6K fresh) | 4.21k / 4.05k / 3.92k tok/s (`pp256`: 305.0 tok/s; live serving 16.1K beside 3 decodes: 3.95k tok/s; 2026-11-26: 2.24k-2.33k tok/s, exact route 1.56k-1.59k) |
-| Serving process, production flags, three decodes beside a 16.1K prompt and its cached repeat | peak 92,680 MiB | peak 91,986 MiB (cap 92,993, headroom 1,007 MiB; 2026-11-26: 91,984 MiB) |
-| Perplexity (different abliterations: not a measure of the quantization) | 3.1489 | 3.2546 (2026-11-27; 2026-11-26: 3.2541) |
+| Decode, one request, `auto`, greedy (512 tok, 4 sets) | 54.5 (49.3-56.1) tok/s (prior: 48.0, 43.9-52.5) | 87.8 (76.7-88.9) tok/s, sets 1-4 (prior: 85.3 sets 4-10) |
+| Decode, one request, `auto`, temperature 1 (512 tok, 4 sets) | 55.4 (47.9-58.5) tok/s (prior: 47.0, 42.3-48.0) | 73.6 median, 54.2-77.2 across sets 1-4 (2026-11-27 prior; 2026-11-26 sets 4-10: 75.1, 72.7-80.7) |
+| Decode, one request, plain (512 tok, 4 sets) | 42.0 (39.9-43.5) tok/s (prior: 36.9, 33.2-38.0) | 56.2 (47.0-60.6) tok/s (2026-11-27) |
+| Decode, four requests, plain (4 sets; NVFP4 512 tok, GGUF 256 tok) | 72.0 (65.2-76.0) tok/s aggregate (prior: 69.5, 60.2-70.8) | 118.1 (103.4-124.2) tok/s aggregate (prior: 81.2, 65.8-88.7) |
+| Same split for both, `vram=40%`, T1 `round_bench` (`1x1` / `4x1` / `1x4`, 2026-11-27) | 38.1 / 93.5 / 82.8 tok/s (prior: 27.8 / 70.0 / 47.9) | 45.7 / 117.0 / 100.0 tok/s (prior: 34.2 / 85.0 / 62.0) |
+| Prefill (`infernix_bench` `pp4096` / `pp16384` / `pp32768`, INT8 KV, 2026-11-27) | 2.40k / 5.56k / 5.41k tok/s (exact: 2.38k / 3.47k / 3.40k; live 20.5K beside 3 decodes: 5.33k) | 4.21k / 4.05k / 3.92k tok/s (`pp256`: 305.0 tok/s; live serving 16.1K beside 3 decodes: 3.95k tok/s; 2026-11-26: 2.24k-2.33k tok/s, exact route 1.56k-1.59k) |
+| Serving process, production flags, three 1K decodes beside a 16-20K prompt and its cached repeat | peak 92,670 MiB (cap 92,993, headroom 323 MiB) | peak 91,986 MiB (cap 92,993, headroom 1,007 MiB; 2026-11-26: 91,984 MiB) |
+| Perplexity (different abliterations: not a measure of the quantization) | 3.1489 (exact) / 3.1479 (`expert-a4-residual`, PPL ratio 0.99967) | 3.2546 (2026-11-27; 2026-11-26: 3.2541) |
 
 No published reference shares this artifact's abliteration, so its quantization loss is not
 measured. GCSA's Q8_0 build of the same repository is not one: against the Q4 build, `attn_output`
@@ -449,10 +454,15 @@ Every routed expert, on every route and processor, computes the same bits (MoE �
 1. **Dequantization.** FP4 nibbles decode through the E2M1 table; each 16-weight group multiplies
    its FP8 E4M3 scale and the matrix's FP32 global scale, giving BF16 weights. The operation is
    fixed-order and identical everywhere.
-2. **Dot products.** BF16 activations × BF16 weights with FP32 accumulation in one fixed order per
-   output (the record's row-group order). The GPU narrow route (T ≤ 8) and the wide route
-   (prefill) run the existing NVFP4 A16 MMA kernels; the CPU lane runs the existing W4A16 path
-   (`src/ops/offloaded_sparse_moe/cpu/`).
+2. **Dot products.** On the exact route, BF16 activations are encoded into 24-bit fixed-point
+   limbs per column and accumulated in exact int64 row sums: narrow calls (`T <= 128`) run the
+   dp4a row kernels (`gate_up_rows_kernel_a16`, `down_rows_kernel_a16`, streaming weight chunks
+   reused across up to 4 columns with direct `__ldg` activations and pre-wait `w0` down-weight
+   preloading at the 4096 × 2048 geometry), wider exact calls run the limb-tile tensor-core
+   kernels (`grouped_kernel_a16`), and the CPU lane runs the bit-exact W4A16 AVX-512 path
+   (`src/ops/offloaded_sparse_moe/cpu/w4a16_expert.cpp`). On the default INT8-KV route, wide NVFP4
+   calls run the qualified `expert-a4-residual` 3-term residual FP4 Tensor Core tiles (§14; GGUF
+   K-quant banks run `ggml_dp4a` / `ggml_tile` or `ggml-bf16-prefill` BF16 tiles, §3.3).
 3. **Clamp and SwiGLU.** gate and up outputs are clamped as exact operations on BF16 values,
    SwiGLU runs in FP32 and h rounds to BF16. The combine is `y = bf16(Σ_i w_i · y_i + y_shared)` in
    FP32, in ascending expert id, so placement cannot change it.
@@ -506,10 +516,14 @@ need, and did not raise the hit rate (§6.3). No promotions follow a walked pref
 ### 6.3 Miss service
 
 CPU-served misses default to 14 workers (`cpu_expert_workers`), up to 16 jobs per layer call
-(`cpu_expert_jobs`), and `cpu_link_share256` = 104/256 (~40.6 % on the PCIe link, ~59.4 % on the
-CPU; raised from 8 / 4 / 128 on 2026-11-27 alongside AVX-512 VNNI block-half unrolling in
-`cpu/ggml_expert.cpp` and a 32-CTA × 32 KiB staging window in `moe_layer.cu` saturating PCIe Gen5
-x16 at ~55 GB/s; MoE §5.6 states the shared share forms). The CPU computes any column count without
+(`cpu_expert_jobs`), and per-format PCIe link shares: `cpu_link_share256` = 120/256 (~46.9 % on
+the PCIe link, ~53.1 % on the CPU) for NVFP4 banks, and `cpu_ggml_link_share256` = 104/256
+(~40.6 % on the PCIe link, ~59.4 % on the CPU) for GGUF K-quant banks (tuned 2026-11-27 alongside
+AVX-512 VNNI block-half unrolling in `cpu/ggml_expert.cpp`, a 32-CTA × 32 KiB staging window in
+`moe_layer.cu`, and cold-placeholder pre-demotion in `ExpertResidency` that asynchronously demotes
+unranked `count == 0` startup seeds into free/shadow RAM slots on `d2h_stream_` so decode misses
+land directly via `stage_kernel` without extra H2D traffic or SSD spill; MoE §5.6 states the
+shared share forms). The CPU computes any column count without
 changing a bit, since every W4A16 and exact ggml route is bit-exact. While the host computes a
 call's misses the device runs the shared expert and warms the next layer's attention mix and first
 input projections into L2 (40 MiB at one column, 16 MiB wider: FN §8.6's budgets); the bits are
@@ -900,12 +914,14 @@ ring returns before decode).
 | Part | Route |
 |---|---|
 | Dense GEMMs and head | BF16 tensor cores (the existing dense kernels), bit-identical to the decode route; shapes at H = 4,096 registered in `src/models/shapes.cpp` |
-| Routed experts | W4A16 wide route, grouped by expert (NVFP4); exact A16 tiles, or the BF16 tiles of `ggml-bf16-prefill` for all active non-CPU jobs at 64+ columns and > 8-entry jobs at 9-63 columns (GGUF, §3.3) |
+| Routed experts | `expert-a4-residual` 3-term residual FP4 Tensor Core tiles on INT8 KV (all active non-CPU jobs at 64+ columns with in-place `h_rows` reuse, > 8-entry jobs at 9-63 columns; exact W4A16 limb tiles under `--disable-fast-paths` or BF16 KV) for NVFP4; exact A16 tiles or `ggml-bf16-prefill` BF16 tiles (GGUF, §3.3) |
 | MLA, indexer | §7.2-§7.3 |
 | KDA | chunked route |
 
-No activation permissions apply: the NVFP4 experts run the exact W4A16 wide route, and the dense
-classes are BF16 already (the GGUF recipe binds its Q8_0 dense classes `A16Only`).
+The dense classes are BF16 already (the GGUF recipe binds its Q8_0 dense classes `A16Only`); wide
+routed-expert activation precision is controlled by `expert-a4-residual` (NVFP4) and
+`ggml-bf16-prefill` (GGUF), both on by default with INT8 KV and disabled by `--disable-fast-paths`
+(§14).
 
 ### 11.4 Prefill beside decode
 
@@ -957,8 +973,8 @@ embedding stays host-resident (pinned, one row read per token). `vram=100%` is r
 The serving split's ledger (§1): model 16.70 GiB (the dense BF16 weights, the drafter, workspace),
 KV 6.36 GiB at 4 × 262,144 INT8 tokens with the prefix cache on (1.59 GiB at one lane), and the
 expert cache 63.8 GiB (4,838 frames of 13.5 MiB, staging included). The measured process peak while
-serving is 92,412 MiB against the 92,993 MiB cap, with or without image and video requests; 42 %
-VRAM sat at 95,672 MiB. KV is allocated for
+serving is 92,670 MiB with `--draft-tokens auto` and `--vision` (92,412 MiB at fixed K = 3)
+against the 92,993 MiB cap; 42 % VRAM sat at 95,672 MiB. KV is allocated for
 every lane at the full context at startup, so the VRAM share must be re-measured whenever
 `--max-context` or `--max-concurrency` changes. Each lane also holds its KDA state (141 MB).
 
@@ -975,19 +991,32 @@ The engine's three-layer contract — the canonical arithmetic, the exact route,
 the [acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-paths) — applies
 in a reduced form here. The exact route (`--disable-fast-paths`; `--a16-activations` selects it too,
 as the quality gate's reference) is canonical, and its prefill bits do not depend on the chunk size
-(§7.2). The family's one fast path, `ggml-bf16-prefill`, applies to the GGUF artifact (§3.3) only
-and is on by default there with INT8 KV (its qualified configuration): calls of 64 or more columns
-run every active non-CPU expert job on BF16 tiles directly from BF16 x (skipping limb encoding and
-narrow dp4a), while calls of 9-63 columns route jobs of more than 8 entries to BF16 tiles, so a
-prompt's bits depend on its call widths (the chunk size, and the 1,024-token calls beside another
-lane's decode), and the GGUF artifact is not request-invariant under it. Decode and verification
-calls (≤ 8 columns, or narrow jobs up to 63 columns) keep the exact narrow dp4a route, so the path
-changes no decode arithmetic. Qualified 2026-11-26 ([model quality §6.7](model-quality.md#67-fast-path-registry)).
-One layer's expert call at 4,096 tokens (288 experts, top-8, every record resident;
-`infernix_offloaded_moe_ggml_test --bench-glm 4096 bf16`, 2026-11-27) takes 10.27-14.09 ms
-(117.1-160.5 effective TOPS, down from 11.5-14.8 ms after eliminating shared-memory bank conflicts
-and adding `__byte_perm` unsigned BF16 decode) against the exact tiles' 27.99-36.81 ms. The NVFP4
-artifact has no fast path: candidates and exclusions are refused there.
+(§7.2). The family has two qualified prefill fast paths, each on by default with INT8 KV (BF16 KV is
+not gated and stays exact):
+
+- **`expert-a4-residual` (NVFP4 artifact).** Wide expert calls encode BF16 activations into 3-term
+  NVFP4 residuals and run native SM120 FP4 Tensor Core MMA tiles (`wide_expert.cuh` `ScheduleResidual`)
+  at the 4096 × 2048 geometry with clamped SwiGLU (limit 10). Calls of 64 or more columns
+  (`kA4ResidualAllJobsMinColumns`) route every active non-CPU job through it, skipping limb encoding
+  and the narrow dp4a pass, and rewrite `h_rows` in place into `h_terms_plane` (`4096 B/row >=
+  3456 B/row`, aliasing `x_token_terms` onto `h_rows`) for zero extra serving VRAM (`work peak
+  1.16 GiB`); calls of 9-63 columns route jobs of more than 8 entries through it. Qualified
+  2026-11-27 ([model quality §6.7](model-quality.md#67-fast-path-registry); mean KL excess
+  -1.72e-4, top-1 excess -0.016 pts, PPL ratio 0.99967, p99.9 ratio 0.992), lifting `pp16384`
+  3.47k → 5.56k tok/s (+60.2 %) and `pp32768` 3.40k → 5.41k tok/s (+59.1 %).
+- **`ggml-bf16-prefill` (GGUF artifact, §3.3).** Calls of 64 or more columns run every active
+  non-CPU expert job on BF16 tiles directly from BF16 x (skipping limb encoding and narrow dp4a),
+  while calls of 9-63 columns route jobs of more than 8 entries to BF16 tiles. Qualified 2026-11-26
+  ([model quality §6.7](model-quality.md#67-fast-path-registry)). One layer's expert call at 4,096
+  tokens (288 experts, top-8, every record resident; `infernix_offloaded_moe_ggml_test --bench-glm
+  4096 bf16`, 2026-11-27) takes 10.27-14.09 ms (117.1-160.5 effective TOPS) against the exact
+  tiles' 27.99-36.81 ms.
+
+Under either path a prompt's bits depend on its call widths (the chunk size, and the 1,024-token
+calls beside another lane's decode), so neither artifact is request-invariant with fast paths on.
+Decode and verification calls (≤ 8 columns, or narrow jobs up to 63 columns) keep the exact narrow
+dp4a routes, so neither path changes decode arithmetic. Each artifact accepts only its own fast path
+and refuses the other or unknown names.
 
 ### 14.1 Op oracles
 
@@ -1122,6 +1151,7 @@ sizing headrooms (`--vram-headroom-mib`, `--ram-headroom-mib`) are shared. This 
 | Option | Default | Meaning |
 |---|---|---|
 | `--spec dflash2 --draft-model FILE --draft-tokens N|auto` | off | DFlash2, the only drafter; N in 1-7 or `auto` (calibrated 0-5, §10.2) |
+| `--spec-min-p P` | 0 | Verify drafts only up to the first whose temperature-1 selector probability falls below P (§10.2) |
 | `--kv-dtype bf16\|int8` | `bf16` | **Changes output**; every other profile is refused |
 | `--max-context N` | the Engine's | Up to 1,048,576, from the device cache |
 | `--prefill-chunk N`, `--prefill-chunk-beside-decode N` | 4,096, 1,024 | Chunking (§11) |
@@ -1131,15 +1161,16 @@ sizing headrooms (`--vram-headroom-mib`, `--ram-headroom-mib`) are shared. This 
 | `--reasoning-effort low\|high\|max` | max | Template default; requests may override |
 
 Refused at startup, each naming the reason: `--spec` other than `dflash2`, n-gram drafting
-(`--ngram-draft-tokens`, `--ngram-archive-mib`, `--ngram-volume`), draft trees, `--spec-min-p`,
-fast-path candidates and exclusions other than `ggml-bf16-prefill` (and that one on the NVFP4
-artifact),
-`--expert-tail-skip`, `--route-trace`, and for the
+(`--ngram-draft-tokens`, `--ngram-archive-mib`, `--ngram-volume`), draft trees, fast-path
+candidates and exclusions other than `expert-a4-residual` (NVFP4 artifact) and `ggml-bf16-prefill`
+(GGUF artifact), `--expert-tail-skip`, `--route-trace`, and for the
 prefix cache the Disk tier, persistence, Device snapshot slots, packed Host state and tool-call
 holds.
 
-Converter: `--model DIR --recipe glm5_3_flash_nvfp4_orcarouter`; the DFlash2 companion with
-`--components dflash2 --source dflash2=PATH --recipe glm5_3_flash_dflash2`.
+Converter: `--model DIR --recipe glm5_3_flash_nvfp4_orcarouter` (default NVFP4),
+`glm5_3_flash_nvfp4_orcarouter_q8dense` (opt-in Q8-dense, §17.2), `--gguf PATH --recipe
+glm5_3_flash_gcsa_gguf` (GGUF K-quant, §3.3); the DFlash2 companion with `--components dflash2
+--source dflash2=PATH --recipe glm5_3_flash_dflash2`.
 
 ## 17. Rejected and not built
 
@@ -1152,7 +1183,6 @@ decided the shared machinery are in
 | Option | Reason |
 |---|---|
 | **The EXL3 3.05 bpw builds as the artifact** (MikeRoz's and turboderp's) | A new codec and kernels, ≈ 7k lines (trellis decode, an `exl3` Linear, an E3A16 canonical arithmetic, a CPU kernel), where the NVFP4 artifact reuses the built W4A16 kernels, the `nvfp4_expert_rg16_v1` layout and the converter's compressed-tensors source. EXL3 3.05 bpw measured mean KL 0.047 against BF16 in alesha-pro's table (§18.3); it stays an option on an owner request |
-| **GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF** | Its "Q4" is 127.66 GiB with experts Q3_K ×105, Q2_K ×19, Q4_K ×2, Q8_0 ×306 and BF16 ×203 other tensors; "Q6" is 218.76 GiB with no manifest; Q8_0 is 310.32 GiB; no KL or perplexity is published for any. Its GSQ training did not improve on its starting point, so the weights are plain k-quants, and its abliteration is a different LoRA-merged edit. Serving it would need new Q2_K/Q3_K kernels. NVFP4 costs ≈ 30 % more expert bytes per token (model: 4.76 GB against ≈ 3.7 GB), bought with published card numbers and no new kernels |
 | Requantizing the artifact's weights at import | Changes the weights for no speed gain; a lighter format is a recipe decision, not an import transform |
 | Any SSD cache, spill or swap file; memory-mapped experts | The artifact already holds the exact bytes (MoE §10.1); a mapped file's unbuffered reads measured a quarter of the unmapped rate on Flash-Next (FN §12.3) |
 | Zero-copy SM reads of host experts | 10-14 GB/s against 24-27.6 staged (Flash-Next, MoE §5.2) |
@@ -1253,7 +1283,8 @@ alesha-pro's table measured several formats against the same BF16 teacher logits
 
 Other cards, each against its own reference: GSQ-RCO 3.5-bit 137.1 GB 0.071 against Q8_0; AesSedai
 IQ4_XS / Q4_K_M / IQ3_S 0.117 / 0.050 / 0.283; REAP-pruned builds 0.45 and worse (pruning costs far
-more than quantization); GCSA-AiLab RCO-GSQ none published (§17.1). orcarouter also publishes
+more than quantization); GCSA-AiLab RCO-GSQ none published (served as the optional GGUF K-quant
+artifact, §3.3). orcarouter also publishes
 `orcarouter/GLM-5.3-Flash-Uncensored-FP8`, the same refusal edit at source precision.
 `RedHatAI/GLM-5.3-Flash-NVFP4` (the base model, same layout) imports through the same recipe.
 
@@ -1281,7 +1312,7 @@ teacher-forced KL harness against a BF16-dense reference:
   [RedHatAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4) (same layout);
   [orcarouter/GLM-5.3-Flash-Uncensored-FP8](https://huggingface.co/orcarouter/GLM-5.3-Flash-Uncensored-FP8)
   (the quantization source).
-- Rejected artifact: [GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF](https://huggingface.co/GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF).
+- GGUF K-quant artifact (§3.3): [GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF](https://huggingface.co/GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF).
 - EXL3 builds: [MikeRoz/GLM-5.3-Flash-Uncensored-3.05bpw-h6-exl3](https://huggingface.co/MikeRoz/GLM-5.3-Flash-Uncensored-3.05bpw-h6-exl3)
   and [turboderp/GLM-5.3-Flash-exl3](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3).
 - Drafter: [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2);

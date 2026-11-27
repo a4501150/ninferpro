@@ -69,8 +69,19 @@ void ExpertPlacementRuntime::create_tier(const ExpertStore& store) {
             : 0U;
     HostExpertTier::Options tier;
     tier.ring = std::max<std::uint32_t>(128, cpu_cap + 2U * options_.staging_slots);
+    const std::uint64_t keys          = static_cast<std::uint64_t>(store.layers()) * store.experts();
+    const std::uint64_t ram_slots_est = options_.expert_ram_bytes / record_stride_;
+    const std::uint32_t base_lists    = tier.ring + tier.prefetch + tier.demotion;
+    // Grow the demotion list up to 128 only out of spare RAM slots beyond the experts that live
+    // outside VRAM, so raising demotion depth never spills a RAM-tier expert onto the SSD.
+    const std::uint64_t min_vram =
+        options_.expert_frame_target > store.layers() ? options_.expert_frame_target - store.layers() : 0ULL;
+    const std::uint64_t need_ram = keys > min_vram ? keys - min_vram : 0ULL;
+    if (options_.expert_frame_target > 0 && ram_slots_est > need_ram + base_lists + 16U) {
+        const std::uint64_t extra = ram_slots_est - need_ram - base_lists - 16U;
+        tier.demotion = static_cast<std::uint32_t>(std::min<std::uint64_t>(128ULL, tier.demotion + extra));
+    }
     const std::uint32_t lists = tier.ring + tier.prefetch + tier.demotion;
-    const std::uint64_t keys  = static_cast<std::uint64_t>(store.layers()) * store.experts();
     // Pinned slots up to every key besides the lists; unpinned records for the keys they leave.
     // With unpinned records, tier.bounce of the pinned slots stage their promotions and
     // tier.stream_bounce the prefill stream's copies of them.
@@ -527,6 +538,7 @@ void ExpertPlacementRuntime::trim_host_heap() {
 
 HostExpertTier::Options ExpertPlacementRuntime::rebuild_options(std::uint32_t residents) const {
     HostExpertTier::Options options = tier_options_;
+    options.demotion                = residents >= 2048 ? 128U : 32U;
     const std::uint32_t lists       = options.ring + options.prefetch + options.demotion;
     // ram=0 below full VRAM still stages SSD reads through the tier's lists; the tier needs
     // one resident slot beyond them.

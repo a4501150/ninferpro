@@ -359,7 +359,8 @@ private:
     std::vector<std::uint32_t> landing_scratch_;
     bool any_landing_      = false;
     bool landing_uploaded_ = false; // the device landing table holds frames
-    bool decode_round_               = false; // the round's before_round had `landing`
+    bool decode_round_     = false; // the round's before_round had `landing`
+    bool has_unused_       = false; // cold startup seeds with count == 0 may still reside in a pool
 
     std::vector<Command> load_commands_; // kCopy commands of every pool, issued together
     std::vector<std::uint32_t> move_to_, move_from_; // a lend's relocations: destination and source frames

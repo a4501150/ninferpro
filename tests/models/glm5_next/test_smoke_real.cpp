@@ -72,7 +72,8 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
-infernix::EngineOptions production_options(const char* artifact, const char* drafter) {
+infernix::EngineOptions production_options(const char* artifact, const char* drafter,
+                                           bool disable_fast_paths = false) {
     infernix::EngineOptions options;
     options.artifact_path        = artifact;
     options.kv_cache             = infernix::KvCacheStorage::Int8Group64;
@@ -81,6 +82,7 @@ infernix::EngineOptions production_options(const char* artifact, const char* dra
     options.max_concurrency      = kLanes;
     options.max_pending_requests = 2 * kLanes;
     options.experts_spec         = "vram=40%,ram=60%";
+    options.fast_paths           = !disable_fast_paths;
     if (drafter != nullptr) {
         options.speculative.backend      = infernix::SpeculativeBackend::DFlash2;
         options.speculative.draft_model  = drafter;
@@ -216,10 +218,10 @@ int production(const char* artifact, const char* drafter, std::uint32_t tokens) 
 }
 
 int golden(const char* artifact, std::uint32_t tokens, const std::filesystem::path& check_path,
-           const std::filesystem::path& record_path) {
-    std::printf("== golden tokens (no drafter)\n");
+           const std::filesystem::path& record_path, bool disable_fast_paths) {
+    std::printf("== golden tokens (no drafter%s)\n", disable_fast_paths ? ", exact route" : "");
     const auto t0 = std::chrono::steady_clock::now();
-    infernix::Engine engine(production_options(artifact, nullptr));
+    infernix::Engine engine(production_options(artifact, nullptr, disable_fast_paths));
     std::printf("  started in %.1f s\n", seconds_since(t0));
     std::vector<Tokens> prompts;
     for (const char* text : kPrompts) { prompts.push_back(engine.tokenize_text(text)); }
@@ -295,7 +297,9 @@ int main(int argc, char** argv) {
         return 77;
     }
     std::filesystem::path check_path, record_path;
-    std::uint32_t tokens = 48;
+    std::uint32_t tokens    = 48;
+    bool disable_fast_paths = false;
+    bool golden_only        = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--check" && i + 1 < argc) {
@@ -304,6 +308,10 @@ int main(int argc, char** argv) {
             record_path = argv[++i];
         } else if (arg == "--tokens" && i + 1 < argc) {
             tokens = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--disable-fast-paths") {
+            disable_fast_paths = true;
+        } else if (arg == "--golden-only") {
+            golden_only = true;
         } else {
             std::fprintf(stderr, "unknown argument %s\n", arg.c_str());
             return 2;
@@ -311,8 +319,8 @@ int main(int argc, char** argv) {
     }
     try {
         const auto t0 = std::chrono::steady_clock::now();
-        int failures  = production(artifact, drafter, tokens);
-        failures += golden(artifact, tokens, check_path, record_path);
+        int failures  = golden_only ? 0 : production(artifact, drafter, tokens);
+        failures += golden(artifact, tokens, check_path, record_path, disable_fast_paths);
         std::printf("%s in %.1f s\n", failures == 0 ? "PASS" : "FAIL", seconds_since(t0));
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& e) {

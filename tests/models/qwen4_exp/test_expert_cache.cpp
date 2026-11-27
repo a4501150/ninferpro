@@ -761,6 +761,42 @@ void test_landing() {
     for (const auto f : reserved) { cache.release(f); }
 }
 
+// Cold startup placeholders (seeded with count == 0, unpinned) can be evicted ahead of landing
+// without touching pinned or used (count > 0) residents, and respecting the evictable gate.
+void test_evict_unused() {
+    constexpr std::uint32_t kKeys = 16, kFrames = 6;
+    CacheController cache(kKeys, kFrames, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    const std::uint32_t seed_keys[] = {0, 1, 2, 3, 4, 5};
+    check(cache.seed(seed_keys, {}, cmds) == 6 && cache.free_frames() == 0, "seed fills all frames");
+    // Pin key 0 and use key 1: neither may be evicted as unused.
+    const std::uint32_t pinned[] = {0};
+    cache.policy().pin_keys(pinned);
+    const std::uint32_t used[] = {1};
+    cmds.clear();
+    cache.on_route(used, 1, cmds, 0);
+    // Evict two of the four remaining unused keys (2, 3, 4, 5).
+    bool remaining = false;
+    cmds.clear();
+    check(cache.evict_unused(2, 1, cmds, remaining) == 2 && remaining,
+          "evict_unused evicts up to count and reports remaining");
+    cache.on_quiescent(cmds);
+    check(cache.free_frames() == 2 && cache.policy().resident(0) && cache.policy().resident(1),
+          "pinned and used keys stay resident while evicted frames free");
+    // Gate refuses key 4: evict_unused stops and still reports remaining.
+    const LfruPolicy::Admissible refuse_four = [](std::uint32_t k) { return k != 4; };
+    cmds.clear();
+    const std::uint32_t gated = cache.evict_unused(4, 2, cmds, remaining, &refuse_four);
+    cache.on_quiescent(cmds);
+    check(gated <= 2 && remaining, "evictable gate halts unused eviction and keeps remaining true");
+    // Without the gate, the rest drain and remaining clears.
+    cmds.clear();
+    (void)cache.evict_unused(4, 3, cmds, remaining);
+    cache.on_quiescent(cmds);
+    check(!remaining && cache.free_frames() == 4 && cache.policy().resident(0) && cache.policy().resident(1),
+          "remaining clears once only pinned and used residents remain");
+}
+
 // The SSD tier's pieces (design §9.5): the admission filter and the eviction gate of the LFRU step,
 // and a demoted expert's frame held past quiescence until its copy completes.
 void test_tier_gates() {
@@ -826,6 +862,7 @@ int main() {
     test_seed();
     test_prompt_credit();
     test_landing();
+    test_evict_unused();
     test_state_file();
     test_calibrated_order();
     if (g_failures) {

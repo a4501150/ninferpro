@@ -87,14 +87,19 @@ void validate(const EngineOptions& options) {
     }
     for (const auto* paths : {&options.fast_path_candidates, &options.fast_path_exclusions}) {
         for (const FastPath path : *paths) {
-            if (path != FastPath::GgmlBf16Prefill) {
-                throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +
-                                            " does not apply to GLM-5.3-Flash (its one fast path is ggml-bf16-prefill)");
+            if (path != FastPath::GgmlBf16Prefill && path != FastPath::ExpertA4Residual) {
+                throw std::invalid_argument(
+                    std::string("fast path ") + fast_path_name(path) +
+                    " does not apply to GLM-5.3-Flash (its fast paths are ggml-bf16-prefill and expert-a4-residual)");
             }
         }
     }
-    if (!options.fast_path_candidates.empty() && !options.fast_path_exclusions.empty()) {
-        throw std::invalid_argument("fast path ggml-bf16-prefill is both a candidate and an exclusion");
+    for (const FastPath path : options.fast_path_candidates) {
+        if (std::find(options.fast_path_exclusions.begin(), options.fast_path_exclusions.end(), path) !=
+            options.fast_path_exclusions.end()) {
+            throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +
+                                        " is both a candidate and an exclusion");
+        }
     }
     if (options.expert_tail_skip != 0) {
         throw std::invalid_argument("GLM-5.3-Flash computes every routed expert: --expert-tail-skip does not apply");
@@ -328,16 +333,30 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
     }
     const std::uint64_t after_weights = vram->query().device_free;
 
-    // The family's one fast path (glm5_3-flash-design.md §14): it applies to GGUF expert banks and is
-    // qualified with INT8 KV (model-quality.md §6.7).
+    // Family fast paths (glm5_3-flash-design.md §14, model-quality.md §6.7): ggml-bf16-prefill
+    // applies to GGUF expert banks and expert-a4-residual applies to NVFP4 expert banks; both are
+    // qualified with INT8 KV.
     const bool ggml_experts = model->expert_banks().front().planes.gate_up_format != QType::NVFP4_MUL;
-    if (!ggml_experts && !(options.fast_path_candidates.empty() && options.fast_path_exclusions.empty())) {
+    const auto has_path     = [](const std::vector<FastPath>& paths, FastPath target) {
+        return std::find(paths.begin(), paths.end(), target) != paths.end();
+    };
+    if (ggml_experts && (has_path(options.fast_path_candidates, FastPath::ExpertA4Residual) ||
+                         has_path(options.fast_path_exclusions, FastPath::ExpertA4Residual))) {
+        throw std::invalid_argument("fast path expert-a4-residual does not apply to GGUF expert banks");
+    }
+    if (!ggml_experts && (has_path(options.fast_path_candidates, FastPath::GgmlBf16Prefill) ||
+                          has_path(options.fast_path_exclusions, FastPath::GgmlBf16Prefill))) {
         throw std::invalid_argument("fast path ggml-bf16-prefill does not apply to NVFP4 expert banks");
     }
     const bool qualified = options.kv_cache == KvCacheStorage::Int8Group64;
-    const bool ggml_bf16_prefill = ggml_experts && options.fast_path_exclusions.empty() &&
-                                   (!options.fast_path_candidates.empty() || (options.fast_paths && qualified));
-    program_options.ggml_bf16_prefill = ggml_bf16_prefill;
+    const bool ggml_bf16_prefill =
+        ggml_experts && !has_path(options.fast_path_exclusions, FastPath::GgmlBf16Prefill) &&
+        (has_path(options.fast_path_candidates, FastPath::GgmlBf16Prefill) || (options.fast_paths && qualified));
+    const bool expert_a4_residual =
+        !ggml_experts && !has_path(options.fast_path_exclusions, FastPath::ExpertA4Residual) &&
+        (has_path(options.fast_path_candidates, FastPath::ExpertA4Residual) || (options.fast_paths && qualified));
+    program_options.ggml_bf16_prefill  = ggml_bf16_prefill;
+    program_options.expert_a4_residual = expert_a4_residual;
 
     StartupPhaseScope frontend_phase(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<Glm5NextInstance>(std::move(model), options);
@@ -395,7 +414,8 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
     summary.fast_paths_disabled  = !options.fast_paths;
     summary.fast_path_configuration = std::string(ggml_experts ? "GGUF" : "NVFP4") + " expert banks, " +
                                       (options.kv_cache == KvCacheStorage::Int8Group64 ? "int8" : "bf16") + " KV";
-    if (ggml_bf16_prefill) { summary.fast_paths = {fast_path_name(FastPath::GgmlBf16Prefill)}; }
+    if (ggml_bf16_prefill) { summary.fast_paths.push_back(fast_path_name(FastPath::GgmlBf16Prefill)); }
+    if (expert_a4_residual) { summary.fast_paths.push_back(fast_path_name(FastPath::ExpertA4Residual)); }
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

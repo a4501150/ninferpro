@@ -128,6 +128,7 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
 
     // Decode and verification calls hand part of their host-memory misses to the CPU team, which
     // computes them from the records in place while the link stages the rest.
+    const std::int32_t cpu_share = c_.ggml_experts ? options_.cpu_ggml_link_share256 : options_.cpu_link_share256;
     if (options_.cpu_expert_workers > 0 && options_.cpu_expert_jobs > 0) {
         std::vector<ops::offloaded_moe::CpuMissService::Layer> layers;
         for (const auto& bank : banks) {
@@ -146,7 +147,7 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
                 .max_jobs    = static_cast<int>(std::min<std::uint32_t>(
                     options_.cpu_expert_jobs, ops::offloaded_moe::kMaxCpuJobs)),
                 .max_columns = decode_columns,
-                .pcie_share  = options_.cpu_link_share256,
+                .pcie_share  = cpu_share,
                 .activation  = ops::offloaded_moe::ExpertActivation::kA16,
                 .geometry    = {.hidden       = static_cast<int>(c_.hidden_size),
                                 .intermediate = static_cast<int>(c_.moe.intermediate),
@@ -171,8 +172,9 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
     experts.landed        = residency_->landed_log();
     experts.landing_slots = static_cast<std::int32_t>(offload::ExpertResidency::kLandingSlots);
     experts.error         = static_cast<std::uint32_t*>(device_error_.data());
-    experts.resident      = residency_->resident();
-    experts.ggml_bf16_prefill = options_.ggml_bf16_prefill;
+    experts.resident           = residency_->resident();
+    experts.ggml_bf16_prefill  = options_.ggml_bf16_prefill;
+    experts.expert_a4_residual = options_.expert_a4_residual;
 
     // The saved state's experts (or, without one, the tier's spread fill) before the first request.
     placement_->warm_start_experts();

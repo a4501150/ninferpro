@@ -85,9 +85,12 @@ struct ForwardExperts {
     std::array<cudaEvent_t, 5> overlap_events{};
     // Every routed expert holds a frame: calls run without staging or the fork.
     bool resident = false;
-    // FastPath::GgmlBf16Prefill: a GGUF bank's wide-call jobs of more than 8 entries run the BF16
-    // tensor-core tiles (ops::offloaded_moe::WideA16::kGgmlBf16) instead of the exact A16 tiles.
+    // FastPath::GgmlBf16Prefill: a GGUF bank's wide-call jobs run the BF16 tensor-core tiles
+    // (ops::offloaded_moe::WideA16::kGgmlBf16) instead of the exact A16 tiles.
     bool ggml_bf16_prefill = false;
+    // FastPath::ExpertA4Residual: an NVFP4 bank's wide-call jobs run the 3-term residual A4
+    // tensor-core tiles (ops::offloaded_moe::WideA16::kA4Residual) instead of the exact A16 tiles.
+    bool expert_a4_residual = false;
     // The prefill expert stream (expert_stream.h): when it is active around a call, its ring
     // carries the chunk's non-resident experts, copied ahead by copy-engine DMA.
     ExpertStream* stream = nullptr;

@@ -31,8 +31,10 @@ void check_launch(const char* what) {
 // One CTA: the call's wide work tiles, (job, first column) for each 64-column slice of every wide
 // job in job order, and for each pass of pass_jobs jobs the index of its first tile.
 __global__ void __launch_bounds__(kPlanThreads)
-    plan_kernel(MoeDispatch dispatch, const ExpertScales* __restrict__ scales, int max_jobs, int pass_jobs, int passes,
-                std::int32_t* __restrict__ tiles, std::int32_t* __restrict__ pass_tiles) {
+    plan_kernel(MoeDispatch dispatch, const ExpertScales* __restrict__ scales,
+                const std::int32_t* __restrict__ cpu_flags, bool all_jobs, int max_jobs,
+                int pass_jobs, int passes, std::int32_t* __restrict__ tiles,
+                std::int32_t* __restrict__ pass_tiles) {
     __shared__ int scan[kPlanThreads];
     __shared__ int base;
     const int tid  = static_cast<int>(threadIdx.x);
@@ -45,7 +47,10 @@ __global__ void __launch_bounds__(kPlanThreads)
         if (job < jobs) {
             const int expert  = dispatch.jobs[job];
             const int columns = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
-            if (wide_route(columns, scales[expert])) { n = (columns + kTileColumns - 1) / kTileColumns; }
+            const bool active = cpu_flags == nullptr || cpu_flags[job] == 0;
+            if (active && (all_jobs || wide_route(columns, scales[expert]))) {
+                n = (columns + kTileColumns - 1) / kTileColumns;
+            }
         }
         scan[tid] = n;
         __syncthreads();
@@ -169,8 +174,16 @@ struct Offsets {
 
 Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
                 ExpertActivation activation, WideA16 wide_a16, const Geometry& geometry) {
-    const int a16_x_row_bytes = geometry.hidden / kA16KTile * kA16LimbTileBytes;
-    const int a16_h_row_bytes = geometry.intermediate / kA16KTile * kA16LimbTileBytes;
+    const int a16_x_row_bytes   = geometry.hidden / kA16KTile * kA16LimbTileBytes;
+    const int a16_h_row_bytes   = geometry.intermediate / kA16KTile * kA16LimbTileBytes;
+    const int terms_x_row_bytes = kResidualTerms * (geometry.hidden / 2 + (geometry.hidden / 16 + 15) / 16 * 16);
+    const int terms_h_stride    = geometry.intermediate == kIntermediate
+                                      ? kHBlocks * static_cast<int>(sizeof(canon::A4Block))
+                                      : geometry.intermediate / 2 + (geometry.intermediate / 16 + 15) / 16 * 16;
+    const int terms_h_row_bytes = kResidualTerms * terms_h_stride;
+    const int terms_h_inplace_bytes =
+        (std::max(geometry.intermediate * 2, terms_h_row_bytes) + 15) / 16 * 16;
+    const bool a4_all = a4_residual_all_jobs(columns, activation, wide_a16, geometry);
     if (max_jobs <= 0 || entries <= 0 || columns <= 0) {
         throw std::invalid_argument("offloaded_sparse_moe experts workspace: empty call");
     }
@@ -189,25 +202,38 @@ Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t column
     o.tiles       = take(static_cast<std::size_t>(max_tiles(max_jobs, entries)) * 2 * sizeof(std::int32_t));
     o.pass_tiles  = take((j + 2) * sizeof(std::int32_t));
     // The dp4a narrow route's x of calls of at most kA16RowsMaxColumns columns: every token's
-    // A16Act rows (a GGUF or block-FP8 bank carves them too and runs its own kernels).
-    if (activation == ExpertActivation::kA16) {
+    // A16Act rows (a GGUF or block-FP8 bank carves them too and runs its own kernels). Non-default
+    // all-jobs residual A4 calls skip the narrow pass entirely.
+    if (activation == ExpertActivation::kA16 && !a4_all) {
         o.x_acts      = take(t * a16_x_row_bytes);
         o.x_acts_emax = take(t * sizeof(std::int32_t));
     }
     // The tensor-core narrow kernels of wider calls read the call's x limbs and exponents and its
     // jobs' gate/up CTA counts.
     if (activation == ExpertActivation::kA16 && wide_a16 == WideA16::kA4Residual) {
-        // The narrow route still needs its h rows (BF16 h of every entry) and exponents.
-        o.h_rows        = take(e * a16_h_row_bytes);
-        o.h_emax  = take(e * sizeof(std::int32_t));
-        o.x_emax  = take(t * sizeof(std::int32_t));
-        o.x_limbs       = take(t * a16_x_row_bytes);
-        o.job_ctas = take(j * sizeof(std::uint32_t));
-        o.x_terms_plane = take(e * kXTermsRowBytes);
-        o.x_token_terms = take(t * kXTermsRowBytes);
-        o.x_row_scale = take(t * sizeof(float));
-        o.h_terms_plane = take(e * kHTermsRowBytes);
-        o.h_row_scale = take(e * sizeof(float));
+        if (a4_all) {
+            // Every active non-CPU job runs the residual A4 route: x_token_terms completes before
+            // pass 0 writes h_rows, and quantize_h_terms rewrites BF16 h_rows into residual terms
+            // in place, so all three share one region.
+            o.h_rows        = take(std::max(e * terms_h_inplace_bytes, t * terms_x_row_bytes));
+            o.x_token_terms = o.h_rows;
+            o.h_terms_plane = o.h_rows;
+            o.x_terms_plane = take(e * terms_x_row_bytes);
+            o.x_row_scale   = take(t * sizeof(float));
+            o.h_row_scale   = take(e * sizeof(float));
+        } else {
+            // The narrow route still needs its h rows (BF16 h of every entry) and exponents.
+            o.h_rows        = take(e * a16_h_row_bytes);
+            o.h_emax        = take(e * sizeof(std::int32_t));
+            o.x_emax        = take(t * sizeof(std::int32_t));
+            o.x_limbs       = take(t * a16_x_row_bytes);
+            o.job_ctas      = take(j * sizeof(std::uint32_t));
+            o.x_terms_plane = take(e * terms_x_row_bytes);
+            o.x_token_terms = take(t * terms_x_row_bytes);
+            o.x_row_scale   = take(t * sizeof(float));
+            o.h_terms_plane = take(e * terms_h_row_bytes);
+            o.h_row_scale   = take(e * sizeof(float));
+        }
     } else if (activation == ExpertActivation::kA16) {
         o.x_limbs  = take(t * a16_x_row_bytes);
         o.h_rows   = take(e * a16_h_row_bytes);
@@ -230,8 +256,7 @@ Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t column
 // The limb-plane encoders (pack16, store_a16_block, unpack16, a16_key, a16_emax) are
 // a16_limbs.cuh's, shared with the tensor-core narrow route, reached through wide_expert_a16.cuh.
 
-constexpr int kEncodeXThreads = kHidden / 16; // one 16-element block per thread
-constexpr int kEncodeWarps    = 8;
+constexpr int kEncodeWarps = 8;
 
 // Every token's x limbs and column exponent (W4A16 wide calls): one CTA per token, a
 // 16-element block per thread.
@@ -330,12 +355,11 @@ __device__ __forceinline__ void plane_order(std::uint32_t lo, std::uint32_t hi, 
     }
 }
 
-// `block`: 16 BF16 values (16-byte aligned); `row_scale`: their row's (0 or NaN: zero terms).
-__device__ __forceinline__ void term_block(const std::uint16_t* block, float row_scale, TermBlock& out) {
+// 16 BF16 values already loaded into registers `p0, p1`; `row_scale`: their row's (0 or NaN: zero terms).
+__device__ __forceinline__ void term_block_packed(uint4 p0, uint4 p1, float row_scale, TermBlock& out) {
     const float divisor = row_scale > 0.0F ? 1.0F / row_scale : 0.0F;
     ops::detail::Nvfp4QuantizedK16 terms[kResidualTerms];
-    ops::detail::quantize_nvfp4_terms_k16<kResidualTerms>(reinterpret_cast<const __nv_bfloat16*>(block), divisor,
-                                                          terms);
+    ops::detail::quantize_nvfp4_terms_k16_packed<kResidualTerms>(p0, p1, divisor, terms);
 #pragma unroll
     for (int term = 0; term < kResidualTerms; ++term) {
         plane_order(terms[term].codes_lo, terms[term].codes_hi, out.low[term], out.high[term]);
@@ -357,21 +381,26 @@ __device__ __forceinline__ void store_terms(std::uint8_t* row, int b, int code_b
 
 // Every token's x row scale and terms: one CTA per token, a 16-element block per thread. A token feeds
 // up to top_k wide entries with the same terms, so they are formed once here and copied to the entries.
-__global__ void __launch_bounds__(kEncodeXThreads)
+template <int H, int I>
+__global__ void __launch_bounds__(H / 16)
     x_token_terms_kernel(const std::uint16_t* __restrict__ x, float* __restrict__ row_scale,
                          std::uint8_t* __restrict__ token_terms) {
-    __shared__ float maxima[kEncodeXThreads / 32];
+    constexpr int kThreads = H / 16;
+    using Terms            = A4Terms<H, I>;
+    __shared__ float maxima[kThreads / 32];
     __shared__ float scale;
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
-    const std::uint16_t* block = x + static_cast<std::size_t>(t) * kHidden + 16 * b;
-    const auto* source = reinterpret_cast<const uint4*>(block);
-    std::uint16_t v[16];
-    unpack16(source[0], source[1], v);
+    const auto* source =
+        reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * H + 16 * b);
+    const uint4 p0 = source[0], p1 = source[1];
+    const unsigned words[8] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
     float amax = 0.0F;
 #pragma unroll
-    for (int j = 0; j < 16; ++j) {
-        const float a = fabsf(canon::bf16_to_f32(v[j]));
-        amax          = a > amax || a != a ? a : amax; // NaN propagates (the row then has no terms)
+    for (int w = 0; w < 8; ++w) {
+        const float a     = fabsf(canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] & 0xFFFFU)));
+        const float b_val = fabsf(canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] >> 16)));
+        amax              = a > amax || a != a ? a : amax; // NaN propagates (the row then has no terms)
+        amax              = b_val > amax || b_val != b_val ? b_val : amax;
     }
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -383,23 +412,26 @@ __global__ void __launch_bounds__(kEncodeXThreads)
     if (b == 0) {
         float all = 0.0F;
 #pragma unroll
-        for (int w = 0; w < kEncodeXThreads / 32; ++w) { all = maxima[w] > all || maxima[w] != maxima[w] ? maxima[w] : all; }
+        for (int w = 0; w < kThreads / 32; ++w) { all = maxima[w] > all || maxima[w] != maxima[w] ? maxima[w] : all; }
         scale        = residual_row_scale(all);
         row_scale[t] = scale;
     }
     __syncthreads();
     TermBlock q;
-    term_block(block, scale, q);
-    store_terms(token_terms + static_cast<std::size_t>(t) * kXTermsRowBytes, b, kXCodeBytes, kXRowBytes, q);
+    term_block_packed(p0, p1, scale, q);
+    store_terms(token_terms + static_cast<std::size_t>(t) * Terms::kXTermsRowBytes, b,
+                Terms::kXCodeBytes, Terms::kXRowBytes, q);
 }
 
 // Every wide entry's x terms: its token's row of x_token_terms_kernel, as quantize_kernel lays out A4.
+template <int H, int I>
 __global__ void __launch_bounds__(kQuantizeThreads)
     copy_x_terms_kernel(int top_k, MoeDispatch dispatch, const std::int32_t* __restrict__ tiles,
                         const std::int32_t* __restrict__ pass_tiles, int passes,
                         const std::uint8_t* __restrict__ token_terms, std::uint8_t* __restrict__ plane) {
-    constexpr int kWords = kXTermsRowBytes / 16;
-    static_assert(kXTermsRowBytes % 16 == 0);
+    using Terms          = A4Terms<H, I>;
+    constexpr int kWords = Terms::kXTermsRowBytes / 16;
+    static_assert(Terms::kXTermsRowBytes % 16 == 0);
     const int total = pass_tiles[passes];
     for (int tile = static_cast<int>(blockIdx.x); tile < total; tile += static_cast<int>(gridDim.x)) {
         const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
@@ -410,18 +442,23 @@ __global__ void __launch_bounds__(kQuantizeThreads)
             const int i = task / kWords, word = task % kWords;
             const int p = first + i;
             const int t = dispatch.entries[p] / top_k;
-            reinterpret_cast<uint4*>(plane + static_cast<std::size_t>(p) * kXTermsRowBytes)[word] =
-                reinterpret_cast<const uint4*>(token_terms + static_cast<std::size_t>(t) * kXTermsRowBytes)[word];
+            reinterpret_cast<uint4*>(plane + static_cast<std::size_t>(p) * Terms::kXTermsRowBytes)[word] =
+                reinterpret_cast<const uint4*>(token_terms + static_cast<std::size_t>(t) * Terms::kXTermsRowBytes)[word];
         }
     }
 }
 
 // The pass's wide entries' h (BF16 rows) as terms with their row scales: one warp per entry.
+// When kInPlace is true, plane aliases h_rows and the warp holds all blocks in registers before writing.
+template <int H, int I, int kHRowBytes, int kHTermsStride, bool kInPlace>
 __global__ void __launch_bounds__(kEncodeWarps * 32)
     quantize_h_terms_kernel(MoeDispatch dispatch, const std::int32_t* __restrict__ tiles,
-                       const std::int32_t* __restrict__ pass_tiles, int pass, const std::uint8_t* __restrict__ h_rows,
-                       std::uint8_t* __restrict__ plane, float* __restrict__ row_scale) {
-    constexpr int kBlocks = kIntermediate / 16; // 40: lane l holds blocks l and l + 32
+                            const std::int32_t* __restrict__ pass_tiles, int pass,
+                            const std::uint8_t* __restrict__ h_rows,
+                            std::uint8_t* __restrict__ plane, float* __restrict__ row_scale) {
+    using Terms               = A4Terms<H, I>;
+    constexpr int kBlocks     = I / 16;
+    constexpr int kMaxPerLane = (kBlocks + 31) / 32;
     const int lane  = static_cast<int>(threadIdx.x) % 32;
     const int warp  = static_cast<int>(blockIdx.x) * kEncodeWarps + static_cast<int>(threadIdx.x) / 32;
     const int warps = static_cast<int>(gridDim.x) * kEncodeWarps;
@@ -432,64 +469,80 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
         const int expert = dispatch.jobs[job];
         const int entry  = dispatch.offsets[expert] + column + c;
         if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
-        const auto* source = reinterpret_cast<const uint4*>(h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes);
-        const bool second  = lane + 32 < kBlocks;
-        std::uint16_t v0[16] = {}, v1[16] = {};
-        unpack16(source[2 * lane], source[2 * lane + 1], v0);
-        if (second) { unpack16(source[2 * (lane + 32)], source[2 * (lane + 32) + 1], v1); }
+        const auto* source =
+            reinterpret_cast<const uint4*>(h_rows + static_cast<std::size_t>(entry) * kHRowBytes);
+        uint4 p0[kMaxPerLane], p1[kMaxPerLane];
         float amax = 0.0F;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const float a = fabsf(canon::bf16_to_f32(v0[j])), b = fabsf(canon::bf16_to_f32(v1[j]));
-            amax = a > amax || a != a ? a : amax;
-            amax = b > amax || b != b ? b : amax;
+        for (int t = 0; t < kMaxPerLane; ++t) {
+            const int b = lane + 32 * t;
+            if (b < kBlocks) {
+                p0[t] = source[2 * b];
+                p1[t] = source[2 * b + 1];
+                const unsigned words[8] = {p0[t].x, p0[t].y, p0[t].z, p0[t].w,
+                                           p1[t].x, p1[t].y, p1[t].z, p1[t].w};
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    const float a     = fabsf(canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] & 0xFFFFU)));
+                    const float b_val = fabsf(canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] >> 16)));
+                    amax              = a > amax || a != a ? a : amax;
+                    amax              = b_val > amax || b_val != b_val ? b_val : amax;
+                }
+            }
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             const float other = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
             amax              = other > amax || other != other ? other : amax;
         }
-        const float rs    = residual_row_scale(amax);
-        const auto* h     = reinterpret_cast<const std::uint16_t*>(h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes);
-        std::uint8_t* row = plane + static_cast<std::size_t>(entry) * kHTermsRowBytes;
-        TermBlock q;
-        term_block(h + 16 * lane, rs, q);
-        store_terms(row, lane, kHCodeBytes, kHRowStride, q);
-        if (second) {
-            term_block(h + 16 * (lane + 32), rs, q);
-            store_terms(row, lane + 32, kHCodeBytes, kHRowStride, q);
+        const float rs = residual_row_scale(amax);
+        if constexpr (kInPlace) { __syncwarp(); }
+        std::uint8_t* row = plane + static_cast<std::size_t>(entry) * kHTermsStride;
+#pragma unroll
+        for (int t = 0; t < kMaxPerLane; ++t) {
+            const int b = lane + 32 * t;
+            if (b < kBlocks) {
+                TermBlock q;
+                term_block_packed(p0[t], p1[t], rs, q);
+                store_terms(row, b, Terms::kHCodeBytes, Terms::kHRowStride, q);
+            }
         }
         if (lane == 0) { row_scale[entry] = rs; }
     }
 }
 
-Descriptors make_descriptors_terms(const std::uint8_t* x_terms_plane, const std::uint8_t* h_terms_plane, int entries) {
+template <int H, int I, int kHTermsStride>
+Descriptors make_descriptors_terms(const std::uint8_t* x_terms_plane,
+                                   const std::uint8_t* h_terms_plane, int entries) {
+    using Terms     = A4Terms<H, I>;
     const auto rows = static_cast<std::uint64_t>(entries);
     auto* x = const_cast<std::uint8_t*>(x_terms_plane);
     auto* h = const_cast<std::uint8_t*>(h_terms_plane);
     Descriptors d{};
     const auto x_maps = [&](std::uint8_t* base, CUtensorMap& codes, CUtensorMap& scales) {
-        codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, kXCodeBytes, rows, kXTermsRowBytes,
-                                           Schedule::kCodeRowBytes, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_64B,
-                                           "encode wide residual x codes TMA");
-        scales = detail::nvfp4_make_tma_2d(base + kXCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8, kXScaleBytes, rows,
-                                           kXTermsRowBytes, 16, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_NONE,
+        codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, Terms::kXCodeBytes, rows,
+                                           Terms::kXTermsRowBytes, Schedule::kCodeRowBytes, Schedule::kBlockTokens,
+                                           CU_TENSOR_MAP_SWIZZLE_64B, "encode wide residual x codes TMA");
+        scales = detail::nvfp4_make_tma_2d(base + Terms::kXCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                                           Terms::kXScaleMapBytes, rows, Terms::kXTermsRowBytes, 16,
+                                           Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_NONE,
                                            "encode wide residual x scales TMA");
     };
     const auto h_maps = [&](std::uint8_t* base, CUtensorMap& codes, CUtensorMap& scales) {
-        codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, kHCodeBytes, rows, kHTermsRowBytes,
-                                           Schedule::kCodeRowBytes, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_64B,
-                                           "encode wide residual h codes TMA");
-        scales = detail::nvfp4_make_tma_2d(base + kHCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8, kHScaleMapBytes, rows,
-                                           kHTermsRowBytes, 16, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_NONE,
+        codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, Terms::kHCodeBytes, rows,
+                                           kHTermsStride, Schedule::kCodeRowBytes, Schedule::kBlockTokens,
+                                           CU_TENSOR_MAP_SWIZZLE_64B, "encode wide residual h codes TMA");
+        scales = detail::nvfp4_make_tma_2d(base + Terms::kHCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                                           Terms::kHScaleMapBytes, rows, kHTermsStride, 16,
+                                           Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_NONE,
                                            "encode wide residual h scales TMA");
     };
     x_maps(x, d.x_codes, d.x_scales);
-    x_maps(x + kXRowBytes, d.x2_codes, d.x2_scales);
-    x_maps(x + 2 * kXRowBytes, d.x3_codes, d.x3_scales);
+    x_maps(x + Terms::kXRowBytes, d.x2_codes, d.x2_scales);
+    x_maps(x + 2 * Terms::kXRowBytes, d.x3_codes, d.x3_scales);
     h_maps(h, d.h_codes, d.h_scales);
-    h_maps(h + kHRowStride, d.h2_codes, d.h2_scales);
-    h_maps(h + 2 * kHRowStride, d.h3_codes, d.h3_scales);
+    h_maps(h + Terms::kHRowStride, d.h2_codes, d.h2_scales);
+    h_maps(h + 2 * Terms::kHRowStride, d.h3_codes, d.h3_scales);
     return d;
 }
 
@@ -512,21 +565,24 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
     w.cpu_call    = p + o.cpu_call;
     w.tiles       = reinterpret_cast<std::int32_t*>(p + o.tiles);
     w.pass_tiles  = reinterpret_cast<std::int32_t*>(p + o.pass_tiles);
-    if (activation == ExpertActivation::kA16) {
+    const bool a4_all = a4_residual_all_jobs(columns, activation, wide_a16, geometry);
+    if (activation == ExpertActivation::kA16 && !a4_all) {
         w.x_acts      = reinterpret_cast<std::uint8_t*>(p + o.x_acts);
         w.x_acts_emax = reinterpret_cast<std::int32_t*>(p + o.x_acts_emax);
     }
     if (activation == ExpertActivation::kA16 && wide_a16 == WideA16::kA4Residual) {
-        w.h_rows      = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
-        w.h_emax      = reinterpret_cast<std::int32_t*>(p + o.h_emax);
-        w.x_emax      = reinterpret_cast<std::int32_t*>(p + o.x_emax);
-        w.x_limbs     = reinterpret_cast<std::uint8_t*>(p + o.x_limbs);
-        w.job_ctas    = reinterpret_cast<std::uint32_t*>(p + o.job_ctas);
+        w.h_rows        = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
+        if (!a4_all) {
+            w.h_emax   = reinterpret_cast<std::int32_t*>(p + o.h_emax);
+            w.x_emax   = reinterpret_cast<std::int32_t*>(p + o.x_emax);
+            w.x_limbs  = reinterpret_cast<std::uint8_t*>(p + o.x_limbs);
+            w.job_ctas = reinterpret_cast<std::uint32_t*>(p + o.job_ctas);
+        }
         w.x_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.x_terms_plane);
         w.x_token_terms = reinterpret_cast<std::uint8_t*>(p + o.x_token_terms);
-        w.x_row_scale = reinterpret_cast<float*>(p + o.x_row_scale);
+        w.x_row_scale   = reinterpret_cast<float*>(p + o.x_row_scale);
         w.h_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.h_terms_plane);
-        w.h_row_scale = reinterpret_cast<float*>(p + o.h_row_scale);
+        w.h_row_scale   = reinterpret_cast<float*>(p + o.h_row_scale);
     } else if (activation == ExpertActivation::kA16) {
         w.x_limbs  = reinterpret_cast<std::uint8_t*>(p + o.x_limbs);
         w.h_rows   = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
@@ -553,9 +609,11 @@ int persistent_ctas() {
 
 Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source, std::int32_t top_k,
              std::int32_t max_jobs, std::int32_t pass_jobs, const ExpertsWorkspace& workspace, Tensor& outputs,
-             cudaStream_t stream) {
+             cudaStream_t stream, const std::int32_t* cpu_flags, bool x_limbs_ready) {
     if (pass_jobs <= 0 || max_jobs <= 0) { throw std::invalid_argument("offloaded_sparse_moe wide: empty passes"); }
     const int entries = outputs.ne[1];
+    const bool a4_all =
+        a4_residual_all_jobs(static_cast<std::int32_t>(x.ne[1]), source.activation, source.wide_a16, source.geometry);
     Call call;
     call.dispatch    = dispatch;
     call.scales      = source.scales;
@@ -565,26 +623,47 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     call.h_plane     = reinterpret_cast<std::uint8_t*>(workspace.h_blocks);
     call.outputs     = static_cast<std::uint16_t*>(outputs.data);
     call.passes      = (max_jobs + pass_jobs - 1) / pass_jobs;
-    plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source.scales, max_jobs, pass_jobs, call.passes,
-                                                workspace.tiles, workspace.pass_tiles);
+    plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source.scales, cpu_flags, a4_all, max_jobs, pass_jobs,
+                                                call.passes, workspace.tiles, workspace.pass_tiles);
     check_launch("plan");
     if (source.activation == ExpertActivation::kA16 && source.wide_a16 == WideA16::kA4Residual) {
         // W4A16 residual A4: every token's row scale, then each wide entry's x terms; h's terms
         // are formed per pass from the BF16 h the gate/up epilogue writes.
         call.a4_residual   = true;
+        call.all_jobs      = a4_all;
+        call.geometry      = source.geometry;
         call.h_rows        = workspace.h_rows;
         call.top_k         = top_k;
         call.x_row_scale   = workspace.x_row_scale;
         call.h_terms_plane = workspace.h_terms_plane;
         call.h_row_scale   = workspace.h_row_scale;
-        x_token_terms_kernel<<<x.ne[1], kEncodeXThreads, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
-                                                                      workspace.x_row_scale, workspace.x_token_terms);
-        check_launch("residual x");
-        copy_x_terms_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
-            top_k, dispatch, workspace.tiles, workspace.pass_tiles, call.passes, workspace.x_token_terms,
-            workspace.x_terms_plane);
-        check_launch("copy residual x");
-        const Descriptors descriptors = make_descriptors_terms(workspace.x_terms_plane, workspace.h_terms_plane, entries);
+        Descriptors descriptors{};
+        const auto prepare_terms = [&](auto geometry) {
+            constexpr int H = decltype(geometry)::kHidden, I = decltype(geometry)::kIntermediate;
+            x_token_terms_kernel<H, I><<<x.ne[1], H / 16, 0, stream>>>(
+                static_cast<const std::uint16_t*>(x.data), workspace.x_row_scale, workspace.x_token_terms);
+            check_launch("residual x");
+            copy_x_terms_kernel<H, I><<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
+                top_k, dispatch, workspace.tiles, workspace.pass_tiles, call.passes, workspace.x_token_terms,
+                workspace.x_terms_plane);
+            check_launch("copy residual x");
+            if (a4_all) {
+                descriptors = make_descriptors_terms<H, I, A4Terms<H, I>::kHInPlaceRowBytes>(
+                    workspace.x_terms_plane, workspace.h_terms_plane, entries);
+            } else {
+                descriptors = make_descriptors_terms<H, I, A4Terms<H, I>::kHTermsRowBytes>(
+                    workspace.x_terms_plane, workspace.h_terms_plane, entries);
+            }
+        };
+        if (source.geometry.hidden == kGeometries[0].hidden &&
+            source.geometry.intermediate == kGeometries[0].intermediate) {
+            prepare_terms(Nvfp4Geometry<kGeometries[0].hidden, kGeometries[0].intermediate>{});
+        } else if (source.geometry.hidden == kGeometries[1].hidden &&
+                   source.geometry.intermediate == kGeometries[1].intermediate) {
+            prepare_terms(Nvfp4Geometry<kGeometries[1].hidden, kGeometries[1].intermediate>{});
+        } else {
+            throw std::invalid_argument("offloaded_sparse_moe wide: unsupported record geometry");
+        }
 #ifdef _WIN32
         call.descriptors = descriptor_staging().stage(descriptors, stream);
 #else
@@ -602,21 +681,23 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.x_emax         = workspace.x_emax;
         call.h_emax         = workspace.h_emax;
         call.top_k          = top_k;
-        const auto encode_x = [&](auto geometry) {
-            constexpr int H = decltype(geometry)::kHidden, I = decltype(geometry)::kIntermediate;
-            encode_x_kernel<H, I><<<x.ne[1], H / 16, 0, stream>>>(
-                static_cast<const std::uint16_t*>(x.data), workspace.x_limbs, workspace.x_emax);
-        };
-        if (source.geometry.hidden == kGeometries[0].hidden &&
-            source.geometry.intermediate == kGeometries[0].intermediate) {
-            encode_x(Nvfp4Geometry<kGeometries[0].hidden, kGeometries[0].intermediate>{});
-        } else if (source.geometry.hidden == kGeometries[1].hidden &&
-                   source.geometry.intermediate == kGeometries[1].intermediate) {
-            encode_x(Nvfp4Geometry<kGeometries[1].hidden, kGeometries[1].intermediate>{});
-        } else {
-            throw std::invalid_argument("offloaded_sparse_moe wide: unsupported record geometry");
+        if (!x_limbs_ready) {
+            const auto encode_x = [&](auto geometry) {
+                constexpr int H = decltype(geometry)::kHidden, I = decltype(geometry)::kIntermediate;
+                encode_x_kernel<H, I><<<x.ne[1], H / 16, 0, stream>>>(
+                    static_cast<const std::uint16_t*>(x.data), workspace.x_limbs, workspace.x_emax);
+            };
+            if (source.geometry.hidden == kGeometries[0].hidden &&
+                source.geometry.intermediate == kGeometries[0].intermediate) {
+                encode_x(Nvfp4Geometry<kGeometries[0].hidden, kGeometries[0].intermediate>{});
+            } else if (source.geometry.hidden == kGeometries[1].hidden &&
+                       source.geometry.intermediate == kGeometries[1].intermediate) {
+                encode_x(Nvfp4Geometry<kGeometries[1].hidden, kGeometries[1].intermediate>{});
+            } else {
+                throw std::invalid_argument("offloaded_sparse_moe wide: unsupported record geometry");
+            }
+            check_launch("encode x");
         }
-        check_launch("encode x");
         return call;
     }
     quantize_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
@@ -636,16 +717,47 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
 void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
     if (pass < 0 || pass >= call.passes) { throw std::out_of_range("offloaded_sparse_moe wide: pass out of range"); }
     if (call.a4_residual) {
-        launch<Matrix::GateUp, ScheduleResidual>(
-            call, pass,
-            GateUpEpilogueResidual{call.scales, call.dispatch.entries, call.x_row_scale, call.h_rows, call.top_k},
-            stream);
-        quantize_h_terms_kernel<<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(
-            call.dispatch, call.tiles, call.pass_tiles, pass, call.h_rows, call.h_terms_plane, call.h_row_scale);
-        check_launch("quantize residual h");
-        launch<Matrix::Down, ScheduleResidual>(
-            call, pass, DownEpilogueResidual{call.scales, call.dispatch.entries, call.h_row_scale, call.outputs},
-            stream);
+        const auto run_residual = [&](auto geometry) {
+            constexpr int H       = decltype(geometry)::kHidden;
+            constexpr int I       = decltype(geometry)::kIntermediate;
+            constexpr float limit = geometry_swiglu_limit<H, I>();
+            if (call.all_jobs) {
+                constexpr int kRow = A4Terms<H, I>::kHInPlaceRowBytes;
+                launch<Matrix::GateUp, ScheduleResidual, H, I>(
+                    call, pass,
+                    GateUpEpilogueResidual<limit, kRow>{call.scales, call.dispatch.entries, call.x_row_scale,
+                                                        call.h_rows, call.top_k},
+                    stream);
+                quantize_h_terms_kernel<H, I, kRow, kRow, true><<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(
+                    call.dispatch, call.tiles, call.pass_tiles, pass, call.h_rows, call.h_terms_plane,
+                    call.h_row_scale);
+            } else {
+                constexpr int kRow    = A16Rows<H, I>::kHRowBytes;
+                constexpr int kStride = A4Terms<H, I>::kHTermsRowBytes;
+                launch<Matrix::GateUp, ScheduleResidual, H, I>(
+                    call, pass,
+                    GateUpEpilogueResidual<limit, kRow>{call.scales, call.dispatch.entries, call.x_row_scale,
+                                                        call.h_rows, call.top_k},
+                    stream);
+                quantize_h_terms_kernel<H, I, kRow, kStride, false>
+                    <<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(call.dispatch, call.tiles, call.pass_tiles,
+                                                                          pass, call.h_rows, call.h_terms_plane,
+                                                                          call.h_row_scale);
+            }
+            check_launch("quantize residual h");
+            launch<Matrix::Down, ScheduleResidual, H, I>(
+                call, pass,
+                DownEpilogueResidual<H>{call.scales, call.dispatch.entries, call.h_row_scale, call.outputs}, stream);
+        };
+        if (call.geometry.hidden == kGeometries[0].hidden &&
+            call.geometry.intermediate == kGeometries[0].intermediate) {
+            run_residual(Nvfp4Geometry<kGeometries[0].hidden, kGeometries[0].intermediate>{});
+        } else if (call.geometry.hidden == kGeometries[1].hidden &&
+                   call.geometry.intermediate == kGeometries[1].intermediate) {
+            run_residual(Nvfp4Geometry<kGeometries[1].hidden, kGeometries[1].intermediate>{});
+        } else {
+            throw std::invalid_argument("offloaded_sparse_moe wide: unsupported record geometry");
+        }
         return;
     }
     if (call.a16) {

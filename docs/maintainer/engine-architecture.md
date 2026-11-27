@@ -30,9 +30,9 @@ Scoring-only staging is allocated only when CausalScoring starts.
 
 Model code owns the mathematical formulas, call order, component handoffs and state transitions. The
 config provides instance parameters such as layer count, dimensions, the Attention/GDN distribution and
-expert geometry. The architecture entry points are `Qwen3_5ForCausalLM` and
-`Qwen3_5MoeForCausalLM`; training instances and physical weight assignments enter the corresponding
-implementation as data.
+expert geometry. The architecture entry points are `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`,
+`Qwen4ExpForCausalLM` (Qwen3.8-Flash-Next) and `Glm5NextForCausalLM` (GLM-5.3-Flash); training
+instances and physical weight assignments enter the corresponding implementation as data.
 
 A v3 artifact stores the config, physical objects, logical parameter Bindings, per-use-site Uses and
 Frontend resources. The Converter handles source mapping, quantized or value-preserving import, fused

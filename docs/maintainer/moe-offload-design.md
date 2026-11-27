@@ -133,16 +133,17 @@ identical on both. A new stored format adds a trait and its kernels beside the e
 (`src/ops/offloaded_sparse_moe/`), not a new engine; a loader check keeps every layer's bank
 one kind and its activation policy consistent with the presence of activation scales.
 
-**Expert geometry.** The routed-expert Op's NVFP4 activation-16 routes take the bank's expert
-geometry — hidden size, intermediate size, and the SwiGLU clamp the family applies to the gate
-and up limbs — as a compile-time parameter over a small registered set (Qwen3.8-Flash-Next's
-2560×640 with no clamp, GLM-5.3-Flash's 4096×2048 with clamp 10); the other bank formats keep
-their kernels at their own geometry. A per-call `Geometry` value is validated against the
-registered set and selects the kernels — one branch per call, never per token — and every
-route that reads an NVFP4 record (the narrow dp4a and tensor-core kernels, the wide prefill
-route, the CPU W4A16 engine, the miss service and the staging, landing and fetch paths)
-computes the same bits at either geometry. A bank whose geometry no instance covers is
-rejected at call time with the registered sizes in the message.
+**Expert geometry.** The routed-expert Op's NVFP4 activation-16 and GGUF K-quant routes take the
+bank's expert geometry — hidden size, intermediate size, and the SwiGLU clamp the family applies to
+the gate and up limbs — as a compile-time parameter over a small registered set (Qwen3.8-Flash-Next's
+2560×640 with no clamp, GLM-5.3-Flash's 4096×2048 with clamp 10); the remaining bank formats (W4A4
+NVFP4, block FP8) keep their kernels at their own geometry. A per-call `Geometry` value is validated
+against the registered set and selects the kernels — one branch per call, never per token — and every
+route that reads an NVFP4 W4A16 or GGUF K-quant record (the narrow dp4a and tensor-core kernels, the
+wide exact and fast prefill routes, the CPU engines, the miss service and the staging, landing and
+fetch paths) computes the same exact bits at either geometry (and the qualified fast prefill routes
+on wide calls). A bank whose geometry no instance covers is rejected at call time with the registered
+sizes in the message.
 
 **The artifact is the SSD tier's source.** `ExpertStore` describes every record as file
 segments — one, or two for a record straddling part files — each 4 KiB-aligned in offset and
@@ -590,8 +591,8 @@ host (i9-13900K, RTX 5090 over Gen5 x8, DFlash2 auto): 51/256 from eight columns
 (2026-11-02), and a measured fractional share flipped calls' splits at floor(M·share) between
 startups (3 workers: 100.8 against 107.5 tok/s). A family may set its own share instead:
 Qwen3.8-Flash-Next's re-derivation on this machine (9950X3D2, Gen5 x16) and its caveat are its
-design §10.5; GLM-5.3-Flash keeps 128/256 of every decode call's host-memory misses on the link
-(its design §10.2).
+design §10.5; GLM-5.3-Flash keeps 120/256 of every decode call's host-memory misses on the link for
+NVFP4 banks and 104/256 for GGUF K-quant banks (14 CPU workers, up to 16 CPU jobs; its design §6.3).
 
 ### 5.7 The prefill CPU split
 
@@ -792,8 +793,10 @@ The checklist, in order:
    (flags, placements, measured speeds) linked from `docs/README.md`.
 9. **Tier extensions**: a family that needs the tier to grow names each addition, where it
    lands and why it costs the existing families nothing, and the addition moves into this
-   document when it is built. GLM-5.3-Flash added the compile-time expert geometry (§3).
-   Multi-drive striping is not built (§10.4).
+   document when it is built. GLM-5.3-Flash added compile-time expert geometry (§3), Q2_K/Q3_K
+   GGUF expert banks, per-pool decode landing, and cold-placeholder pre-demotion (async D2H of
+   unranked `count == 0` startup seeds into free/shadow RAM slots so decode misses land directly
+   without extra H2D traffic or SSD spill). Multi-drive striping is not built (§10.4).
 
 ## 10. Rejected and not built
 

@@ -590,6 +590,22 @@ void test_held() {
     tier.check();
 }
 
+// ---- mark_shadow: a fill-phase landing into VRAM marks an existing RAM resident as a shadow
+// without disturbing keys absent from RAM or already shadows.
+void test_mark_shadow() {
+    HostTier tier(small_config());
+    std::int32_t slot = -1;
+    check(tier.prefill(3, slot), "prefill key 3");
+    check(tier.shadow_count() == 0, "starts as non-shadow resident");
+    tier.mark_shadow(3);
+    check(tier.shadow_count() == 1 && tier.state(static_cast<std::uint32_t>(slot)) == SlotState::kShadow,
+          "mark_shadow turns a RAM resident into a shadow");
+    tier.mark_shadow(3); // idempotent
+    tier.mark_shadow(99); // absent key is ignored
+    check(tier.shadow_count() == 1, "mark_shadow is idempotent and ignores absent keys");
+    tier.check();
+}
+
 } // namespace
 
 int main() {
@@ -599,6 +615,7 @@ int main() {
         test_shadow_rank();
         test_warm_fill();
         test_held();
+        test_mark_shadow();
         test_stream_pins();
         test_rebuild_pins();
         test_fill_adopt();

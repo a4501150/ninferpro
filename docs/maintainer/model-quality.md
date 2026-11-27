@@ -751,6 +751,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | GLM-5.3-Flash: `ggml-bf16-prefill` | GGUF expert jobs in wide calls (all active non-CPU jobs at 64+ columns; > 8 entries at 9-63 columns) | the GSQ-Q4 GGUF artifact with INT8 KV (BF16 KV not gated) |
+| GLM-5.3-Flash: `expert-a4-residual` | NVFP4 W4A16 expert jobs in wide calls (all active non-CPU jobs at 64+ columns with in-place residual plane reuse; > 8 entries at 9-63 columns) | the NVFP4 artifact with INT8 KV (BF16 KV not gated) |
 | Qwen3.8-Flash-Next: `gdn-compensated` | GDN calls of 16+ tokens in the construction-exact configurations (recipe C with BF16, INT8 or FP8 KV) | recipe C with INT8 or FP8 KV (BF16 KV is the reference's own exact route, not gated; 6.8) |
 | Qwen3.8-Flash-Next: `hc-sliced-k` | the Q8 hyper-connection mix ([324, 10240], [320, 10240]) of recipe C at 29-2,048 columns | recipe C with FP8 KV (INT8 fails its decode tail, below; other formats not gated) |
 | Qwen3.8-Flash-Next: `bf16-index-mma` | the BF16 QSA index projection ([640, 2560]) of recipe C at 9 or more columns | recipe C with FP8 KV (other formats not gated) |
@@ -2023,6 +2024,22 @@ fast route sits slightly closer to the reference than the exact route with INT8 
 decode and verification calls are never wide, so the path changes no decode arithmetic; decode reads
 a prompt's KV computed under it, which the gate's later-window positions cover. BF16 KV is not gated
 (its exact route is the reference itself, floor 0), so the path stays off there.
+
+**`expert-a4-residual` on GLM-5.3-Flash (the NVFP4 artifact with INT8 KV, qualified
+2026-11-27).** Wide expert calls (`columns >= 64` for all active non-CPU jobs with in-place
+`h_rows` residual reuse, or `> 8` entries at 9-63 columns) encode activations as 3-term NVFP4
+residuals on SM120 FP4 Tensor Cores at the 4096 × 2048 geometry with clamped SwiGLU (limit 10).
+Prefill gate (`fast_path_gate.py prefill --quick --context 8192 --stride 4096 --kv int8 --chunk
+1024 2048 4096 8192 --fast-path expert-a4-residual`, 60 windows, 1,011,292 positions per route,
+RTX PRO 6000): mean KL excess -1.72e-4 (95 % bound -1.51e-5 of 1.5e-3; floor 5.50e-3), top-1
+disagreement excess -0.016 points (bound +0.041 of 0.5; floor 2.63 %), corpus NLL excess -3.31e-4
+(perplexity ratio 0.99967, default 1.14745 vs fast 1.14712), p99.9 KL ratio 0.992 (default 0.1995,
+fast 0.1979 / budget 1.25), context `[2048,4096)` KL excess -4.51e-4 and `[4096,8192)` -1.50e-4
+(budget 3.0e-3). Decode and verification calls (`<= 8` columns) keep the exact narrow A16 dp4a
+route, so no decode arithmetic changes; BF16 KV stays off (not gated, floor 0). Prefill throughput
+(`infernix_bench`, INT8 KV, `max-ctx 65536`, `prefill-chunk 4096`, `work peak 1.16 GiB`): `pp4096`
+2,381 -> 2,395 tok/s (PCIe DMA-bound), `pp16384` 3,474 -> 5,564 tok/s (+60.2 %), `pp32768`
+3,402 -> 5,414 tok/s (+59.1 %).
 
 ### 7.4 A UD-Q4_K_XL artifact for Qwen3.8-Flash-Next (not built)
 

@@ -95,9 +95,43 @@ INFERNIX_WIDE_HD constexpr int plane_block(int b) { return (b & ~3) | ((b & 1) <
 // (the W4A4 plane layout above), then each further term's, all scaled by one FP32 row scale. Two
 // terms leave about 0.8 % relative error per row, four times BF16 rounding; three bring it below the
 // output's BF16 rounding (design §3.1).
-inline constexpr int kResidualTerms  = 3;
-inline constexpr int kXTermsRowBytes = kResidualTerms * kXRowBytes;
-inline constexpr int kHTermsRowBytes = kResidualTerms * kHRowStride;
+inline constexpr int kResidualTerms             = 3;
+inline constexpr int kA4ResidualAllJobsMinColumns = 64;
+
+template <int H, int I>
+struct A4Terms {
+    static constexpr int kXCodeBytes     = H / 2;
+    static constexpr int kXScaleBytes    = H / 16;
+    static constexpr int kXScaleMapBytes = (kXScaleBytes + 15) / 16 * 16;
+    static constexpr int kXRowBytes      = kXCodeBytes + kXScaleMapBytes;
+    static constexpr int kXTermsRowBytes = kResidualTerms * kXRowBytes;
+    static constexpr int kHCodeBytes     = I / 2;
+    static constexpr int kHScaleBytes    = I / 16;
+    static constexpr int kHScaleMapBytes = (kHScaleBytes + 15) / 16 * 16;
+    static constexpr int kHRowStride =
+        I == kIntermediate ? kHBlocks * static_cast<int>(sizeof(canon::A4Block))
+                           : kHCodeBytes + kHScaleMapBytes;
+    static constexpr int kHTermsRowBytes = kResidualTerms * kHRowStride;
+    // Non-default all-jobs calls rewrite BF16 h_rows in place into h_terms_plane, so one row holds
+    // whichever is wider (for H=4096, I=2048: 4,096 B >= 3,456 B, zero extra h_terms workspace).
+    static constexpr int kHInPlaceRowBytes =
+        ((I * 2 > kHTermsRowBytes ? I * 2 : kHTermsRowBytes) + 15) / 16 * 16;
+    static_assert(kXRowBytes % 16 == 0 && kXCodeBytes % 16 == 0 && kXScaleMapBytes % 16 == 0);
+    static_assert(kHRowStride % 16 == 0 && kHCodeBytes % 16 == 0 && kHScaleMapBytes % 16 == 0);
+    static_assert(kHTermsRowBytes % 16 == 0 && kHInPlaceRowBytes % 16 == 0);
+};
+
+inline constexpr int kXTermsRowBytes = A4Terms<kHidden, kIntermediate>::kXTermsRowBytes;
+inline constexpr int kHTermsRowBytes = A4Terms<kHidden, kIntermediate>::kHTermsRowBytes;
+
+// Non-default NVFP4 banks under WideA16::kA4Residual route every active non-CPU job of a wide
+// call (at least kA4ResidualAllJobsMinColumns columns) through the residual A4 tiles, skipping
+// limb encoding and the narrow pass and rewriting BF16 h rows into residual terms in place.
+INFERNIX_WIDE_HD bool a4_residual_all_jobs(std::int32_t columns, ExpertActivation activation,
+                                           WideA16 wide_a16, const Geometry& geometry) {
+    return activation == ExpertActivation::kA16 && wide_a16 == WideA16::kA4Residual &&
+           geometry.hidden != kDefaultGeometry.hidden && columns >= kA4ResidualAllJobsMinColumns;
+}
 
 // GGUF banks' kGgmlBf16 route at the default geometry (ggml_expert.cuh; other geometries' tiles
 // decode their rows in the K loop and carve nothing): every wide job's records decoded into planes
@@ -185,17 +219,19 @@ struct Call {
     std::int32_t top_k          = 0;
     // W4A16 residual A4 (descriptors then name every term's plane)
     bool a4_residual                = false;
+    bool all_jobs                   = false; // non-default residual A4: every active non-CPU job, in-place h terms
     const float* x_row_scale        = nullptr; // [T]
-    std::uint8_t* h_terms_plane     = nullptr; // [entries][kHTermsRowBytes]
+    std::uint8_t* h_terms_plane     = nullptr; // [entries][kHTermsRowBytes or kHInPlaceRowBytes]
     float* h_row_scale              = nullptr; // [entries]
 };
 
 // Plans the call's wide work tiles in passes of `pass_jobs` jobs (the passes moe_experts stages),
 // quantizes x for every wide entry and stages the TMA descriptors (W4A4), or encodes every token's
-// x limbs (W4A16). Enqueued on `stream`.
+// x limbs (W4A16, unless `x_limbs_ready` says prepare_x already encoded them). Enqueued on `stream`.
 [[nodiscard]] Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                            std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs,
-                           const ExpertsWorkspace& workspace, Tensor& outputs, cudaStream_t stream);
+                           const ExpertsWorkspace& workspace, Tensor& outputs, cudaStream_t stream,
+                           const std::int32_t* cpu_flags = nullptr, bool x_limbs_ready = false);
 
 // Computes the wide experts among the jobs of `pass`, whose records job_records holds by then:
 // the gate/up GEMM with SwiGLU and the encoding of h (A4, or the W4A16 limbs), then the down GEMM

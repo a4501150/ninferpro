@@ -187,7 +187,7 @@ std::vector<std::uint16_t> cpu_run(moe::CpuIsa isa, const Expert& e, const std::
 void run_gpu(const std::vector<Expert>& bank, const std::vector<std::uint16_t>& x, int columns,
              int top_k, const std::vector<std::int32_t>& ids_host,
              std::vector<std::uint16_t>& out_host, std::int32_t staging_slots = 0,
-             bool zero_copy = false) {
+             bool zero_copy = false, moe::WideA16 wide_a16 = moe::WideA16::kExact) {
     const int experts_n        = static_cast<int>(bank.size());
     const int entries          = top_k * columns;
     const std::uint64_t stride = kGeo.record_bytes();
@@ -233,7 +233,7 @@ void run_gpu(const std::vector<Expert>& bank, const std::vector<std::uint16_t>& 
     void* workspace                   = nullptr;
     const std::int32_t max_jobs       = experts_n;
     const std::size_t workspace_bytes = infernix::ops::moe_experts_workspace_bytes(
-        max_jobs, entries, columns, moe::ExpertActivation::kA16, moe::WideA16::kExact, kGeo);
+        max_jobs, entries, columns, moe::ExpertActivation::kA16, wide_a16, kGeo);
     cuda_check(cudaMalloc(&workspace, workspace_bytes), "cudaMalloc");
     auto* d_outputs = static_cast<std::uint16_t*>(nullptr);
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_outputs),
@@ -257,6 +257,7 @@ void run_gpu(const std::vector<Expert>& bank, const std::vector<std::uint16_t>& 
                                           .scales =
                                               reinterpret_cast<const moe::ExpertScales*>(d_scales),
                                           .activation    = moe::ExpertActivation::kA16,
+                                          .wide_a16      = wide_a16,
                                           .geometry      = kGeo,
                                           .staging_base  = nullptr,
                                           .staging_slots = staging_slots};
@@ -831,6 +832,74 @@ void test_cpu_isa_equality() {
     }
 }
 
+// Residual A4 fast path (WideA16::kA4Residual) at the second geometry (4096, 2048, clamp 10):
+//   - columns = 40 (< 64): narrow jobs (<= 8 cols) stay bit-exact against CPU; wide jobs within
+//     2^-6 worst / 2^-9 mean relative L2 against CPU exact (clamped SwiGLU).
+//   - columns = 130 (>= 64, all-jobs in-place h terms): every job including narrow ones runs the
+//     residual A4 tiles within 2^-6 worst / 2^-9 mean relative L2, a non-finite column produces
+//     the canonical NaN, and resident / staged / zero-copy placements produce bit-identical output.
+void test_a4_residual() {
+    std::mt19937 rng(37);
+    std::vector<Expert> experts;
+    for (int e = 0; e < 25; ++e) { experts.push_back(random_a16_expert(rng)); }
+    const int top_k = 3;
+    for (int columns : {40, 130}) {
+        const auto ids = craft_ids(columns, top_k);
+        auto x         = random_activations(rng, columns, true);
+        if (columns == 130) { x[5] = 0x7F80U; } // +Inf in column 0
+        std::vector<std::uint16_t> gpu_res, gpu_staged, gpu_zc;
+        run_gpu(experts, x, columns, top_k, ids, gpu_res, /*staging_slots=*/0, /*zero_copy=*/false,
+                moe::WideA16::kA4Residual);
+        run_gpu(experts, x, columns, top_k, ids, gpu_staged, /*staging_slots=*/4, /*zero_copy=*/true,
+                moe::WideA16::kA4Residual);
+        run_gpu(experts, x, columns, top_k, ids, gpu_zc, /*staging_slots=*/0, /*zero_copy=*/true,
+                moe::WideA16::kA4Residual);
+        check(gpu_res == gpu_staged && gpu_res == gpu_zc,
+              "kA4Residual at second geometry is placement-invariant across resident, staged and zero-copy");
+
+        std::vector<int> counts(experts.size(), 0);
+        for (int id : ids) { ++counts[static_cast<std::size_t>(id)]; }
+        const bool all_jobs = columns >= 64;
+        double worst = 0.0, sum = 0.0;
+        long measured = 0, narrow_bad = 0, nan_bad = 0;
+        for (int t = 0; t < columns; ++t) {
+            for (int slot = 0; slot < top_k; ++slot) {
+                const int e      = ids[static_cast<std::size_t>(t) * top_k + slot];
+                const auto* got  = gpu_res.data() + (static_cast<std::size_t>(t) * top_k + slot) * kH;
+                if (columns == 130 && t == 0) {
+                    for (int i = 0; i < kH; ++i) { nan_bad += got[i] != 0x7FC0U; }
+                    continue;
+                }
+                const auto ref = cpu_run(moe::best_cpu_isa(), experts[static_cast<std::size_t>(e)],
+                                         x.data() + static_cast<std::size_t>(t) * kH, 1);
+                const bool residual = all_jobs || counts[static_cast<std::size_t>(e)] > moe::kMaxColumns;
+                if (!residual) {
+                    narrow_bad += !std::equal(ref.begin(), ref.end(), got);
+                } else {
+                    double err = 0.0, norm = 0.0;
+                    for (int i = 0; i < kH; ++i) {
+                        const double r = canon::bf16_to_f32(ref[static_cast<std::size_t>(i)]);
+                        const double d = canon::bf16_to_f32(got[i]) - r;
+                        err += d * d;
+                        norm += r * r;
+                    }
+                    const double rel = norm > 0.0 ? std::sqrt(err / norm) : std::sqrt(err);
+                    worst            = std::max(worst, rel);
+                    sum += rel;
+                    ++measured;
+                }
+            }
+        }
+        const double mean = measured > 0 ? sum / static_cast<double>(measured) : 0.0;
+        std::printf("kA4Residual columns=%d (%s): mean rel L2 %.5f, worst %.5f (%ld entries), narrow_bad=%ld, nan_bad=%ld\n",
+                    columns, all_jobs ? "all-jobs in-place" : "mixed", mean, worst, measured, narrow_bad, nan_bad);
+        check(narrow_bad == 0, "kA4Residual narrow entries equal CPU bit for bit");
+        check(nan_bad == 0, "kA4Residual non-finite column produces canonical NaN");
+        check(worst <= std::ldexp(1.0, -6), "kA4Residual every residual entry within 2^-6 relative L2 of exact");
+        check(mean <= std::ldexp(1.0, -9), "kA4Residual mean relative L2 within 2^-9 of exact");
+    }
+}
+
 int main() {
     std::mt19937 rng(3);
     for (int trial = 0; trial < 2; ++trial) {
@@ -840,6 +909,7 @@ int main() {
     }
     test_cpu_isa_equality();
     test_layer_routes();
+    test_a4_residual();
     test_zero_copy();
     test_staged();
     test_wide_call_narrow_jobs();

@@ -73,6 +73,10 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_flash_next_fp8` | Qwen's official FP8 checkpoint bit-exact: `fp8_e4m3fn_b128` routed experts (E4M3FN codes, BF16 128×128 tile scales, W8A16), BF16/FP32 tensors unchanged, the MTP drafter re-quantized (`q2_g64_fp16` experts) | None |
 | `qwen3_8_flash_next_gsq_rco_iq3s` | ISTA-DASLab's GSQ-RCO IQ3_S GGUF bit-exact: every GGML block format stored verbatim, dense tiled formats in 16-row tiles, routed experts as ggml banks, A16 everywhere | `--gguf` |
 | `qwen3_8_flash_next_dflash2` | The DFlash2 drafter as a companion artifact (`--components dflash2`): `q8_g32_fp16` projections, BF16 dynamic-convolution kernel projections, selector and norms | `dflash2` |
+| `glm5_3_flash_nvfp4_orcarouter` | GLM-5.3-Flash NVFP4 (default): compressed-tensors `nvfp4_mul` routed experts (W4A16, 4096×2048), BF16 dense projections, embedding, head and vision tower, FP32 routers, norms and mHC scalars ([design](maintainer/glm5_3-flash-design.md)) | None |
+| `glm5_3_flash_nvfp4_orcarouter_q8dense` | Opt-in Q8-dense variant of `glm5_3_flash_nvfp4_orcarouter`: KDA q/k/v/o, MLA query down/latent/up/output, dense MLP and shared experts quantized to `q8_g32_fp16`; embedding, `lm_head`, control projections, `k_b`/`v_b` and indexer stay BF16 | None |
+| `glm5_3_flash_gcsa_gguf` | GCSA-AiLab RCO-GSQ GGUF bit-exact: `ggml_expert_*_v1` banks (Q4_K/Q3_K/Q2_K, A16), Q8_0 dense/embedding/head, BF16 MLA/KDA control tensors, FP32 norms/routers/mHC (no vision or MTP) | `--gguf` |
+| `glm5_3_flash_dflash2` | GLM-5.3-Flash DFlash2 companion drafter (`--components dflash2`): `q8_g32_fp16` projections, BF16 norms/selector/feature fusion | `dflash2` |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -133,8 +137,8 @@ DFlash2 only. The same converter stores the checkpoint's vision tower as a `visi
 (every tower tensor BF16 as the checkpoint keeps it, and the checkpoint's `processor_config.json`
 — a single file holding the image and the video processor — kept byte for byte as the component's
 one resource) by default; `--components text` converts text only, and a checkpoint without
-`model.visual.*` tensors converts text only regardless. The GLM engine does not bind `vision` yet,
-so the component costs disk space and nothing else until a later track loads it.
+`model.visual.*` tensors converts text only regardless. The GLM engine binds `vision` when started
+with `--vision` (streaming the tower from pinned RAM by default under `--vision-offload auto`).
 
 A Qwen3.8-Flash-Next DFlash2 drafter is converted on its own, into a companion artifact that runs
 beside any Flash-Next artifact (`--spec dflash2 --draft-model FILE`): `--components dflash2` alone,

@@ -1292,9 +1292,32 @@ __device__ __forceinline__ void a16_unit_terms(const UnitRows& w, const A16Act& 
 // The step counts whose units a lane holds in registers across a job's columns: the default
 // geometry's gate/up and down warps hold five (20 units, ~25 registers, no spills at
 // kA16RowsMinCtas). A bigger geometry's warps stream their units in kA16RowChunkSteps-unit steps
-// per column instead: holding them would spill into local memory.
-constexpr int kA16RowHeldSteps  = 5;
-constexpr int kA16RowChunkSteps = 4;
+// across up to kA16StreamBatch columns at a time so multi-column experts reuse each weight read.
+constexpr int kA16RowHeldSteps   = 5;
+constexpr int kA16RowChunkSteps  = 4;
+constexpr int kA16MultiChunkSteps = 2;
+constexpr int kA16StreamBatch    = 4;
+
+__device__ __forceinline__ A16Act ldg_a16_act(const A16Act* p) {
+    const auto* v = reinterpret_cast<const uint4*>(p);
+    const uint4 a = __ldg(v);
+    const uint4 b = __ldg(v + 1);
+    const uint4 c = __ldg(v + 2);
+    A16Act out;
+    out.lo[0]  = a.x;
+    out.lo[1]  = a.y;
+    out.lo[2]  = a.z;
+    out.lo[3]  = a.w;
+    out.mid[0] = b.x;
+    out.mid[1] = b.y;
+    out.mid[2] = b.z;
+    out.mid[3] = b.w;
+    out.hi[0]  = static_cast<std::int32_t>(c.x);
+    out.hi[1]  = static_cast<std::int32_t>(c.y);
+    out.hi[2]  = static_cast<std::int32_t>(c.z);
+    out.hi[3]  = static_cast<std::int32_t>(c.w);
+    return out;
+}
 
 // A lane's rows of the warp's units j (unit j = 4 step + s), block base + j * stride of `matrix`,
 // all in flight at once. They stay in registers for every column of the job, so a job of n columns
@@ -1330,39 +1353,6 @@ __device__ __forceinline__ void a16_row_sums(const UnitRows (&w)[WarpUnits / 4],
     }
 }
 
-// The streamed form of a16_row_sums for records whose units exceed a lane's held registers: the
-// warp's units are re-read per column in kChunkSteps-step chunks and the sums accumulated chunk by
-// chunk in the held form's unit order (the int64 sums are exact, so the bits are the held form's).
-// Lanes 0..7 hold the sums on return.
-template <int WarpUnits, int kChunkSteps>
-__device__ __forceinline__ void a16_row_sums_streamed(const std::uint8_t* matrix, int base, int stride,
-                                                      const A16Act* acts, std::int64_t& lo, std::int64_t& hi) {
-    constexpr int kSteps = WarpUnits / 4;
-    static_assert(kSteps % kChunkSteps == 0, "whole chunks");
-    const int lane = threadIdx.x % 32, s = lane >> 3, i = lane & 7;
-    lo = hi = 0;
-    // The chunk loop stays a runtime loop: unrolling it lets ptxas hoist every chunk's unit
-    // addresses (loop-invariant across the column loop) into a live address register file it then
-    // spills. Inside the chunk the four loads stay batched.
-    for (int c0 = 0; c0 < kSteps; c0 += kChunkSteps) {
-        UnitRows w[kChunkSteps];
-#pragma unroll
-        for (int step = 0; step < kChunkSteps; ++step) {
-            w[step] = load_unit_rows(
-                matrix + static_cast<std::size_t>(base + (4 * (c0 + step) + s) * stride) * moe::kUnitBytes, i);
-        }
-#pragma unroll
-        for (int step = 0; step < kChunkSteps; ++step) {
-            a16_unit_terms(w[step], acts[base + (4 * (c0 + step) + s) * stride], lo, hi);
-        }
-    }
-#pragma unroll
-    for (int offset = 8; offset <= 16; offset <<= 1) {
-        lo += __shfl_xor_sync(0xFFFFFFFFU, lo, offset);
-        hi += __shfl_xor_sync(0xFFFFFFFFU, hi, offset);
-    }
-}
-
 // Three CTAs per SM (80 registers, no spills): with a row pair's four quads per lane (one scale and one
 // int64 product per unit), which the CTA-shape sweep measured fastest (its per-variant numbers are in
 // RESEARCH_NOTES.md, "Offloaded MoE layer: removed expert-kernel forms"; the routed form's own
@@ -1371,9 +1361,12 @@ constexpr int kA16RowsMinCtas = 3;
 
 template <int H, int I>
 struct GateUpRowShared16 {
-    A16Act acts[moe::Nvfp4Geometry<H, I>::kGateUpBlocks];
+    static constexpr bool kHeld =
+        (moe::Nvfp4Geometry<H, I>::kGateUpBlocks / kWarps / 4) <= kA16RowHeldSteps;
+    A16Act acts[kHeld ? moe::Nvfp4Geometry<H, I>::kGateUpBlocks : 1];
     std::int64_t partial[kWarps][16];
     std::uint16_t y[16];
+    int tokens[kA16StreamBatch];
 };
 
 // One CTA per (gate/up row group g, job): gate rows even, up rows odd, so it gives h elements
@@ -1412,52 +1405,163 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
         record + static_cast<std::size_t>(g) * kGateUpBlocks * moe::kUnitBytes;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     constexpr int kGateUpSteps = kGateUpWarpUnits / 4;
-    // The weights stay in registers across the job's columns while a lane's steps fit kA16RowHeldSteps;
-    // a bigger geometry streams its units in kA16RowChunkSteps-unit chunks per column instead (holding
-    // them spills: the sums are exact integers in the same unit order, so the bits do not move).
-    [[maybe_unused]] UnitRows w[kGateUpSteps <= kA16RowHeldSteps ? kGateUpSteps : kA16RowChunkSteps];
     if constexpr (kGateUpSteps <= kA16RowHeldSteps) {
+        UnitRows w[kGateUpSteps];
         load_warp_units<kGateUpWarpUnits>(matrix, warp, kWarps, w);
-    }
-    for (int c = 0; c < count; ++c) {
-        if (c > 0) { __syncthreads(); } // every warp has read the previous column's acts and y
-        const int token = dispatch.entries[first + c] / top_k;
-        stage_async(reinterpret_cast<const std::uint8_t*>(x_acts + static_cast<std::size_t>(token) *
-                                                                       kGateUpBlocks),
-                    reinterpret_cast<std::uint8_t*>(sm.acts), sizeof(A16Act) * kGateUpBlocks);
-        stage_wait();
-        __syncthreads();
-        std::int64_t lo, hi;
-        if constexpr (kGateUpSteps <= kA16RowHeldSteps) {
+        for (int c = 0; c < count; ++c) {
+            if (c > 0) { __syncthreads(); } // every warp has read the previous column's acts and y
+            const int token = dispatch.entries[first + c] / top_k;
+            stage_async(reinterpret_cast<const std::uint8_t*>(x_acts + static_cast<std::size_t>(token) *
+                                                                           kGateUpBlocks),
+                        reinterpret_cast<std::uint8_t*>(sm.acts), sizeof(A16Act) * kGateUpBlocks);
+            stage_wait();
+            __syncthreads();
+            std::int64_t lo, hi;
             a16_row_sums<kGateUpWarpUnits>(w, warp, kWarps, sm.acts, lo, hi);
-        } else {
-            a16_row_sums_streamed<kGateUpWarpUnits, kA16RowChunkSteps>(matrix, warp, kWarps, sm.acts, lo, hi);
-        }
-        if (lane < 8) {
-            sm.partial[warp][lane]     = lo;
-            sm.partial[warp][lane + 8] = hi;
-        }
-        __syncthreads();
-        if (threadIdx.x < 16) {
-            const int row      = threadIdx.x;
-            std::int64_t total = 0;
+            if (lane < 8) {
+                sm.partial[warp][lane]     = lo;
+                sm.partial[warp][lane + 8] = hi;
+            }
+            __syncthreads();
+            if (threadIdx.x < 16) {
+                const int row      = threadIdx.x;
+                std::int64_t total = 0;
 #pragma unroll
-            for (int v = 0; v < kWarps; ++v) { total += sm.partial[v][row]; }
-            sm.y[row] = canon::a16_row_output(total, x_emax[token], (row & 1) == 0 ? scales.alpha_gate : scales.alpha_up);
+                for (int v = 0; v < kWarps; ++v) { total += sm.partial[v][row]; }
+                sm.y[row] = canon::a16_row_output(total, x_emax[token], (row & 1) == 0 ? scales.alpha_gate : scales.alpha_up);
+            }
+            __syncthreads();
+            if (threadIdx.x < 8) {
+                const int k = threadIdx.x;
+                h_plane[static_cast<std::size_t>(first + c) * moe::wide::A16Rows<H, I>::kHRowElements +
+                        8 * g + k] =
+                    kLimit > 0.0F ? canon::swiglu_bf16_clamped(sm.y[2 * k], sm.y[2 * k + 1], kLimit)
+                                  : canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
+                if (count_elements) {
+                    // Count the element for the job's down CTAs (wait_job_h): fire-and-forget, so no
+                    // CTA waits on the count, and the release orders this thread's h store before it.
+                    // Eight per column and row group, one per h element, so every store is covered
+                    // without a barrier.
+                    asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(job_ctas + job) : "memory");
+                }
+            }
         }
-        __syncthreads();
-        if (threadIdx.x < 8) {
-            const int k = threadIdx.x;
-            h_plane[static_cast<std::size_t>(first + c) * moe::wide::A16Rows<H, I>::kHRowElements +
-                    8 * g + k] =
-                kLimit > 0.0F ? canon::swiglu_bf16_clamped(sm.y[2 * k], sm.y[2 * k + 1], kLimit)
-                              : canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
-            if (count_elements) {
-                // Count the element for the job's down CTAs (wait_job_h): fire-and-forget, so no
-                // CTA waits on the count, and the release orders this thread's h store before it.
-                // Eight per column and row group, one per h element, so every store is covered
-                // without a barrier.
-                asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(job_ctas + job) : "memory");
+    } else {
+        // Streamed geometry: read x_acts directly through L1/L2 (__ldg, uniform across lanes 8s..8s+7
+        // and all row-group CTAs of the job) and reuse each streamed weight chunk across up to
+        // kA16StreamBatch columns with identical exact int64 sums.
+        const int s = lane >> 3, i = lane & 7;
+        if (count == 1) {
+            const int token    = dispatch.entries[first] / top_k;
+            const A16Act* acts = x_acts + static_cast<std::size_t>(token) * kGateUpBlocks;
+            std::int64_t lo = 0, hi = 0;
+            for (int k0 = 0; k0 < kGateUpSteps; k0 += kA16RowChunkSteps) {
+                UnitRows w[kA16RowChunkSteps];
+#pragma unroll
+                for (int step = 0; step < kA16RowChunkSteps; ++step) {
+                    w[step] = load_unit_rows(
+                        matrix + static_cast<std::size_t>(warp + (4 * (k0 + step) + s) * kWarps) * moe::kUnitBytes, i);
+                }
+#pragma unroll
+                for (int step = 0; step < kA16RowChunkSteps; ++step) {
+                    a16_unit_terms(w[step], ldg_a16_act(acts + warp + (4 * (k0 + step) + s) * kWarps), lo, hi);
+                }
+            }
+#pragma unroll
+            for (int offset = 8; offset <= 16; offset <<= 1) {
+                lo += __shfl_xor_sync(0xFFFFFFFFU, lo, offset);
+                hi += __shfl_xor_sync(0xFFFFFFFFU, hi, offset);
+            }
+            if (lane < 8) {
+                sm.partial[warp][lane]     = lo;
+                sm.partial[warp][lane + 8] = hi;
+            }
+            __syncthreads();
+            if (threadIdx.x < 16) {
+                const int row      = threadIdx.x;
+                std::int64_t total = 0;
+#pragma unroll
+                for (int v = 0; v < kWarps; ++v) { total += sm.partial[v][row]; }
+                sm.y[row] = canon::a16_row_output(total, x_emax[token], (row & 1) == 0 ? scales.alpha_gate : scales.alpha_up);
+            }
+            __syncthreads();
+            if (threadIdx.x < 8) {
+                const int k = threadIdx.x;
+                h_plane[static_cast<std::size_t>(first) * moe::wide::A16Rows<H, I>::kHRowElements + 8 * g + k] =
+                    kLimit > 0.0F ? canon::swiglu_bf16_clamped(sm.y[2 * k], sm.y[2 * k + 1], kLimit)
+                                  : canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
+                if (count_elements) {
+                    asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(job_ctas + job) : "memory");
+                }
+            }
+            return;
+        }
+        for (int c0 = 0; c0 < count; c0 += kA16StreamBatch) {
+            if (c0 > 0) { __syncthreads(); }
+            const int batch = min(kA16StreamBatch, count - c0);
+            if (threadIdx.x < kA16StreamBatch) {
+                sm.tokens[threadIdx.x] =
+                    static_cast<int>(threadIdx.x) < batch ? dispatch.entries[first + c0 + threadIdx.x] / top_k : 0;
+            }
+            __syncthreads();
+            std::int64_t lo[kA16StreamBatch] = {}, hi[kA16StreamBatch] = {};
+            for (int k0 = 0; k0 < kGateUpSteps; k0 += kA16MultiChunkSteps) {
+                UnitRows w[kA16MultiChunkSteps];
+#pragma unroll
+                for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+                    w[step] = load_unit_rows(
+                        matrix + static_cast<std::size_t>(warp + (4 * (k0 + step) + s) * kWarps) * moe::kUnitBytes, i);
+                }
+#pragma unroll
+                for (int b = 0; b < kA16StreamBatch; ++b) {
+                    if (b < batch) {
+                        const A16Act* acts = x_acts + static_cast<std::size_t>(sm.tokens[b]) * kGateUpBlocks;
+#pragma unroll
+                        for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+                            a16_unit_terms(w[step], ldg_a16_act(acts + warp + (4 * (k0 + step) + s) * kWarps), lo[b],
+                                           hi[b]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < kA16StreamBatch; ++b) {
+                if (b < batch) {
+#pragma unroll
+                    for (int offset = 8; offset <= 16; offset <<= 1) {
+                        lo[b] += __shfl_xor_sync(0xFFFFFFFFU, lo[b], offset);
+                        hi[b] += __shfl_xor_sync(0xFFFFFFFFU, hi[b], offset);
+                    }
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < kA16StreamBatch; ++b) {
+                if (b >= batch) { break; }
+                if (b > 0) { __syncthreads(); }
+                if (lane < 8) {
+                    sm.partial[warp][lane]     = lo[b];
+                    sm.partial[warp][lane + 8] = hi[b];
+                }
+                __syncthreads();
+                if (threadIdx.x < 16) {
+                    const int row      = threadIdx.x;
+                    std::int64_t total = 0;
+#pragma unroll
+                    for (int v = 0; v < kWarps; ++v) { total += sm.partial[v][row]; }
+                    sm.y[row] = canon::a16_row_output(total, x_emax[sm.tokens[b]],
+                                                      (row & 1) == 0 ? scales.alpha_gate : scales.alpha_up);
+                }
+                __syncthreads();
+                if (threadIdx.x < 8) {
+                    const int k = threadIdx.x;
+                    h_plane[static_cast<std::size_t>(first + c0 + b) * moe::wide::A16Rows<H, I>::kHRowElements +
+                            8 * g + k] =
+                        kLimit > 0.0F ? canon::swiglu_bf16_clamped(sm.y[2 * k], sm.y[2 * k + 1], kLimit)
+                                      : canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
+                }
+            }
+            if (count_elements && threadIdx.x < 8) {
+                asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(job_ctas + job), "r"(batch) : "memory");
             }
         }
     }
@@ -1548,9 +1652,12 @@ __device__ __forceinline__ void encode_a16_h(const std::uint16_t* column, A16Act
 
 template <int H, int I>
 struct DownRowShared16 {
-    A16Act acts[moe::Nvfp4Geometry<H, I>::kHBlocks];
+    static constexpr bool kHeld =
+        (moe::Nvfp4Geometry<H, I>::kDownBlocks / 2 / 4) <= kA16RowHeldSteps;
+    static constexpr int kActCols = kHeld ? 1 : kA16StreamBatch;
+    A16Act acts[kActCols][moe::Nvfp4Geometry<H, I>::kHBlocks];
     std::int64_t partial[kWarps][16];
-    int emax[1];
+    int emax[kActCols];
     unsigned key[kWarps][1];
 };
 
@@ -1593,17 +1700,24 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
     }
     const int group = kDownGroups * tile + warp / 2, base = (warp % 2) * kDownWarpUnits;
     constexpr int kDownSteps = kDownWarpUnits / 4;
-    // The held-or-streamed weight choice of gate_up_rows_kernel_a16 (kA16RowHeldSteps): the down
-    // warps hold their units across the job's columns at the default geometry and stream them per
-    // column at bigger ones, with the same bits (the int64 sums are exact in the same unit order).
-    // The streamed form reads its weights after the job's h wait, not during it.
-    [[maybe_unused]] const std::uint8_t* down_matrix =
+    const std::uint8_t* down_matrix =
         record + moe::Nvfp4Geometry<H, I>::kGateUpBytes +
-            static_cast<std::size_t>(group) * kDownBlocks * moe::kUnitBytes;
-    [[maybe_unused]] UnitRows w[kDownSteps <= kA16RowHeldSteps ? kDownSteps : kA16RowChunkSteps];
-    if constexpr (kDownSteps <= kA16RowHeldSteps) {
-        if (record != nullptr) {
-            load_warp_units<kDownWarpUnits>(down_matrix, base, 1, w);
+        static_cast<std::size_t>(group) * kDownBlocks * moe::kUnitBytes;
+    const int s = lane >> 3, i = lane & 7;
+    // The held-or-streamed weight choice of gate_up_rows_kernel_a16 (kA16RowHeldSteps): held
+    // geometries preload all units before the wait; streamed geometries preload their first
+    // kA16RowChunkSteps-unit chunk before the wait and reuse every chunk across up to
+    // kA16StreamBatch columns after it (exact int64 sums, identical bits).
+    UnitRows w0[kDownSteps <= kA16RowHeldSteps ? kDownSteps : kA16MultiChunkSteps];
+    if (record != nullptr) {
+        if constexpr (kDownSteps <= kA16RowHeldSteps) {
+            load_warp_units<kDownWarpUnits>(down_matrix, base, 1, w0);
+        } else {
+#pragma unroll
+            for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+                w0[step] = load_unit_rows(
+                    down_matrix + static_cast<std::size_t>(base + 4 * step + s) * moe::kUnitBytes, i);
+            }
         }
     }
     if (per_job_wait) {
@@ -1620,16 +1734,52 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
         pdl::wait_for_dependencies();
         if (record == nullptr) { return; }
     }
-    for (int c = 0; c < count; ++c) {
-        __syncthreads();
-        encode_a16_h<I>(h_plane + static_cast<std::size_t>(first + c) *
+    if constexpr (kDownSteps <= kA16RowHeldSteps) {
+        for (int c = 0; c < count; ++c) {
+            __syncthreads();
+            encode_a16_h<I>(h_plane + static_cast<std::size_t>(first + c) *
+                                          moe::wide::A16Rows<H, I>::kHRowElements,
+                            sm.acts[0], &sm.emax[0], sm.key);
+            std::int64_t lo, hi;
+            a16_row_sums<kDownWarpUnits>(w0, base, 1, sm.acts[0], lo, hi);
+            if (lane < 8) {
+                sm.partial[warp][lane]     = lo;
+                sm.partial[warp][lane + 8] = hi;
+            }
+            __syncthreads();
+            if (threadIdx.x < 16 * kDownGroups) {
+                const int row = threadIdx.x, r = row / 16, k = row % 16;
+                const std::int64_t total = sm.partial[2 * r][k] + sm.partial[2 * r + 1][k];
+                const int entry = dispatch.entries[first + c];
+                reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(entry) * hidden + 16 * kDownGroups * tile + row] =
+                    canon::a16_row_output(total, sm.emax[0], scales.alpha_down);
+            }
+        }
+    } else if (count == 1) {
+        encode_a16_h<I>(h_plane + static_cast<std::size_t>(first) *
                                       moe::wide::A16Rows<H, I>::kHRowElements,
-                        sm.acts, sm.emax, sm.key);
-        std::int64_t lo, hi;
-        if constexpr (kDownSteps <= kA16RowHeldSteps) {
-            a16_row_sums<kDownWarpUnits>(w, base, 1, sm.acts, lo, hi);
-        } else {
-            a16_row_sums_streamed<kDownWarpUnits, kA16RowChunkSteps>(down_matrix, base, 1, sm.acts, lo, hi);
+                        sm.acts[0], &sm.emax[0], sm.key);
+        std::int64_t lo = 0, hi = 0;
+#pragma unroll
+        for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+            a16_unit_terms(w0[step], sm.acts[0][base + 4 * step + s], lo, hi);
+        }
+        for (int k0 = kA16MultiChunkSteps; k0 < kDownSteps; k0 += kA16MultiChunkSteps) {
+            UnitRows w[kA16MultiChunkSteps];
+#pragma unroll
+            for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+                w[step] = load_unit_rows(
+                    down_matrix + static_cast<std::size_t>(base + 4 * (k0 + step) + s) * moe::kUnitBytes, i);
+            }
+#pragma unroll
+            for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+                a16_unit_terms(w[step], sm.acts[0][base + 4 * (k0 + step) + s], lo, hi);
+            }
+        }
+#pragma unroll
+        for (int offset = 8; offset <= 16; offset <<= 1) {
+            lo += __shfl_xor_sync(0xFFFFFFFFU, lo, offset);
+            hi += __shfl_xor_sync(0xFFFFFFFFU, hi, offset);
         }
         if (lane < 8) {
             sm.partial[warp][lane]     = lo;
@@ -1639,9 +1789,81 @@ __global__ void __launch_bounds__(kThreads, kA16RowsMinCtas)
         if (threadIdx.x < 16 * kDownGroups) {
             const int row = threadIdx.x, r = row / 16, k = row % 16;
             const std::int64_t total = sm.partial[2 * r][k] + sm.partial[2 * r + 1][k];
-            const int entry = dispatch.entries[first + c];
+            const int entry = dispatch.entries[first];
             reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(entry) * hidden + 16 * kDownGroups * tile + row] =
                 canon::a16_row_output(total, sm.emax[0], scales.alpha_down);
+        }
+    } else {
+        for (int c0 = 0; c0 < count; c0 += kA16StreamBatch) {
+            if (c0 > 0) { __syncthreads(); }
+            const int batch = min(kA16StreamBatch, count - c0);
+            for (int b = 0; b < batch; ++b) {
+                encode_a16_h<I>(h_plane + static_cast<std::size_t>(first + c0 + b) *
+                                              moe::wide::A16Rows<H, I>::kHRowElements,
+                                sm.acts[b], &sm.emax[b], sm.key);
+            }
+            if (c0 > 0) {
+#pragma unroll
+                for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+                    w0[step] = load_unit_rows(
+                        down_matrix + static_cast<std::size_t>(base + 4 * step + s) * moe::kUnitBytes, i);
+                }
+            }
+            std::int64_t lo[kA16StreamBatch] = {}, hi[kA16StreamBatch] = {};
+#pragma unroll
+            for (int b = 0; b < kA16StreamBatch; ++b) {
+                if (b < batch) {
+#pragma unroll
+                    for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+                        a16_unit_terms(w0[step], sm.acts[b][base + 4 * step + s], lo[b], hi[b]);
+                    }
+                }
+            }
+            for (int k0 = kA16MultiChunkSteps; k0 < kDownSteps; k0 += kA16MultiChunkSteps) {
+                UnitRows w[kA16MultiChunkSteps];
+#pragma unroll
+                for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+                    w[step] = load_unit_rows(
+                        down_matrix + static_cast<std::size_t>(base + 4 * (k0 + step) + s) * moe::kUnitBytes, i);
+                }
+#pragma unroll
+                for (int b = 0; b < kA16StreamBatch; ++b) {
+                    if (b < batch) {
+#pragma unroll
+                        for (int step = 0; step < kA16MultiChunkSteps; ++step) {
+                            a16_unit_terms(w[step], sm.acts[b][base + 4 * (k0 + step) + s], lo[b], hi[b]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < kA16StreamBatch; ++b) {
+                if (b < batch) {
+#pragma unroll
+                    for (int offset = 8; offset <= 16; offset <<= 1) {
+                        lo[b] += __shfl_xor_sync(0xFFFFFFFFU, lo[b], offset);
+                        hi[b] += __shfl_xor_sync(0xFFFFFFFFU, hi[b], offset);
+                    }
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < kA16StreamBatch; ++b) {
+                if (b >= batch) { break; }
+                if (b > 0) { __syncthreads(); }
+                if (lane < 8) {
+                    sm.partial[warp][lane]     = lo[b];
+                    sm.partial[warp][lane + 8] = hi[b];
+                }
+                __syncthreads();
+                if (threadIdx.x < 16 * kDownGroups) {
+                    const int row = threadIdx.x, r = row / 16, k = row % 16;
+                    const std::int64_t total = sm.partial[2 * r][k] + sm.partial[2 * r + 1][k];
+                    const int entry = dispatch.entries[first + c0 + b];
+                    reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(entry) * hidden +
+                                                              16 * kDownGroups * tile + row] =
+                        canon::a16_row_output(total, sm.emax[b], scales.alpha_down);
+                }
+            }
         }
     }
 }
@@ -2491,16 +2713,24 @@ bool ggml_bf16_all_jobs(std::int64_t columns, const MoeExpertSource& source) {
            columns >= kGgmlBf16AllJobsMinColumns && source.wide_a16 == moe::WideA16::kGgmlBf16;
 }
 
+// A non-default NVFP4 bank on WideA16::kA4Residual likewise routes every active non-CPU job of a
+// wide call (at least kA4ResidualAllJobsMinColumns columns) through the residual A4 tiles.
+bool a4_residual_all_jobs(std::int64_t columns, const MoeExpertSource& source) {
+    return !ggml_bank(source) &&
+           moe::wide::a4_residual_all_jobs(static_cast<std::int32_t>(columns), source.activation,
+                                           source.wide_a16, source.geometry);
+}
+
 // The call's routing-independent preparation (its activation encoding), which needs neither the
 // dispatch nor the CPU plan: every token's x encoded once per call - an NVFP4 A16 call of at most
 // kA16RowsMaxColumns columns as the dp4a rows kernels' A16Act rows, a wider one as the wide route's
 // limb rows with the jobs' gate/up CTA counts (the tensor-core narrow kernels), a ggml bank's call
 // in its limb layout. Every A16 call needs one except the in-place route plan's (a call of the
 // fused route's width whose source stages nothing and serves no miss: its fused kernel is the
-// encoding) and non-default ggml BF16 wide calls.
+// encoding) and non-default all-jobs wide fast paths.
 bool needs_prepare(const Tensor& x, const MoeExpertSource& source, std::int32_t top_k) {
     if (source.activation != moe::ExpertActivation::kA16) { return false; }
-    if (ggml_bf16_all_jobs(x.ne[1], source)) { return false; }
+    if (ggml_bf16_all_jobs(x.ne[1], source) || a4_residual_all_jobs(x.ne[1], source)) { return false; }
     const std::int64_t columns = x.ne[1];
     const bool fused = columns <= kRouteDispatchColumns && columns * top_k <= kDispatchThreads;
     return !fused || !in_place_call(x, source);
@@ -2698,8 +2928,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     require(geometry.hidden == moe::kDefaultGeometry.hidden ||
                 (source.activation == moe::ExpertActivation::kA16 && source.ggml.gate_up_format != QType::FP8_E4M3FN_B128 &&
                  (source.wide_a16 == moe::WideA16::kExact ||
+                  (source.wide_a16 == moe::WideA16::kA4Residual && !ggml_bank(source)) ||
                   (source.wide_a16 == moe::WideA16::kGgmlBf16 && ggml_bank(source)))),
-            "a non-default record geometry serves exact NVFP4 A16 or GGUF A16 (exact or BF16) routes only");
+            "a non-default record geometry serves NVFP4 A16 (exact or residual A4) or GGUF A16 (exact or BF16) routes only");
     require(x.ne[0] == geometry.hidden && outputs.ne[0] == geometry.hidden &&
                 outputs.ne[1] == x.ne[1] * top_k,
             "experts geometry differs from the x and outputs' hidden size");
@@ -2756,9 +2987,12 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     // itself encodes here, whatever its source: a call that stages nothing and serves no miss at
     // more than the fused route's width takes no plan and is one of these.
     const bool bf16_all = ggml_bf16_all_jobs(x.ne[1], source);
-    if (!x_prepared && !in_place && !bf16_all && source.activation == moe::ExpertActivation::kA16) {
+    const bool a4_all   = a4_residual_all_jobs(x.ne[1], source);
+    if (!x_prepared && !in_place && !bf16_all && !a4_all && source.activation == moe::ExpertActivation::kA16) {
         prepare_x(x, source, max_jobs, layout, stream);
     }
+    const bool x_limbs_ready = !ggml && !a4_all && source.activation == moe::ExpertActivation::kA16 &&
+                               x.ne[1] > static_cast<std::int64_t>(kA16RowsMaxColumns);
     // A ggml bank's wide jobs' work tiles, planned once the dispatch is known.
     if (ggml && x.ne[1] > moe::kMaxColumns && !bf16_all) {
         launch_plan_ggml(dispatch, max_jobs, layout, stream);
@@ -2825,7 +3059,10 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
         return;
     }
-    if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream); }
+    if (use_wide) {
+        wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream, flags,
+                                  x_limbs_ready);
+    }
     MoeExpertSource unlanded = source; // landing is for forked calls only
     unlanded.landing         = nullptr;
     unlanded.landing_slots   = 0;
@@ -2835,8 +3072,10 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             CUDA_CHECK(pdl::launch_consumer({dim3(source.staging_slots > 0 ? kStageCtas : 1), dim3(kThreads), 0, stream},
                                             stage_kernel, dispatch, unlanded, base, jobs, flags, job_records, fetch));
         }
-        launch_pass(static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base, jobs,
-                    layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
+        if (!a4_all) {
+            launch_pass(static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base, jobs,
+                        layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
+        }
         if (wide) { moe::wide::run_pass(*wide, base / pass_jobs, stream); }
     }
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }

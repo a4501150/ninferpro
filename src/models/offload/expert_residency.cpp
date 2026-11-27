@@ -709,6 +709,7 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
                     pool.controller->adopt(key, frame, group_, round_, pool.commands)) {
                     table[key]   = static_cast<std::int32_t>(frame);
                     table_dirty_ = true;
+                    if (tier_ != nullptr) { tier_->controller().mark_shadow(key); }
                     ++adopted;
                 } else {
                     pool.controller->release(frame);
@@ -729,6 +730,50 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
     }
     any_landing_ = false;
     if (frames() == 0) { return; }
+    // Cold startup placeholders (count == 0, unpinned, e.g. from an unranked placement fill) sit in
+    // VRAM to avoid SSD spill at startup, leaving zero free frames for landing. During decode,
+    // pre-demote a small landing frontier of those unused placeholders asynchronously on d2h_stream_
+    // (only into free or shadow RAM slots so no RAM-only expert is ever evicted to SSD) so misses
+    // land directly into VRAM at zero extra H2D cost until every placeholder has been replaced.
+    if (decode_round_ && swap_enabled_ && !resident_ && has_unused_) {
+        std::vector<std::uint32_t> demoting_pool(pools_.size(), 0);
+        for (const auto& d : demotions_) { ++demoting_pool[pool_of_layer_[d.key / experts_]]; }
+        std::size_t ram_room = std::numeric_limits<std::size_t>::max();
+        if (tier_ != nullptr) {
+            const auto& host = tier_->controller();
+            const std::size_t used_demotion =
+                host.config().demotion > host.demotion_slots() ? host.config().demotion - host.demotion_slots() : 0;
+            const std::size_t free_or_shadow = host.free_residents() + host.shadow_count();
+            ram_room = free_or_shadow > used_demotion ? free_or_shadow - used_demotion : 0;
+            ram_room = std::min(ram_room, host.demotion_slots());
+            ram_room = std::min<std::size_t>(ram_room, host.demotion_allowance());
+        }
+        bool any_unused = false;
+        for (std::size_t p = 0; p < pools_.size(); ++p) {
+            Pool& pool = pools_[p];
+            if (pool.frames == 0 || pool.layers.empty()) { continue; }
+            const std::uint32_t target =
+                std::min<std::uint32_t>(kLandingSlots, 4U) * static_cast<std::uint32_t>(pool.layers.size());
+            const std::uint32_t have = pool.controller->free_frames() + demoting_pool[p];
+            if (have >= target) {
+                any_unused = true;
+                continue;
+            }
+            const std::uint32_t cap = std::max<std::uint32_t>(1U, 3U * static_cast<std::uint32_t>(pool.layers.size()));
+            const std::uint32_t want = static_cast<std::uint32_t>(
+                std::min<std::size_t>({static_cast<std::size_t>(target - have), static_cast<std::size_t>(cap), ram_room}));
+            if (want == 0) {
+                any_unused = true;
+                continue;
+            }
+            bool pool_remaining = false;
+            const std::uint32_t evicted = pool.controller->evict_unused(
+                want, round_, pool.commands, pool_remaining, tier_ != nullptr ? &evictable_ : nullptr);
+            if (tier_ != nullptr) { ram_room = ram_room > evicted ? ram_room - evicted : 0; }
+            if (pool_remaining) { any_unused = true; }
+        }
+        has_unused_ = any_unused;
+    }
     load_commands_.clear();
     for (auto& pool : pools_) {
         if (pool.frames == 0) { continue; }
@@ -826,6 +871,7 @@ std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t
     issue_loads(compute);
     stats_.promotions -= loaded; // issue_loads counted them; they are seeds, not promotions
     stats_.seeded += loaded;
+    if (loaded > 0) { has_unused_ = true; }
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
     publish_landed();
     if (table_dirty_) { upload_table(compute); }

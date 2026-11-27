@@ -35,6 +35,11 @@ The binaries keep their Infernix names (`infernix-serve`, `infernix`, `infernix-
   code as text, and a call cannot start inside its thinking: the model must close its thinking
   before calling, and the turn cannot end there. `--tolerant-tool-calls` recovers a complete call
   with malformed wrapper markup.
+- **GLM-5.3-Flash (`glm5_next`).** Kimi Delta Attention (KDA), sparse MLA with pooled indexer, mHC,
+  and NVFP4 W4A16 or GGUF K-quant (Q4_K/Q3_K/Q2_K) routed experts on the shared three-tier placement,
+  DFlash2 drafting with calibrated `--draft-tokens auto`, streamed layer-walked prefill with qualified
+  fast paths (`expert-a4-residual` and `ggml-bf16-prefill`), prefix cache, and `--vision` image/video
+  input ([design](docs/maintainer/glm5_3-flash-design.md)).
 - `--served-model-name` aliases, and a Linux fix to VRAM spill detection.
 
 ## Measured

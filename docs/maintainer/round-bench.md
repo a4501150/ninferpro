@@ -27,10 +27,11 @@ in VRAM, so its round bench builds the family's instance with production's place
 graph, CPU-served misses, sampling and commit) after warm rounds, reporting the expert hit rate
 instead of a speed of light; its hash covers every row's greedy tokens, and `--replays` (or
 `--determinism`) repeats a shape from a fresh binding. A shape `1xW` with W >= 2 is a one-row
-DFlash2 round drafting W - 1 tokens. The family has no exact route, so `T1_EXACT` is empty
-(`make t1-exact` refuses) and the smoke test's golden tokens are the default route's, taken
-without the drafter; `make t1 SWEEP=1` and `PROFILE=1` do not apply (no speed-of-light fields,
-no `--sections`).
+DFlash2 round drafting W - 1 tokens. Both GLM fast paths (`expert-a4-residual` on NVFP4 and
+`ggml-bf16-prefill` on GGUF) touch wide prefill only and leave decode arithmetic identical to the
+exact route, so `T1_EXACT` is empty (`make t1-exact` refuses) and the smoke test's golden tokens
+record the default route without the drafter (`--disable-fast-paths` checks the exact route);
+`make t1 SWEEP=1` and `PROFILE=1` do not apply (no speed-of-light fields, no `--sections`).
 
 ## The round bench
 

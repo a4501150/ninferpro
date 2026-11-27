@@ -153,11 +153,9 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
 // decoded code * scale left. Term 0 is therefore bit-identical to quantize_nvfp4_k16, and every term
 // shares its divisor, so the MMA sums the terms' products into one accumulator under the same alpha.
 template <int Terms>
-__device__ __forceinline__ void quantize_nvfp4_terms_k16(const __nv_bfloat16* source,
-                                                         float input_scale_divisor,
-                                                         Nvfp4QuantizedK16 (&terms)[Terms]) {
-    const uint4 packed0                = load_vec<uint4>(source);
-    const uint4 packed1                = load_vec<uint4>(source + 8);
+__device__ __forceinline__ void quantize_nvfp4_terms_k16_packed(uint4 packed0, uint4 packed1,
+                                                                float input_scale_divisor,
+                                                                Nvfp4QuantizedK16 (&terms)[Terms]) {
     const std::uint32_t represented[8] = {
         packed0.x, packed0.y, packed0.z, packed0.w, packed1.x, packed1.y, packed1.z, packed1.w,
     };
@@ -205,6 +203,14 @@ __device__ __forceinline__ void quantize_nvfp4_terms_k16(const __nv_bfloat16* so
             remainder[pair].y = __fsub_rn(remainder[pair].y, __fmul_rn(code.y, scale));
         }
     }
+}
+
+template <int Terms>
+__device__ __forceinline__ void quantize_nvfp4_terms_k16(const __nv_bfloat16* source,
+                                                         float input_scale_divisor,
+                                                         Nvfp4QuantizedK16 (&terms)[Terms]) {
+    quantize_nvfp4_terms_k16_packed<Terms>(load_vec<uint4>(source), load_vec<uint4>(source + 8),
+                                           input_scale_divisor, terms);
 }
 
 } // namespace infernix::ops::detail

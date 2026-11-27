@@ -346,12 +346,15 @@ struct ProgramOptions {
     bool prefill_walk = true;
     // FastPath::GgmlBf16Prefill (GGUF expert banks only): wide expert jobs run the BF16 tiles.
     bool ggml_bf16_prefill = false;
-    // CPU-served misses of decode and verification calls: host expert-engine workers (0
-    // disables), the most of a layer call's misses they take, and the link's share of a call's
-    // host-memory misses in 256ths (the rest go to the CPU).
-    std::uint32_t cpu_expert_workers = 14;
-    std::uint32_t cpu_expert_jobs    = 16;
-    std::int32_t cpu_link_share256   = 104;
+    // FastPath::ExpertA4Residual (NVFP4 expert banks only): wide expert jobs run the 3-term residual A4 tiles.
+    bool expert_a4_residual = false;
+    // CPU-served misses of decode and verification calls: host expert-engine workers (0 disables),
+    // the most of a layer call's misses they take, and the link's share of a call's host-memory
+    // misses in 256ths (NVFP4 vs GGUF K-quant banks; the rest go to the CPU).
+    std::uint32_t cpu_expert_workers    = 14;
+    std::uint32_t cpu_expert_jobs       = 16;
+    std::int32_t cpu_link_share256      = 120;
+    std::int32_t cpu_ggml_link_share256 = 104;
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
     // The MLA latent's storage: BF16 (1024 B a token and layer) or Int8Group64 (528 B; the

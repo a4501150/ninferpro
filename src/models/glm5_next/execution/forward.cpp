@@ -113,16 +113,24 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     const std::size_t e = c.moe.experts, k = c.moe.top_k;
     const auto entries  = static_cast<std::int32_t>(k * t);
     const std::int32_t max_jobs = std::min(static_cast<std::int32_t>(e), entries);
+    const std::size_t moe_experts_ws =
+        c.ggml_experts
+            ? std::max(ops::moe_experts_workspace_bytes(max_jobs, entries, static_cast<std::int32_t>(t),
+                                                        ops::offloaded_moe::ExpertActivation::kA16,
+                                                        ops::offloaded_moe::WideA16::kExact, expert_geometry(c)),
+                       ops::moe_experts_workspace_bytes(max_jobs, entries, static_cast<std::int32_t>(t),
+                                                        ops::offloaded_moe::ExpertActivation::kA16,
+                                                        ops::offloaded_moe::WideA16::kGgmlBf16, expert_geometry(c)))
+            : std::max(ops::moe_experts_workspace_bytes(max_jobs, entries, static_cast<std::int32_t>(t),
+                                                        ops::offloaded_moe::ExpertActivation::kA16,
+                                                        ops::offloaded_moe::WideA16::kExact, expert_geometry(c)),
+                       ops::moe_experts_workspace_bytes(max_jobs, entries, static_cast<std::int32_t>(t),
+                                                        ops::offloaded_moe::ExpertActivation::kA16,
+                                                        ops::offloaded_moe::WideA16::kA4Residual, expert_geometry(c)));
     const std::size_t moe =
         aligned(e * t * f32) + aligned(k * t * 4) + aligned(k * t * f32) + aligned(t * f32) +
         aligned(ops::moe_dispatch_bytes(static_cast<std::int32_t>(e), entries)) + aligned(h * k * t * bf) +
-        aligned(std::max(ops::moe_experts_workspace_bytes(max_jobs, entries, static_cast<std::int32_t>(t),
-                                                          ops::offloaded_moe::ExpertActivation::kA16,
-                                                          ops::offloaded_moe::WideA16::kExact, expert_geometry(c)),
-                         ops::moe_experts_workspace_bytes(max_jobs, entries, static_cast<std::int32_t>(t),
-                                                          ops::offloaded_moe::ExpertActivation::kA16,
-                                                          ops::offloaded_moe::WideA16::kGgmlBf16, expert_geometry(c)))) +
-        mlp_bytes(c.moe.shared_intermediate) + y;
+        aligned(moe_experts_ws) + mlp_bytes(c.moe.shared_intermediate) + y;
     const std::size_t head = aligned(s * h * t * bf) + 2 * aligned(h * t * bf);
 
     const std::size_t phase =
@@ -526,8 +534,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t moe_l
     const auto geometry             = expert_geometry(config_);
     const auto& planes              = p.bank->planes;
     const bool ggml_bank            = planes.gate_up_format != QType::NVFP4_MUL;
-    const auto wide_a16 = ggml_bank && experts_.ggml_bf16_prefill ? ops::offloaded_moe::WideA16::kGgmlBf16
-                                                                  : ops::offloaded_moe::WideA16::kExact;
+    const auto wide_a16             = ggml_bank
+                                          ? (experts_.ggml_bf16_prefill ? ops::offloaded_moe::WideA16::kGgmlBf16
+                                                                        : ops::offloaded_moe::WideA16::kExact)
+                                          : (experts_.expert_a4_residual ? ops::offloaded_moe::WideA16::kA4Residual
+                                                                         : ops::offloaded_moe::WideA16::kExact);
     const DeviceSpan expert_ws = work_.alloc_bytes(ops::moe_experts_workspace_bytes(
         max_jobs, K * T, T, ops::offloaded_moe::ExpertActivation::kA16, wide_a16, geometry));
 

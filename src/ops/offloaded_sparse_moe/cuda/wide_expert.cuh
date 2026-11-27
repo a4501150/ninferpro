@@ -205,7 +205,7 @@ __device__ __forceinline__ void rg16_fragments(const std::uint8_t* units, int gr
     scale_hi = __byte_perm(__byte_perm(t0, t2, select), __byte_perm(t1, t3, select), 0x5410);
 }
 
-template <Matrix M, class Epilogue, class S = Schedule>
+template <Matrix M, class Epilogue, class S = Schedule, int H = kHidden, int I = kIntermediate>
 __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kernel(
 #ifdef _WIN32
     // As in nvfp4_a4_tma_kernel: MSVC cannot pass the over-aligned descriptors by value.
@@ -217,7 +217,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
 #ifdef _WIN32
     const Descriptors& descriptors = *descriptors_pointer;
 #endif
-    using Shape                = MatrixShape<M>;
+    using Shape                = MatrixShapeG<M, H, I>;
     constexpr int kRowBlocks   = Shape::kRowGroups / S::kRowGroups;
     constexpr int kKTiles      = Shape::kBlocks / S::kUnitsPerKTile;
     static_assert(Shape::kRowGroups % S::kRowGroups == 0 && Shape::kBlocks % S::kUnitsPerKTile == 0);
@@ -456,8 +456,9 @@ struct DownEpilogue {
 };
 
 // Residual A4 (W4A16 fast path): the accumulators are in units of the row scale, so the gate/up
-// outputs are bf16_rn(acc * row_scale(token) * alpha), h = swiglu_bf16(gate, up) is written as the
-// entry's BF16 h row (the A16 h_rows layout), and its terms are formed by a separate pass.
+// outputs are bf16_rn(acc * row_scale(token) * alpha), h = swiglu_bf16(gate, up) (clamped by
+// kLimit when > 0) is written as the entry's BF16 h row, and its terms are formed by a separate pass.
+template <float kLimit = 0.0F, int kHRowBytes = kA16HRowBytes>
 struct GateUpEpilogueResidual {
     const ExpertScales* scales;
     const std::int32_t* entries;
@@ -476,14 +477,15 @@ struct GateUpEpilogueResidual {
                 if (column >= ctx.columns) { continue; }
                 const int entry = ctx.first + column;
                 const float rs  = x_row_scale[entries[entry] / top_k];
-                auto* h = reinterpret_cast<std::uint16_t*>(h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes);
+                auto* h = reinterpret_cast<std::uint16_t*>(h_rows + static_cast<std::size_t>(entry) * kHRowBytes);
 #pragma unroll
                 for (int r = 0; r < S::kMmaRows; ++r) {
                     const std::uint16_t gate =
                         canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(acc[m][r][2 * half], rs), sc.alpha_gate));
                     const std::uint16_t up =
                         canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(acc[m][r][2 * half + 1], rs), sc.alpha_up));
-                    h[(ctx.row_block * S::kBlockRows + tile_row(ctx.warp_n, r, ctx.tig)) / 2] = canon::swiglu_bf16(gate, up);
+                    h[(ctx.row_block * S::kBlockRows + tile_row(ctx.warp_n, r, ctx.tig)) / 2] =
+                        kLimit > 0.0F ? canon::swiglu_bf16_clamped(gate, up, kLimit) : canon::swiglu_bf16(gate, up);
                 }
             }
         }
@@ -491,6 +493,7 @@ struct GateUpEpilogueResidual {
 };
 
 // y = bf16_rn(acc * row_scale(entry's h) * alpha_down) into the entry's output column.
+template <int H = kHidden>
 struct DownEpilogueResidual {
     const ExpertScales* scales;
     const std::int32_t* entries;
@@ -507,7 +510,7 @@ struct DownEpilogueResidual {
                 const int column = ctx.warp_m * S::kWarpTokens + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 const float rs     = h_row_scale[ctx.first + column];
-                std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * kHidden +
+                std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * H +
                                      ctx.row_block * S::kBlockRows;
 #pragma unroll
                 for (int r = 0; r < S::kMmaRows; ++r) {
@@ -525,11 +528,11 @@ struct DownEpilogueResidual {
 
 [[nodiscard]] int persistent_ctas();
 
-template <Matrix M, class S = Schedule, class Epilogue>
+template <Matrix M, class S = Schedule, int H = kHidden, int I = kIntermediate, class Epilogue>
 void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaStream_t stream) {
     constexpr int bytes = static_cast<int>(sizeof(Storage<S>));
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
-    static constexpr auto kernel = grouped_kernel<M, Epilogue, S>;
+    static constexpr auto kernel = grouped_kernel<M, Epilogue, S, H, I>;
     static const bool configured = [] {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                         cudaSharedmemCarveoutMaxShared));

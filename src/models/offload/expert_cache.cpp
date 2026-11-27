@@ -535,6 +535,32 @@ std::uint32_t CacheController::reserve_free(std::uint32_t count, std::vector<std
     return reserved;
 }
 
+std::uint32_t CacheController::evict_unused(std::uint32_t count, std::uint64_t round_started,
+                                            std::vector<Command>& out, bool& any_remaining,
+                                            const LfruPolicy::Admissible* evictable) {
+    std::vector<std::uint32_t> victims;
+    victims.reserve(count);
+    any_remaining = false;
+    for (const std::uint32_t key : policy_.residents()) {
+        if (policy_.pinned(key) || policy_.count(key) > 0.0) { continue; }
+        if (table_[key].state != ResidencyState::kReady) { continue; }
+        if (victims.size() >= count) {
+            any_remaining = true;
+            break;
+        }
+        if (evictable != nullptr && !(*evictable)(key)) {
+            any_remaining = true;
+            break;
+        }
+        victims.push_back(key);
+    }
+    for (const std::uint32_t key : victims) {
+        policy_.evict(key);
+        frames_.retire(make_absent(key, out), round_started);
+    }
+    return static_cast<std::uint32_t>(victims.size());
+}
+
 bool CacheController::adopt(std::uint32_t key, std::uint32_t frame, std::span<const std::uint32_t> protect,
                             std::uint64_t round_started, std::vector<Command>& out) {
     if (key >= table_.size() || table_[key].state != ResidencyState::kAbsent) { return false; }

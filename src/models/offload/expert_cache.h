@@ -294,6 +294,11 @@ public:
     // already loading or resident elsewhere (the caller then releases the frame). release returns
     // a reserved frame that received no expert.
     std::uint32_t reserve_free(std::uint32_t count, std::vector<std::uint32_t>& out);
+    // Evicts up to `count` unpinned ready residents with zero use count (cold startup placeholders),
+    // retiring their frames so demotion frees them for fill-phase landing. Sets `any_remaining` when
+    // another such resident remains in the pool.
+    std::uint32_t evict_unused(std::uint32_t count, std::uint64_t round_started, std::vector<Command>& out,
+                               bool& any_remaining, const LfruPolicy::Admissible* evictable = nullptr);
     bool adopt(std::uint32_t key, std::uint32_t frame, std::span<const std::uint32_t> protect,
                std::uint64_t round_started, std::vector<Command>& out);
     void release(std::uint32_t frame);
