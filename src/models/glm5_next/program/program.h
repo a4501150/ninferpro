@@ -390,6 +390,7 @@ struct ProgramOptions {
     std::uint64_t prefix_host_bytes = 0;
     runtime::prefix_cache::TapPlannerConfig prefix_taps;
     runtime::prefix_cache::CacheCostModel prefix_cost;
+    std::filesystem::path route_trace;
     DiagnosticObserver diagnostics;
 };
 

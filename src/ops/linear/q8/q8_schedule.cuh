@@ -78,7 +78,7 @@ template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpToke
           Q8MmaFragmentPipeline FragmentPipeline = Q8MmaFragmentPipeline::PingPong,
           Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg,
           Cache PredicatedCache = Cache::ca, bool Predicated = false, int StaticK = 0,
-          int KLoopUnroll = 4>
+          int KLoopUnroll = 4, int WeightStages = 1>
 struct Q8A16MmaSchedule {
     static constexpr int kBlockRows         = BlockRows;
     static constexpr int kBlockTokens       = BlockTokens;
@@ -86,6 +86,7 @@ struct Q8A16MmaSchedule {
     static constexpr int kWarpRows          = WarpRows;
     static constexpr int kWarpTokens        = WarpTokens;
     static constexpr int kActivationStages  = ActivationStages;
+    static constexpr int kWeightStages      = WeightStages;
     static constexpr int kStages            = 2;
     static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
     static constexpr auto kFragmentPipeline = FragmentPipeline;
@@ -103,9 +104,9 @@ struct Q8A16MmaSchedule {
     static constexpr int kMmaTokens         = WarpTokens / 8;
     static constexpr int kMmaKSteps         = BlockK / 16;
     static constexpr int kScaleCacheBytes   = 16;
-    static constexpr int kSharedBytes       = BlockRows * BlockK * 3 +
+    static constexpr int kSharedBytes       = WeightStages * BlockRows * BlockK * 3 +
                                               ActivationStages * BlockTokens * BlockK * 2 +
-                                              BlockRows * kScaleCacheBytes;
+                                              WeightStages * BlockRows * kScaleCacheBytes;
     static_assert(BlockRows > 0 && BlockTokens > 0 && WarpRows > 0 && WarpTokens > 0);
     static_assert(BlockRows % WarpRows == 0 && BlockTokens % WarpTokens == 0);
     static_assert(WarpRows % 16 == 0 && WarpTokens % 8 == 0);
@@ -113,6 +114,7 @@ struct Q8A16MmaSchedule {
     static_assert(StaticK == 0 || (StaticK > 0 && StaticK % BlockK == 0));
     static_assert(KLoopUnroll > 0);
     static_assert(ActivationStages == 1 || ActivationStages == 2);
+    static_assert(WeightStages == 1 || (WeightStages == 2 && ActivationStages == 2));
     static_assert(kThreads <= 1024 && MinBlocksPerSm > 0);
     static_assert(kSharedBytes <= 99 * 1024);
 };

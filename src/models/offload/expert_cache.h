@@ -50,7 +50,12 @@ public:
     using Admissible = std::function<bool(std::uint32_t)>;
 
     // halving_period > 0 halves every count each that many ticks (moe-offload-design.md §4.3).
-    LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period = 0);
+    // When recency_scale > 0, scores use LRFU-Blend:
+    //   score = f * (1 + recency_weight / ((now - last) / recency_scale + 1)),
+    // which keeps frequency dominant across multi-layer ticks while still strictly decreasing
+    // monotonically with age so the low-set victim search remains exact.
+    LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period = 0,
+               double recency_scale = 0.0, double recency_weight = 0.0);
     // Halved counts below this become 0 (they never reach subnormals, which would slow the scan).
     static constexpr double kCountFloor = 1.0 / 1024.0;
 
@@ -86,10 +91,17 @@ public:
     [[nodiscard]] std::size_t resident_count() const { return residents_.size(); }
     [[nodiscard]] std::uint32_t capacity() const { return capacity_; }
     [[nodiscard]] std::uint64_t now() const { return now_; }
+    [[nodiscard]] std::uint64_t last(std::uint32_t key) const { return last_[key]; }
+    [[nodiscard]] double recency_scale() const { return recency_scale_; }
     [[nodiscard]] double score(std::uint32_t key) const;
     [[nodiscard]] double count(std::uint32_t key) const { return count_[key]; }
     [[nodiscard]] std::uint32_t num_keys() const { return static_cast<std::uint32_t>(count_.size()); }
     [[nodiscard]] std::span<const std::uint32_t> residents() const { return residents_; }
+
+    // Lowest (score, key) unpinned resident outside `protect`, without evicting it.
+    [[nodiscard]] std::optional<std::uint32_t> peek_victim(std::span<const std::uint32_t> protect);
+    // Inserts a non-resident key when resident_count() < capacity(); false otherwise.
+    bool admit_free(std::uint32_t key);
 
     // Seeds residency and counts, for example from a saved state or a shipped profile.
     void seed(std::span<const std::uint32_t> resident_keys, std::span<const std::uint32_t> counts);
@@ -109,6 +121,10 @@ public:
 
 private:
     static constexpr std::uint32_t kNone = 0xFFFFFFFFU;
+    [[nodiscard]] double score_at(double count, double last, double now_d) const noexcept {
+        if (recency_scale_ <= 0.0) { return count / (now_d + 1.0 - last); }
+        return count * (1.0 + recency_weight_ / ((now_d - last) * inv_recency_scale_ + 1.0));
+    }
     void insert(std::uint32_t key);
     void erase(std::uint32_t key);
     void select_victims(std::size_t need, std::span<const std::uint32_t> protect,
@@ -134,6 +150,9 @@ private:
 
     std::uint32_t capacity_;
     std::uint32_t halving_period_;
+    double recency_scale_     = 0.0;
+    double inv_recency_scale_ = 0.0;
+    double recency_weight_    = 0.0;
     std::uint64_t now_ = 0;
     std::vector<double> count_; // binary64 uses, halved in place (replay.py does the same operations)
     std::vector<std::uint8_t> pinned_; // pin_keys: residents never evicted (empty: none)
@@ -241,14 +260,20 @@ public:
         std::uint64_t serial = 0; // kCopy: this load's serial (complete_load)
     };
 
-    // `frames` backed now, up to `max_frames` (0: no growth); `halving_period` as LfruPolicy's.
+    // `frames` backed now, up to `max_frames` (0: no growth); `halving_period`, `recency_scale` and
+    // `recency_weight` as LfruPolicy's.
     CacheController(std::uint32_t num_keys, std::uint32_t frames, std::uint32_t slack_frames,
-                    std::uint32_t rounds_in_flight, std::uint32_t max_frames = 0, std::uint32_t halving_period = 0);
+                    std::uint32_t rounds_in_flight, std::uint32_t max_frames = 0, std::uint32_t halving_period = 0,
+                    double recency_scale = 0.0, double recency_weight = 0.0);
 
     // The route log of one layer call. `round_started` is the agent's latest sample.
     void on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,
                   std::vector<Command>& out, std::size_t admission_budget = static_cast<std::size_t>(-1),
                   const LfruPolicy::Admissible* admissible = nullptr, const LfruPolicy::Admissible* evictable = nullptr);
+    // Records one layer call's routes in the policy (advances clock and counts) without admitting or
+    // evicting; misses are readable through last_misses().
+    void record_route(std::span<const std::uint32_t> group);
+    [[nodiscard]] std::span<const std::uint32_t> last_misses() const { return step_.misses; }
     // A prompt's weighted routes at its end (LfruPolicy::credit); issues no command.
     void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) { policy_.credit(keys, amounts); }
     // The SSD tier's demotion (moe-offload-design.md §4.6): after on_route evicted an expert and before
@@ -301,6 +326,12 @@ public:
                                bool& any_remaining, const LfruPolicy::Admissible* evictable = nullptr);
     bool adopt(std::uint32_t key, std::uint32_t frame, std::span<const std::uint32_t> protect,
                std::uint64_t round_started, std::vector<Command>& out);
+    // Adopts `key` into a reserved `frame` without evicting (requires room in the policy).
+    bool adopt_free(std::uint32_t key, std::uint32_t frame, std::vector<Command>& out);
+    // Evicts a specific resident key and retires its frame; no-op when not resident.
+    void evict_key(std::uint32_t key, std::uint64_t round_started, std::vector<Command>& out);
+    // Admits an absent key into the policy (when it has room) and queues its load for drain_queue.
+    bool enqueue_admit(std::uint32_t key);
     void release(std::uint32_t frame);
     [[nodiscard]] std::uint32_t loaned_frames() const { return frames_.loaned_count(); }
     // The longest run of backed frames none of which is lent: the most one more lease can take, since

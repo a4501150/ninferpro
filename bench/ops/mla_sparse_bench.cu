@@ -48,8 +48,12 @@ const ops::DsaIndexerGeometry kIndexerGeometry{.heads     = kIndexHeads,
 struct Options {
     std::vector<int> contexts{4096, 32768, 131072};
     std::vector<int> batches{1, 4};
-    int warmup = 5;
-    int repeat = 50;
+    int width          = 1;
+    int warmup         = 5;
+    int repeat         = 50;
+    bool tensor_cores  = false;
+    bool int8_kv       = false;
+    bool attention_only = false;
 };
 
 std::vector<int> parse_ints(std::string_view s) {
@@ -76,12 +80,21 @@ Options parse_options(int argc, char** argv) {
             o.contexts = parse_ints(value());
         } else if (arg == "--batches") {
             o.batches = parse_ints(value());
+        } else if (arg == "--width") {
+            o.width = std::atoi(argv[++i]);
+        } else if (arg == "--tensor-cores") {
+            o.tensor_cores = true;
+        } else if (arg == "--int8") {
+            o.int8_kv = true;
+        } else if (arg == "--attention-only") {
+            o.attention_only = true;
         } else if (arg == "--warmup") {
             o.warmup = std::atoi(argv[++i]);
         } else if (arg == "--repeat") {
             o.repeat = std::atoi(argv[++i]);
         } else if (arg == "--help") {
             std::printf("infernix_mla_sparse_bench [--contexts 4096,32768,131072] [--batches 1,4] "
+                        "[--width N] [--tensor-cores] [--int8] [--attention-only] "
                         "[--warmup N] [--repeat N]\n");
             std::exit(0);
         } else {
@@ -92,21 +105,30 @@ Options parse_options(int argc, char** argv) {
 }
 
 struct Case {
-    int batch, context, pages_per_row, pages;
+    int batch, width, context, pages_per_row, pages;
+    bool tensor_cores, int8_kv;
     std::size_t workspace_bytes = 0, index_workspace_bytes = 0;
-    DeviceBuffer k, z, pooled, latents, ape, gamma, beta, raw_k, index_z, index_q, index_w, pools,
-        counts;
+    DeviceBuffer k, z, pooled, latents, latent_scales, ape, gamma, beta, raw_k, index_z, index_q,
+        index_w, pools, counts;
     DeviceBuffer q, w_uk, w_uv, qa, out, tables, positions, rows, attn_workspace, index_workspace;
 
-    Case(int batch_, int context_) : batch(batch_), context(context_) {
+    Case(int batch_, int width_, int context_, bool tensor_cores_, bool int8_kv_)
+        : batch(batch_), width(width_), context(context_), tensor_cores(tensor_cores_),
+          int8_kv(int8_kv_) {
         pages_per_row  = (context + kPage - 1) / kPage;
         pages          = pages_per_row * batch;
-        const int cols = batch; // decode: width 1
+        const int cols = batch * width;
         // Index cache planes (fixture BF16 in [0.002, 0.01]; the timing does not read values).
-        k       = bench::make_bf16(static_cast<std::size_t>(kIndexDim) * kPage * batch, 11);
-        z       = bench::make_bf16(static_cast<std::size_t>(kIndexDim) * kPage * batch, 12);
-        pooled  = bench::make_bf16(static_cast<std::size_t>(kIndexDim / kPool) * kPage * pages, 13);
-        latents = bench::make_bf16(static_cast<std::size_t>(kLatent) * kPage * pages, 14);
+        k      = bench::make_bf16(static_cast<std::size_t>(kIndexDim) * kPage * batch, 11);
+        z      = bench::make_bf16(static_cast<std::size_t>(kIndexDim) * kPage * batch, 12);
+        pooled = bench::make_bf16(static_cast<std::size_t>(kIndexDim / kPool) * kPage * pages, 13);
+        if (int8_kv) {
+            latents       = DeviceBuffer(static_cast<std::size_t>(kLatent) * kPage * pages);
+            latent_scales = bench::make_bf16(static_cast<std::size_t>(kLatent / 64) * kPage * pages, 14, 0.005F, 0.02F);
+            CUDA_CHECK(cudaMemset(latents.p, 17, latents.bytes));
+        } else {
+            latents = bench::make_bf16(static_cast<std::size_t>(kLatent) * kPage * pages, 14);
+        }
         ape     = bench::make_zeros(sizeof(float) * kPool * kIndexDim);
         gamma   = bench::make_bf16(kIndexDim, 15, 0.9F, 1.1F);
         beta    = bench::make_bf16(kIndexDim, 16, -0.1F, 0.1F);
@@ -122,7 +144,7 @@ struct Case {
         w_uv = bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kLatent * kHeads, 23);
         qa   = bench::make_bf16(static_cast<std::size_t>(kLatent) * kHeads * cols, 24);
         out  = bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kHeads * cols, 25);
-        // Batch descriptors: lane b at the context's last position, disjoint pages per lane.
+        // Batch descriptors: lane b at the context's last `width` positions, disjoint pages per lane.
         std::vector<std::int32_t> table(static_cast<std::size_t>(pages_per_row) * batch),
             position(cols), rows_h(batch);
         for (int b = 0; b < batch; ++b) {
@@ -130,7 +152,9 @@ struct Case {
             for (int p = 0; p < pages_per_row; ++p) {
                 table[b * pages_per_row + p] = b * pages_per_row + p;
             }
-            position[b] = context - 1;
+            for (int w = 0; w < width; ++w) {
+                position[b * width + w] = context - width + w;
+            }
         }
         const auto upload = [](const std::vector<std::int32_t>& h) {
             DeviceBuffer d(h.size() * sizeof(std::int32_t));
@@ -140,17 +164,33 @@ struct Case {
         tables    = upload(table);
         positions = upload(position);
         rows      = upload(rows_h);
+        // Deterministic sparse pool selection (even stride across available pools) so attention
+        // can run standalone without select() when --attention-only is set.
+        std::vector<std::int32_t> pools_h(static_cast<std::size_t>(kTopPools) * cols, 0);
+        std::vector<std::int32_t> counts_h(cols, 0);
+        for (int c = 0; c < cols; ++c) {
+            const int avail = (position[c] + 1) / kPool;
+            const int cnt   = std::min(kTopPools, avail);
+            counts_h[c]     = cnt;
+            for (int i = 0; i < cnt; ++i) {
+                pools_h[static_cast<std::size_t>(c) * kTopPools + i] =
+                    static_cast<std::int32_t>((static_cast<std::int64_t>(i) * avail) / cnt);
+            }
+        }
+        CUDA_CHECK(cudaMemcpy(pools.p, pools_h.data(), pools.bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(counts.p, counts_h.data(), counts.bytes, cudaMemcpyHostToDevice));
         const ops::MlaSparseBatch batch_desc{
             .block_tables = Tensor(tables.p, DType::I32, {pages_per_row, batch}),
             .table_rows   = Tensor(rows.p, DType::I32, {batch}),
             .positions    = Tensor(positions.p, DType::I32, {cols}),
             .batch        = batch,
-            .width        = 1};
+            .width        = width};
         index_workspace_bytes =
             ops::dsa_indexer_select_workspace_bytes(kIndexerGeometry, cols, context);
         index_workspace = DeviceBuffer(index_workspace_bytes);
+        const ops::MlaAttentionExecutionEnvelope env{.tensor_cores = tensor_cores};
         workspace_bytes = ops::mla_sparse_attention_workspace_bytes(
-            kAttentionGeometry, cols, context, ops::MlaAttentionExecutionEnvelope{});
+            kAttentionGeometry, cols, context, env);
         attn_workspace = DeviceBuffer(workspace_bytes);
         batch_desc_    = batch_desc;
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -166,8 +206,9 @@ struct Case {
     }
 
     void update(cudaStream_t s) const {
-        ops::dsa_indexer_update(Tensor(raw_k.p, DType::BF16, {kIndexDim, batch}),
-                                Tensor(index_z.p, DType::BF16, {kIndexDim, batch}),
+        const int cols = batch * width;
+        ops::dsa_indexer_update(Tensor(raw_k.p, DType::BF16, {kIndexDim, cols}),
+                                Tensor(index_z.p, DType::BF16, {kIndexDim, cols}),
                                 Tensor(gamma.p, DType::BF16, {kIndexDim}),
                                 Tensor(beta.p, DType::BF16, {kIndexDim}),
                                 Tensor(ape.p, DType::FP32, {kIndexDim, kPool}), index_cache(),
@@ -175,31 +216,41 @@ struct Case {
     }
 
     void select(cudaStream_t s) const {
-        Tensor pools_out(pools.p, DType::I32, {kTopPools, batch});
-        Tensor counts_out(counts.p, DType::I32, {batch});
-        ops::dsa_indexer_select(Tensor(index_q.p, DType::BF16, {kIndexDim, kIndexHeads, batch}),
-                                Tensor(index_w.p, DType::BF16, {kIndexHeads, batch}), index_cache(),
+        const int cols = batch * width;
+        Tensor pools_out(pools.p, DType::I32, {kTopPools, cols});
+        Tensor counts_out(counts.p, DType::I32, {cols});
+        ops::dsa_indexer_select(Tensor(index_q.p, DType::BF16, {kIndexDim, kIndexHeads, cols}),
+                                Tensor(index_w.p, DType::BF16, {kIndexHeads, cols}), index_cache(),
                                 batch_desc_, kIndexerGeometry, kIndexScale, context,
                                 index_workspace.p, index_workspace_bytes, pools_out, counts_out, s);
     }
 
     void project(cudaStream_t s) const {
-        Tensor qa_out(qa.p, DType::BF16, {kLatent, kHeads, batch});
-        ops::mla_absorbed_q_projection(Tensor(q.p, DType::BF16, {kHeadDim, kHeads, batch}),
+        const int cols = batch * width;
+        Tensor qa_out(qa.p, DType::BF16, {kLatent, kHeads, cols});
+        ops::mla_absorbed_q_projection(Tensor(q.p, DType::BF16, {kHeadDim, kHeads, cols}),
                                        w_uk_tensor(), qa_out, s);
     }
 
     void attention(cudaStream_t s) const {
-        Tensor pools_out(pools.p, DType::I32, {kTopPools, batch});
-        Tensor counts_out(counts.p, DType::I32, {batch});
+        const int cols = batch * width;
+        Tensor pools_out(pools.p, DType::I32, {kTopPools, cols});
+        Tensor counts_out(counts.p, DType::I32, {cols});
         const ops::MlaSelectedPools selected{
             .pools = &pools_out, .counts = &counts_out, .pool = kPool};
-        Tensor o(out.p, DType::BF16, {kHeadDim, kHeads, batch});
+        Tensor o(out.p, DType::BF16, {kHeadDim, kHeads, cols});
+        ops::MlaLatentBatchView cache{};
+        if (int8_kv) {
+            cache.pages  = Tensor(latents.p, DType::I8, {kLatent, kPage, 1, pages});
+            cache.scales = Tensor(latent_scales.p, DType::FP16, {kLatent / 64, kPage, 1, pages});
+        } else {
+            cache.pages = Tensor(latents.p, DType::BF16, {kLatent, kPage, 1, pages});
+        }
         ops::mla_sparse_attention(
-            Tensor(qa.p, DType::BF16, {kLatent, kHeads, batch}), w_uv_tensor(),
-            {.pages = Tensor(latents.p, DType::BF16, {kLatent, kPage, 1, pages})}, batch_desc_,
-            selected, kAttentionGeometry, kScale, context, ops::MlaAttentionExecutionEnvelope{},
-            attn_workspace.p, workspace_bytes, o, s);
+            Tensor(qa.p, DType::BF16, {kLatent, kHeads, cols}), w_uv_tensor(), cache, batch_desc_,
+            selected, kAttentionGeometry, kScale, context,
+            ops::MlaAttentionExecutionEnvelope{.tensor_cores = tensor_cores}, attn_workspace.p,
+            workspace_bytes, o, s);
     }
 
     Tensor w_uk_tensor() const { return Tensor(w_uk.p, DType::BF16, {kHeadDim, kLatent, kHeads}); }
@@ -266,25 +317,35 @@ int main(int argc, char** argv) {
                     options.repeat);
         for (const int context : options.contexts) {
             for (const int batch : options.batches) {
-                Case data(batch, context);
+                Case data(batch, options.width, context, options.tensor_cores, options.int8_kv);
                 double update_b = 0, select_b = 0, project_b = 0, attention_b = 0;
                 data.bytes(update_b, select_b, project_b, attention_b);
                 const double bytes = update_b + select_b + project_b + attention_b;
                 try {
-                    const auto update    = time(flush, stream, options.warmup, options.repeat,
-                                                [&](cudaStream_t s) { data.update(s); });
-                    const auto select    = time(flush, stream, options.warmup, options.repeat,
-                                                [&](cudaStream_t s) { data.select(s); });
-                    const auto project   = time(flush, stream, options.warmup, options.repeat,
-                                                [&](cudaStream_t s) { data.project(s); });
+                    const double update_us =
+                        options.attention_only
+                            ? 0.0
+                            : time(flush, stream, options.warmup, options.repeat,
+                                   [&](cudaStream_t s) { data.update(s); })
+                                  .median_us;
+                    const double select_us =
+                        options.attention_only
+                            ? 0.0
+                            : time(flush, stream, options.warmup, options.repeat,
+                                   [&](cudaStream_t s) { data.select(s); })
+                                  .median_us;
+                    const double project_us =
+                        options.attention_only
+                            ? 0.0
+                            : time(flush, stream, options.warmup, options.repeat,
+                                   [&](cudaStream_t s) { data.project(s); })
+                                  .median_us;
                     const auto attention = time(flush, stream, options.warmup, options.repeat,
                                                 [&](cudaStream_t s) { data.attention(s); });
-                    const double total   = update.median_us + select.median_us + project.median_us +
-                                           attention.median_us;
+                    const double total   = update_us + select_us + project_us + attention.median_us;
                     std::printf("%7d %5d %11.2f %10.2f %10.2f %12.2f %9.2f %12.2f %10.2f\n",
-                                context, batch, update.median_us, select.median_us,
-                                project.median_us, attention.median_us, total, bytes / 1.0e6,
-                                bytes / total / 1.0e3);
+                                context, batch * options.width, update_us, select_us, project_us,
+                                attention.median_us, total, bytes / 1.0e6, bytes / total / 1.0e3);
                 } catch (const std::invalid_argument& e) {
                     std::printf("%7d %5d unsupported: %s\n", context, batch, e.what());
                 }

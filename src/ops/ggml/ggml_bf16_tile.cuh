@@ -28,6 +28,7 @@
 
 #include "core/ggml_format.h"
 #include "ops/common/memory.cuh"
+#include "ops/common/mma.cuh"
 #include "ops/ggml/ggml_dp4a.cuh"
 #include "ops/ggml/ggml_tile.cuh"
 
@@ -293,28 +294,49 @@ __device__ __forceinline__ uint4 words4_at(const std::uint8_t* p) {
                       __funnelshift_r(w3, w4, s));
 }
 
+__device__ __forceinline__ std::uint32_t u32_at(const std::uint8_t* p) {
+    const auto a     = reinterpret_cast<std::uintptr_t>(p);
+    const auto* w    = reinterpret_cast<const std::uint32_t*>(a & ~std::uintptr_t{3});
+    const unsigned s = static_cast<unsigned>(a & 3) * 8;
+    return s == 0 ? w[0] : __funnelshift_r(w[0], w[1], s);
+}
+
 // Half h16 of slice sb of a kFold block b: its 16 unsigned codes (Q3_K: 0..7 representing code + 4;
 // Q2_K: 0..3; byte j of word w is element 4w + j), its sub-scale and (Q2_K) its min sub-scale.
 template <QType F>
 __device__ __forceinline__ void fold_half(const std::uint8_t* b, int sb, int h16, unsigned (&code)[4], int& sub, int& mn) {
     const int half = sb / 4, plane = sb % 4, l = 16 * h16;
     if constexpr (F == QType::GGML_Q3_K) {
-        const uint4 q = words4_at(b + 32 + 32 * half + l), m = words4_at(b + l);
-        const unsigned qw[4] = {q.x, q.y, q.z, q.w}, mw[4] = {m.x, m.y, m.z, m.w};
-        const int bit = 4 * half + plane;
+        {
+            const uint4 q        = words4_at(b + 32 + 32 * half + l);
+            const unsigned qw[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            code[w] = ((qw[w] >> (2 * plane)) & 0x03030303U) | (((mw[w] >> bit) & 0x01010101U) << 2);
+            for (int w = 0; w < 4; ++w) { code[w] = (qw[w] >> (2 * plane)) & 0x03030303U; }
         }
-        const int i = 8 * half + 2 * plane + h16;
-        sub = (((b[96 + i % 8] >> (4 * (i / 8))) & 0xF) | (((b[104 + i % 4] >> (2 * (i / 4))) & 3) << 4)) - 32;
+        {
+            const uint4 m        = words4_at(b + l);
+            const unsigned mw[4] = {m.x, m.y, m.z, m.w};
+            const int bit        = 4 * half + plane;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) { code[w] |= ((mw[w] >> bit) & 0x01010101U) << 2; }
+        }
+        // 32-bit loads broadcast across both dj=0 and dj=1 half-warps (same i & 4), avoiding
+        // 2-way LDS.U8 bank conflicts on the scale bytes.
+        const int i            = 8 * half + 2 * plane + h16;
+        const std::uint32_t lw = u32_at(b + 96 + (i & 4));
+        const std::uint32_t hw = u32_at(b + 104);
+        const int lb           = static_cast<int>((lw >> (8 * (i & 3))) & 0xFFU);
+        const int hb           = static_cast<int>((hw >> (8 * (i & 3))) & 0xFFU);
+        sub = (((lb >> (4 * (i >> 3))) & 0xF) | (((hb >> (2 * (i >> 2))) & 3) << 4)) - 32;
     } else {
         static_assert(F == QType::GGML_Q2_K);
         const uint4 q = words4_at(b + 16 + 32 * half + l);
         const unsigned qw[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
         for (int w = 0; w < 4; ++w) { code[w] = (qw[w] >> (2 * plane)) & 0x03030303U; }
-        const int s = b[8 * half + 2 * plane + h16];
+        const int i           = 8 * half + 2 * plane + h16;
+        const std::uint32_t sw = u32_at(b + (i & ~3));
+        const int s           = static_cast<int>((sw >> (8 * (i & 3))) & 0xFFU);
         sub = s & 0xF;
         mn  = s >> 4;
     }
@@ -328,25 +350,36 @@ __device__ __forceinline__ std::uint16_t fold_d(const std::uint8_t* b) {
 
 // One stage of a 64-row tile of a kFold format: per slice and m16 tile, lane (g, t)'s BF16 A registers
 // in 16-byte chunks, chunk (2 t + half) ^ g of row group g (so neither the decode's stores nor the
-// MMAs' loads conflict much) holding the k16 half's four words (row g's elements 4t, 4t + 1 and
-// 4t + 2, 4t + 3 of the half, then row g + 8's: the K order of the permuted x units, so one thread
-// stores a row's pair of words at once); each row's d (FP32, the block's, which spans the stage).
+// MMAs' loads conflict) holding the k16 half's four words in natural MMA K order: row g's elements
+// (2t, 2t+1) and (8+2t, 8+2t+1), then row g+8's, matching ldmatrix_x4 on swizzled sm.x.
 struct FoldStage {
     alignas(16) unsigned a[kSlices][kMTiles][8][8][4];
     float d[tile::kTileRows];
 };
 // ... and Q2_K's min terms: dmin * min of each row's two halves per slice (FP32, exact).
+// Stride 64 + 16 words places dj=0 in banks 0..15 and dj=1 in banks 16..31 (0 store conflicts).
 struct FoldMinStage : FoldStage {
-    float2 m[kSlices][tile::kTileRows];
+    float m[2][kSlices][tile::kTileRows + 16];
+};
+
+template <Scaling S>
+struct XSumStorage {};
+template <>
+struct XSumStorage<Scaling::kMin> {
+    alignas(16) float xsum[kSlices][kColumns];
+};
+template <>
+struct XSumStorage<Scaling::kHalfMin> {
+    alignas(16) float xsum[kSlices][2][kColumns];
 };
 
 // Dynamic shared memory of compute_decode: the stage images of both 64-row tiles for two stages
 // (the one the MMAs read, the next being decoded), two stages of x units, two raw units.
 template <class Stage, QType F>
-struct DecodeSharedOf {
+struct DecodeSharedOf : XSumStorage<kScaling<F>> {
     static constexpr int kRawRowBytes = kFold<F> ? (kFoldRowWords<F> * 4) : (kUnitChunks<F> * 16);
     alignas(16) Stage code[2][2];
-    alignas(16) std::uint16_t x[2][kSlices][kColumns][32]; // BF16 bits, 8-byte units permuted
+    alignas(16) std::uint16_t x[2][kSlices][kColumns][32]; // BF16 bits (swizzled natural-K for kFold, permuted otherwise)
     alignas(16) std::uint8_t raw[2][kRows * kRawRowBytes];
     std::uint8_t raw_offset[2][kRows]; // where row r's unit bytes start in raw[.][r * kRawRowBytes]
     const std::uint16_t* column[kColumns]; // the tile's columns (Columns::column, null past them)
@@ -363,25 +396,24 @@ constexpr int kDecodeMTiles  = 2;
 static_assert(kDecodeThreads / 32 == (kRows / 32) * (kColumns / kWarpColumns));
 
 struct DecodeWarpLayout {
-    int tile_h;      // 0 (rows 0..63) or 1 (rows 64..127)
-    int m0;          // first m16 tile in tile_h (0..3)
-    int mtiles;      // 1 or 2
-    int col_base;    // first column within the CTA's 128
-    int ntiles;      // 1, 2 or 4
-    int x_cols;      // active column window: 16, 32, 64 or 128
-    int x_cols_log2; // 4, 5, 6 or 7
+    int tile_h;   // 0 (rows 0..63) or 1 (rows 64..127)
+    int m0;       // first m16 tile in tile_h (0..3)
+    int mtiles;   // 1 or 2
+    int col_base; // first column within the CTA's 128
+    int ntiles;   // 1, 2 or 4
+    int x_cols;   // active column window: 16, 32, 64 or 128
 };
 
 __device__ __forceinline__ DecodeWarpLayout decode_warp_layout(int warp, int live_cols) {
     if (live_cols > 64) {
         const int wr = warp >> 2, wc = warp & 3;
-        return {wr >> 1, 2 * (wr & 1), 2, wc << 5, 4, 128, 7};
+        return {wr >> 1, 2 * (wr & 1), 2, wc << 5, 4, 128};
     }
     const int wr = warp >> 1, wc = warp & 1;
     const int tile_h = wr >> 2, m0 = wr & 3;
-    if (live_cols > 32) { return {tile_h, m0, 1, wc << 5, 4, 64, 6}; }
-    if (live_cols > 16) { return {tile_h, m0, 1, wc << 4, 2, 32, 5}; }
-    return {tile_h, m0, 1, wc << 3, 1, 16, 4};
+    if (live_cols > 32) { return {tile_h, m0, 1, wc << 5, 4, 64}; }
+    if (live_cols > 16) { return {tile_h, m0, 1, wc << 4, 2, 32}; }
+    return {tile_h, m0, 1, wc << 3, 1, 16};
 }
 
 struct DecodeAccumulators {
@@ -418,20 +450,34 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
     static_assert(kUnitStages >= 2 && kDecodeChunks * kDecodeThreads == kRows * kSlices * 4);
     static_assert(!kFold<F> || (kUnitElems<F> == static_cast<int>(ggml_block_elems(F)) && kRows * kSlices * 2 == kDecodeThreads));
     const int units = stages / kUnitStages;
+    const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
     // The columns once per tile (a gathered column's token is a division by top_k).
     if (static_cast<int>(threadIdx.x) < kXCols) { sm.column[threadIdx.x] = cols.column(static_cast<int>(threadIdx.x)); }
     const auto issue_x = [&](int st, int buf) {
-        for (int i = static_cast<int>(threadIdx.x); i < kSlices * kXCols * 8; i += kDecodeThreads) {
-            const int j = i / (kXCols * 8), c = (i / 8) % kXCols, u = i % 8;
-            const std::uint16_t* column = sm.column[c];
-            const std::uint16_t* from   = column != nullptr ? column + cols.element((st * kSlices + j) * 32 + 4 * u)
-                                                            : sm.column[0];
-            ops::cp_async_zfill<8>(&sm.x[buf][j][c][4 * (2 * (u % 4) + u / 4)], from, column != nullptr ? 8 : 0);
+        if constexpr (kFold<F>) {
+            // 16-byte cp.async into swizzled natural-K layout: chunk ch ^ ((c >> 1) & 3) gives
+            // zero bank conflicts on both cp.async.16 stores and ldmatrix_x4 loads while halving
+            // LDGSTS count vs 8-byte permuted copies.
+            for (int i = static_cast<int>(threadIdx.x); i < kSlices * kXCols * 4; i += kDecodeThreads) {
+                const int j = i / (kXCols * 4), c = (i >> 2) % kXCols, ch = i & 3;
+                const std::uint16_t* column = sm.column[c];
+                const std::uint16_t* from   = column != nullptr ? column + cols.element((st * kSlices + j) * 32 + 8 * ch)
+                                                                : sm.column[0];
+                ops::cp_async_zfill<16>(&sm.x[buf][j][c][8 * (ch ^ ((c >> 1) & 3))], from, column != nullptr ? 16 : 0);
+            }
+        } else {
+            for (int i = static_cast<int>(threadIdx.x); i < kSlices * kXCols * 8; i += kDecodeThreads) {
+                const int j = i / (kXCols * 8), c = (i / 8) % kXCols, u = i % 8;
+                const std::uint16_t* column = sm.column[c];
+                const std::uint16_t* from   = column != nullptr ? column + cols.element((st * kSlices + j) * 32 + 4 * u)
+                                                                : sm.column[0];
+                ops::cp_async_zfill<8>(&sm.x[buf][j][c][4 * (2 * (u % 4) + u / 4)], from, column != nullptr ? 8 : 0);
+            }
         }
     };
-    // A row's unit: a kFold format's by 4-byte copies into a flat odd-word-strided buffer (32
-    // consecutive words per warp -> zero write bank conflicts, and odd word stride -> zero read
-    // bank conflicts across 16 rows); the others' by 16-byte copies.
+    // A row's unit: a kFold format copies one whole row per warp (128 rows / 16 warps = 8 rows
+    // per warp, coalesced within one row with 0 excessive L2 sectors and 0 shared store conflicts);
+    // the others' by 16-byte copies.
     const auto issue_raw = [&](int buf, int unit) {
         const std::size_t begin = static_cast<std::size_t>(unit) * kUnitBytes<F>;
         if constexpr (!kFold<F>) {
@@ -447,19 +493,21 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
                     tile::cp_async16(&sm.raw[buf][r * kRawRowBytes + 16 * chunk], aligned + 16 * chunk, need < 16 ? need : 16);
                 }
             }
-            return;
-        }
-        constexpr int kWords = kFoldRowWords<F>;
-        for (int i = static_cast<int>(threadIdx.x); i < kRows * kWords; i += kDecodeThreads) {
-            const int r = i / kWords, w = i % kWords;
-            const std::uint8_t* src = row_of(r / tile::kTileRows, r % tile::kTileRows) + begin;
-            const auto* aligned = reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t{3});
-            const int offset    = static_cast<int>(src - aligned);
-            if (w == 0) { sm.raw_offset[buf][r] = static_cast<std::uint8_t>(offset); }
-            if (4 * w < offset + kUnitBytes<F>) { tile::cp_async4(&sm.raw[buf][4 * i], aligned + 4 * w); }
+        } else {
+            static_assert(kFoldRowWords<F> <= 32);
+#pragma unroll
+            for (int it = 0; it < kRows / (kDecodeThreads / 32); ++it) {
+                const int r             = warp + it * (kDecodeThreads / 32);
+                const std::uint8_t* src = row_of(r / tile::kTileRows, r % tile::kTileRows) + begin;
+                const auto* aligned     = reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t{3});
+                const int offset        = static_cast<int>(src - aligned);
+                if (lane == 0) { sm.raw_offset[buf][r] = static_cast<std::uint8_t>(offset); }
+                if (4 * lane < offset + kUnitBytes<F>) {
+                    tile::cp_async4(&sm.raw[buf][r * kRawRowBytes + 4 * lane], aligned + 4 * lane);
+                }
+            }
         }
     };
-    const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
     const auto decode = [&](int st) {
         const int unit = st / kUnitStages, ubuf = unit & 1;
         if constexpr (kFold<F>) {
@@ -499,14 +547,18 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
                 }
                 return v.bits;
             };
-#pragma unroll
-            for (int w = 0; w < 4; ++w) { // elements 4w .. 4w + 3 of the half: lane t = w
-                *reinterpret_cast<uint2*>(&image.a[dj][grp][g][(2 * w + h16) ^ g][2 * hr]) =
-                    make_uint2(scaled(code[w]), scaled(code[w] >> 16));
-            }
+            // Store in natural MMA K order: lane t gets (2t, 2t+1) and (8+2t, 8+2t+1) of the half.
+            *reinterpret_cast<uint2*>(&image.a[dj][grp][g][(0 + h16) ^ g][2 * hr]) =
+                make_uint2(scaled(code[0]), scaled(code[2]));
+            *reinterpret_cast<uint2*>(&image.a[dj][grp][g][(2 + h16) ^ g][2 * hr]) =
+                make_uint2(scaled(code[0] >> 16), scaled(code[2] >> 16));
+            *reinterpret_cast<uint2*>(&image.a[dj][grp][g][(4 + h16) ^ g][2 * hr]) =
+                make_uint2(scaled(code[1]), scaled(code[3]));
+            *reinterpret_cast<uint2*>(&image.a[dj][grp][g][(6 + h16) ^ g][2 * hr]) =
+                make_uint2(scaled(code[1] >> 16), scaled(code[3] >> 16));
             if (dj == 0 && h16 == 0) { image.d[r] = f16_value(fold_d<F>(b)); }
             if constexpr (fast::kMinHalf<F>) {
-                (&image.m[dj][r].x)[h16] = f16_value(u16_at(b + 82)) * static_cast<float>(mn);
+                image.m[h16][dj][r] = f16_value(u16_at(b + 82)) * static_cast<float>(mn);
             }
         } else {
 #pragma unroll
@@ -524,12 +576,6 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
         }
         }
     };
-    // The sum of a B register's two BF16 elements.
-    const auto pair_sum = [](unsigned v) {
-        const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
-        return f.x + f.y;
-    };
-
     const int g = lane >> 2, t = lane & 3;
     float block[kMT][kNT][4]; // kFold: the current block's sums of (code * sub) * x
 #pragma unroll
@@ -543,31 +589,75 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
             }
         }
     }
+    const auto compute_xsum = [&](int buf) {
+        if constexpr (S == Scaling::kHalfMin || S == Scaling::kMin) {
+            const auto psum = [](unsigned p) {
+                const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&p));
+                return f.x + f.y;
+            };
+            const int tid = static_cast<int>(threadIdx.x);
+            if constexpr (S == Scaling::kHalfMin) {
+                // 512 threads = 2 slices x 2 halves x 128 columns: one 16-element half-slice per thread.
+                const int j    = tid >> 8;
+                const int half = (tid >> 7) & 1;
+                const int c    = tid & 127;
+                if (c < kXCols) {
+                    uint4 v0, v1;
+                    if constexpr (kFold<F>) {
+                        const int sw = (c >> 1) & 3;
+                        v0 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][8 * ((2 * half) ^ sw)]);
+                        v1 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][8 * ((2 * half + 1) ^ sw)]);
+                    } else {
+                        const uint4 a0 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][0]);
+                        const uint4 a1 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][8]);
+                        const uint4 a2 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][16]);
+                        const uint4 a3 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][24]);
+                        v0 = half == 0 ? make_uint4(a0.x, a0.y, a1.x, a1.y) : make_uint4(a0.z, a0.w, a1.z, a1.w);
+                        v1 = half == 0 ? make_uint4(a2.x, a2.y, a3.x, a3.y) : make_uint4(a2.z, a2.w, a3.z, a3.w);
+                    }
+                    const float s0      = (psum(v0.x) + psum(v0.y)) + (psum(v0.z) + psum(v0.w));
+                    const float s1      = (psum(v1.x) + psum(v1.y)) + (psum(v1.z) + psum(v1.w));
+                    sm.xsum[j][half][c] = s0 + s1;
+                }
+            } else {
+                // kMin: one 32-element full slice sum per column (256 threads active).
+                const int j = tid >> 7;
+                const int c = tid & 127;
+                if (tid < kSlices * kColumns && c < kXCols) {
+                    const uint4 a0 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][0]);
+                    const uint4 a1 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][8]);
+                    const uint4 a2 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][16]);
+                    const uint4 a3 = *reinterpret_cast<const uint4*>(&sm.x[buf][j][c][24]);
+                    const float s0 = (psum(a0.x) + psum(a0.y)) + (psum(a0.z) + psum(a0.w));
+                    const float s1 = (psum(a1.x) + psum(a1.y)) + (psum(a1.z) + psum(a1.w));
+                    const float s2 = (psum(a2.x) + psum(a2.y)) + (psum(a2.z) + psum(a2.w));
+                    const float s3 = (psum(a3.x) + psum(a3.y)) + (psum(a3.z) + psum(a3.w));
+                    sm.xsum[j][c]  = (s0 + s1) + (s2 + s3);
+                }
+            }
+        }
+    };
     const auto mma_stage = [&](int st) {
         const int buf = st & 1;
         if constexpr (kFold<F>) {
-            const auto& fs = sm.code[buf][tile_h];
-#pragma unroll
-            for (int j = 0; j < kSlices; ++j) {
+            const auto& fs  = sm.code[buf][tile_h];
+            const int ld_ch = lane >> 3;
+            const auto run_fold_slice = [&](int j) {
                 uint4 b[kNT];
 #pragma unroll
                 for (int nt = 0; nt < kNT; ++nt) {
-                    b[nt] = *reinterpret_cast<const uint4*>(&sm.x[buf][j][col_base + 8 * nt + g][8 * t]);
+                    const int row = col_base + 8 * nt + (lane & 7);
+                    ops::ldmatrix_x4(
+                        b[nt].x, b[nt].y, b[nt].z, b[nt].w,
+                        ops::smem_addr(&sm.x[buf][j][row][8 * (ld_ch ^ ((row >> 1) & 3))]));
                 }
-                float xs[kNT][2][2] = {};
+                float2 xs0[kNT], xs1[kNT];
                 if constexpr (kSums) {
 #pragma unroll
                     for (int nt = 0; nt < kNT; ++nt) {
-                        float h0 = pair_sum(b[nt].x) + pair_sum(b[nt].y), h1 = pair_sum(b[nt].z) + pair_sum(b[nt].w);
-                        h0 += __shfl_xor_sync(0xFFFFFFFFU, h0, 1);
-                        h1 += __shfl_xor_sync(0xFFFFFFFFU, h1, 1);
-                        h0 += __shfl_xor_sync(0xFFFFFFFFU, h0, 2);
-                        h1 += __shfl_xor_sync(0xFFFFFFFFU, h1, 2);
-#pragma unroll
-                        for (int c = 0; c < 2; ++c) {
-                            xs[nt][c][0] = __shfl_sync(0xFFFFFFFFU, h0, 4 * (2 * t + c));
-                            xs[nt][c][1] = __shfl_sync(0xFFFFFFFFU, h1, 4 * (2 * t + c));
-                        }
+                        const int c0 = col_base + 8 * nt + 2 * t;
+                        xs0[nt]      = *reinterpret_cast<const float2*>(&sm.xsum[j][0][c0]);
+                        xs1[nt]      = *reinterpret_cast<const float2*>(&sm.xsum[j][1][c0]);
                     }
                 }
 #pragma unroll
@@ -581,18 +671,26 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
                         mma(block[mi][nt], hi, b[nt].z, b[nt].w);
                     }
                     if constexpr (kSums) {
-                        const int r = 16 * (m0 + mi) + g;
-                        const float2 m0v = fs.m[j][r], m1v = fs.m[j][r + 8];
+                        const int r     = 16 * (m0 + mi) + g;
+                        const float m0x = fs.m[0][j][r], m0y = fs.m[1][j][r];
+                        const float m1x = fs.m[0][j][r + 8], m1y = fs.m[1][j][r + 8];
 #pragma unroll
                         for (int nt = 0; nt < kNT; ++nt) {
                             float(&o)[4] = acc.r[mi][nt];
-                            o[0] = fmaf(-m0v.y, xs[nt][0][1], fmaf(-m0v.x, xs[nt][0][0], o[0]));
-                            o[1] = fmaf(-m0v.y, xs[nt][1][1], fmaf(-m0v.x, xs[nt][1][0], o[1]));
-                            o[2] = fmaf(-m1v.y, xs[nt][0][1], fmaf(-m1v.x, xs[nt][0][0], o[2]));
-                            o[3] = fmaf(-m1v.y, xs[nt][1][1], fmaf(-m1v.x, xs[nt][1][0], o[3]));
+                            o[0] = fmaf(-m0y, xs1[nt].x, fmaf(-m0x, xs0[nt].x, o[0]));
+                            o[1] = fmaf(-m0y, xs1[nt].y, fmaf(-m0x, xs0[nt].y, o[1]));
+                            o[2] = fmaf(-m1y, xs1[nt].x, fmaf(-m1x, xs0[nt].x, o[2]));
+                            o[3] = fmaf(-m1y, xs1[nt].y, fmaf(-m1x, xs0[nt].y, o[3]));
                         }
                     }
                 }
+            };
+            if constexpr (kSums) {
+#pragma unroll 1
+                for (int j = 0; j < kSlices; ++j) { run_fold_slice(j); }
+            } else {
+#pragma unroll
+                for (int j = 0; j < kSlices; ++j) { run_fold_slice(j); }
             }
             if ((st + 1) % kUnitStages == 0) { // the block's last stage: its sums times d
 #pragma unroll
@@ -612,30 +710,29 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
             }
         } else {
             const tile::CodeStage& cs = sm.code[buf][tile_h];
-    #pragma unroll
+#pragma unroll 1
             for (int j = 0; j < kSlices; ++j) {
                 uint4 b[kNT];
-    #pragma unroll
+#pragma unroll
                 for (int nt = 0; nt < kNT; ++nt) {
                     b[nt] = *reinterpret_cast<const uint4*>(&sm.x[buf][j][col_base + 8 * nt + g][8 * t]);
                 }
-                float xs[kNT][2][2] = {};
-                if constexpr (kSums) {
-    #pragma unroll
+                float2 xs0[kNT], xs1[kNT];
+                if constexpr (S == Scaling::kHalfMin) {
+#pragma unroll
                     for (int nt = 0; nt < kNT; ++nt) {
-                        float h0 = pair_sum(b[nt].x) + pair_sum(b[nt].y), h1 = pair_sum(b[nt].z) + pair_sum(b[nt].w);
-                        h0 += __shfl_xor_sync(0xFFFFFFFFU, h0, 1);
-                        h1 += __shfl_xor_sync(0xFFFFFFFFU, h1, 1);
-                        h0 += __shfl_xor_sync(0xFFFFFFFFU, h0, 2);
-                        h1 += __shfl_xor_sync(0xFFFFFFFFU, h1, 2);
-    #pragma unroll
-                        for (int c = 0; c < 2; ++c) {
-                            xs[nt][c][0] = __shfl_sync(0xFFFFFFFFU, h0, 4 * (2 * t + c));
-                            xs[nt][c][1] = __shfl_sync(0xFFFFFFFFU, h1, 4 * (2 * t + c));
-                        }
+                        const int c0 = col_base + 8 * nt + 2 * t;
+                        xs0[nt]      = *reinterpret_cast<const float2*>(&sm.xsum[j][0][c0]);
+                        xs1[nt]      = *reinterpret_cast<const float2*>(&sm.xsum[j][1][c0]);
+                    }
+                } else if constexpr (S == Scaling::kMin) {
+#pragma unroll
+                    for (int nt = 0; nt < kNT; ++nt) {
+                        const int c0 = col_base + 8 * nt + 2 * t;
+                        xs0[nt]      = *reinterpret_cast<const float2*>(&sm.xsum[j][c0]);
                     }
                 }
-    #pragma unroll
+#pragma unroll
                 for (int mi = 0; mi < kMT; ++mi) {
                     const int4 a = *reinterpret_cast<const int4*>(cs.a[j][m0 + mi][g][t]);
                     const unsigned lo[4] = {bf16_pair(static_cast<unsigned>(a.x)), bf16_pair(static_cast<unsigned>(a.y)),
@@ -663,7 +760,7 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
                         m10 = dm1 * static_cast<float>(cs.min[j][r + 8] & 0xFF);
                         m11 = dm1 * static_cast<float>(cs.min[j][r + 8] >> 8);
                     }
-    #pragma unroll
+#pragma unroll
                     for (int nt = 0; nt < kNT; ++nt) {
                         float(&o)[4] = acc.r[mi][nt];
                         if constexpr (S == Scaling::kHalf || S == Scaling::kHalfMin) {
@@ -683,11 +780,16 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
                             o[2] = fmaf(s10, p[2], o[2]);
                             o[3] = fmaf(s10, p[3], o[3]);
                         }
-                        if constexpr (kSums) {
-                            o[0] = fmaf(-m01, xs[nt][0][1], fmaf(-m00, xs[nt][0][0], o[0]));
-                            o[1] = fmaf(-m01, xs[nt][1][1], fmaf(-m00, xs[nt][1][0], o[1]));
-                            o[2] = fmaf(-m11, xs[nt][0][1], fmaf(-m10, xs[nt][0][0], o[2]));
-                            o[3] = fmaf(-m11, xs[nt][1][1], fmaf(-m10, xs[nt][1][0], o[3]));
+                        if constexpr (S == Scaling::kHalfMin) {
+                            o[0] = fmaf(-m01, xs1[nt].x, fmaf(-m00, xs0[nt].x, o[0]));
+                            o[1] = fmaf(-m01, xs1[nt].y, fmaf(-m00, xs0[nt].y, o[1]));
+                            o[2] = fmaf(-m11, xs1[nt].x, fmaf(-m10, xs0[nt].x, o[2]));
+                            o[3] = fmaf(-m11, xs1[nt].y, fmaf(-m10, xs0[nt].y, o[3]));
+                        } else if constexpr (S == Scaling::kMin) {
+                            o[0] = fmaf(-m00, xs0[nt].x, o[0]);
+                            o[1] = fmaf(-m00, xs0[nt].y, o[1]);
+                            o[2] = fmaf(-m10, xs0[nt].x, o[2]);
+                            o[3] = fmaf(-m10, xs0[nt].y, o[3]);
                         }
                     }
                 }
@@ -713,6 +815,10 @@ __device__ __forceinline__ void compute_decode_impl(DecodeShared<F>& sm, RowOf r
             issue_raw((next / kUnitStages + 1) & 1, next / kUnitStages + 1);
         }
         ops::cp_commit();
+        if constexpr (kSums) {
+            compute_xsum(st & 1);
+            __syncthreads();
+        }
         if (next < stages) { decode(next); }
         mma_stage(st);
     }

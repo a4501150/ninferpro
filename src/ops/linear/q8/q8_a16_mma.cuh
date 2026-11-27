@@ -74,10 +74,10 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     constexpr int kOutputRowsPerCta = RowPolicy::kOutputRowsPerCta;
 
     struct OperandStorage {
-        alignas(16) __nv_bfloat16 weights[BM * BK];
+        alignas(16) __nv_bfloat16 weights[Cfg::kWeightStages][BM * BK];
         alignas(16) __nv_bfloat16 activations[Cfg::kActivationStages][BN * BK];
-        alignas(16) std::uint8_t codes[BM * BK];
-        alignas(16) std::uint8_t scales[BM * Cfg::kScaleCacheBytes];
+        alignas(16) std::uint8_t codes[Cfg::kWeightStages][BM * BK];
+        alignas(16) std::uint8_t scales[Cfg::kWeightStages][BM * Cfg::kScaleCacheBytes];
     };
 
     static_assert(sizeof(OperandStorage) == Cfg::kSharedBytes);
@@ -96,8 +96,27 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 
-    const int m0 = static_cast<int>(blockIdx.x) * kOutputRowsPerCta;
-    const int n0 = token_begin + static_cast<int>(blockIdx.y) * BN;
+    // Group adjacent M-tiles across N-stripes so large-M weights stay hot in L2 while keeping
+    // x reuse across the M-group (exact bijection over all gridDim.x * gridDim.y CTAs).
+    int bx = static_cast<int>(blockIdx.x);
+    int by = static_cast<int>(blockIdx.y);
+    if constexpr (Cfg::kThreads <= 512) {
+        const int gx = static_cast<int>(gridDim.x);
+        const int gy = static_cast<int>(gridDim.y);
+        if (gy >= 4 && gx >= 8) {
+            constexpr int kGroupM      = 8;
+            const int linear           = by * gx + bx;
+            const int blocks_per_group = kGroupM * gy;
+            const int group            = linear / blocks_per_group;
+            const int first_m          = group * kGroupM;
+            const int group_m          = min(kGroupM, gx - first_m);
+            const int in_group         = linear - group * blocks_per_group;
+            bx                         = first_m + (in_group % group_m);
+            by                         = in_group / group_m;
+        }
+    }
+    const int m0 = bx * kOutputRowsPerCta;
+    const int n0 = token_begin + by * BN;
     const int kg = padded_k / 32;
 
     float acc[MT][NT][4];
@@ -142,16 +161,20 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
         }
     };
 
-    auto stage_w = [&](int kt) {
-        constexpr int GROUPS            = BK / 32;
-        constexpr int SCALE_CACHE_TILES = 8 / GROUPS;
-        const int g0                    = kt * GROUPS;
+    constexpr int GROUPS            = BK / 32;
+    constexpr int SCALE_CACHE_TILES = 8 / GROUPS;
+    static_assert(BK % 32 == 0 && (8 % GROUPS) == 0,
+                  "a 16-code chunk must lie inside one Q8G32 group and the scale cache "
+                  "must hold whole tiles");
+
+    auto stage_w_codes = [&](int wbuf, int kt) {
+        const int g0 = kt * GROUPS;
 #pragma unroll 1
         for (int item = tid; item < BM * (BK / 16); item += Cfg::kThreads) {
             const int row   = item / (BK / 16);
             const int chunk = item - row * (BK / 16);
             const int grow  = row_policy.weight_row(m0, row, m);
-            auto* dst       = &Cr[row * BK + chunk * 16];
+            auto* dst       = &Cr[wbuf][row * BK + chunk * 16];
             if constexpr (Full) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                 cp_async<16, Cfg::kWeightCache>(dst, &codes[gi * 32 + chunk * 16]);
@@ -162,93 +185,85 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
                     dst, &codes[gi * 32 + chunk * 16], valid_row ? 16 : 0);
             }
         }
-        if ((kt % SCALE_CACHE_TILES) == 0) {
-            for (int row = tid; row < BM; row += Cfg::kThreads) {
-                const int grow = row_policy.weight_row(m0, row, m);
-                auto* dst      = &Sr[row * Cfg::kScaleCacheBytes];
-                if constexpr (Full) {
-                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
-                    cp_async<16, Cfg::kWeightCache>(dst, &scales[gi * 2]);
-                } else if (kg % 8 == 0) {
-                    const bool valid_row   = grow < m;
-                    const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
-                    const std::int64_t gi =
-                        static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
-                    cp_async_zfill<16, Cfg::kPredicatedCache>(dst, &scales[gi * 2],
-                                                              valid_scales * 2);
-                } else {
+    };
+
+    auto stage_w_scales = [&](int sbuf, int kt) {
+        const int g0 = kt * GROUPS;
+        for (int row = tid; row < BM; row += Cfg::kThreads) {
+            const int grow = row_policy.weight_row(m0, row, m);
+            auto* dst      = &Sr[sbuf][row * Cfg::kScaleCacheBytes];
+            if constexpr (Full) {
+                const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
+                cp_async<16, Cfg::kWeightCache>(dst, &scales[gi * 2]);
+            } else if (kg % 8 == 0) {
+                const bool valid_row   = grow < m;
+                const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
+                const std::int64_t gi =
+                    static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
+                cp_async_zfill<16, Cfg::kPredicatedCache>(dst, &scales[gi * 2], valid_scales * 2);
+            } else {
 #pragma unroll
-                    for (int pair = 0; pair < 4; ++pair) {
-                        if (grow < m && g0 + pair * 2 < kg)
-                            cp_async<4>(dst + pair * 4,
-                                        scales + (static_cast<std::int64_t>(grow) * kg + g0) * 2 +
-                                            pair * 4);
-                        else
-                            *reinterpret_cast<unsigned*>(dst + pair * 4) = 0;
-                    }
+                for (int pair = 0; pair < 4; ++pair) {
+                    if (grow < m && g0 + pair * 2 < kg)
+                        cp_async<4>(dst + pair * 4,
+                                    scales + (static_cast<std::int64_t>(grow) * kg + g0) * 2 +
+                                        pair * 4);
+                    else
+                        *reinterpret_cast<unsigned*>(dst + pair * 4) = 0;
                 }
             }
         }
     };
 
-    auto dequant_w = [&](int kt) {
-        constexpr int GROUPS            = BK / 32;
-        constexpr int SCALE_CACHE_TILES = 8 / GROUPS;
-        // q8_g32_swz64 permutes whole eight-element runs, so eight codes are the widest chunk
-        // contiguous in As for every row. BK % 32 keeps gg inside GROUPS and the row stride
-        // aligned for the vector store; 8 % GROUPS keeps the scale cache a whole number of tiles.
-        constexpr int kChunksPerRow = BK / 8;
-        static_assert(BK % 32 == 0 && (8 % GROUPS) == 0,
-                      "an eight-code chunk must lie inside one Q8G32 group and the scale cache "
-                      "must hold whole tiles");
+    // Uses the exact same (row, chunk) mapping as stage_w_codes (16 codes per item, all within one
+    // Q8G32 scale group), so each thread reads only the Cr bytes it staged itself via cp.async<16>.
+    auto dequant_w = [&](int wbuf, int sbuf, int kt) {
+        constexpr int kChunks16     = BK / 16;
         const int scale_tile_offset = (kt % SCALE_CACHE_TILES) * GROUPS * 2;
-        for (int item = tid; item < BM * kChunksPerRow; item += Cfg::kThreads) {
-            const int row   = item / kChunksPerRow;
-            const int chunk = item - row * kChunksPerRow;
-            const int col   = chunk * 8;
+        constexpr float kBias       = 8388736.0f;
+        const auto i8_to_f          = [](unsigned u, unsigned sel) {
+            return __uint_as_float(__byte_perm(u, 0x4B000000U, sel)) - kBias;
+        };
+        for (int item = tid; item < BM * kChunks16; item += Cfg::kThreads) {
+            const int row   = item / kChunks16;
+            const int chunk = item - row * kChunks16;
+            const int col   = chunk * 16;
             const int gg    = col >> 5;
             const float scale =
                 (FullK || kt * BK + col < k)
                     ? __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
-                          &Sr[row * Cfg::kScaleCacheBytes + scale_tile_offset + gg * 2])))
+                          &Sr[sbuf][row * Cfg::kScaleCacheBytes + scale_tile_offset + gg * 2])))
                     : 0.0f;
-            const uint2 packed = *reinterpret_cast<const uint2*>(&Cr[row * BK + col]);
-            Q8Bf16x8Bits decoded;
-#pragma unroll
-            for (int pair = 0; pair < 4; ++pair) {
-                const unsigned word = (pair < 2 ? packed.x : packed.y) >> ((pair & 1) * 16);
-                const int q0        = static_cast<int>(static_cast<std::int8_t>(word & 0xffu));
-                const int q1 = static_cast<int>(static_cast<std::int8_t>((word >> 8) & 0xffu));
-                decoded.pair[pair] = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
-                                                           static_cast<float>(q1) * scale);
+            const float scale_hi =
+                (FullK || kt * BK + col + 8 < k) ? scale : 0.0f;
+            const auto decode8 = [&](unsigned w0, unsigned w1, float s, int col_off) {
+                const unsigned u0 = w0 ^ 0x80808080U;
+                const unsigned u1 = w1 ^ 0x80808080U;
+                Q8Bf16x8Bits out;
+                out.pair[0] = __floats2bfloat162_rn(i8_to_f(u0, 0x7650U) * s,
+                                                    i8_to_f(u0, 0x7651U) * s);
+                out.pair[1] = __floats2bfloat162_rn(i8_to_f(u0, 0x7652U) * s,
+                                                    i8_to_f(u0, 0x7653U) * s);
+                out.pair[2] = __floats2bfloat162_rn(i8_to_f(u1, 0x7650U) * s,
+                                                    i8_to_f(u1, 0x7651U) * s);
+                out.pair[3] = __floats2bfloat162_rn(i8_to_f(u1, 0x7652U) * s,
+                                                    i8_to_f(u1, 0x7653U) * s);
+                store_vec(&As[wbuf][row * BK + q8_g32_swz64(row, col + col_off)], out.raw);
+            };
+            if constexpr (Cfg::kThreads <= 512) {
+                const uint4 packed = *reinterpret_cast<const uint4*>(&Cr[wbuf][row * BK + col]);
+                decode8(packed.x, packed.y, scale, 0);
+                decode8(packed.z, packed.w, scale_hi, 8);
+            } else {
+                const uint2 lo = *reinterpret_cast<const uint2*>(&Cr[wbuf][row * BK + col]);
+                decode8(lo.x, lo.y, scale, 0);
+                const uint2 hi = *reinterpret_cast<const uint2*>(&Cr[wbuf][row * BK + col + 8]);
+                decode8(hi.x, hi.y, scale_hi, 8);
             }
-            store_vec(&As[row * BK + q8_g32_swz64(row, col)], decoded.raw);
         }
     };
 
-    const int nkt = padded_k / BK;
-    stage_x(0, 0);
-    stage_w(0);
-    infernix::ops::cp_commit();
-
-#pragma unroll Cfg::kKLoopUnroll
-    for (int kt = 0; kt < nkt; ++kt) {
-        const int stage = kt % Cfg::kStages;
-        infernix::ops::cp_wait<0>();
-        __syncthreads();
-
-        dequant_w(kt);
-        __syncthreads();
-
-        const int next = kt + 1;
-        if (next < nkt) {
-            if constexpr (Cfg::kActivationStages == Cfg::kStages) {
-                stage_x(next % Cfg::kStages, next);
-            }
-            stage_w(next);
-            infernix::ops::cp_commit();
-        }
-
+    auto run_mma = [&](int wbuf, int xbuf, int ks_begin, int ks_end) {
         unsigned af[2][MT][4];
         unsigned bf[2][NT][2];
         auto load_fragments = [&](int slot, int ks) {
@@ -257,27 +272,39 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
                 const int ar = wm * WM + mi * 16 + a_rowoff;
                 const int ac = ks * 16 + a_coloff;
                 ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
-                            smem_addr(&As[ar * BK + q8_g32_swz64(ar, ac)]));
+                            smem_addr(&As[wbuf][ar * BK + q8_g32_swz64(ar, ac)]));
             }
+            if constexpr ((NT % 2) == 0) {
+                const int b4_rowoff = ((lane >> 4) << 3) + b_rin;
 #pragma unroll
-            for (int ni = 0; ni < NT; ++ni) {
-                const int br = wn * WN + ni * 8 + b_rin;
-                const int bc = ks * 16 + b_koff;
-                ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
-                            smem_addr(&Bs[Cfg::kActivationStages == 1 ? 0 : stage]
-                                         [br * BK + q8_g32_swz64(br, bc)]));
+                for (int ni = 0; ni < NT; ni += 2) {
+                    const int br = wn * WN + ni * 8 + b4_rowoff;
+                    const int bc = ks * 16 + b_koff;
+                    ldmatrix_x4(bf[slot][ni][0], bf[slot][ni][1], bf[slot][ni + 1][0],
+                                bf[slot][ni + 1][1],
+                                smem_addr(&Bs[xbuf][br * BK + q8_g32_swz64(br, bc)]));
+                }
+            } else {
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const int br = wn * WN + ni * 8 + b_rin;
+                    const int bc = ks * 16 + b_koff;
+                    ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
+                                smem_addr(&Bs[xbuf][br * BK + q8_g32_swz64(br, bc)]));
+                }
             }
         };
 
         if constexpr (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong)
-            load_fragments(0, 0);
+            load_fragments(0, ks_begin);
 #pragma unroll
-        for (int ks = 0; ks < KSUB; ++ks) {
-            const int slot = Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong ? ks & 1 : 0;
+        for (int ks = ks_begin; ks < ks_end; ++ks) {
+            const int slot =
+                Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong ? ((ks - ks_begin) & 1) : 0;
             if constexpr (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::Serial) {
                 load_fragments(0, ks);
             }
-            if (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong && ks + 1 < KSUB) {
+            if (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong && ks + 1 < ks_end) {
                 load_fragments(slot ^ 1, ks + 1);
             }
 #pragma unroll
@@ -290,12 +317,89 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
                 }
             }
         }
+    };
 
-        if constexpr (Cfg::kActivationStages == 1) {
+    const int nkt = padded_k / BK;
+    if constexpr (Cfg::kWeightStages == 2) {
+        // Double-buffered weights & scales: 1 __syncthreads() per K-tile. Each thread stages and
+        // dequantizes its own 16-byte Cr chunk (overlapping dequant of kt+1 between the two MMA
+        // halves of kt); scales for the next scale-cache block are prefetched with stage_x one
+        // K-tile early so they are CTA-visible before dequant_w reads them.
+        static_assert(KSUB >= 2 && (KSUB % 2) == 0);
+        stage_w_codes(0, 0);
+        stage_w_scales(0, 0);
+        infernix::ops::cp_commit();
+        infernix::ops::cp_wait<0>();
+        __syncthreads();
+
+        stage_x(0, 0);
+        infernix::ops::cp_commit();
+        if (1 < nkt) { stage_w_codes(1, 1); }
+        infernix::ops::cp_commit();
+        dequant_w(0, 0, 0);
+        infernix::ops::cp_wait<1>();
+        __syncthreads();
+
+#pragma unroll Cfg::kKLoopUnroll
+        for (int kt = 0; kt < nkt; ++kt) {
+            const int cur   = kt & 1;
+            const int nxt   = cur ^ 1;
+            const int next  = kt + 1;
+            const int next2 = kt + 2;
+
+            if (next < nkt) { stage_x(nxt, next); }
+            if (next2 < nkt && (next2 % SCALE_CACHE_TILES) == 0) {
+                stage_w_scales((next2 / SCALE_CACHE_TILES) & 1, next2);
+            }
+            infernix::ops::cp_commit();
+
+            run_mma(cur, cur, 0, KSUB / 2);
+
+            infernix::ops::cp_wait<1>();
+            if (next < nkt) { dequant_w(nxt, (next / SCALE_CACHE_TILES) & 1, next); }
+
+            run_mma(cur, cur, KSUB / 2, KSUB);
+
+            if (next2 < nkt) { stage_w_codes(cur, next2); }
+            infernix::ops::cp_commit();
+
+            infernix::ops::cp_wait<1>();
+            __syncthreads();
+        }
+        infernix::ops::cp_wait<0>();
+    } else {
+        stage_x(0, 0);
+        stage_w_codes(0, 0);
+        stage_w_scales(0, 0);
+        infernix::ops::cp_commit();
+
+#pragma unroll Cfg::kKLoopUnroll
+        for (int kt = 0; kt < nkt; ++kt) {
+            const int stage = kt % Cfg::kStages;
+            infernix::ops::cp_wait<0>();
+            __syncthreads();
+
+            dequant_w(0, 0, kt);
+            __syncthreads();
+
+            const int next = kt + 1;
             if (next < nkt) {
-                __syncthreads();
-                stage_x(0, next);
+                if constexpr (Cfg::kActivationStages == Cfg::kStages) {
+                    stage_x(next % Cfg::kStages, next);
+                }
+                stage_w_codes(0, next);
+                if ((next % SCALE_CACHE_TILES) == 0) { stage_w_scales(0, next); }
                 infernix::ops::cp_commit();
+            }
+
+            run_mma(0, Cfg::kActivationStages == 1 ? 0 : stage, 0, KSUB);
+
+            if constexpr (Cfg::kActivationStages == 1) {
+                if (next < nkt) {
+                    __syncthreads();
+                    stage_x(0, next);
+                    infernix::ops::cp_commit();
+                }
             }
         }
     }
@@ -306,6 +410,60 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
                                                                n);
                   }) {
         epilogue.template finish_tile<Cfg, Full>(output_tile, scratch, acc, m0, n0, m, n);
+    } else if constexpr (requires { output_tile.store_vector(0, 0, uint4{}); } &&
+                         (Cfg::kThreads <= 512) && (kOutputRowsPerCta % 8 == 0) &&
+                         (BN * (kOutputRowsPerCta + 8) * static_cast<int>(sizeof(__nv_bfloat16)) <=
+                          q8_mma_shared_bytes<Cfg, Epilogue>)) {
+        // Transpose BF16 outputs into [col][row] SMEM so global stores issue coalesced 16B uint4s
+        // instead of strided 2B STG.U16 writes.
+        constexpr int kOutStr = kOutputRowsPerCta + 8;
+        __syncthreads();
+        auto* out_s = reinterpret_cast<__nv_bfloat16*>(scratch);
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            const int lr0 = wm * WM + mi * 16 + gid;
+            const int r0  = m0 + lr0;
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+                const int lc0  = wn * WN + ni * 8 + 2 * lid;
+                const int c0   = n0 + lc0;
+                const float* a = acc[mi][ni];
+                if (Full || (r0 < m && c0 < n))
+                    out_s[lc0 * kOutStr + lr0] =
+                        __float2bfloat16_rn(epilogue.apply(r0, c0, a[0]));
+                if (Full || (r0 < m && c0 + 1 < n))
+                    out_s[(lc0 + 1) * kOutStr + lr0] =
+                        __float2bfloat16_rn(epilogue.apply(r0, c0 + 1, a[1]));
+                if (Full || (r0 + 8 < m && c0 < n))
+                    out_s[lc0 * kOutStr + lr0 + 8] =
+                        __float2bfloat16_rn(epilogue.apply(r0 + 8, c0, a[2]));
+                if (Full || (r0 + 8 < m && c0 + 1 < n))
+                    out_s[(lc0 + 1) * kOutStr + lr0 + 8] =
+                        __float2bfloat16_rn(epilogue.apply(r0 + 8, c0 + 1, a[3]));
+            }
+        }
+        __syncthreads();
+        constexpr int kPacksPerCol = kOutputRowsPerCta / 8;
+        constexpr int kPacks       = BN * kPacksPerCol;
+        for (int pack = tid; pack < kPacks; pack += Cfg::kThreads) {
+            const int lc = pack / kPacksPerCol;
+            const int lr = (pack - lc * kPacksPerCol) * 8;
+            const int c  = n0 + lc;
+            const int r  = m0 + lr;
+            if (Full || (c < n && r < m)) {
+                if (Full || ((m & 7) == 0 && r + 8 <= m)) {
+                    output_tile.store_vector(r, c, load_vec<uint4>(&out_s[lc * kOutStr + lr]));
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (r + i < m) {
+                            output_tile.store(r + i, c,
+                                              __bfloat162float(out_s[lc * kOutStr + lr + i]));
+                        }
+                    }
+                }
+            }
+        }
     } else {
         const auto store = [&](int row, int token, float value) {
             if (Full || (row < m && token < n))

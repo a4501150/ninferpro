@@ -64,6 +64,27 @@ __device__ __forceinline__ int store_group(std::int32_t* column, int g, int x0, 
     return x0 + x1 + x2 + x3;
 }
 
+// Encodes four consecutive A16 integers into the coalesced narrow layout for 4096-wide K-quant
+// blocks: [sb 0..7][limb_vec 0..5][blk 0..15] of int4 so 16 block lanes read contiguously.
+__device__ __forceinline__ int store_group_coalesced(std::int32_t* column, int g, int x0, int x1, int x2, int x3) {
+    int a[4], b[4], c[4];
+    split_limbs(x0, a[0], b[0], c[0]);
+    split_limbs(x1, a[1], b[1], c[1]);
+    split_limbs(x2, a[2], b[2], c[2]);
+    split_limbs(x3, a[3], b[3], c[3]);
+    const int s   = g >> 3;
+    const int blk = s >> 3;
+    const int sb  = s & 7;
+    const int w   = g & 7;
+    const int h   = w >> 2;
+    const int q   = w & 3;
+    const int base = (sb * 6 + h) * 64 + blk * 4 + q;
+    column[base]       = pack4(a[0], a[1], a[2], a[3]);
+    column[base + 128] = pack4(b[0], b[1], b[2], b[3]);
+    column[base + 256] = pack4(c[0], c[1], c[2], c[3]);
+    return x0 + x1 + x2 + x3;
+}
+
 // ------------------------------------------------------------------------------- weight slices
 
 // Formats with a min term per slice (whose slices read the column's slice sums), and per 16-element
@@ -551,7 +572,9 @@ __device__ __forceinline__ int q3k_sub_from_words(const std::uint32_t (&sw)[3], 
 }
 
 // Single-lane whole-block accumulation (gate/up narrow path: 16 lanes = 16 blocks per 4096 row).
-template <QType F, int C>
+// With kCoalesced, xs[c] uses store_group_coalesced's [sb][v][blk] int4 layout and x_sums[c] uses
+// [sb][blk] int2 layout so lanes blk = 0..15 read two contiguous cache lines instead of sixteen.
+template <QType F, int C, bool kCoalesced = false>
 __device__ __forceinline__ void add_block(I128 (&acc)[C], const std::uint8_t* b, const std::int32_t* const (&xs)[C],
                                           const std::int32_t* const (&x_sums)[C], int blk, int n) {
     static_assert(kFastBlock<F>);
@@ -562,6 +585,41 @@ __device__ __forceinline__ void add_block(I128 (&acc)[C], const std::uint8_t* b,
         acc_a[c] = acc_b[c] = acc_c[c] = 0;
         m_blk[c]                       = 0;
     }
+    const auto dot_slice = [&](const int (&q)[8], int sub0, int sub1, int sb, int s) {
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            if (C == 1 || c < n) {
+                int4 l0, l1, l2, l3, l4, l5;
+                if constexpr (kCoalesced) {
+                    const auto* base = reinterpret_cast<const int4*>(xs[c]) + sb * 96 + blk;
+                    l0               = base[0];
+                    l1               = base[16];
+                    l2               = base[32];
+                    l3               = base[48];
+                    l4               = base[64];
+                    l5               = base[80];
+                } else {
+                    const auto* l = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
+                    l0            = l[0];
+                    l1            = l[1];
+                    l2            = l[2];
+                    l3            = l[3];
+                    l4            = l[4];
+                    l5            = l[5];
+                }
+                acc_c[c] += limb_dot_q(q, sub0, sub1, l4, l5);
+                acc_b[c] += limb_dot_q(q, sub0, sub1, l2, l3);
+                acc_a[c] += limb_dot_q(q, sub0, sub1, l0, l1);
+            }
+        }
+    };
+    const auto load_xsum = [&](int c, int sb, int s) -> int2 {
+        if constexpr (kCoalesced) {
+            return reinterpret_cast<const int2*>(x_sums[c])[sb * 16 + blk];
+        } else {
+            return make_int2(x_sums[c][2 * s], x_sums[c][2 * s + 1]);
+        }
+    };
     std::uint16_t d = 0, dmin = 0;
     if constexpr (F == QType::GGML_Q3_K) {
         d = sm_ld_u16(b + 108);
@@ -574,33 +632,28 @@ __device__ __forceinline__ void add_block(I128 (&acc)[C], const std::uint8_t* b,
             sm_ld_words_a2<8>(b + 32 + 32 * half, qw);
 #pragma unroll 1
             for (int plane = 0; plane < 4; ++plane) {
-                const int sb   = 4 * half + plane;
-                const int s    = 8 * blk + sb;
-                const int sub0 = q3k_sub_from_words(sw, 2 * sb);
-                const int sub1 = q3k_sub_from_words(sw, 2 * sb + 1);
+                const int sb            = 4 * half + plane;
+                const int s             = 8 * blk + sb;
+                const std::uint32_t lo_w = (plane < 2) ? sw[0] : sw[1];
+                const std::uint32_t lo_p = (lo_w >> (16 * (plane & 1) + 4 * half)) & 0x0F0FU;
+                const std::uint32_t hi_p = (sw[2] >> (16 * (plane & 1) + 2 * (2 * half + (plane >> 1)))) & 0x0303U;
+                const int sub0           = static_cast<int>((lo_p & 0xFU) | ((hi_p & 3U) << 4)) - 32;
+                const int sub1           = static_cast<int>(((lo_p >> 8) & 0xFU) | (((hi_p >> 8) & 3U) << 4)) - 32;
                 int q[8];
 #pragma unroll
                 for (int w = 0; w < 8; ++w) {
-                    const std::uint32_t ql = (qw[w] >> (2 * plane)) & 0x03030303U;
-                    const std::uint32_t qh = (hw[w] >> sb) & 0x01010101U;
+                    const std::uint32_t ql = qw[w] & 0x03030303U;
+                    const std::uint32_t qh = hw[w] & 0x01010101U;
                     q[w]                   = sub_bytes4(ql | (qh << 2), 0x04040404U);
+                    qw[w] >>= 2;
+                    hw[w] >>= 1;
                 }
-#pragma unroll
-                for (int c = 0; c < C; ++c) {
-                    if (c < n) {
-                        const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
-                        acc_c[c] += limb_dot_q(q, sub0, sub1, l4[4], l4[5]);
-                        acc_b[c] += limb_dot_q(q, sub0, sub1, l4[2], l4[3]);
-                        acc_a[c] += limb_dot_q(q, sub0, sub1, l4[0], l4[1]);
-                    }
-                }
+                dot_slice(q, sub0, sub1, sb, s);
             }
         }
     } else if constexpr (F == QType::GGML_Q2_K) {
         d    = sm_ld_u16(b + 80);
         dmin = sm_ld_u16(b + 82);
-        std::uint32_t sc_w[4];
-        sm_ld_words_a2<4>(b, sc_w);
 #pragma unroll 1
         for (int half = 0; half < 2; ++half) {
             std::uint32_t qw[8];
@@ -609,23 +662,23 @@ __device__ __forceinline__ void add_block(I128 (&acc)[C], const std::uint8_t* b,
             for (int plane = 0; plane < 4; ++plane) {
                 const int sb            = 4 * half + plane;
                 const int s             = 8 * blk + sb;
-                const std::uint32_t sc2 = (sc_w[2 * half + (plane >> 1)] >> (16 * (plane & 1))) & 0xFFFFU;
+                const std::uint32_t sc2 = sm_ld_u16(b + 2 * sb);
                 const int sub0          = static_cast<int>(sc2 & 0xFU);
                 const int min0          = static_cast<int>((sc2 >> 4) & 0xFU);
                 const int sub1          = static_cast<int>((sc2 >> 8) & 0xFU);
                 const int min1          = static_cast<int>(sc2 >> 12);
                 int q[8];
 #pragma unroll
-                for (int w = 0; w < 8; ++w) { q[w] = static_cast<int>((qw[w] >> (2 * plane)) & 0x03030303U); }
+                for (int w = 0; w < 8; ++w) {
+                    q[w] = static_cast<int>(qw[w] & 0x03030303U);
+                    qw[w] >>= 2;
+                }
+                dot_slice(q, sub0, sub1, sb, s);
 #pragma unroll
                 for (int c = 0; c < C; ++c) {
-                    if (c < n) {
-                        const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
-                        acc_c[c] += limb_dot_q(q, sub0, sub1, l4[4], l4[5]);
-                        acc_b[c] += limb_dot_q(q, sub0, sub1, l4[2], l4[3]);
-                        acc_a[c] += limb_dot_q(q, sub0, sub1, l4[0], l4[1]);
-                        m_blk[c] += static_cast<long long>(min0) * x_sums[c][2 * s] +
-                                    static_cast<long long>(min1) * x_sums[c][2 * s + 1];
+                    if (C == 1 || c < n) {
+                        const int2 s01 = load_xsum(c, sb, s);
+                        m_blk[c] += static_cast<long long>(min0) * s01.x + static_cast<long long>(min1) * s01.y;
                     }
                 }
             }
@@ -647,15 +700,13 @@ __device__ __forceinline__ void add_block(I128 (&acc)[C], const std::uint8_t* b,
                 int q[8];
 #pragma unroll
                 for (int w = 0; w < 8; ++w) { q[w] = static_cast<int>((qw[w] >> (4 * hi)) & 0x0F0F0F0FU); }
+                dot_slice(q, sc, sc, sb, s);
 #pragma unroll
                 for (int c = 0; c < C; ++c) {
-                    if (c < n) {
-                        const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
-                        acc_c[c] += limb_dot_q(q, sc, sc, l4[4], l4[5]);
-                        acc_b[c] += limb_dot_q(q, sc, sc, l4[2], l4[3]);
-                        acc_a[c] += limb_dot_q(q, sc, sc, l4[0], l4[1]);
+                    if (C == 1 || c < n) {
+                        const int2 s01 = load_xsum(c, sb, s);
                         m_blk[c] += static_cast<long long>(mn) *
-                                    (static_cast<long long>(x_sums[c][2 * s]) + static_cast<long long>(x_sums[c][2 * s + 1]));
+                                    (static_cast<long long>(s01.x) + static_cast<long long>(s01.y));
                     }
                 }
             }
@@ -676,7 +727,7 @@ __device__ __forceinline__ void add_block(I128 (&acc)[C], const std::uint8_t* b,
     }
 #pragma unroll
     for (int c = 0; c < C; ++c) {
-        if (c < n) {
+        if (C == 1 || c < n) {
             const long long p = static_cast<long long>(acc_c[c]) + (static_cast<long long>(acc_b[c]) << 8) +
                                 (static_cast<long long>(acc_a[c]) << 16);
             add_shifted(acc[c], mant * p, shift);
@@ -724,7 +775,7 @@ __device__ __forceinline__ void add_block_quad(I128 (&acc)[C], const std::uint8_
             }
 #pragma unroll
             for (int c = 0; c < C; ++c) {
-                if (c < n) {
+                if (C == 1 || c < n) {
                     const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
                     acc_c[c] += limb_dot_q(q, sub0, sub1, l4[4], l4[5]);
                     acc_b[c] += limb_dot_q(q, sub0, sub1, l4[2], l4[3]);
@@ -750,7 +801,7 @@ __device__ __forceinline__ void add_block_quad(I128 (&acc)[C], const std::uint8_
             for (int w = 0; w < 8; ++w) { q[w] = static_cast<int>((qw[w] >> (2 * plane)) & 0x03030303U); }
 #pragma unroll
             for (int c = 0; c < C; ++c) {
-                if (c < n) {
+                if (C == 1 || c < n) {
                     const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
                     acc_c[c] += limb_dot_q(q, sub0, sub1, l4[4], l4[5]);
                     acc_b[c] += limb_dot_q(q, sub0, sub1, l4[2], l4[3]);
@@ -776,7 +827,7 @@ __device__ __forceinline__ void add_block_quad(I128 (&acc)[C], const std::uint8_
             for (int w = 0; w < 8; ++w) { q[w] = static_cast<int>((qw[w] >> (4 * hi)) & 0x0F0F0F0FU); }
 #pragma unroll
             for (int c = 0; c < C; ++c) {
-                if (c < n) {
+                if (C == 1 || c < n) {
                     const int4* l4 = reinterpret_cast<const int4*>(xs[c] + s * kSliceWords);
                     acc_c[c] += limb_dot_q(q, sc, sc, l4[4], l4[5]);
                     acc_b[c] += limb_dot_q(q, sc, sc, l4[2], l4[3]);
@@ -789,7 +840,7 @@ __device__ __forceinline__ void add_block_quad(I128 (&acc)[C], const std::uint8_
     }
 #pragma unroll
     for (int c = 0; c < C; ++c) {
-        if (c < n) {
+        if (C == 1 || c < n) {
             acc_a[c] += __shfl_xor_sync(0xFFFFFFFFU, acc_a[c], 2);
             acc_a[c] += __shfl_xor_sync(0xFFFFFFFFU, acc_a[c], 1);
             acc_b[c] += __shfl_xor_sync(0xFFFFFFFFU, acc_b[c], 2);
@@ -828,7 +879,7 @@ __device__ __forceinline__ void add_block_quad(I128 (&acc)[C], const std::uint8_
         }
 #pragma unroll
         for (int c = 0; c < C; ++c) {
-            if (c < n) {
+            if (C == 1 || c < n) {
                 const long long p = static_cast<long long>(acc_c[c]) + (static_cast<long long>(acc_b[c]) << 8) +
                                     (static_cast<long long>(acc_a[c]) << 16);
                 add_shifted(acc[c], mant * p, shift);

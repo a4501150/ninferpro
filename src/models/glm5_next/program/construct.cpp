@@ -325,6 +325,20 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters, DeviceContext&
 
     execution::ForwardExperts experts;
     create_experts(experts, allocated);
+    if (!options_.route_trace.empty()) {
+        trace_ = std::make_unique<offload::RouteTrace>(
+            options_.route_trace,
+            offload::RouteTraceSetup{.layers             = c_.moe_layers(),
+                                     .experts            = c_.moe.experts,
+                                     .top_k              = c_.moe.top_k,
+                                     .frames             = residency_->frames(),
+                                     .max_columns        = static_cast<std::uint32_t>(columns_),
+                                     .lanes              = options_.max_concurrency,
+                                     .max_width          = static_cast<std::uint32_t>(plan_.width),
+                                     .mtp_draft_tokens   = 0,
+                                     .ngram_draft_tokens = 0,
+                                     .prefill_chunk      = options_.prefill_chunk});
+    }
     forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, state, std::move(kv),
                                                     std::move(experts), dim(options_.max_context));
     if (plan_.draft > 0) {

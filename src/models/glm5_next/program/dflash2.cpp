@@ -16,6 +16,7 @@
 #include "infernix/ops/speculative_round.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 
 namespace infernix::models::glm5_next::detail {
@@ -161,17 +162,29 @@ std::int32_t ProgramImpl::verify_length(Lane& lane, std::int32_t room) {
         ++k;
     }
     if (!options_.auto_draft_length || k == 0) { return k; }
-    std::int32_t best =
-        calibrated_draft_length(lane.calibration, std::span<const float>(confidence.data(), static_cast<std::size_t>(k)), k);
-    // A probe keeps the longer drafts' deciles measured.
+    std::int32_t best = calibrated_draft_length(
+        lane.calibration, round_cost_,
+        std::span<const float>(confidence.data(), static_cast<std::size_t>(k)), k);
+    // A probe keeps the longer drafts' deciles and round times measured.
     if (++lane.policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, k); }
+    if ((round_cost_logs_++ & 127U) == 127U) {
+        double a = 0.0, b = 0.0, proposal = 0.0, fixed = 0.0, slope = 0.0;
+        if (round_cost_.fit_step(a, b) && round_cost_.normalized(proposal, fixed, slope)) {
+            char line[224];
+            std::snprintf(line, sizeof(line),
+                          "DFlash2 round cost fit: n=%.0f plain_n=%.0f a_v=%.1f ms b=%.2f ms/draft "
+                          "-> proposal %.2f + fixed %.2f + slope %.2f plain rounds",
+                          round_cost_.n, round_cost_.plain_n, a * 1e3, b * 1e3, proposal, fixed, slope);
+            diagnostic(line, DiagnosticLevel::Debug);
+        }
+    }
     return best;
 }
 
 PendingBatch ProgramImpl::speculate(std::span<const SequenceHandle> sequences,
                                     std::span<const std::uint32_t> lanes,
                                     std::span<const std::int32_t> positions, std::int32_t width,
-                                    Clock::time_point start) {
+                                    Clock::time_point start, Clock::time_point step_start) {
     const cudaStream_t s = device_.stream;
     const auto& io       = plan_.dflash_io;
     const auto batch     = static_cast<std::int32_t>(lanes.size());
@@ -285,10 +298,22 @@ PendingBatch ProgramImpl::speculate(std::span<const SequenceHandle> sequences,
             std::span<const float>(confidence_[b].data(), static_cast<std::size_t>(K)),
             static_cast<std::uint32_t>(K), static_cast<std::uint32_t>(A), kCalibrationWeight);
     }
-    after_call(batch * W, decode_budget(static_cast<std::uint32_t>(advanced)));
+    verify_live_.assign(static_cast<std::size_t>(batch * W), 0);
+    for (std::int32_t b = 0; b < batch; ++b) {
+        const std::int32_t L = pending_counts_[static_cast<std::size_t>(b)];
+        for (std::int32_t j = 0; j < L && j < W; ++j) {
+            verify_live_[static_cast<std::size_t>(b * W + j)] = 1;
+        }
+    }
+    after_call(batch * W, decode_budget(static_cast<std::uint32_t>(advanced)),
+               offload::RouteTraceKind::Verify, batch, W, static_cast<std::uint32_t>(advanced),
+               offload::RouteTrace::kUnknownPosition, verify_live_);
+    const auto done = Clock::now();
+    round_cost_.observe_step(K, std::chrono::duration<double>(done - step_start).count());
     round_width_ = W;
     runtime::ExecutionTiming timing;
-    timing.submit_host_ns = elapsed_ns(start);
+    timing.submit_host_ns =
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(done - start).count());
     for (std::int32_t b = 0; b < batch; ++b) {
         Lane& lane = lanes_[lanes[b]];
         lane.decode_ns += timing.submit_host_ns;

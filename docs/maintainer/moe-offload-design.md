@@ -195,16 +195,20 @@ list produces such a value; 36 replays of the sequence, nine more matrices and t
 workspace test did not reproduce it. A recurrence's Xid address against the startup `device
 address map` line names the frame index again.
 
-### 4.3 Replacement and admission: LFRU
+### 4.3 Replacement and admission: LFRU-Blend
 
-**Score.** `f / (now − last + 1)`, with `f` a global per-key use count kept for every routed
-key, never reset on eviction. The clock advances once per routed layer call. Scores compare as
-IEEE binary64 and ties evict the lower key, so the engine and the offline replay tool decide
-identically step for step. `f` halves exactly every `halving_period` ticks (a pool's period is
-scaled by its share of layers; counts below a floor become 0), so `f` weighs recent use; the
-period is a family-tuned constant. Replay on Qwen3.8-Flash-Next traces (greedy decode of 14
-mixed requests, 8,000 frames, 2026-10-10) measured halving 9-12 % better than never halving,
-and never-halved LFRU loses to plain LRU by 4-5 % on a topic-changing trace.
+**Score.** Plain LFRU scores `f / (now − last + 1)`; `ExpertResidency` configures LFRU-Blend
+(`recency_scale > 0`), scoring `f · (1 + recency_weight / ((now − last) / recency_scale + 1))`
+(`kLfruHalvingPeriod = 16,384` global layer calls scaled by each pool's layer share,
+`kLfruRecencyRounds = 32`, `kLfruRecencyWeight = 2.0`), with `f` a global per-key use count kept
+for every routed key and never reset on eviction. The clock advances once per routed layer call.
+Keeping frequency dominant across multi-layer ticks prevents a single recent miss from evicting a
+warm resident from the prior round while staying strictly monotonic in age so the exact low-set
+victim search still applies. Scores compare as IEEE binary64 and ties evict the lower key; `f`
+halves every `halving_period` ticks (counts below `kCountFloor = 1/1024` become 0), so `f` weighs
+recent use. Replay on Qwen3.8-Flash-Next traces (greedy decode of 14 mixed requests, 8,000 frames,
+2026-10-10) measured halving 9-12 % better than never halving, and never-halved LFRU loses to plain
+LRU by 4-5 % on a topic-changing trace.
 
 **Victim search.** A budgeted round picks its victims through a low set (`LfruPolicy::build_low`):
 the unpinned residents that can reach the 256th-lowest score or less within 64 ticks answer each
@@ -235,12 +239,17 @@ options. Hard per-layer quotas lost 3-34 % in replay; per-layer routing entropy 
 static, while the order the cache exploits is temporal, which one global LFRU already tracks.
 Replay stays offline (§10.1).
 
-**Admission budget.** One promotion per layer call per decode round, the interval scaled to
-the measured link (a promotion moves as many PCIe bytes as serving the expert once
-zero-copy). Until the session has promoted or landed as many experts as there are frames (the
-fill phase), every round promotes at that rate. In tier mode only keys with a host copy are
-admitted — SSD-only experts reach VRAM through landing (§4.4) — and the RAM tier's eviction
-gate can refuse a victim, which stops that layer's admissions for the round.
+**Admission budget and margins.** Decode rounds reserve landing frames per pool (`kLandingSlots =
+16` per layer) and settle landed misses ahead of explicit H2D promotions, applying score margins
+that price the copy cost (`kLandingD2HMargin = 1.10` when a landing needs a D2H demotion,
+`kH2DShadowMargin = 1.05` for an H2D swap against a shadowed victim, `kH2DD2HMargin = 1.15` when an
+H2D swap also requires a D2H demotion). When PCIe landing is quiet, decode H2D admissions scale up
+to `kDecodeAdaptiveH2DCap = 6` per round; prefill boundaries refill free frames best-first from the
+non-resident frontier. Until the session has promoted or landed as many experts as there are frames
+(the fill phase), cold unpinned `count == 0` placeholders pre-demote into spare/shadow RAM slots so
+active misses land immediately. In tier mode only keys with a host copy are admitted — SSD-only
+experts reach VRAM through landing (§4.4) — and the RAM tier's eviction gate can refuse a victim,
+which stops that layer's admissions for the round.
 
 **Pins and seeds.** An explicit placement's VRAM set is pinned: pinned keys are never
 eviction victims, so exactly the placed set stays resident. The cache starts from the saved

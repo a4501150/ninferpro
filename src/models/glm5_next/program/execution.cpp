@@ -370,9 +370,24 @@ void ProgramImpl::seed_prompt_experts(Lane& lane) {
     lane.prompt_counted = 0;
 }
 
-void ProgramImpl::after_call(std::int32_t columns, std::size_t promotions) {
+void ProgramImpl::after_call(std::int32_t columns, std::size_t promotions,
+                             offload::RouteTraceKind kind, std::int32_t rows, std::int32_t width,
+                             std::uint32_t tokens, std::uint32_t position,
+                             std::span<const std::uint8_t> live) {
+    const std::size_t budget = walk_.active ? 0 : promotions;
+    if (trace_) {
+        trace_->append({.kind     = kind,
+                        .rows     = static_cast<std::uint32_t>(rows),
+                        .width    = static_cast<std::uint32_t>(width),
+                        .tokens   = tokens,
+                        .budget   = static_cast<std::uint32_t>(std::min<std::size_t>(budget, 0xFFFFFFFFU)),
+                        .position = position,
+                        .frames   = residency_->frames()},
+                       std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(rows)),
+                       live, residency_->route_host(), residency_->route_stride());
+    }
     // An active layer walk's stream planned its copies against the frames of its start.
-    residency_->after_round(device_.stream, columns, walk_.active ? 0 : promotions);
+    residency_->after_round(device_.stream, columns, budget, live);
     if (!walk_.active) { (void)placement_->apply_placement(false); }
 }
 
@@ -479,7 +494,9 @@ PrefillProgress ProgramImpl::after_prefill(Lane& lane, std::uint32_t index, std:
         sample(lanes, positions); // synchronizes
         vision_release(lane);     // the prompt's calls have read the handoff
         note_prompt_routes(lane, width);
-        after_call(width, promotions);
+        host_lanes_[0] = static_cast<std::int32_t>(index);
+        after_call(width, promotions, offload::RouteTraceKind::PrefillChunk, 1, width, tokens,
+                   static_cast<std::uint32_t>(begin));
         seed_prompt_experts(lane);
         const SequenceHandle rows[] = {handle(index)};
         out.timing.submit_host_ns   = elapsed_ns(start);
@@ -492,7 +509,9 @@ PrefillProgress ProgramImpl::after_prefill(Lane& lane, std::uint32_t index, std:
         device_.synchronize();
         check_device_error();
         note_prompt_routes(lane, width);
-        after_call(width, promotions);
+        host_lanes_[0] = static_cast<std::int32_t>(index);
+        after_call(width, promotions, offload::RouteTraceKind::PrefillChunk, 1, width, tokens,
+                   static_cast<std::uint32_t>(begin));
         out.timing.submit_host_ns = elapsed_ns(start);
         lane.prefill_ns += out.timing.submit_host_ns;
     }
@@ -522,6 +541,8 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
     }
     const std::span<const std::uint32_t> round_lanes(lanes.data(), static_cast<std::size_t>(batch));
     const std::span<const std::int32_t> round_positions(positions.data(), static_cast<std::size_t>(batch));
+    auto step_start        = start;
+    bool observe_plain     = false;
     if (drafter_) {
         // A one-row round proposes what its row has room for and verifies the drafts
         // verify_length keeps (none: it decodes plainly). A round of several rows, or of a
@@ -536,9 +557,14 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
         }
         if (!plain && room > 0) {
             propose(round_lanes, room + 1);
+            step_start = Clock::now();
+            round_cost_.observe_proposal(std::chrono::duration<double>(step_start - start).count());
             const std::int32_t k = verify_length(lanes_[lanes[0]], room);
-            if (k > 0) { return speculate(sequences, round_lanes, round_positions, k + 1, start); }
+            if (k > 0) {
+                return speculate(sequences, round_lanes, round_positions, k + 1, start, step_start);
+            }
         }
+        observe_plain = batch == 1 && lanes_[lanes[0]].constraint == nullptr;
         for (std::int32_t b = 0; b < batch; ++b) {
             ++lanes_[lanes[static_cast<std::size_t>(b)]].speculative.fallback_steps;
         }
@@ -547,9 +573,17 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
     run(batch, 1, batch, true);
     for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[static_cast<std::size_t>(b)]].state_tokens; }
     sample(round_lanes, round_positions); // synchronizes
-    after_call(batch, decode_budget(1));
+    for (std::int32_t b = 0; b < batch; ++b) {
+        host_lanes_[static_cast<std::size_t>(b)] = static_cast<std::int32_t>(lanes[static_cast<std::size_t>(b)]);
+    }
+    after_call(batch, decode_budget(1), offload::RouteTraceKind::Decode, batch, 1, 1);
+    const auto done = Clock::now();
+    if (observe_plain) {
+        round_cost_.observe_step(0, std::chrono::duration<double>(done - step_start).count());
+    }
     runtime::ExecutionTiming timing;
-    timing.submit_host_ns = elapsed_ns(start);
+    timing.submit_host_ns =
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(done - start).count());
     for (std::int32_t b = 0; b < batch; ++b) {
         Lane& lane = lanes_[lanes[static_cast<std::size_t>(b)]];
         lane.decode_ns += timing.submit_host_ns;
@@ -589,7 +623,10 @@ runtime::ExecutionTiming ProgramImpl::append_forced(std::span<const SequenceHand
         if (stream_lease_.valid() && !prefilling_besides(index)) { return_stream_lease(); }
         device_.synchronize();
         check_device_error();
-        after_call(static_cast<std::int32_t>(stride), decode_budget(stride));
+        host_lanes_[0] = static_cast<std::int32_t>(index);
+        after_call(static_cast<std::int32_t>(stride), decode_budget(stride),
+                   offload::RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride,
+                   static_cast<std::uint32_t>(begin));
         lane.state_tokens += stride;
     }
     runtime::ExecutionTiming timing;

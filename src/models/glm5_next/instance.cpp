@@ -107,9 +107,6 @@ void validate(const EngineOptions& options) {
     if (!options.ngram_volume_path.empty()) {
         throw std::invalid_argument("GLM-5.3-Flash has no n-gram table: --ngram-volume does not apply");
     }
-    if (!options.route_trace_path.empty()) {
-        throw std::invalid_argument("GLM-5.3-Flash records no route traces yet: --route-trace does not apply");
-    }
 }
 
 // The RAM ledger's demand before the placement resolution adjusts its expert cap.
@@ -184,7 +181,8 @@ ConstructedGlm5Next construct_glm5_next(const EngineOptions& options, DeviceCont
                                        : 0;
     program_options.auto_draft_length = options.speculative.draft_tokens_auto;
     program_options.draft_min_p       = options.speculative.draft_min_p.value_or(0.0F);
-    program_options.diagnostics                 = options.diagnostic_observer;
+    program_options.route_trace       = options.route_trace_path;
+    program_options.diagnostics       = options.diagnostic_observer;
     // The hybrid prefix cache (design §12). Snapshots are born in the pinned Host slab pool; the
     // cost constants rate a resume's restore against a re-prefill of the same tokens, at the
     // measured prefill and link rates of this family.

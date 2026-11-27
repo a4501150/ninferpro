@@ -81,10 +81,17 @@ public:
     // decode or verification round, the round's forked MoE calls copy their first staged misses
     // into them instead of staging slots, and the round's settle adopts them as resident.
     static constexpr std::uint32_t kLandingSlots = 16;
-    // LFRU counts halve every this many ticks (layer calls, ~170 plain rounds; moe-offload-design.md
-    // §4.3 holds the trace measurements behind halving). A pool
-    // ticks once per call of its layers, so its period is this share of its layers.
-    static constexpr std::uint32_t kLfruHalvingPeriod = 8192;
+    // LFRU-Blend parameters: counts halve every kLfruHalvingPeriod global layer calls (scaled to
+    // each pool's layer share), and recency adds a bounded bonus with half-scale kLfruRecencyRounds
+    // decode rounds (so a single recent miss never outscores a warm resident from the prior round).
+    static constexpr std::uint32_t kLfruHalvingPeriod = 16384;
+    static constexpr double kLfruRecencyRounds        = 32.0;
+    static constexpr double kLfruRecencyWeight        = 2.0;
+    // Smooth per-round H2D promotion ceiling on decode rounds when PCIe landing is quiet.
+    static constexpr std::size_t kDecodeAdaptiveH2DCap = 6;
+    static constexpr double kLandingD2HMargin          = 1.10;
+    static constexpr double kH2DShadowMargin           = 1.05;
+    static constexpr double kH2DD2HMargin              = 1.15;
 
     using SavedState = expert_cache::SavedState;
     [[nodiscard]] SavedState saved_state() const;
@@ -334,6 +341,12 @@ private:
     // Tier mode: completes the demotions whose copies finished (all of them, waiting, with `wait`):
     // publishes their slots (T7), frees their frames and loads queued experts into them.
     void finish_demotions(cudaStream_t compute, bool wait);
+    // Steady-state landing frontier (free frames kept per pool for zero-extra-H2D miss landing).
+    [[nodiscard]] std::uint32_t steady_landing_target(const Pool& pool) const noexcept;
+    // Free/shadow RAM demotion headroom available without evicting a RAM-only expert to SSD.
+    [[nodiscard]] std::size_t tier_ram_room() const noexcept;
+    // Applies a pool's queued commands through demote_or_drop, on_quiescent, table updates and load queue.
+    void flush_pool_commands(Pool& pool, std::int32_t* table);
 
     std::vector<const std::uint8_t*> banks_;
     std::vector<std::uint64_t> host_strides_; // per layer: its bank's record stride
@@ -357,9 +370,19 @@ private:
     std::vector<std::uint32_t> reserved_;       // [layers_ * kLandingSlots] reserved frames (in the layer's pool)
     std::vector<std::uint32_t> landing_counts_; // per-layer reserved landing count (0..kLandingSlots)
     std::vector<std::uint32_t> landing_scratch_;
+    std::vector<double> layer_miss_ema_;        // per-layer decode miss EWMA (ranks partial landing frontiers)
+    std::vector<std::uint32_t> layer_rank_;     // scratch: pool layers ordered by miss urgency
+    std::vector<std::vector<std::uint32_t>> pool_routed_; // per-pool live routed keys of the current round
+    struct MissCandidate {
+        double score;
+        std::uint32_t pool;
+        std::uint32_t key;
+    };
+    std::vector<MissCandidate> decode_misses_;
     bool any_landing_      = false;
     bool landing_uploaded_ = false; // the device landing table holds frames
     bool decode_round_     = false; // the round's before_round had `landing`
+    bool walking_round_    = false; // the round's before_round had `walking`
     bool has_unused_       = false; // cold startup seeds with count == 0 may still reside in a pool
 
     std::vector<Command> load_commands_; // kCopy commands of every pool, issued together

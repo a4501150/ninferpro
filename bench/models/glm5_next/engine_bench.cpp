@@ -40,7 +40,8 @@ constexpr std::size_t kMaxConcurrency = 8;
 
 infernix::EngineOptions production_options(const char* artifact, const char* drafter,
                                            std::uint32_t lanes, const std::string& experts,
-                                           std::uint32_t draft_tokens, bool draft_auto) {
+                                           std::uint32_t draft_tokens, bool draft_auto,
+                                           const std::string& route_trace) {
     infernix::EngineOptions options;
     options.artifact_path            = artifact;
     options.kv_cache                 = infernix::KvCacheStorage::Int8Group64;
@@ -49,6 +50,7 @@ infernix::EngineOptions production_options(const char* artifact, const char* dra
     options.max_concurrency          = lanes;
     options.max_pending_requests     = 2 * lanes;
     options.experts_spec             = experts;
+    options.route_trace_path         = route_trace;
     if (draft_tokens != 0 || draft_auto) {
         options.speculative.backend           = infernix::SpeculativeBackend::DFlash2;
         options.speculative.draft_model       = drafter;
@@ -82,6 +84,7 @@ infernix::RequestOptions request(std::uint32_t tokens, float temperature, std::u
 struct SetResult {
     double seconds = 0, tokens_per_second = 0;
     std::uint64_t tokens = 0, drafted = 0, accepted = 0, rounds = 0, fallback = 0;
+    std::uint64_t decode_hits = 0, decode_routed = 0;
 };
 
 SetResult run_set(infernix::Engine& engine, std::uint32_t concurrency, std::uint32_t tokens,
@@ -112,6 +115,10 @@ SetResult run_set(infernix::Engine& engine, std::uint32_t concurrency, std::uint
         out.accepted += r.speculative.accepted_tokens;
         out.rounds += r.speculative.rounds;
         out.fallback += r.speculative.fallback_steps;
+        if (r.expert_cache) {
+            out.decode_hits   = std::max(out.decode_hits, r.expert_cache->decode_hits);
+            out.decode_routed = std::max(out.decode_routed, r.expert_cache->decode_routed);
+        }
     }
     out.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     out.tokens_per_second = static_cast<double>(out.tokens) / out.seconds;
@@ -121,11 +128,12 @@ SetResult run_set(infernix::Engine& engine, std::uint32_t concurrency, std::uint
 void print_set(const char* what, const SetResult& r) {
     std::printf(
         "  %-8s %7.1f tok/s  %5llu tokens in %.2f s  drafted %llu accepted %llu (%.0f %%)  "
-        "rounds %llu fallback %llu\n",
+        "rounds %llu fallback %llu  hit %.1f%%\n",
         what, r.tokens_per_second, static_cast<unsigned long long>(r.tokens), r.seconds,
         static_cast<unsigned long long>(r.drafted), static_cast<unsigned long long>(r.accepted),
         r.drafted ? 100.0 * static_cast<double>(r.accepted) / static_cast<double>(r.drafted) : 0.0,
-        static_cast<unsigned long long>(r.rounds), static_cast<unsigned long long>(r.fallback));
+        static_cast<unsigned long long>(r.rounds), static_cast<unsigned long long>(r.fallback),
+        r.decode_routed ? 100.0 * static_cast<double>(r.decode_hits) / static_cast<double>(r.decode_routed) : 0.0);
 }
 
 } // namespace
@@ -141,6 +149,7 @@ int main(int argc, char** argv) {
     bool draft_auto     = false;
     float temperature   = 0.0F;
     std::string experts = "vram=40%,ram=60%";
+    std::string route_trace;
     bool profile        = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -154,6 +163,10 @@ int main(int argc, char** argv) {
         }
         if (arg == "--experts") {
             experts = argv[++i];
+            continue;
+        }
+        if (arg == "--route-trace") {
+            route_trace = argv[++i];
             continue;
         }
         if (arg == "--temperature") {
@@ -186,7 +199,7 @@ int main(int argc, char** argv) {
     try {
         const auto t0 = std::chrono::steady_clock::now();
         infernix::Engine engine(
-            production_options(artifact, drafter, concurrency, experts, draft_tokens, draft_auto));
+            production_options(artifact, drafter, concurrency, experts, draft_tokens, draft_auto, route_trace));
         std::printf("engine started in %.1f s; %u concurrent requests of %u tokens; experts %s; "
                     "draft tokens %s; temperature %g\n",
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),

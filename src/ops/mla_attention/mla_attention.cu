@@ -6,6 +6,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
@@ -448,28 +449,41 @@ __global__ void __launch_bounds__(kThreads, 2)
 }
 
 // The tensor-core prompt route (MlaAttentionExecutionEnvelope::tensor_cores): one CTA per column
-// and all 64 heads, which share the column's selected tokens. A tile of kMmaTokens latent rows is
-// staged as BF16 (INT8 codes are exact in BF16); the scores are BF16 MMAs with FP32 accumulation
-// (an INT8 cache's 64-dimension group dots scaled in FP32, as the split route does), the softmax is
-// online in FP32, and the value MMAs take each probability (times the INT8 group scale) as a BF16
-// high and low pair, about 16 significant bits. Warp w owns latent group w (dimensions 64 w ..
-// 64 w + 63) of every head in the value phase; in the score phase warp w owns heads 16 (w % 4) ..
-// and tokens 8 (w / 4) .. of the tile.
-constexpr int kMmaThreads = 256;
-constexpr int kMmaTokens  = 16;
-constexpr int kMmaHeads   = 64;
-constexpr int kMmaChunks  = kLatent / 8; // 16-byte BF16 chunks per row
+// (all 64 heads sharing one KV decode and one L2 fetch), 16 warps (512 threads), and 16-token KV
+// tiles. For INT8 caches, each warp prefetches one token's raw INT8 codes and FP16 scales via
+// cp.async into double-buffered raw storage while the current tile's score, softmax and value
+// phases execute. In the score phase, 16 warps cover 4 head tiles x 2 token tiles x 2 K-halves
+// (4 latent groups each); in the value phase, 16 warps split the 8 latent groups into 32-dim
+// halves (64 accumulator registers per thread).
+constexpr int kMmaThreads    = 512;
+constexpr int kMmaTokens     = 16;
+constexpr int kMmaHeads      = 64;
+constexpr int kMmaHeadBlocks = 1;
+constexpr int kMmaChunks     = kLatent / 8; // 16-byte BF16 chunks per row
 
-// Element offset helpers moved above AttentionShared.
+// Pair-column index (0..7) for float2 access into a [64][16] score plane: XORing bit 2 with
+// ((row >> 1) & 1) gives 2-way (minimal for 32-lane LDS.64) shared-memory traffic with no padding.
+__device__ __forceinline__ int score_pair_col(int row, int pair) {
+    return (pair ^ ((row & 2) << 1)) << 1;
+}
+
+template <bool kInt8>
 struct MmaShared {
-    static constexpr std::size_t kQ      = sizeof(bf16) * kMmaHeads * kLatent;
-    static constexpr std::size_t kK      = kQ + sizeof(bf16) * kMmaTokens * kLatent;
-    static constexpr std::size_t kScales = kK + sizeof(float) * kMmaTokens * kGroups;
-    static constexpr int kScorePitch     = kMmaTokens + 1;
-    static constexpr std::size_t kScores = kScales + sizeof(float) * kMmaHeads * kScorePitch;
-    static constexpr std::size_t kStats  = kScores + sizeof(float) * 3 * kMmaHeads;
-    static constexpr std::size_t kBytes  = kStats + sizeof(std::int64_t) * kMmaTokens;
+    static constexpr int kScalePitch         = kMmaTokens + 1;
+    static constexpr std::size_t kQ          = sizeof(bf16) * kMmaHeads * kLatent;
+    static constexpr std::size_t kK          = kQ + sizeof(bf16) * kMmaTokens * kLatent;
+    static constexpr std::size_t kKRaw       = kK + (kInt8 ? sizeof(unsigned char) * kMmaTokens * kLatent : 0);
+    static constexpr std::size_t kScaleRaw   = kKRaw + (kInt8 ? sizeof(__half) * kMmaTokens * kGroups : 0);
+    static constexpr std::size_t kScales     =
+        kScaleRaw + (kInt8 ? sizeof(float) * kGroups * kScalePitch : 0);
+    static constexpr std::size_t kScoreParts =
+        ((kScales + 15) / 16 * 16) + sizeof(float) * 2 * kMmaHeads * kMmaTokens;
+    static constexpr std::size_t kScoreOff   = (kScales + 15) / 16 * 16;
+    static constexpr std::size_t kBytes      = kScoreParts + sizeof(float) * 3 * kMmaHeads;
 };
+
+static_assert(MmaShared<true>::kBytes <= 99 * 1024, "MMA attention shared memory must fit 99 KiB");
+static_assert(MmaShared<false>::kBytes <= 99 * 1024, "MMA attention shared memory must fit 99 KiB");
 
 template <bool kInt8>
 __global__ void __launch_bounds__(kMmaThreads, 1)
@@ -480,8 +494,10 @@ __global__ void __launch_bounds__(kMmaThreads, 1)
                          const std::int32_t* __restrict__ pools,
                          const std::int32_t* __restrict__ counts, int top, int pool, float scale,
                          int column_begin, float* __restrict__ ol) {
+    using Shared = MmaShared<kInt8>;
     pdl::enter();
-    const int t = static_cast<int>(blockIdx.x), column = column_begin + t;
+    const int t      = static_cast<int>(blockIdx.x);
+    const int column = column_begin + t;
     const int count  = counts == nullptr ? -1 : counts[column];
     const bool dense = pools == nullptr || counts == nullptr || count < 0;
     const int n      = positions[column] + 1;
@@ -491,16 +507,19 @@ __global__ void __launch_bounds__(kMmaThreads, 1)
         tables + static_cast<std::int64_t>(table_rows[column / width]) * table_stride;
 
     extern __shared__ __align__(16) unsigned char smem[];
-    auto* q_s     = reinterpret_cast<bf16*>(smem);
-    auto* k_s     = reinterpret_cast<bf16*>(smem + MmaShared::kQ);
-    auto* scale_s = reinterpret_cast<float (*)[kGroups]>(smem + MmaShared::kK);
-    auto* score_s = reinterpret_cast<float (*)[MmaShared::kScorePitch]>(smem + MmaShared::kScales);
-    float* m_s    = reinterpret_cast<float*>(smem + MmaShared::kScores);
+    auto* q_s          = reinterpret_cast<bf16*>(smem);
+    auto* k_s          = reinterpret_cast<bf16*>(smem + Shared::kQ);
+    auto* k_raw_s      = reinterpret_cast<unsigned char*>(smem + Shared::kK);
+    auto* scale_raw_s  = reinterpret_cast<__half*>(smem + Shared::kKRaw);
+    auto* scale_s      = reinterpret_cast<float (*)[Shared::kScalePitch]>(smem + Shared::kScaleRaw);
+    auto* score_part_s =
+        reinterpret_cast<float (*)[kMmaHeads][kMmaTokens]>(smem + Shared::kScoreOff);
+    auto* score_s = score_part_s[0];
+    float* m_s    = reinterpret_cast<float*>(smem + Shared::kScoreParts);
     float* l_s    = m_s + kMmaHeads;
     float* a_s    = l_s + kMmaHeads;
-    auto* offset  = reinterpret_cast<std::int64_t*>(smem + MmaShared::kStats);
 
-    const int tid = static_cast<int>(threadIdx.x), warp = tid / 32, lane = tid % 32;
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
 
     // The column's queries, every head, swizzled.
     {
@@ -516,133 +535,185 @@ __global__ void __launch_bounds__(kMmaThreads, 1)
         l_s[tid] = 0.0F;
     }
 
-    // Score phase tiling, and the value phase's accumulators: heads 16 mt + lane / 4 (+ 8) by
-    // latent dimensions 64 warp + 8 nt + 2 (lane % 4) (+ 1).
-    const int score_mt = warp % 4, score_nt = warp / 4;
-    float acc[4][8][4];
+    // Score tiling: 4 head tiles x 16 tokens/warp (2x Q reuse, 2 independent MMA chains) x 4 K-quarters (2 groups each).
+    const int score_mt = warp & 3;
+    const int score_kq = warp >> 2;
+    // Value tiling: 8 latent groups x 2 32-dim halves (4 n-tiles per warp) across all 64 heads.
+    const int val_g    = warp >> 1;
+    const int val_half = warp & 1;
+
+    float acc[4][4][4];
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt) {
 #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) {
+        for (int nt = 0; nt < 4; ++nt) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) { acc[mt][nt][i] = 0.0F; }
         }
     }
 
-    for (int first = 0; first < total; first += kMmaTokens) {
-        const int n_tok = min(kMmaTokens, total - first);
-        if (tid < kMmaTokens) {
-            const int index = first + tid;
-            std::int64_t at = -1;
-            if (tid < n_tok) {
-                const int position =
-                    dense ? index
-                          : attended_position(index, count, pool, pools, top, column, tail_base);
-                at = (static_cast<std::int64_t>(table[position >> kPagedKVPageShift]) * kPagedKVPageSize +
-                      (position & kPagedKVPageMask)) *
-                     kLatent;
-            }
-            offset[tid] = at;
+    // Issue cp.async for 16 tokens starting at `tile_first`: 16 warps = 1 token per warp.
+    const auto issue_tile = [&](int tile_first) {
+        const int j      = warp;
+        const int index  = tile_first + j;
+        const bool valid = index < total;
+        std::int64_t at  = 0;
+        if (valid) {
+            const int position =
+                dense ? index : attended_position(index, count, pool, pools, top, column, tail_base);
+            at = (static_cast<std::int64_t>(table[position >> kPagedKVPageShift]) * kPagedKVPageSize +
+                  (position & kPagedKVPageMask)) *
+                 kLatent;
         }
-        __syncthreads();
-        // The tile's rows as BF16 (zero past the tile's tokens, so their weights of 0 stay 0).
         if constexpr (kInt8) {
-            for (int i = tid; i < kMmaTokens * (kLatent / 16); i += kMmaThreads) {
-                const int j = i / (kLatent / 16), ch = i % (kLatent / 16);
-                uint4 lo8 = make_uint4(0, 0, 0, 0), hi8 = make_uint4(0, 0, 0, 0);
-                if (offset[j] >= 0) {
-                    const uint4 raw = *reinterpret_cast<const uint4*>(pages + offset[j] + 16 * ch);
-                    lo8 = make_uint4(int8_to_bf16_pair(raw.x), int8_to_bf16_pair(raw.x >> 16),
-                                     int8_to_bf16_pair(raw.y), int8_to_bf16_pair(raw.y >> 16));
-                    hi8 = make_uint4(int8_to_bf16_pair(raw.z), int8_to_bf16_pair(raw.z >> 16),
-                                     int8_to_bf16_pair(raw.w), int8_to_bf16_pair(raw.w >> 16));
-                }
-                *reinterpret_cast<uint4*>(k_s + swizzled(j, 2 * ch))     = lo8;
-                *reinterpret_cast<uint4*>(k_s + swizzled(j, 2 * ch + 1)) = hi8;
-            }
-            if (tid < kMmaTokens * kGroups) {
-                const int j = tid / kGroups, g = tid % kGroups;
-                scale_s[j][g] = offset[j] >= 0 ? __half2float(scales[offset[j] / kGroup + g]) : 0.0F;
+            cp_async_zfill<16>(&k_raw_s[j * kLatent + 16 * lane],
+                               valid ? (pages + at + 16 * lane) : pages, valid ? 16 : 0);
+            if (lane == 0) {
+                cp_async_zfill<16>(&scale_raw_s[j * kGroups],
+                                   valid ? (scales + at / kGroup) : scales, valid ? 16 : 0);
             }
         } else {
-            for (int i = tid; i < kMmaTokens * kMmaChunks; i += kMmaThreads) {
-                const int j = i / kMmaChunks, ch = i % kMmaChunks;
-                *reinterpret_cast<uint4*>(k_s + swizzled(j, ch)) =
-                    offset[j] >= 0 ? *reinterpret_cast<const uint4*>(
-                                         pages + sizeof(bf16) * offset[j] + 16 * ch)
-                                   : make_uint4(0, 0, 0, 0);
-            }
+            const unsigned char* base = valid ? (pages + sizeof(bf16) * at) : pages;
+            cp_async_zfill<16>(k_s + swizzled(j, lane), base + 16 * lane, valid ? 16 : 0);
+            cp_async_zfill<16>(k_s + swizzled(j, lane + 32), base + 16 * (lane + 32),
+                               valid ? 16 : 0);
         }
-        __syncthreads();
+        cp_commit();
+    };
 
-        // Scores: heads 16 score_mt .., tokens 8 score_nt .. of the tile, over every dimension.
+    if constexpr (kInt8) {
+        if (total > 0) { issue_tile(0); }
+        cp_wait<0>();
+    }
+    __syncthreads();
+
+    for (int first = 0; first < total; first += kMmaTokens) {
+        const int n_tok = min(kMmaTokens, total - first);
+        if constexpr (kInt8) {
+            // Interleave even/odd token parity across 4-lane groups so every 8-lane STS.128 wave
+            // covers all 32 banks of swizzled k_s with zero store bank conflicts, while k_raw_s
+            // reads stay conflict-free at 16 * lane.
+            const int dj    = (warp & ~1) | (((lane >> 2) ^ warp) & 1);
+            const uint4 raw = *reinterpret_cast<const uint4*>(&k_raw_s[dj * kLatent + 16 * lane]);
+            const uint4 lo8 = make_uint4(int8_to_bf16_pair(raw.x), int8_to_bf16_pair(raw.x >> 16),
+                                         int8_to_bf16_pair(raw.y), int8_to_bf16_pair(raw.y >> 16));
+            const uint4 hi8 = make_uint4(int8_to_bf16_pair(raw.z), int8_to_bf16_pair(raw.z >> 16),
+                                         int8_to_bf16_pair(raw.w), int8_to_bf16_pair(raw.w >> 16));
+            *reinterpret_cast<uint4*>(k_s + swizzled(dj, 2 * lane))     = lo8;
+            *reinterpret_cast<uint4*>(k_s + swizzled(dj, 2 * lane + 1)) = hi8;
+            if (lane < kGroups) {
+                scale_s[lane][warp] = __half2float(scale_raw_s[warp * kGroups + lane]);
+            }
+            __syncthreads();
+            if (first + kMmaTokens < total) { issue_tile(first + kMmaTokens); }
+        } else {
+            issue_tile(first);
+            cp_wait<0>();
+            __syncthreads();
+        }
+
+        // Scores: 4 head tiles x 16 tokens/warp (both n-tiles, 2x Q reuse) x 4 K-quarters (2 groups).
         {
-            const int token0 = 8 * score_nt + 2 * (lane % 4);
-            float s[4]       = {0.0F, 0.0F, 0.0F, 0.0F};
+            const int pair0 = lane & 3;
+            const int pair1 = pair0 + 4;
+            const int tok0  = 2 * pair0;
+            float s0[4]     = {0.0F, 0.0F, 0.0F, 0.0F};
+            float s1[4]     = {0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll
-            for (int g = 0; g < kGroups; ++g) {
-                float part[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+            for (int lg = 0; lg < 2; ++lg) {
+                const int g = 2 * score_kq + lg;
+                float p0[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+                float p1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll
-                for (int kp = 0; kp < 2; ++kp) { // two pairs of 16-dimension steps
+                for (int kp = 0; kp < 2; ++kp) {
                     const int chunk0 = g * 8 + kp * 4;
-                    unsigned b[4];
-                    ldmatrix_x4(b[0], b[1], b[2], b[3],
-                                smem_address(k_s + swizzled(8 * score_nt + lane % 8, chunk0 + lane / 8)));
-#pragma unroll
-                    for (int ks = 0; ks < 2; ++ks) {
-                        unsigned a[4];
-                        ldmatrix_x4(a[0], a[1], a[2], a[3],
-                                    smem_address(q_s + swizzled(16 * score_mt + lane % 16,
-                                                                chunk0 + 2 * ks + lane / 16)));
-                        mma_bf16(part[0], part[1], part[2], part[3], a[0], a[1], a[2], a[3],
-                                 b[2 * ks], b[2 * ks + 1]);
-                    }
+                    unsigned b0[4], b1[4], a0[4], a1[4];
+                    ldmatrix_x4(b0[0], b0[1], b0[2], b0[3],
+                                smem_address(k_s + swizzled(lane & 7, chunk0 + (lane >> 3))));
+                    ldmatrix_x4(b1[0], b1[1], b1[2], b1[3],
+                                smem_address(k_s + swizzled(8 + (lane & 7), chunk0 + (lane >> 3))));
+                    ldmatrix_x4(a0[0], a0[1], a0[2], a0[3],
+                                smem_address(q_s + swizzled(16 * score_mt + (lane & 15),
+                                                            chunk0 + (lane >> 4))));
+                    ldmatrix_x4(a1[0], a1[1], a1[2], a1[3],
+                                smem_address(q_s + swizzled(16 * score_mt + (lane & 15),
+                                                            chunk0 + 2 + (lane >> 4))));
+                    mma_bf16(p0[0], p0[1], p0[2], p0[3], a0[0], a0[1], a0[2], a0[3], b0[0], b0[1]);
+                    mma_bf16(p1[0], p1[1], p1[2], p1[3], a0[0], a0[1], a0[2], a0[3], b1[0], b1[1]);
+                    mma_bf16(p0[0], p0[1], p0[2], p0[3], a1[0], a1[1], a1[2], a1[3], b0[2], b0[3]);
+                    mma_bf16(p1[0], p1[1], p1[2], p1[3], a1[0], a1[1], a1[2], a1[3], b1[2], b1[3]);
                 }
                 if constexpr (kInt8) {
-                    const float s0 = scale_s[token0][g], s1 = scale_s[token0 + 1][g];
-                    s[0] += part[0] * s0;
-                    s[1] += part[1] * s1;
-                    s[2] += part[2] * s0;
-                    s[3] += part[3] * s1;
+                    const float sc0 = scale_s[g][tok0], sc1 = scale_s[g][tok0 + 1];
+                    const float sc8 = scale_s[g][tok0 + 8], sc9 = scale_s[g][tok0 + 9];
+                    s0[0] = fmaf(p0[0], sc0, s0[0]);
+                    s0[1] = fmaf(p0[1], sc1, s0[1]);
+                    s0[2] = fmaf(p0[2], sc0, s0[2]);
+                    s0[3] = fmaf(p0[3], sc1, s0[3]);
+                    s1[0] = fmaf(p1[0], sc8, s1[0]);
+                    s1[1] = fmaf(p1[1], sc9, s1[1]);
+                    s1[2] = fmaf(p1[2], sc8, s1[2]);
+                    s1[3] = fmaf(p1[3], sc9, s1[3]);
                 } else {
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) { s[i] += part[i]; }
+                    for (int i = 0; i < 4; ++i) {
+                        s0[i] += p0[i];
+                        s1[i] += p1[i];
+                    }
                 }
             }
-            const int row = 16 * score_mt + lane / 4;
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int token = token0 + (i & 1);
-                score_s[row + 8 * (i / 2)][token] = token < n_tok ? s[i] * scale : -INFINITY;
+            const int row = 16 * score_mt + (lane >> 2);
+            const int c0a = score_pair_col(row, pair0), c0b = score_pair_col(row + 8, pair0);
+            const int c1a = score_pair_col(row, pair1), c1b = score_pair_col(row + 8, pair1);
+            const int slot = score_kq & 1;
+            if (score_kq < 2) {
+                *reinterpret_cast<float2*>(&score_part_s[slot][row][c0a])     = make_float2(s0[0], s0[1]);
+                *reinterpret_cast<float2*>(&score_part_s[slot][row + 8][c0b]) = make_float2(s0[2], s0[3]);
+                *reinterpret_cast<float2*>(&score_part_s[slot][row][c1a])     = make_float2(s1[0], s1[1]);
+                *reinterpret_cast<float2*>(&score_part_s[slot][row + 8][c1b]) = make_float2(s1[2], s1[3]);
+            }
+            __syncthreads();
+            if (score_kq >= 2) {
+                const float2 a0 = *reinterpret_cast<const float2*>(&score_part_s[slot][row][c0a]);
+                const float2 b0 = *reinterpret_cast<const float2*>(&score_part_s[slot][row + 8][c0b]);
+                const float2 a1 = *reinterpret_cast<const float2*>(&score_part_s[slot][row][c1a]);
+                const float2 b1 = *reinterpret_cast<const float2*>(&score_part_s[slot][row + 8][c1b]);
+                *reinterpret_cast<float2*>(&score_part_s[slot][row][c0a]) =
+                    make_float2(a0.x + s0[0], a0.y + s0[1]);
+                *reinterpret_cast<float2*>(&score_part_s[slot][row + 8][c0b]) =
+                    make_float2(b0.x + s0[2], b0.y + s0[3]);
+                *reinterpret_cast<float2*>(&score_part_s[slot][row][c1a]) =
+                    make_float2(a1.x + s1[0], a1.y + s1[1]);
+                *reinterpret_cast<float2*>(&score_part_s[slot][row + 8][c1b]) =
+                    make_float2(b1.x + s1[2], b1.y + s1[3]);
             }
         }
         __syncthreads();
 
-        // Online softmax: four threads per head, four tokens each.
+        // Online softmax: 8 threads per head, 2 tokens (one float2 pair) per thread.
         {
-            const int row = tid / 4, part = tid % 4;
-            float v[4];
-            float tmax = -INFINITY;
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                v[e] = score_s[row][4 * part + e];
-                tmax = fmaxf(tmax, v[e]);
-            }
-            tmax              = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFU, tmax, 1));
-            tmax              = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFU, tmax, 2));
+            const int row  = tid >> 3;
+            const int pair = tid & 7;
+            const int col  = score_pair_col(row, pair);
+            const float2 a = *reinterpret_cast<const float2*>(&score_part_s[0][row][col]);
+            const float2 b = *reinterpret_cast<const float2*>(&score_part_s[1][row][col]);
+            const int t0 = 2 * pair, t1 = t0 + 1;
+            const float v0 = t0 < n_tok ? (a.x + b.x) * scale : -INFINITY;
+            const float v1 = t1 < n_tok ? (a.y + b.y) * scale : -INFINITY;
+            float tmax     = fmaxf(v0, v1);
+            tmax           = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFU, tmax, 1, 8));
+            tmax           = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFU, tmax, 2, 8));
+            tmax           = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFU, tmax, 4, 8));
             const float m_old = m_s[row];
             const float m_new = fmaxf(m_old, tmax);
-            float sum         = 0.0F;
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const float p = v[e] == -INFINITY ? 0.0F : expf(v[e] - m_new);
-                score_s[row][4 * part + e] = p;
-                sum += p;
-            }
-            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 1);
-            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 2);
-            __syncwarp();
-            if (part == 0) {
+            const float p0    = v0 == -INFINITY ? 0.0F : expf(v0 - m_new);
+            const float p1    = v1 == -INFINITY ? 0.0F : expf(v1 - m_new);
+            *reinterpret_cast<float2*>(&score_s[row][col]) = make_float2(p0, p1);
+            float sum = p0 + p1;
+            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 1, 8);
+            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 2, 8);
+            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 4, 8);
+            if (pair == 0) {
                 const float alpha = m_old == -INFINITY ? 0.0F : expf(m_old - m_new);
                 a_s[row]          = alpha;
                 l_s[row]          = l_s[row] * alpha + sum;
@@ -651,45 +722,55 @@ __global__ void __launch_bounds__(kMmaThreads, 1)
         }
         __syncthreads();
 
-        // Values: latent group `warp` of every head.
+        // Values: half `val_half` (32 dims) of latent group `val_g` for all 64 heads.
         {
-            const int g = warp;
+            const int g = val_g;
             if constexpr (kInt8) {
-                float s_max = lane < 16 ? fabsf(scale_s[lane][g]) : 0.0F;
+                float s_max = lane < 16 ? fabsf(scale_s[g][lane]) : 0.0F;
                 s_max       = fmaxf(s_max, __shfl_xor_sync(0xFFFFFFFFU, s_max, 1));
                 s_max       = fmaxf(s_max, __shfl_xor_sync(0xFFFFFFFFU, s_max, 2));
                 s_max       = fmaxf(s_max, __shfl_xor_sync(0xFFFFFFFFU, s_max, 4));
                 s_max       = fmaxf(s_max, __shfl_xor_sync(0xFFFFFFFFU, s_max, 8));
                 s_max       = __shfl_sync(0xFFFFFFFFU, s_max, 0);
                 const float inv_smax = s_max > 0.0F ? (1.0F / s_max) : 0.0F;
-                const int k0         = 2 * (lane % 4);
-                const float w0       = scale_s[k0][g] * inv_smax;
-                const float w1       = scale_s[k0 + 1][g] * inv_smax;
-                const float w8       = scale_s[k0 + 8][g] * inv_smax;
-                const float w9       = scale_s[k0 + 9][g] * inv_smax;
+                const int p_lo       = lane & 3;
+                const int p_hi       = p_lo + 4;
+                const int k0         = 2 * p_lo;
+                const float w0       = scale_s[g][k0] * inv_smax;
+                const float w1       = scale_s[g][k0 + 1] * inv_smax;
+                const float w8       = scale_s[g][k0 + 8] * inv_smax;
+                const float w9       = scale_s[g][k0 + 9] * inv_smax;
                 unsigned a_f16[4][4];
 #pragma unroll
                 for (int mt = 0; mt < 4; ++mt) {
-                    const int r0       = 16 * mt + lane / 4;
+                    const int r0       = 16 * mt + (lane >> 2);
                     const float alpha0 = a_s[r0], alpha1 = a_s[r0 + 8];
 #pragma unroll
-                    for (int nt = 0; nt < 8; ++nt) {
+                    for (int nt = 0; nt < 4; ++nt) {
                         acc[mt][nt][0] *= alpha0;
                         acc[mt][nt][1] *= alpha0;
                         acc[mt][nt][2] *= alpha1;
                         acc[mt][nt][3] *= alpha1;
                     }
-                    a_f16[mt][0] = pack_f16(score_s[r0][k0] * w0, score_s[r0][k0 + 1] * w1);
-                    a_f16[mt][1] = pack_f16(score_s[r0 + 8][k0] * w0, score_s[r0 + 8][k0 + 1] * w1);
-                    a_f16[mt][2] = pack_f16(score_s[r0][k0 + 8] * w8, score_s[r0][k0 + 9] * w9);
-                    a_f16[mt][3] =
-                        pack_f16(score_s[r0 + 8][k0 + 8] * w8, score_s[r0 + 8][k0 + 9] * w9);
+                    const float2 q0 =
+                        *reinterpret_cast<const float2*>(&score_s[r0][score_pair_col(r0, p_lo)]);
+                    const float2 q1 = *reinterpret_cast<const float2*>(
+                        &score_s[r0 + 8][score_pair_col(r0 + 8, p_lo)]);
+                    const float2 q2 =
+                        *reinterpret_cast<const float2*>(&score_s[r0][score_pair_col(r0, p_hi)]);
+                    const float2 q3 = *reinterpret_cast<const float2*>(
+                        &score_s[r0 + 8][score_pair_col(r0 + 8, p_hi)]);
+                    a_f16[mt][0] = pack_f16(q0.x * w0, q0.y * w1);
+                    a_f16[mt][1] = pack_f16(q1.x * w0, q1.y * w1);
+                    a_f16[mt][2] = pack_f16(q2.x * w8, q2.y * w9);
+                    a_f16[mt][3] = pack_f16(q3.x * w8, q3.y * w9);
                 }
 #pragma unroll
-                for (int np = 0; np < 4; ++np) { // pairs of 8-dimension n-tiles
+                for (int np = 0; np < 2; ++np) {
+                    const int chunk_base = g * 8 + val_half * 4 + 2 * np;
                     unsigned b[4];
                     ldmatrix_x4_t(b[0], b[1], b[2], b[3],
-                                  smem_address(k_s + swizzled(lane % 16, g * 8 + 2 * np + lane / 16)));
+                                  smem_address(k_s + swizzled(lane & 15, chunk_base + (lane >> 4))));
                     b[0] = bf16_pair_to_f16_pair(b[0]);
                     b[1] = bf16_pair_to_f16_pair(b[1]);
                     b[2] = bf16_pair_to_f16_pair(b[2]);
@@ -697,70 +778,88 @@ __global__ void __launch_bounds__(kMmaThreads, 1)
 #pragma unroll
                     for (int half = 0; half < 2; ++half) {
                         const int nt = 2 * np + half;
+                        float v[4][4];
 #pragma unroll
                         for (int mt = 0; mt < 4; ++mt) {
-                            float v0 = 0.0F, v1 = 0.0F, v2 = 0.0F, v3 = 0.0F;
-                            mma_f16(v0, v1, v2, v3, a_f16[mt][0], a_f16[mt][1], a_f16[mt][2],
-                                    a_f16[mt][3], b[2 * half], b[2 * half + 1]);
-                            acc[mt][nt][0] = fmaf(s_max, v0, acc[mt][nt][0]);
-                            acc[mt][nt][1] = fmaf(s_max, v1, acc[mt][nt][1]);
-                            acc[mt][nt][2] = fmaf(s_max, v2, acc[mt][nt][2]);
-                            acc[mt][nt][3] = fmaf(s_max, v3, acc[mt][nt][3]);
+                            v[mt][0] = v[mt][1] = v[mt][2] = v[mt][3] = 0.0F;
+                            mma_f16(v[mt][0], v[mt][1], v[mt][2], v[mt][3], a_f16[mt][0],
+                                    a_f16[mt][1], a_f16[mt][2], a_f16[mt][3], b[2 * half],
+                                    b[2 * half + 1]);
+                        }
+#pragma unroll
+                        for (int mt = 0; mt < 4; ++mt) {
+                            acc[mt][nt][0] = fmaf(s_max, v[mt][0], acc[mt][nt][0]);
+                            acc[mt][nt][1] = fmaf(s_max, v[mt][1], acc[mt][nt][1]);
+                            acc[mt][nt][2] = fmaf(s_max, v[mt][2], acc[mt][nt][2]);
+                            acc[mt][nt][3] = fmaf(s_max, v[mt][3], acc[mt][nt][3]);
                         }
                     }
                 }
             } else {
+                const int p_lo = lane & 3;
+                const int p_hi = p_lo + 4;
                 unsigned a_hi[4][4], a_lo[4][4];
 #pragma unroll
                 for (int mt = 0; mt < 4; ++mt) {
-                    const int r0 = 16 * mt + lane / 4, k0 = 2 * (lane % 4);
+                    const int r0       = 16 * mt + (lane >> 2);
                     const float alpha0 = a_s[r0], alpha1 = a_s[r0 + 8];
 #pragma unroll
-                    for (int nt = 0; nt < 8; ++nt) {
+                    for (int nt = 0; nt < 4; ++nt) {
                         acc[mt][nt][0] *= alpha0;
                         acc[mt][nt][1] *= alpha0;
                         acc[mt][nt][2] *= alpha1;
                         acc[mt][nt][3] *= alpha1;
                     }
-                    split_bf16(score_s[r0][k0], score_s[r0][k0 + 1], a_hi[mt][0], a_lo[mt][0]);
-                    split_bf16(score_s[r0 + 8][k0], score_s[r0 + 8][k0 + 1], a_hi[mt][1], a_lo[mt][1]);
-                    split_bf16(score_s[r0][k0 + 8], score_s[r0][k0 + 9], a_hi[mt][2], a_lo[mt][2]);
-                    split_bf16(score_s[r0 + 8][k0 + 8], score_s[r0 + 8][k0 + 9], a_hi[mt][3],
-                               a_lo[mt][3]);
+                    const float2 q0 =
+                        *reinterpret_cast<const float2*>(&score_s[r0][score_pair_col(r0, p_lo)]);
+                    const float2 q1 = *reinterpret_cast<const float2*>(
+                        &score_s[r0 + 8][score_pair_col(r0 + 8, p_lo)]);
+                    const float2 q2 =
+                        *reinterpret_cast<const float2*>(&score_s[r0][score_pair_col(r0, p_hi)]);
+                    const float2 q3 = *reinterpret_cast<const float2*>(
+                        &score_s[r0 + 8][score_pair_col(r0 + 8, p_hi)]);
+                    split_bf16(q0.x, q0.y, a_hi[mt][0], a_lo[mt][0]);
+                    split_bf16(q1.x, q1.y, a_hi[mt][1], a_lo[mt][1]);
+                    split_bf16(q2.x, q2.y, a_hi[mt][2], a_lo[mt][2]);
+                    split_bf16(q3.x, q3.y, a_hi[mt][3], a_lo[mt][3]);
                 }
 #pragma unroll
-                for (int np = 0; np < 4; ++np) { // pairs of 8-dimension n-tiles
+                for (int np = 0; np < 2; ++np) {
+                    const int chunk_base = g * 8 + val_half * 4 + 2 * np;
                     unsigned b[4];
                     ldmatrix_x4_t(b[0], b[1], b[2], b[3],
-                                  smem_address(k_s + swizzled(lane % 16, g * 8 + 2 * np + lane / 16)));
+                                  smem_address(k_s + swizzled(lane & 15, chunk_base + (lane >> 4))));
 #pragma unroll
                     for (int half = 0; half < 2; ++half) {
                         const int nt = 2 * np + half;
 #pragma unroll
                         for (int mt = 0; mt < 4; ++mt) {
                             mma_bf16(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3],
-                                     a_hi[mt][0], a_hi[mt][1], a_hi[mt][2], a_hi[mt][3], b[2 * half],
-                                     b[2 * half + 1]);
+                                     a_hi[mt][0], a_hi[mt][1], a_hi[mt][2], a_hi[mt][3],
+                                     b[2 * half], b[2 * half + 1]);
                             mma_bf16(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3],
-                                     a_lo[mt][0], a_lo[mt][1], a_lo[mt][2], a_lo[mt][3], b[2 * half],
-                                     b[2 * half + 1]);
+                                     a_lo[mt][0], a_lo[mt][1], a_lo[mt][2], a_lo[mt][3],
+                                     b[2 * half], b[2 * half + 1]);
                         }
                     }
                 }
             }
         }
-        __syncthreads(); // the tile's rows, probabilities and offsets are free
+        if constexpr (kInt8) {
+            if (first + kMmaTokens < total) { cp_wait<0>(); }
+        }
+        __syncthreads();
     }
 
     // The normalized latent sums: ol (d, h, t) FP32.
     float* out = ol + static_cast<std::size_t>(t) * kLatent * kMmaHeads;
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt) {
-        const int r0 = 16 * mt + lane / 4;
+        const int r0     = 16 * mt + (lane >> 2);
         const float inv0 = 1.0F / l_s[r0], inv1 = 1.0F / l_s[r0 + 8];
 #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) {
-            const int d = 64 * warp + 8 * nt + 2 * (lane % 4);
+        for (int nt = 0; nt < 4; ++nt) {
+            const int d = 64 * val_g + 32 * val_half + 8 * nt + 2 * (lane & 3);
             *reinterpret_cast<float2*>(out + d + static_cast<std::size_t>(r0) * kLatent) =
                 make_float2(acc[mt][nt][0] * inv0, acc[mt][nt][1] * inv0);
             *reinterpret_cast<float2*>(out + d + static_cast<std::size_t>(r0 + 8) * kLatent) =
@@ -1146,11 +1245,27 @@ struct Carve {
     float* ol         = nullptr; // [latent, heads, chunk] FP32, the merged latent sums
 };
 
-// The tensor-core route keeps only the FP32 latent sums of a chunk of columns.
+// The tensor-core route keeps only the FP32 latent sums of a chunk of columns, rounded down to a
+// whole wave of CTAs so full chunks avoid short tail waves while keeping workspace bytes monotonic.
 Carve carve_mma(void* base, int columns) {
     Carve out;
     const std::size_t per_column = sizeof(float) * kMmaHeads * kLatent;
-    out.chunk = std::clamp<std::size_t>(kMmaChunkBudget / per_column, 1, static_cast<std::size_t>(columns));
+    std::size_t max_chunk        = std::max<std::size_t>(1, kMmaChunkBudget / per_column);
+    static const int sms         = [] {
+        int device = 0, count = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+            count > 0) {
+            return count;
+        }
+        return 0;
+    }();
+    const std::size_t wave_cols =
+        sms > 0 ? static_cast<std::size_t>((sms + kMmaHeadBlocks - 1) / kMmaHeadBlocks) : 0;
+    if (wave_cols > 0 && max_chunk >= wave_cols) {
+        max_chunk = (max_chunk / wave_cols) * wave_cols;
+    }
+    out.chunk = std::clamp<std::size_t>(max_chunk, 1, static_cast<std::size_t>(columns));
     out.bytes = align256(out.chunk * per_column);
     out.ol    = static_cast<float*>(base);
     return out;
@@ -1332,21 +1447,23 @@ void mla_sparse_attention(const Tensor& qa, const Tensor& w_uv, const MlaLatentB
         static const bool attributes = [] {
             CUDA_CHECK(cudaFuncSetAttribute(attention_mma_kernel<false>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            static_cast<int>(MmaShared::kBytes)));
+                                            static_cast<int>(MmaShared<false>::kBytes)));
             CUDA_CHECK(cudaFuncSetAttribute(attention_mma_kernel<true>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            static_cast<int>(MmaShared::kBytes)));
+                                            static_cast<int>(MmaShared<true>::kBytes)));
             return true;
         }();
         (void)attributes;
         for (int begin = 0; begin < columns; begin += static_cast<int>(ws.chunk)) {
             const int n = std::min<int>(static_cast<int>(ws.chunk), columns - begin);
-            const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(n)), dim3(kMmaThreads), MmaShared::kBytes, stream};
+            const dim3 grid(static_cast<unsigned>(n));
             if (int8) {
+                const pdl::LaunchConfig launch{grid, dim3(kMmaThreads), MmaShared<true>::kBytes, stream};
                 CUDA_CHECK(pdl::launch_consumer(launch, attention_mma_kernel<true>, static_cast<const bf16*>(qa.data),
                                                 pages, scales, tables, stride, rows, pos, batch.width, pool_p, cnt_p,
                                                 top, pool, scale, begin, ws.ol));
             } else {
+                const pdl::LaunchConfig launch{grid, dim3(kMmaThreads), MmaShared<false>::kBytes, stream};
                 CUDA_CHECK(pdl::launch_consumer(launch, attention_mma_kernel<false>, static_cast<const bf16*>(qa.data),
                                                 pages, scales, tables, stride, rows, pos, batch.width, pool_p, cnt_p,
                                                 top, pool, scale, begin, ws.ol));

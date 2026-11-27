@@ -60,23 +60,25 @@ the tower streamed from pinned RAM. The placement puts
 VRAM cap (92,993 MiB). KV is allocated for every lane at the full context at startup, and with the
 prefix cache on, its KV holds every lane's full context (6.36 GiB INT8 at 4 × 262,144).
 
-The serving build (2026-11-27: 3-term `expert-a4-residual` wide prefill, 4-column weight-reusing
-narrow A16 rows with pre-wait down-weight preload, cold-placeholder pre-demotion, and 14/16/120
-miss split, §6.3 and §14), `infernix_glm5_next_engine_bench --tokens 512 --repeat 4` at the serving
-split (model 15.44 GiB, 16.70 with the drafter; KV 1.59 GiB at one lane, 6.36 at four; experts
-63.8 GiB, 4,838 VRAM / 7,258 RAM / 0 SSD), median and range:
+The serving build (2026-11-27: LRFU-Blend shared offload cache policy with adaptive decode
+admissions, conditional CPU-plan `x` copy, online DFlash2 `RoundCostModel`, 3-term
+`expert-a4-residual` wide prefill, 16-warp `64h × 16t` sparse MLA prefill, double-buffered `mhc`,
+4-column weight-reusing narrow A16 rows, and 14/16/120 miss split, §6.3, §7.2, §10.2 and §14),
+`infernix_glm5_next_engine_bench --tokens 512 --repeat 4` at the serving split (model 15.44 GiB,
+16.70 with the drafter; KV 1.59 GiB at one lane, 6.36 at four; experts 63.8 GiB, 4,838 VRAM /
+7,258 RAM / 0 SSD), median and range:
 
 | Requests | Plain | DFlash2 `auto` (greedy) | DFlash2 `auto` (T = 1.0) |
 |---|---|---|---|
-| 1 | 42.0 (39.9-43.5) | 54.5 (49.3-56.1) | 55.4 (47.9-58.5) |
-| 4 | 72.0 (65.2-76.0) | | |
+| 1 | 42.3 (41.5-43.4) | 55.0 (52.0-57.3) | 54.1 (47.2-56.2) |
+| 4 | 75.8 (74.1-76.2) | | |
 
 Prior 2026-11-24 baseline at the same split (512 tokens, 4 sets): 1-request plain 36.9 (33.2-38.0),
 K = 2 44.4 (40.8-46.4), K = 3 45.8 (34.6-45.8), 4-request plain 69.5 (60.2-70.8), 4-request with
 drafter loaded 64.8 (60.0-65.5). Prefill (`infernix_bench`, INT8 KV, chunk 4,096, `max-ctx 65536`,
-`work peak 1.16 GiB`, 2026-11-27): `pp4096` 2.40k (PCIe DMA-bound), `pp16384` 5.56k (+60.2 % over
-exact 3.47k), `pp32768` 5.41k (+59.1 % over exact 3.40k); live serving 20.5K fresh prompt beside
-three concurrent decodes measured 5.33k tok/s at peak process VRAM 92,670 MiB (cap 92,993).
+`work peak 1.16 GiB`, 2026-11-27): `pp4096` 2.37k (PCIe DMA-bound), `pp16384` 5.75k (+65.6 % over
+exact 3.47k), `pp32768` 5.68k (+67.1 % over exact 3.40k); live serving 17.6K fresh prompt beside
+three concurrent decodes measured 5.68k tok/s at peak process VRAM 92,666 MiB (cap 92,993).
 
 The Q8-dense artifact (§17.2; not served: it misses the KL gate) against the BF16-dense one at the same split (`vram=40%,ram=60%`, 4,838 / 7,258 / 0
 experts, plain decode, `infernix_glm5_next_engine_bench` 512 tokens, median and range of four sets;
@@ -99,7 +101,7 @@ the generic routes (38.7 tok/s). The rows below are the BF16-dense artifact's.
 | Decode, four requests of 256 tokens (rounds of several rows decode plainly) | median 59.9 tok/s aggregate, sets 56.5-62.0 |
 | Same bench at `vram=42%,ram=58%` (5,080 / 7,016 / 0 experts), one request, by draft length | K = 0 35.0, K = 1 40.9, K = 2 44.4, K = 3 47.8, K = 4 43.2, K = 5 37.7 tok/s (§10.3) |
 | Process VRAM while serving: four 1,024-token decodes beside a 9.4K prompt and its cached repeat | peak 92,412 MiB; at vram=42 % it sat at 95,672 MiB |
-| Same with `--draft-tokens auto` (48 staging slots against 32) and `--vision`: three 1,024-token decodes beside a 20.5K fresh prompt (5.33k tok/s) and its cached repeat, 2026-11-27 | peak 92,670 MiB (cap 92,993; headroom 323 MiB; 2026-11-26: 92,680 MiB) |
+| Same with `--draft-tokens auto` (48 staging slots against 32) and `--vision`: three 1,024-token decodes beside a 17.6K fresh prompt (5.68k tok/s) and its cached repeat, 2026-11-27 | peak 92,666 MiB (cap 92,993; headroom 327 MiB; prior: 92,670 MiB) |
 | Same with `--vision`: two decodes, the 9.4K prompt and an image (551-token prompt), then a video (1,544 tokens) | peak 92,412 MiB; the image answer reads the chart's title |
 | Prefill, fresh prompts of 10K-38K tokens, walk spans, `vram=42%,ram=58%` | 2.35-2.43k tok/s, compute-bound (§11.1) |
 | One 255,771-token prompt, INT8 KV, `vram=42%,ram=58%` | prefill 2.09k tok/s (TTFT 2 min 2 s), then 256 tokens at 33.3 tok/s |
@@ -337,35 +339,40 @@ Up to 8 columns (`moe::kMaxColumns`) run the exact narrow dp4a kernels (`ggml_dp
 exact route run the same arithmetic on tensor cores (`ggml_tile.cuh` decode-in-loop tiles, which form
 the X sums from the activation limbs, at this family's H4096 x I2048 geometry with the clamped
 SwiGLU), bit-equal to the narrow route. By default the `ggml-bf16-prefill` fast path (§14) runs
-BF16 tensor-core tiles (`ggml_bf16_tile.cuh` `compute_decode`, one CTA per SM over (tile, row block)
-work items with templated 128/64/32/16-column warp layouts, conflict-free shared-memory staging and
-`__byte_perm` unsigned BF16 decode): calls of 64 or more columns (`kGgmlBf16AllJobsMinColumns`) route
-every active non-CPU job through the BF16 tiles directly from BF16 x (skipping limb encoding, the
-exact-tile plan and the narrow dp4a pass), while calls of 9-63 columns keep narrow dp4a for jobs of
-at most 8 entries. Each 128 x 128 tile copies its rows' raw 256-element units by cp.async one unit
-ahead and decodes them in the K loop, x and h stay as stored, and the sums are FP32. Q3_K's and
-Q2_K's code times sub-scale fits 8 bits, so it is stored exact in BF16 and the MMAs sum a whole block
-before one multiply by d; Q4_K and Q8_0 scale per slice. A 4,096-token chunk gives an expert about
-114 entries, one tile, so a decoded plane (the default geometry's form) would be used once. The
-record strides differ by layer, so the expert cache keeps one frame pool per stride and gives every
-layer the same frame count (a switch target rounds down to a multiple of 42). The RAM tier sizes
-every slot at the largest stride (layer 3's 13.0 MB), so it holds about 20 % fewer records than its
-bytes would at the mean stride.
+BF16 tensor-core tiles (`ggml_bf16_tile.cuh` `compute_decode`, persistent one-CTA-per-SM grid over
+(tile, row block) items with templated 128/64/32/16-column warp layouts, natural-K swizzled `sm.x`
+with `ldmatrix_x4`, 1-warp-per-row `cp.async`, CTA-wide `compute_xsum`, `__byte_perm` unsigned BF16
+decode, and SMEM-transposed `uint4` epilogue stores): calls of 64 or more columns
+(`kGgmlBf16AllJobsMinColumns`) route every active non-CPU job through the BF16 tiles directly from
+BF16 x (skipping limb encoding, the exact-tile plan and the narrow dp4a pass), while calls of 9-63
+columns keep narrow dp4a for jobs of at most 8 entries. Narrow decode calls (`<= 8` columns) use
+block-coalesced limb/sum encoding (`store_group_coalesced`) with specialized `kCols = 1/2/4`
+gate/up and down kernels and cooperative 4-warp `h` encoding, while Q8 dense prefill adds a
+1-barrier double-buffered `MmaR128T128` schedule (`WeightStages = 2`, 16-code magic-bias dequant,
+2D L2 swizzle, coalesced `uint4` epilogue). Each 128 x 128 expert tile copies its rows' raw
+256-element units by cp.async one unit ahead and decodes them in the K loop, x and h stay as
+stored, and the sums are FP32. Q3_K's and Q2_K's code times sub-scale fits 8 bits, so it is stored
+exact in BF16 and the MMAs sum a whole block before one multiply by d; Q4_K and Q8_0 scale per
+slice. A 4,096-token chunk gives an expert about 114 entries, one tile, so a decoded plane (the
+default geometry's form) would be used once. The record strides differ by layer, so the expert
+cache keeps one frame pool per stride and gives every layer the same frame count (a switch target
+rounds down to a multiple of 42). The RAM tier sizes every slot at the largest stride (layer 3's
+13.0 MB), so it holds about 20 % fewer records than its bytes would at the mean stride.
 
-Measured against the NVFP4 artifact (2026-11-27 optimized build; `infernix_glm5_next_engine_bench`,
-four sets after warm-up; `infernix_bench` INT8 KV chunk 4,096; `infernix-perplexity` quick corpus,
-context 8192, stride 4096, INT8 KV, 252,823 positions):
+Measured against the NVFP4 artifact (2026-11-27 build; `infernix_glm5_next_engine_bench`, 512
+tokens, four sets after warm-up; `infernix_bench` INT8 KV chunk 4,096; `infernix-perplexity` quick
+corpus, context 8192, stride 4096, INT8 KV, 252,823 positions):
 
 | Measurement | NVFP4, `vram=40%` (4,838 VRAM / 7,258 RAM / 0 SSD) | GGUF, `vram=59%` (7,098 VRAM / 4,998 RAM / 0 SSD) |
 |---|---|---|
-| Decode, one request, `auto`, greedy (512 tok, 4 sets) | 54.5 (49.3-56.1) tok/s (prior: 48.0, 43.9-52.5) | 87.8 (76.7-88.9) tok/s, sets 1-4 (prior: 85.3 sets 4-10) |
-| Decode, one request, `auto`, temperature 1 (512 tok, 4 sets) | 55.4 (47.9-58.5) tok/s (prior: 47.0, 42.3-48.0) | 73.6 median, 54.2-77.2 across sets 1-4 (2026-11-27 prior; 2026-11-26 sets 4-10: 75.1, 72.7-80.7) |
-| Decode, one request, plain (512 tok, 4 sets) | 42.0 (39.9-43.5) tok/s (prior: 36.9, 33.2-38.0) | 56.2 (47.0-60.6) tok/s (2026-11-27) |
-| Decode, four requests, plain (4 sets; NVFP4 512 tok, GGUF 256 tok) | 72.0 (65.2-76.0) tok/s aggregate (prior: 69.5, 60.2-70.8) | 118.1 (103.4-124.2) tok/s aggregate (prior: 81.2, 65.8-88.7) |
-| Same split for both, `vram=40%`, T1 `round_bench` (`1x1` / `4x1` / `1x4`, 2026-11-27) | 38.1 / 93.5 / 82.8 tok/s (prior: 27.8 / 70.0 / 47.9) | 45.7 / 117.0 / 100.0 tok/s (prior: 34.2 / 85.0 / 62.0) |
-| Prefill (`infernix_bench` `pp4096` / `pp16384` / `pp32768`, INT8 KV, 2026-11-27) | 2.40k / 5.56k / 5.41k tok/s (exact: 2.38k / 3.47k / 3.40k; live 20.5K beside 3 decodes: 5.33k) | 4.21k / 4.05k / 3.92k tok/s (`pp256`: 305.0 tok/s; live serving 16.1K beside 3 decodes: 3.95k tok/s; 2026-11-26: 2.24k-2.33k tok/s, exact route 1.56k-1.59k) |
-| Serving process, production flags, three 1K decodes beside a 16-20K prompt and its cached repeat | peak 92,670 MiB (cap 92,993, headroom 323 MiB) | peak 91,986 MiB (cap 92,993, headroom 1,007 MiB; 2026-11-26: 91,984 MiB) |
-| Perplexity (different abliterations: not a measure of the quantization) | 3.1489 (exact) / 3.1479 (`expert-a4-residual`, PPL ratio 0.99967) | 3.2546 (2026-11-27; 2026-11-26: 3.2541) |
+| Decode, one request, `auto`, greedy (512 tok, 4 sets) | 55.0 (52.0-57.3) tok/s (prior: 54.5, 48.0) | 97.7 (84.3-100.7) tok/s (prior: 87.8) |
+| Decode, one request, `auto`, temperature 1 (512 tok, 4 sets) | 54.1 (47.2-56.2) tok/s (prior: 55.4, 47.0) | 96.4 (87.4-97.0) tok/s (prior: 73.6) |
+| Decode, one request, plain (512 tok, 4 sets) | 42.3 (41.5-43.4) tok/s (prior: 42.0, 36.9) | 69.1 (65.6-69.3) tok/s (prior: 56.2) |
+| Decode, four requests, plain (512 tok, 4 sets) | 75.8 (74.1-76.2) tok/s aggregate (prior: 72.0, 69.5) | 147.8 (144.3-150.5) tok/s aggregate (prior 256 tok: 118.1, 81.2) |
+| Same split for both, `vram=40%`, T1 `round_bench` (`1x1` / `4x1` / `1x4`, 2026-11-27) | 35.9 / 120.0 / 100.5 tok/s (prior: 38.1 / 93.5 / 82.8) | 44.8 / 142.7 / 103.8 tok/s (prior: 45.7 / 117.0 / 100.0) |
+| Prefill (`infernix_bench` `pp4096` / `pp16384` / `pp32768`, INT8 KV, 2026-11-27) | 2.37k / 5.75k / 5.68k tok/s (prior: 2.40k / 5.56k / 5.41k; exact: 2.38k / 3.47k / 3.40k; live 17.6K beside 3 decodes: 5.68k) | 4.48k / 4.46k / 4.32k tok/s (prior: 4.21k / 4.05k / 3.92k; live 17.6K beside 3 decodes: 4.40k; exact route 1.56k-1.59k) |
+| Serving process, production flags, three 1K decodes beside a 17.6K prompt and its cached repeat | peak 92,666 MiB (cap 92,993, headroom 327 MiB) | peak 91,986 MiB (cap 92,993, headroom 1,007 MiB) |
+| Perplexity (different abliterations: not a measure of the quantization) | 3.1496 (`mean_nll` 1.1473, `expert-a4-residual`; 2443ee471 gate: 1.1471) | 3.2526 (`mean_nll` 1.1794; prior: 3.2546) |
 
 No published reference shares this artifact's abliteration, so its quantization loss is not
 measured. GCSA's Q8_0 build of the same repository is not one: against the Q4 build, `attn_output`
@@ -617,19 +624,23 @@ qualified against an FP64 oracle of the reference formula.
   over 16-head groups run S = Q'Cᵀ (BF16 MMA, FP32 acc) and U = P C with online softmax between
   them, split over 32-token blocks and merged in fixed block order. A CTA gathers whole 4-token
   pools through the block table plus the tail tokens.
-- **Prompt calls of 64 or more columns** take the tensor-core envelope: one CTA per column with
-  all 64 heads sharing its tokens, 16-token tiles of latent rows staged as BF16 (INT8 codes
-  exactly), scores on BF16 MMAs with FP32 accumulation. One route serves both regimes (dense below
-  2,051 visible tokens and sparse above), in the absorbed form throughout. Against the FP64 oracle
-  both routes pass the `2.8e-3` relative-L2 / `5.0e-3` gross-relative criterion and strict bitwise
-  column invariance. The prefill is bit-identical across chunks of 1,024, 4,096 and 8,192.
+- **Prompt calls of 64 or more columns** take the tensor-core envelope (`attention_mma_kernel`, 16
+  warps = 512 threads, `REG: 128`, `STACK: 0`, 99,872 B shared memory): one CTA per column with all
+  64 heads sharing its 16-token tiles, SM-wave-aligned chunks (`carve_mma` rounds down to 752 = 4 ×
+  188 columns), 1-warp-per-token `cp.async` overlap for INT8 latents, parity-interleaved decode into
+  swizzled `k_s`, and `4 mt × 16 tokens × 4 K-quarters` Score MMAs (2× Q reuse) with FP32
+  accumulation. One route serves both regimes (dense below 2,051 visible tokens and sparse above),
+  in the absorbed form throughout. Against the FP64 oracle both routes pass the `2.8e-3` relative-L2
+  / `5.0e-3` gross-relative criterion and strict bitwise column invariance. The prefill is
+  bit-identical across chunks of 1,024, 4,096 and 8,192.
 - **INT8-G64 latents** are staged as stored (codes and FP16 group scales) and decoded in the score
   and value folds: a lane's 16 dimensions lie in one group of 64, so the group scale multiplies the
   lane's partial dot once. For `kInt8 = true`, both `attention_split_kernel` and
   `attention_mma_kernel` run the Value phase with a single `mma_f16` (per-group `s_max`
   normalization, `w = p · scale / s_max`, rescaled into FP32 `acc`), halving Value MMAs and
-  cutting `pp16384` attention time from ~720 ms to 456.6 ms (2026-11-27); BF16 latents keep the
-  BF16 high/low probability pair.
+  lowering `context = 16,384, T = 4,096` attention time from 11.87 ms to 7.74 ms per layer
+  (`infernix_mla_sparse_bench --width 4096 --tensor-cores --int8 --attention-only`, 1.53×; BF16 KV
+  11.79 → 8.69 ms, 1.36×, 2026-11-27); BF16 latents keep the BF16 high/low probability pair.
 
 ### 7.3 The indexer (`dsa_indexer`)
 
@@ -693,7 +704,9 @@ built (§17.2).
 The `mhc` Op (`include/infernix/ops/mhc.h`) has three calls: `mhc_mix` (the mixer: norm, the 24
 projections, gates, Sinkhorn, collapse), `mhc_update` (the residual update) and `mhc_update_mix`
 (the update followed by the next block's mixer in one call, with the separate calls' bits). The
-mixer reduces fixed-order partials of f and of the squared RMS per feature chunk, so a column's
+mixer stages double-buffered BF16 residuals and packed `fn` pairs, folds two columns at a time with
+bit-exact dual-pair butterfly reductions, and sums chunk partials in strict ascending order
+(`T = 4,096`: 652.9 → 368.6 µs per call, 1.77×, 1,421 GB/s, bit-exact, 2026-11-27), so a column's
 bits depend only on that column.
 
 Numerics:
@@ -737,11 +750,14 @@ block, then chooses how many of the drafts to verify:
 - `--draft-tokens auto` proposes 5 (`kDraftTokensAuto`) and verifies the k in 0..5 that maximizes
   (1 + sum over j ≤ k of the product of the first j drafts' calibrated acceptances) / T(k), where a
   draft's acceptance is read from its probability's decile, learned per request (EWMA 0.1, one
-  draft more every 8 rounds keeps the longer deciles measured), and T(k) is the measured one-row
-  round time in plain rounds (`program/draft_length.h`: 1.07 for a plain round after a spent
-  proposal, then 1.50 / 1.79 / 1.96 / 2.29 / 2.68 for k = 1-5, §10.3). k = 0 decodes the round
-  plainly. Not 7: a verify column's routes miss on their own, so the length rarely pays past five,
-  and each column more costs eight staging slots.
+  draft more every 8 rounds keeps the longer deciles measured), and T(k) comes from an online
+  `RoundCostModel` (`program/draft_length.h`, exponentially weighted `kDecay = 0.97`, separating
+  plain `k = 0` EMA from `k >= 1` linear OLS so fixed verify/commit overhead `kPriorVerifyFx = 0.08`
+  is preserved, resetting on expert placement switches, RAM-tier rebuilds, and resident refills, and
+  falling back to the static `kRoundCost` prior `1.07 / 1.50 / 1.79 / 1.96 / 2.29 / 2.68` until
+  enough spread verify rounds settle). k = 0 decodes the round plainly. Not 7: a verify column's
+  routes miss on their own, so the length rarely pays past five, and each column more costs eight
+  staging slots.
 
 Greedy output equals plain decoding either way; a sampled row's verification is the same sparse
 rejection sampling against the selector's laws on a prefix of its drafts.
@@ -1009,8 +1025,8 @@ not gated and stays exact):
   while calls of 9-63 columns route jobs of more than 8 entries to BF16 tiles. Qualified 2026-11-26
   ([model quality §6.7](model-quality.md#67-fast-path-registry)). One layer's expert call at 4,096
   tokens (288 experts, top-8, every record resident; `infernix_offloaded_moe_ggml_test --bench-glm
-  4096 bf16`, 2026-11-27) takes 10.27-14.09 ms (117.1-160.5 effective TOPS) against the exact
-  tiles' 27.99-36.81 ms.
+  4096 bf16`, 2026-11-27) takes 9.51-12.59 ms (131.0-173.3 effective TOPS) against the exact
+  tiles' 28.47-37.26 ms.
 
 Under either path a prompt's bits depend on its call widths (the chunk size, and the 1,024-token
 calls beside another lane's decode), so neither artifact is request-invariant with fast paths on.

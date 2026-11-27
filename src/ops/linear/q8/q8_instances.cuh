@@ -17,11 +17,13 @@ using MmaR64T96  = Q8A16MmaSchedule<64, 96, 64, 64, 16, 2, 2>;
 // The wide route of the linear family is the one schedule measured to want cg on the predicated
 // path; every other schedule, here and in the six other Ops that instantiate this same tile, keeps
 // the inherited ca.
-using MmaR64T128 = Q8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2, Q8MmaFragmentPipeline::PingPong,
+using MmaR64T128 = Q8A16MmaSchedule<64, 128, 64, 32, 32, 2, 2, Q8MmaFragmentPipeline::PingPong,
                                     Cache::cg, Cache::cg, Cache::cg>;
 using MmaR96T96  = Q8A16MmaSchedule<96, 96, 64, 48, 16, 2, 2>;
 using MmaR128T64 = Q8A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>;
 using MmaR128T80 = Q8A16MmaSchedule<128, 80, 64, 64, 16, 2, 2>;
+using MmaR128T128 = Q8A16MmaSchedule<128, 128, 64, 64, 32, 2, 1, Q8MmaFragmentPipeline::PingPong,
+                                     Cache::cg, Cache::cg, Cache::cg, false, 0, 4, 2>;
 // K128 single-activation-stage schedules shared with fused consumers.
 using MmaR64x16T48K128A1 = Q8A16MmaSchedule<64, 48, 128, 16, 24, 1, 2>;
 using MmaR64x32T64K128A1 = Q8A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>;

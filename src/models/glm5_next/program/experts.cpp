@@ -73,6 +73,10 @@ void ProgramImpl::create_experts(execution::ForwardExperts& experts, std::uint64
                                      std::move(bindings.staging));
         }
     };
+    hooks.on_switch_settled = [this](const char* reason) {
+        round_cost_.reset();
+        diagnostic(std::string("DFlash2 round cost fit reset: ") + reason);
+    };
     hooks.all_lanes_idle  = [this] {
         return std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; });
     };

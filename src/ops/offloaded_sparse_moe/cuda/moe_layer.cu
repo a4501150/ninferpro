@@ -1929,7 +1929,7 @@ void launch_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSour
     }
     if (ggml_bank(source)) {
         launch_pass_ggml(x, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
-                        wide ? columns_out : 0);
+                         wide ? columns_out : 0, columns);
         return;
     }
     if (source.activation == moe::ExpertActivation::kA16) {
@@ -2113,12 +2113,7 @@ cpu_plan_body(const MoeDispatch& dispatch, const MoeExpertSource& source,
                 slot_first[slot]              = first;
                 for (int c = 0; c < width; ++c) {
                     const int column = dispatch.entries[first + c] / top_k;
-                    if constexpr (Named) {
-                        // The fused route published every column at its own index before the routing.
-                        channel.request->column[slot][c] = column;
-                    } else {
-                        atomicOr(&used[column / 32], 1U << (column % 32));
-                    }
+                    atomicOr(&used[column / 32], 1U << (column % 32));
                 }
             }
         }
@@ -2129,37 +2124,32 @@ cpu_plan_body(const MoeDispatch& dispatch, const MoeExpertSource& source,
         plan_barrier<Named>();
     }
     if (threadIdx.x == 0) {
-        if constexpr (!Named) {
-            int k = 0;
-            for (int t = 0; t < columns; ++t) {
-                if ((used[t / 32] >> (t % 32)) & 1U) {
-                    compact[t]     = static_cast<short>(k);
-                    published[k++] = static_cast<short>(t);
-                }
+        int k = 0;
+        for (int t = 0; t < columns; ++t) {
+            if ((used[t / 32] >> (t % 32)) & 1U) {
+                compact[t]     = static_cast<short>(k);
+                published[k++] = static_cast<short>(t);
             }
-            publish_count = k;
         }
+        publish_count           = k;
         channel.request->layer  = channel.layer;
         channel.request->jobs   = chosen;
         channel.request->tiered = source.host_table != nullptr ? 1 : 0;
     }
     plan_barrier<Named>();
-    if constexpr (!Named) {
-        // Each chosen job's columns by compact index.
-        for (int i = threadIdx.x; i < chosen * offloaded_moe::kMaxCpuColumns; i += kThreads) {
-            const int slot = i / offloaded_moe::kMaxCpuColumns, c = i % offloaded_moe::kMaxCpuColumns;
-            if (c < channel.request->ncols[slot]) {
-                channel.request->column[slot][c] = compact[dispatch.entries[slot_first[slot] + c] / top_k];
-            }
+    // Each chosen job's columns by compact index, and only the referenced columns copied to host.
+    for (int i = threadIdx.x; i < chosen * offloaded_moe::kMaxCpuColumns; i += kThreads) {
+        const int slot = i / offloaded_moe::kMaxCpuColumns, c = i % offloaded_moe::kMaxCpuColumns;
+        if (c < channel.request->ncols[slot]) {
+            channel.request->column[slot][c] = compact[dispatch.entries[slot_first[slot] + c] / top_k];
         }
-        // The chosen jobs' columns, compacted, 16 bytes per store.
-        const int kVectors     = hidden * 2 / 16;
-        const auto* src        = reinterpret_cast<const int4*>(x);
-        auto* dst              = reinterpret_cast<int4*>(channel.x);
-        for (int i = threadIdx.x; i < publish_count * kVectors; i += kThreads) {
-            const int k = i / kVectors, v = i % kVectors;
-            dst[static_cast<std::size_t>(k) * kVectors + v] = src[static_cast<std::size_t>(published[k]) * kVectors + v];
-        }
+    }
+    const int kVectors = hidden * 2 / 16;
+    const auto* src    = reinterpret_cast<const int4*>(x);
+    auto* dst          = reinterpret_cast<int4*>(channel.x);
+    for (int i = threadIdx.x; i < publish_count * kVectors; i += kThreads) {
+        const int k = i / kVectors, v = i % kVectors;
+        dst[static_cast<std::size_t>(k) * kVectors + v] = src[static_cast<std::size_t>(published[k]) * kVectors + v];
     }
     __threadfence_system();
     plan_barrier<Named>();
@@ -2181,23 +2171,10 @@ __global__ void __launch_bounds__(kThreads)
     cpu_plan_body<false>(dispatch, source, x, columns, top_k, max_jobs, hidden, cpu_flags, call);
 }
 
-// The fused route's x for the CPU channel: every column at its own index (the request names columns
-// by their index), by threads [first, first + count) of the CTA.
-__device__ __forceinline__ void publish_x_columns(const MoeCpuChannel& channel, const bf16* __restrict__ x,
-                                                  int hidden, int columns, int first, int count) {
-    const int vectors = hidden * 2 / 16;
-    const auto* src   = reinterpret_cast<const int4*>(x);
-    auto* dst         = reinterpret_cast<int4*>(channel.x);
-    for (int i = static_cast<int>(threadIdx.x) - first; i < columns * vectors; i += count) { dst[i] = src[i]; }
-}
-
 // route_dispatch_kernel followed by the CPU plan in the same CTA: after a barrier of the whole CTA
 // makes the dispatch visible, its first kThreads threads plan as cpu_plan_kernel does (the same
 // results) and the rest exit, so the plan, and the host's start, follow the dispatch with no kernel
-// boundary. The warps that route no column publish x for the CPU while the others route (a call of
-// 32 columns: every thread, after the routing), so the copy, thousands of cycles after the plan's
-// decision before, overlaps the routing and the request goes out that much sooner (design §8.4);
-// the plan's system fence orders these stores too (every thread passed the barriers before it).
+// boundary. Only layers with at least one CPU-served miss copy the referenced x columns over PCIe.
 template <bool kNoaux>
 __global__ void __launch_bounds__(kDispatchThreads)
     route_dispatch_plan_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
@@ -2223,14 +2200,8 @@ __global__ void __launch_bounds__(kDispatchThreads)
             id = route_column(logits, experts, top_k, warp, ids, weights, shared_gate);
         }
         if (lane < top_k) { routed[warp * top_k + lane] = id; }
-    } else {
-        publish_x_columns(source.cpu, x, hidden, columns, 32 * columns,
-                          kDispatchThreads - 32 * columns);
     }
     __syncthreads();
-    if (32 * columns == kDispatchThreads) {
-        publish_x_columns(source.cpu, x, hidden, columns, 0, kDispatchThreads);
-    }
     const int entries = columns * top_k;
     dispatch_small(i < entries ? routed[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
     __syncthreads();

@@ -25,8 +25,12 @@ ResidencyEntry ResidencyEntry::next(ResidencyState new_state, std::uint32_t new_
 
 // ---------------------------------------------------------------------------- LFRU
 
-LfruPolicy::LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period)
-    : capacity_(capacity), halving_period_(halving_period), count_(num_keys, 0.0), last_(num_keys, 0),
+LfruPolicy::LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period,
+                       double recency_scale, double recency_weight)
+    : capacity_(capacity), halving_period_(halving_period),
+      recency_scale_(recency_scale > 0.0 ? recency_scale : 0.0),
+      inv_recency_scale_(recency_scale > 0.0 ? 1.0 / recency_scale : 0.0),
+      recency_weight_(recency_weight > 0.0 ? recency_weight : 0.0), count_(num_keys, 0.0), last_(num_keys, 0),
       slot_(num_keys, kNone), mark_(num_keys, 0), in_low_(num_keys, 0) {
     residents_.reserve(capacity);
     resident_count_.reserve(capacity);
@@ -34,7 +38,7 @@ LfruPolicy::LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint
 }
 
 double LfruPolicy::score(std::uint32_t key) const {
-    return count_[key] / static_cast<double>(now_ - last_[key] + 1);
+    return score_at(count_[key], static_cast<double>(last_[key]), static_cast<double>(now_));
 }
 
 void LfruPolicy::insert(std::uint32_t key) {
@@ -55,10 +59,10 @@ void LfruPolicy::build_low() {
     const std::size_t n = residents_.size();
     const double* counts = resident_count_.data();
     const double* lasts  = resident_last_.data();
-    const double next    = static_cast<double>(now_) + 1.0;
+    const double now_d   = static_cast<double>(now_);
     low_scores_.clear();
     for (std::size_t i = 0; i < n; ++i) {
-        if (!pinned_any_ || pinned_[residents_[i]] == 0) { low_scores_.push_back(counts[i] / (next - lasts[i])); }
+        if (!pinned_any_ || pinned_[residents_[i]] == 0) { low_scores_.push_back(score_at(counts[i], lasts[i], now_d)); }
     }
     if (low_scores_.size() <= kLowSize) {
         low_bound_ = std::numeric_limits<double>::infinity();
@@ -69,14 +73,14 @@ void LfruPolicy::build_low() {
         }
         return;
     }
-    // Scores as select_victims computes them (exact integer denominators), now and at low_until_.
+    // Scores as select_victims computes them, now and at low_until_.
     std::nth_element(low_scores_.begin(), low_scores_.begin() + static_cast<std::ptrdiff_t>(kLowSize - 1),
                      low_scores_.end());
-    low_bound_       = low_scores_[kLowSize - 1];
-    const double end = static_cast<double>(low_until_) + 1.0;
+    low_bound_         = low_scores_[kLowSize - 1];
+    const double end_d = static_cast<double>(low_until_);
     for (std::size_t i = 0; i < n; ++i) {
         if (pinned_any_ && pinned_[residents_[i]] != 0) { continue; }
-        if (counts[i] / (end - lasts[i]) <= low_bound_) {
+        if (score_at(counts[i], lasts[i], end_d) <= low_bound_) {
             low_.push_back(residents_[i]);
             in_low_[residents_[i]] = 1;
         }
@@ -89,18 +93,18 @@ void LfruPolicy::note_low(std::uint32_t key) {
         low_valid_ = false;
         return;
     }
-    if (count_[key] / (static_cast<double>(low_until_) + 1.0 - static_cast<double>(last_[key])) <= low_bound_) {
+    if (score_at(count_[key], static_cast<double>(last_[key]), static_cast<double>(low_until_)) <= low_bound_) {
         low_.push_back(key);
         in_low_[key] = 1;
     }
 }
 
 bool LfruPolicy::try_low(std::size_t need, std::vector<std::uint32_t>& out) {
-    const double next = static_cast<double>(now_) + 1.0;
+    const double now_d = static_cast<double>(now_);
     scratch_.clear();
     for (const std::uint32_t k : low_) {
         if (slot_[k] != kNone && mark_[k] == 0) {
-            scratch_.emplace_back(count_[k] / (next - static_cast<double>(last_[k])), k);
+            scratch_.emplace_back(score_at(count_[k], static_cast<double>(last_[k]), now_d), k);
         }
     }
     if (scratch_.size() < need) { return false; }
@@ -168,8 +172,8 @@ void LfruPolicy::select_victims(std::size_t need, std::span<const std::uint32_t>
     const double* counts = resident_count_.data();
     const double* lasts  = resident_last_.data();
     double* scores       = scores_.data();
-    const double next    = static_cast<double>(now_) + 1.0;
-    for (std::size_t i = 0; i < n; ++i) { scores[i] = counts[i] / (next - lasts[i]); }
+    const double now_d   = static_cast<double>(now_);
+    for (std::size_t i = 0; i < n; ++i) { scores[i] = score_at(counts[i], lasts[i], now_d); }
     constexpr double kProtected = std::numeric_limits<double>::infinity();
     std::size_t protected_residents = 0;
     for (std::uint32_t k : protect) {
@@ -343,6 +347,19 @@ void LfruPolicy::evict(std::uint32_t key) {
     if (resident(key)) { erase(key); }
 }
 
+std::optional<std::uint32_t> LfruPolicy::peek_victim(std::span<const std::uint32_t> protect) {
+    victim_.clear();
+    select_victims(1, protect, victim_);
+    if (victim_.empty()) { return std::nullopt; }
+    return victim_[0];
+}
+
+bool LfruPolicy::admit_free(std::uint32_t key) {
+    if (key >= count_.size() || resident(key) || residents_.size() >= capacity_) { return false; }
+    insert(key);
+    return true;
+}
+
 void LfruPolicy::set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims) {
     if (residents_.size() > capacity) {
         const std::size_t first = victims.size();
@@ -490,9 +507,10 @@ void FramePool::on_quiescent() {
 
 CacheController::CacheController(std::uint32_t num_keys, std::uint32_t frames, std::uint32_t slack_frames,
                                  std::uint32_t rounds_in_flight, std::uint32_t max_frames,
-                                 std::uint32_t halving_period)
-    : policy_(num_keys, frames > slack_frames ? frames - slack_frames : 0, halving_period), slack_(slack_frames),
-      frames_(frames, rounds_in_flight, max_frames), table_(num_keys), is_queued_(num_keys, 0),
+                                 std::uint32_t halving_period, double recency_scale, double recency_weight)
+    : policy_(num_keys, frames > slack_frames ? frames - slack_frames : 0, halving_period, recency_scale,
+              recency_weight),
+      slack_(slack_frames), frames_(frames, rounds_in_flight, max_frames), table_(num_keys), is_queued_(num_keys, 0),
       load_serial_(num_keys, 0), frame_key_(frames_.max_frames(), kNoKey) {}
 
 void CacheController::load(std::uint32_t key, std::uint32_t frame, std::vector<Command>& out) {
@@ -581,6 +599,35 @@ bool CacheController::adopt(std::uint32_t key, std::uint32_t frame, std::span<co
     return true;
 }
 
+bool CacheController::adopt_free(std::uint32_t key, std::uint32_t frame, std::vector<Command>& out) {
+    if (key >= table_.size() || table_[key].state != ResidencyState::kAbsent || !policy_.admit_free(key)) {
+        return false;
+    }
+    table_[key] = table_[key].next(ResidencyState::kLoading, frame);
+    table_[key] = table_[key].next(ResidencyState::kReady, frame);
+    out.push_back({Command::Kind::kWriteEntry, key, frame, table_[key].encode()});
+    load_serial_[key] = ++next_serial_;
+    frame_key_[frame] = key;
+    return true;
+}
+
+void CacheController::evict_key(std::uint32_t key, std::uint64_t round_started, std::vector<Command>& out) {
+    if (key >= table_.size() || !policy_.resident(key)) { return; }
+    policy_.evict(key);
+    if (table_[key].state != ResidencyState::kAbsent) { frames_.retire(make_absent(key, out), round_started); }
+}
+
+bool CacheController::enqueue_admit(std::uint32_t key) {
+    if (key >= table_.size() || table_[key].state != ResidencyState::kAbsent || !policy_.admit_free(key)) {
+        return false;
+    }
+    if (!is_queued_[key]) {
+        queued_.push_back(key);
+        is_queued_[key] = 1;
+    }
+    return true;
+}
+
 void CacheController::release(std::uint32_t frame) { frames_.release_now(frame); }
 
 bool CacheController::complete_load(std::uint32_t key, std::uint32_t frame, std::uint64_t serial) const {
@@ -602,6 +649,10 @@ void CacheController::drain_queue(std::vector<Command>& out) {
         is_queued_[key] = 0;
         load(key, *frame, out);
     }
+}
+
+void CacheController::record_route(std::span<const std::uint32_t> group) {
+    policy_.step(group, step_, 0);
 }
 
 void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,

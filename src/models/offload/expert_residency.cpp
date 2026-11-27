@@ -90,11 +90,13 @@ ExpertResidency::ExpertResidency(const ExpertBankGeometry& geometry, std::vector
             pool.arena = std::make_unique<VmmArena>(device, total_bytes, kChunkBytes);
             pool.limit = static_cast<std::uint32_t>(std::min<std::uint64_t>(pool.limit, pool.arena->reserved_bytes() / pitch));
         }
-        // The pool ticks once per call of its layers: its halving period is their share.
+        // The pool ticks once per call of its layers: both its halving period and recency half-scale
+        // scale with its layer share so scores stay comparable across size-class pools.
         const auto period = static_cast<std::uint32_t>(
             std::max<std::uint64_t>(1, static_cast<std::uint64_t>(kLfruHalvingPeriod) * layers.size() / layers_));
+        const double recency_scale = kLfruRecencyRounds * static_cast<double>(layers.size());
         pool.controller = std::make_unique<CacheController>(static_cast<std::uint32_t>(keys), 0, slack_frames(0), 1,
-                                                            pool.limit, period);
+                                                            pool.limit, period, recency_scale, kLfruRecencyWeight);
         pools_.push_back(std::move(pool));
     }
     table_device_ = DeviceBuffer(keys * sizeof(std::int32_t));
@@ -115,6 +117,8 @@ ExpertResidency::ExpertResidency(const ExpertBankGeometry& geometry, std::vector
     landed_device_.copy_from_host(landed_host_.data(), landing_bytes);
     reserved_.assign(static_cast<std::size_t>(layers_) * kLandingSlots, 0);
     landing_counts_.assign(layers_, 0);
+    layer_miss_ema_.assign(layers_, 1.0);
+    pool_routed_.resize(pools_.size());
     seen_.assign(experts_, 0);
     group_.reserve(experts_);
     routed_by_layer_.assign(layers_, 0);
@@ -529,8 +533,48 @@ void ExpertResidency::tier_step(cudaStream_t compute) {
     }
 }
 
+std::uint32_t ExpertResidency::steady_landing_target(const Pool& pool) const noexcept {
+    if (pool.frames == 0 || pool.layers.empty() || pool.controller->loaned_frames() != 0) { return 0; }
+    const std::uint64_t pool_keys = static_cast<std::uint64_t>(pool.layers.size()) * experts_;
+    if (pool.frames >= pool_keys) { return 0; }
+    const std::uint32_t max_overhead = pool.frames / 32U;
+    if (max_overhead == 0) { return 0; }
+    return std::min<std::uint32_t>(static_cast<std::uint32_t>(pool.layers.size()), max_overhead);
+}
+
+std::size_t ExpertResidency::tier_ram_room() const noexcept {
+    if (tier_ == nullptr) { return std::numeric_limits<std::size_t>::max(); }
+    const auto& host = tier_->controller();
+    const std::size_t used_demotion =
+        host.config().demotion > host.demotion_slots() ? host.config().demotion - host.demotion_slots() : 0;
+    const std::size_t free_or_shadow = host.free_residents() + host.shadow_count();
+    std::size_t room = free_or_shadow > used_demotion ? free_or_shadow - used_demotion : 0;
+    room             = std::min(room, host.demotion_slots());
+    return std::min<std::size_t>(room, host.demotion_allowance());
+}
+
+void ExpertResidency::flush_pool_commands(Pool& pool, std::int32_t* table) {
+    if (pool.frames == 0) {
+        pool.commands.clear();
+        return;
+    }
+    if (tier_ != nullptr) { demote_or_drop(pool, pool.commands, table); } // before on_quiescent frees the victims' frames
+    pool.controller->on_quiescent(pool.commands);
+    // Evictions take effect on the compute stream before the next round; promotions copy on
+    // the copy stream once that table is in place. A demoted expert stays readable in its held frame.
+    for (const auto& command : pool.commands) {
+        if (absent_write(command) && table[command.key] >= 0 && (tier_ == nullptr || demoting_[command.key] == 0)) {
+            table[command.key] = -1;
+            table_dirty_       = true;
+        }
+    }
+    take_loads(pool.commands);
+    pool.commands.clear();
+}
+
 void ExpertResidency::before_round(cudaStream_t compute, bool landing, bool walking, std::uint32_t stream_slots) {
-    decode_round_ = landing;
+    decode_round_  = landing;
+    walking_round_ = walking;
     publish_landed();
     if (tier_ != nullptr) {
         finish_demotions(compute, false);
@@ -561,19 +605,22 @@ void ExpertResidency::before_round(cudaStream_t compute, bool landing, bool walk
     }
     release_reservations(); // a discarded round's
     bool any_landing = false;
-    if (landing && frames() > 0) {
+    if (landing && swap_enabled_ && !resident_ && frames() > 0) {
         // Reserve landing frames independently per pool: stage_kernel reads each layer's own
-        // kLandingSlots row (-1 = unused), so free frames in one pool (e.g. after a prefill lease)
-        // land misses even while another pool is full.
+        // kLandingSlots row (-1 = unused). When fewer than one frame per layer is free, hand out
+        // the remainder to the pool's highest-miss layers so partial frontiers still land misses.
         for (std::size_t p = 0; p < pools_.size(); ++p) {
             const auto n = static_cast<std::uint32_t>(pools_[p].layers.size());
             if (n == 0) { continue; }
-            const std::uint32_t want =
-                std::min<std::uint32_t>(kLandingSlots, pools_[p].controller->free_frames() / n);
-            if (want == 0) { continue; }
+            const std::uint32_t free = pools_[p].controller->free_frames();
+            if (free == 0) { continue; }
+            const std::uint32_t want = std::min<std::uint32_t>(kLandingSlots * n, free);
             landing_scratch_.clear();
-            pools_[p].controller->reserve_free(want * n, landing_scratch_);
-            const std::uint32_t per = static_cast<std::uint32_t>(landing_scratch_.size()) / n;
+            pools_[p].controller->reserve_free(want, landing_scratch_);
+            const auto got = static_cast<std::uint32_t>(landing_scratch_.size());
+            if (got == 0) { continue; }
+            const std::uint32_t per = std::min<std::uint32_t>(kLandingSlots, got / n);
+            const std::uint32_t rem = per < kLandingSlots ? std::min<std::uint32_t>(n, got - per * n) : 0U;
             std::size_t next        = 0;
             if (per > 0) {
                 any_landing = true;
@@ -582,6 +629,22 @@ void ExpertResidency::before_round(cudaStream_t compute, bool landing, bool walk
                     for (std::uint32_t k = 0; k < per; ++k) {
                         reserved_[layer * kLandingSlots + k] = landing_scratch_[next++];
                     }
+                }
+            }
+            if (rem > 0) {
+                any_landing = true;
+                layer_rank_.assign(pools_[p].layers.begin(), pools_[p].layers.end());
+                std::partial_sort(layer_rank_.begin(), layer_rank_.begin() + static_cast<std::ptrdiff_t>(rem),
+                                  layer_rank_.end(), [&](std::uint32_t a, std::uint32_t b) {
+                                      if (layer_miss_ema_[a] != layer_miss_ema_[b]) {
+                                          return layer_miss_ema_[a] > layer_miss_ema_[b];
+                                      }
+                                      return ((a + round_) % layers_) < ((b + round_) % layers_);
+                                  });
+                for (std::uint32_t i = 0; i < rem; ++i) {
+                    const std::uint32_t layer              = layer_rank_[i];
+                    const std::uint32_t slot               = landing_counts_[layer]++;
+                    reserved_[layer * kLandingSlots + slot] = landing_scratch_[next++];
                 }
             }
             for (; next < landing_scratch_.size(); ++next) { pools_[p].controller->release(landing_scratch_[next]); }
@@ -659,17 +722,22 @@ void ExpertResidency::enqueue_route_download(cudaStream_t compute, std::int32_t 
 
 void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
                                   std::span<const std::uint8_t> live) {
-    const auto* routes = static_cast<const std::int32_t*>(route_host_.data());
-    auto* table        = static_cast<std::int32_t*>(table_host_.data());
+    const auto* routes     = static_cast<const std::int32_t*>(route_host_.data());
+    auto* table            = static_cast<std::int32_t*>(table_host_.data());
     const std::size_t used = static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(columns);
     ++round_;
     for (auto& pool : pools_) { pool.commands.clear(); }
+    for (auto& routed : pool_routed_) { routed.clear(); }
+    decode_misses_.clear();
     if (tier_ != nullptr) {
         tier_->end_round();
         uses_.clear();
     }
+    const bool adaptive_decode = decode_round_ && swap_enabled_ && !resident_ && !walking_round_;
+    std::size_t round_landed   = 0;
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-        Pool& pool = pools_[pool_of_layer_[layer]];
+        const std::uint32_t p = pool_of_layer_[layer];
+        Pool& pool            = pools_[p];
         group_.clear();
         const std::int32_t* ids = routes + static_cast<std::size_t>(layer) * route_stride_;
         for (std::size_t i = 0; i < used; ++i) {
@@ -680,8 +748,8 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
             group_.push_back(layer * experts_ + expert);
         }
         if (tier_ != nullptr) { uses_.insert(uses_.end(), group_.begin(), group_.end()); }
+        pool_routed_[p].insert(pool_routed_[p].end(), group_.begin(), group_.end());
         for (const auto key : group_) {
-            seen_[key - layer * experts_] = 0;
             ++stats_.routed;
             ++routed_by_layer_[layer];
             if (table[key] >= 0) {
@@ -693,13 +761,64 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
             stats_.decode_routed += group_.size();
             for (const auto key : group_) { stats_.decode_hits += table[key] >= 0 ? 1U : 0U; }
         }
-        // The layer's landed experts become resident in their frames; the rest of its reserved
-        // frames return to the pool. --expert-swap off freezes the content: nothing is adopted
-        // and the policy gets no promotion budget, so the pools keep what the seeds placed.
-        std::size_t budget = swap_enabled_ ? per_layer_budget : 0;
+        if (adaptive_decode) {
+            // Update LFRU-Blend counts and clock first so admission checks compare each landed miss
+            // and CPU miss at its post-route score, and only live columns' misses can adopt.
+            pool.controller->record_route(group_);
+            const auto misses = pool.controller->last_misses();
+            layer_miss_ema_[layer] = 0.75 * layer_miss_ema_[layer] + 0.25 * static_cast<double>(misses.size());
+            const std::uint32_t count = landing_counts_[layer];
+            if (count > 0) {
+                const auto* landed = static_cast<const std::int32_t*>(landed_host_.data()) + layer * kLandingSlots;
+                const std::uint32_t target = steady_landing_target(pool);
+                const auto& policy         = pool.controller->policy();
+                std::size_t adopted        = 0;
+                for (std::uint32_t n = 0; n < count; ++n) {
+                    const std::uint32_t frame = reserved_[layer * kLandingSlots + n];
+                    const std::int32_t expert = landed[n];
+                    const bool valid_live     = expert >= 0 && static_cast<std::uint32_t>(expert) < experts_ &&
+                                            seen_[static_cast<std::uint32_t>(expert)] != 0;
+                    const std::uint32_t key = layer * experts_ + static_cast<std::uint32_t>(expert);
+                    bool worthy             = false;
+                    if (valid_live && (tier_ == nullptr || demoting_[key] == 0) &&
+                        pool.controller->entry(key).state == ResidencyState::kAbsent && !policy.resident(key)) {
+                        if (has_unused_ || policy.resident_count() + target < policy.capacity()) {
+                            worthy = true;
+                        } else if (const auto victim = pool.controller->policy().peek_victim(pool_routed_[p])) {
+                            const bool v_in_ram = (tier_ == nullptr) || tier_->controller().host_copy(*victim) ||
+                                                  tier_->controller().held(*victim);
+                            const double margin = v_in_ram ? 1.0 : kLandingD2HMargin;
+                            worthy              = policy.score(key) > policy.score(*victim) * margin;
+                        }
+                    }
+                    if (worthy && pool.controller->adopt_free(key, frame, pool.commands)) {
+                        table[key]   = static_cast<std::int32_t>(frame);
+                        table_dirty_ = true;
+                        if (tier_ != nullptr) { tier_->controller().mark_shadow(key); }
+                        ++adopted;
+                        ++round_landed;
+                    } else {
+                        pool.controller->release(frame);
+                    }
+                }
+                landing_counts_[layer] = 0;
+                stats_.landed += adopted;
+            }
+            for (const std::uint32_t key : misses) {
+                if (!pool.controller->policy().resident(key) && (tier_ == nullptr || demoting_[key] == 0) &&
+                    (tier_ == nullptr || admissible_(key))) {
+                    decode_misses_.push_back({pool.controller->policy().score(key), p, key});
+                }
+            }
+            for (const auto key : group_) { seen_[key - layer * experts_] = 0; }
+            continue;
+        }
+        for (const auto key : group_) { seen_[key - layer * experts_] = 0; }
+        // Prefill, walk-active, resident, or --expert-swap off path.
+        std::size_t budget        = swap_enabled_ ? per_layer_budget : 0;
         const std::uint32_t count = landing_counts_[layer];
         if (count > 0) {
-            const auto* landed = static_cast<const std::int32_t*>(landed_host_.data()) + layer * kLandingSlots;
+            const auto* landed  = static_cast<const std::int32_t*>(landed_host_.data()) + layer * kLandingSlots;
             std::size_t adopted = 0;
             for (std::uint32_t n = 0; n < count; ++n) {
                 const std::uint32_t frame = reserved_[layer * kLandingSlots + n];
@@ -730,64 +849,111 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
     }
     any_landing_ = false;
     if (frames() == 0) { return; }
-    // Cold startup placeholders (count == 0, unpinned, e.g. from an unranked placement fill) sit in
-    // VRAM to avoid SSD spill at startup, leaving zero free frames for landing. During decode,
-    // pre-demote a small landing frontier of those unused placeholders asynchronously on d2h_stream_
-    // (only into free or shadow RAM slots so no RAM-only expert is ever evicted to SSD) so misses
-    // land directly into VRAM at zero extra H2D cost until every placeholder has been replaced.
-    if (decode_round_ && swap_enabled_ && !resident_ && has_unused_) {
+
+    load_commands_.clear();
+    if (adaptive_decode) {
         std::vector<std::uint32_t> demoting_pool(pools_.size(), 0);
         for (const auto& d : demotions_) { ++demoting_pool[pool_of_layer_[d.key / experts_]]; }
-        std::size_t ram_room = std::numeric_limits<std::size_t>::max();
-        if (tier_ != nullptr) {
-            const auto& host = tier_->controller();
-            const std::size_t used_demotion =
-                host.config().demotion > host.demotion_slots() ? host.config().demotion - host.demotion_slots() : 0;
-            const std::size_t free_or_shadow = host.free_residents() + host.shadow_count();
-            ram_room = free_or_shadow > used_demotion ? free_or_shadow - used_demotion : 0;
-            ram_room = std::min(ram_room, host.demotion_slots());
-            ram_room = std::min<std::size_t>(ram_room, host.demotion_allowance());
-        }
-        bool any_unused = false;
-        for (std::size_t p = 0; p < pools_.size(); ++p) {
-            Pool& pool = pools_[p];
-            if (pool.frames == 0 || pool.layers.empty()) { continue; }
-            const std::uint32_t target =
-                std::min<std::uint32_t>(kLandingSlots, 4U) * static_cast<std::uint32_t>(pool.layers.size());
-            const std::uint32_t have = pool.controller->free_frames() + demoting_pool[p];
-            if (have >= target) {
-                any_unused = true;
-                continue;
+        std::size_t ram_room = tier_ram_room();
+        // Phase A: drain cold startup placeholders (count == 0, unpinned) into free/shadow RAM slots.
+        if (has_unused_) {
+            bool any_unused = false;
+            for (std::size_t p = 0; p < pools_.size(); ++p) {
+                Pool& pool = pools_[p];
+                if (pool.frames == 0 || pool.layers.empty() || pool.controller->loaned_frames() != 0) { continue; }
+                const std::uint32_t target =
+                    std::min<std::uint32_t>(kLandingSlots, 4U) * static_cast<std::uint32_t>(pool.layers.size());
+                const std::uint32_t have = pool.controller->free_frames() + demoting_pool[p];
+                if (have >= target) {
+                    any_unused = true;
+                    continue;
+                }
+                const std::uint32_t cap  = std::max<std::uint32_t>(1U, 3U * static_cast<std::uint32_t>(pool.layers.size()));
+                const std::uint32_t want = static_cast<std::uint32_t>(
+                    std::min<std::size_t>({static_cast<std::size_t>(target - have), static_cast<std::size_t>(cap), ram_room}));
+                if (want == 0) {
+                    any_unused = true;
+                    continue;
+                }
+                bool pool_remaining = false;
+                const std::uint32_t evicted = pool.controller->evict_unused(
+                    want, round_, pool.commands, pool_remaining, tier_ != nullptr ? &evictable_ : nullptr);
+                if (tier_ != nullptr) { ram_room = ram_room > evicted ? ram_room - evicted : 0; }
+                if (pool_remaining) { any_unused = true; }
             }
-            const std::uint32_t cap = std::max<std::uint32_t>(1U, 3U * static_cast<std::uint32_t>(pool.layers.size()));
-            const std::uint32_t want = static_cast<std::uint32_t>(
-                std::min<std::size_t>({static_cast<std::size_t>(target - have), static_cast<std::size_t>(cap), ram_room}));
-            if (want == 0) {
-                any_unused = true;
-                continue;
-            }
-            bool pool_remaining = false;
-            const std::uint32_t evicted = pool.controller->evict_unused(
-                want, round_, pool.commands, pool_remaining, tier_ != nullptr ? &evictable_ : nullptr);
-            if (tier_ != nullptr) { ram_room = ram_room > evicted ? ram_room - evicted : 0; }
-            if (pool_remaining) { any_unused = true; }
+            has_unused_ = any_unused;
         }
-        has_unused_ = any_unused;
-    }
-    load_commands_.clear();
-    for (auto& pool : pools_) {
-        if (pool.frames == 0) { continue; }
-        if (tier_ != nullptr) { demote_or_drop(pool, pool.commands, table); } // before on_quiescent frees the victims' frames
-        pool.controller->on_quiescent(pool.commands);
-        // Evictions take effect on the compute stream before the next round; promotions copy on
-        // the copy stream once that table is in place. A demoted expert stays readable in its held frame.
-        for (const auto& command : pool.commands) {
-            if (absent_write(command) && table[command.key] >= 0 && (tier_ == nullptr || demoting_[command.key] == 0)) {
-                table[command.key] = -1;
-                table_dirty_       = true;
+        // Phase B: adaptive round-level H2D promotions for top-scoring misses when PCIe landing was quiet
+        // (e.g. C1 decode where small-miss layers route to CPU instead of stage_kernel).
+        const std::size_t h2d_budget =
+            round_landed < kDecodeAdaptiveH2DCap ? (kDecodeAdaptiveH2DCap - round_landed) : 0;
+        if (h2d_budget > 0 && !decode_misses_.empty()) {
+            std::sort(decode_misses_.begin(), decode_misses_.end(), [](const MissCandidate& a, const MissCandidate& b) {
+                return a.score != b.score ? a.score > b.score : a.key < b.key;
+            });
+            std::size_t promoted = 0;
+            for (const auto& cand : decode_misses_) {
+                if (promoted >= h2d_budget) { break; }
+                Pool& pool = pools_[cand.pool];
+                if (pool.frames == 0 || pool.controller->loaned_frames() != 0) { continue; }
+                auto& policy = pool.controller->policy();
+                if (policy.resident(cand.key) || pool.controller->entry(cand.key).state != ResidencyState::kAbsent) {
+                    continue;
+                }
+                const std::uint32_t target = steady_landing_target(pool);
+                if (policy.resident_count() + target < policy.capacity()) {
+                    if (pool.controller->enqueue_admit(cand.key)) { ++promoted; }
+                    continue;
+                }
+                const auto victim = policy.peek_victim(pool_routed_[cand.pool]);
+                if (!victim || pool.controller->entry(*victim).state != ResidencyState::kReady) { continue; }
+                const bool v_in_ram =
+                    (tier_ == nullptr) || tier_->controller().host_copy(*victim) || tier_->controller().held(*victim);
+                const double margin = v_in_ram ? kH2DShadowMargin : kH2DD2HMargin;
+                if (!(policy.score(cand.key) > policy.score(*victim) * margin)) { continue; }
+                if (tier_ != nullptr && !v_in_ram) {
+                    if (ram_room == 0 || !tier_->controller().demotion_worthy(*victim) || !evictable_(*victim)) {
+                        continue;
+                    }
+                    --ram_room;
+                }
+                pool.controller->evict_key(*victim, round_, pool.commands);
+                if (pool.controller->enqueue_admit(cand.key)) { ++promoted; }
             }
         }
-        take_loads(pool.commands);
+        // Flush Phase A & B commands so demotions_ and free_frames() are exact before frontier refill.
+        for (auto& pool : pools_) { flush_pool_commands(pool, table); }
+        // Phase C: maintain the steady-state landing frontier (~1 free frame per layer) once cold
+        // placeholders are gone, bounded by free/shadow RAM headroom so no RAM-only expert spills.
+        if (!has_unused_) {
+            std::fill(demoting_pool.begin(), demoting_pool.end(), 0U);
+            for (const auto& d : demotions_) { ++demoting_pool[pool_of_layer_[d.key / experts_]]; }
+            ram_room = tier_ram_room();
+            for (std::size_t p = 0; p < pools_.size(); ++p) {
+                Pool& pool                 = pools_[p];
+                const std::uint32_t target = steady_landing_target(pool);
+                if (target == 0) { continue; }
+                const std::uint32_t have = pool.controller->free_frames() + demoting_pool[p];
+                if (have >= target) { continue; }
+                const std::uint32_t need = target - have;
+                for (std::uint32_t i = 0; i < need; ++i) {
+                    const auto victim = pool.controller->policy().peek_victim(pool_routed_[p]);
+                    if (!victim || pool.controller->entry(*victim).state != ResidencyState::kReady) { break; }
+                    const bool v_in_ram =
+                        (tier_ == nullptr) || tier_->controller().host_copy(*victim) || tier_->controller().held(*victim);
+                    if (tier_ != nullptr && !v_in_ram) {
+                        if (ram_room == 0 || !tier_->controller().demotion_worthy(*victim) || !evictable_(*victim)) {
+                            break;
+                        }
+                        --ram_room;
+                    }
+                    pool.controller->evict_key(*victim, round_, pool.commands);
+                }
+                flush_pool_commands(pool, table);
+            }
+        }
+    } else {
+        for (auto& pool : pools_) { flush_pool_commands(pool, table); }
     }
     if (table_dirty_) { upload_table(compute); }
     issue_loads(compute);
@@ -820,16 +986,20 @@ ExpertResidency::SavedState ExpertResidency::saved_state() const {
     for (std::uint32_t key = 0; key < keys; ++key) {
         out.counts[key] = static_cast<std::uint32_t>(std::lround(pool_of(key).controller->policy().count(key)));
     }
-    // Every pool's residents by score, a pool's age (its own ticks) scaled to layer calls of every
-    // layer so scores compare across pools (warm_start loads each pool's keys in this order).
+    // Every pool's residents by score: LRFU-Blend already normalizes recency and halving by each
+    // pool's layer share, so policy.score(key) is directly comparable across pools.
     std::vector<std::pair<double, std::uint32_t>> ranked;
     for (const auto& pool : pools_) {
         const auto& policy = pool.controller->policy();
         const double scale = static_cast<double>(layers_) / static_cast<double>(pool.layers.size());
         for (const std::uint32_t key : policy.residents()) {
-            const double count = policy.count(key), score = policy.score(key);
-            const double age   = score > 0.0 ? count / score - 1.0 : 0.0;
-            ranked.emplace_back(score > 0.0 ? count / (age * scale + 1.0) : 0.0, key);
+            if (policy.recency_scale() > 0.0) {
+                ranked.emplace_back(policy.score(key), key);
+            } else {
+                const double count = policy.count(key);
+                const double age   = static_cast<double>(policy.now() - policy.last(key));
+                ranked.emplace_back(count > 0.0 ? count / (age * scale + 1.0) : 0.0, key);
+            }
         }
     }
     std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });

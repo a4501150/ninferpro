@@ -13,6 +13,7 @@
 
 using infernix::models::glm5_next::detail::calibrated_draft_length;
 using infernix::models::glm5_next::detail::kRoundCost;
+using infernix::models::glm5_next::detail::RoundCostModel;
 using infernix::models::glm5_next::detail::SelectorCalibration;
 
 namespace {
@@ -83,6 +84,41 @@ int main() {
         require(std::abs(u.accept[9] - (0.5 * 0.95 + 0.5)) < 1e-12, "an accepted draft raises its decile");
         require(std::abs(u.accept[7] - 0.5 * 0.75) < 1e-12, "the first rejected draft lowers its decile");
         require(u.accept[5] == 0.55 && u.accept[3] == 0.35, "drafts after the first rejection are untouched");
+
+        // Online round-cost model: falls back to kRoundCost until enough spread rounds arrive,
+        // learns cheaper/more expensive marginal slopes, ignores outlier spikes, and resets cleanly.
+        RoundCostModel model;
+        for (std::int32_t k = 0; k < static_cast<std::int32_t>(kRoundCost.size()); ++k) {
+            require(std::abs(model.cost(k) - kRoundCost[static_cast<std::size_t>(k)]) < 1e-12,
+                    "unfitted model uses prior kRoundCost");
+        }
+        // Only constant-k observations have zero spread and keep the prior.
+        for (int i = 0; i < 30; ++i) {
+            model.observe_proposal(0.0015);
+            model.observe_step(3, 0.025);
+        }
+        double a = 0.0, b = 0.0;
+        require(!model.fit_step(a, b), "zero-spread observations do not activate the fit");
+        model.reset();
+        // Low-slope placement (e.g., high VRAM share): 15 ms plain, 16.2 ms + 2.25 ms/draft verify, 1.5 ms proposal.
+        for (int i = 0; i < 60; ++i) {
+            const std::int32_t k = i % 6;
+            model.observe_proposal(0.0015);
+            model.observe_step(k, k == 0 ? 0.015 : (0.0162 + 0.00225 * static_cast<double>(k)));
+        }
+        // An outlier spike (graph capture or host pause) is rejected.
+        model.observe_proposal(0.250);
+        model.observe_step(5, 0.500);
+        double prop = 0.0, fixed = 0.0, slope = 0.0;
+        require(model.normalized(prop, fixed, slope), "spread observations activate the fit");
+        require(std::abs(prop - 0.10) < 0.01 && std::abs(fixed - 0.08) < 0.01 &&
+                    std::abs(slope - 0.15) < 0.01,
+                "fitted proposal, verify overhead and slope match true timings despite outlier");
+        // With the cheaper marginal slope (0.15 vs prior ~0.35), confident drafts verify longer.
+        require(calibrated_draft_length(c, model, sure, 7) > calibrated_draft_length(c, sure, 7),
+                "cheaper marginal column cost lengthens confident verification");
+        model.reset();
+        require(!model.fit_step(a, b), "reset clears the fit");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

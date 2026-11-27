@@ -846,6 +846,100 @@ void test_tier_gates() {
     }
 }
 
+void test_lrfu_blend_and_primitives() {
+    // Anti-cliff check: a warm resident used 5 times one 42-layer round ago must still outrank a
+    // brand-new 1-hit wonder at age 0 under LRFU-Blend (recency_scale = 32 * 42, recency_weight = 2).
+    {
+        LfruPolicy policy(128, 16, 16384, 32.0 * 42.0, 2.0);
+        LfruPolicy::Step step;
+        const std::uint32_t warm[] = {1};
+        for (int i = 0; i < 5; ++i) { policy.step(warm, step); }
+        for (int i = 0; i < 41; ++i) {
+            const std::uint32_t other[] = {static_cast<std::uint32_t>(10 + (i % 5))};
+            policy.step(other, step);
+        }
+        const std::uint32_t cold[] = {99};
+        policy.step(cold, step);
+        check(policy.score(1) > policy.score(99), "LRFU-Blend: warm resident beats 1-hit wonder after a 42-layer round");
+    }
+    // Low-set exactness under LRFU-Blend with halving, credits, shifting hot set, and pinning.
+    std::mt19937 rng(37);
+    LfruPolicy policy(16384, 2000, 600, 32.0 * 34.0, 2.0);
+    std::vector<std::uint32_t> pins;
+    for (std::uint32_t k = 0; k < 16384; k += 53) { pins.push_back(k); }
+    policy.pin_keys(pins);
+    LfruPolicy::Step step;
+    std::size_t checked = 0;
+    for (int i = 0; i < 3000; ++i) {
+        std::set<std::uint32_t> g;
+        const auto hot = static_cast<std::uint32_t>(i / 500) * 2000;
+        while (g.size() < 20) { g.insert((hot + static_cast<std::uint32_t>(rng() % 4000)) % 16384); }
+        const std::vector<std::uint32_t> group(g.begin(), g.end());
+        if (i % 83 == 0 && policy.resident_count() > 0) {
+            const std::uint32_t keys[] = {policy.residents()[rng() % policy.resident_count()]};
+            const double amt[]         = {1.5};
+            policy.credit(keys, amt);
+        }
+        const std::size_t budget = i % 4 == 3 ? static_cast<std::size_t>(-1) : static_cast<std::size_t>(i % 4);
+        policy.step(group, step, budget);
+        if (i % 17 == 0 && policy.resident_count() > 0) {
+            const auto peek = policy.peek_victim(group);
+            check(peek.has_value(), "peek_victim finds an unpinned resident");
+            if (peek) {
+                check(!g.count(*peek) && !policy.pinned(*peek), "peek_victim is unpinned and unprotected");
+                const double sp = policy.score(*peek);
+                for (const std::uint32_t r : policy.residents()) {
+                    if (g.count(r) || policy.pinned(r)) { continue; }
+                    const double sr = policy.score(r);
+                    check(sr > sp || (sr == sp && r >= *peek), "LRFU-Blend peek_victim matches full scan");
+                }
+            }
+        }
+        if (!step.victims.empty()) {
+            double top_score     = -1.0;
+            std::uint32_t top_key = 0;
+            for (const std::uint32_t v : step.victims) {
+                check(!g.count(v) && !policy.pinned(v), "LRFU-Blend victim is unpinned and outside group");
+                const double s = policy.score(v);
+                if (s > top_score || (s == top_score && v > top_key)) {
+                    top_score = s;
+                    top_key   = v;
+                }
+            }
+            for (const std::uint32_t r : policy.residents()) {
+                if (g.count(r) || policy.pinned(r)) { continue; }
+                const double s = policy.score(r);
+                check(s > top_score || (s == top_score && r > top_key), "LRFU-Blend low set matches full scan");
+            }
+            checked += step.victims.size();
+        }
+        if (g_failures) { return; }
+    }
+    std::printf("LRFU-Blend low set: %zu victims checked\n", checked);
+    check(checked > 1000, "LRFU-Blend low-set test checked enough victims");
+
+    // Controller primitives: record_route, adopt_free, evict_key, enqueue_admit.
+    CacheController cache(32, 4, 0, 1, 0, 16384, 32.0, 2.0);
+    std::vector<CacheController::Command> cmds;
+    std::vector<std::uint32_t> reserved;
+    check(cache.reserve_free(2, reserved) == 2, "reserve two landing frames");
+    const std::uint32_t r1[] = {2, 5};
+    cache.record_route(r1);
+    check(cache.last_misses().size() == 2 && cache.policy().resident_count() == 0, "record_route counts without admitting");
+    check(cache.adopt_free(2, reserved[0], cmds) && cache.policy().resident(2), "adopt_free admits into reserved frame");
+    check(!cache.adopt_free(2, reserved[1], cmds), "adopt_free rejects already-resident key");
+    cache.release(reserved[1]);
+    check(cache.enqueue_admit(5) && cache.queued_loads() == 1, "enqueue_admit queues absent key");
+    cmds.clear();
+    cache.on_quiescent(cmds);
+    check(cache.queued_loads() == 0 && cache.entry(5).state == ResidencyState::kReady, "on_quiescent loads enqueued key");
+    cmds.clear();
+    cache.evict_key(2, 1, cmds);
+    cache.on_quiescent(cmds);
+    check(!cache.policy().resident(2) && cache.entry(2).state == ResidencyState::kAbsent && cache.free_frames() == 3,
+          "evict_key retires frame and frees it on quiescence");
+}
+
 int main() {
     test_residency_entries();
     test_tier_gates();
@@ -853,6 +947,7 @@ int main() {
     test_budgeted_admission();
     test_low_set();
     test_low_set_pinned();
+    test_lrfu_blend_and_primitives();
     test_frame_epochs();
     test_agent_simulation();
     test_pool_resize();

@@ -137,6 +137,7 @@ std::vector<Candidate> candidates(int k) {
         INFERNIX_FN(launch_q8_a16_mma_r48_t64), INFERNIX_FN(launch_q8_a16_mma_r64_t96),
         INFERNIX_FN(launch_q8_a16_mma_r64_t128), INFERNIX_FN(launch_q8_a16_mma_r96_t96),
         INFERNIX_FN(launch_q8_a16_mma_r128_t64), INFERNIX_FN(launch_q8_a16_mma_r128_t80),
+        INFERNIX_FN(launch_q8_a16_mma_r128_t128),
         INFERNIX_FN(launch_q8_a16_mma_r64x16_t48_k128_a1),
         INFERNIX_FN(launch_q8_a16_mma_r64x32_t64_k128_a1),
     };

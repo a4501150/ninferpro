@@ -28,6 +28,7 @@
 #include "models/glm5_next/program/prefix/prefix_cache.h"
 #include "models/offload/expert_residency.h"
 #include "models/offload/host_expert_tier.h"
+#include "models/offload/route_trace.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "runtime/diagnostics.h"
@@ -497,7 +498,11 @@ private:
     void note_prompt_routes(Lane& lane, std::int32_t width);
     void seed_prompt_experts(Lane& lane);
     // After a call completed (the stream was synchronized): the expert cache's round boundary.
-    void after_call(std::int32_t columns, std::size_t promotions);
+    void after_call(std::int32_t columns, std::size_t promotions,
+                    offload::RouteTraceKind kind = offload::RouteTraceKind::Decode,
+                    std::int32_t rows = 1, std::int32_t width = 1, std::uint32_t tokens = 1,
+                    std::uint32_t position = offload::RouteTrace::kUnknownPosition,
+                    std::span<const std::uint8_t> live = {});
 
     // The promotions a served call of `tokens` columns may make at its round boundary: one per
     // layer every promotion_interval_ tokens.
@@ -565,7 +570,8 @@ private:
     [[nodiscard]] PendingBatch speculate(std::span<const SequenceHandle> sequences,
                                          std::span<const std::uint32_t> lanes,
                                          std::span<const std::int32_t> positions,
-                                         std::int32_t width, Clock::time_point start);
+                                         std::int32_t width, Clock::time_point start,
+                                         Clock::time_point step_start);
     void propose(std::span<const std::uint32_t> lanes, std::int32_t width);
     [[nodiscard]] CommitResult commit_verified(PendingBatch&& pending,
                                                std::span<const runtime::CommitDecision> decisions);
@@ -700,6 +706,8 @@ private:
     std::array<std::int32_t, kMaximumConcurrency> pending_counts_{};
     std::int32_t round_width_ = 1;
     std::array<std::int32_t, kMaximumConcurrency> host_lanes_{};
+    std::vector<std::uint8_t> verify_live_;
+    std::unique_ptr<offload::RouteTrace> trace_;
 
     DeviceBuffer kda_backing_, index_ring_, kv_backing_, io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_,
         token_counts_, constraint_, grammar_masks_, staging_, score_residuals_, score_logits_, score_logits16_, score_io_;
@@ -735,6 +743,8 @@ private:
     std::array<std::array<TokenId, 16>, kMaximumConcurrency> drafts_{};
     // Each draft's selector probability (temperature 1), read back with the drafts.
     std::array<std::array<float, 16>, kMaximumConcurrency> confidence_{};
+    RoundCostModel round_cost_{};
+    std::uint64_t round_cost_logs_ = 0;
     static constexpr std::uint64_t kProbeInterval = 8;
     static constexpr double kCalibrationWeight    = 0.1;
 
