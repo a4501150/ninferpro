@@ -109,15 +109,21 @@ def _q8_blocks(store: GgufStore, name: str, begin: int, end: int, k: int) -> tup
     return codes, scales.view(np.float16).astype(np.float64)
 
 
-def _q8_rounding_rows(codes: np.ndarray, scales: np.ndarray, ref: np.ndarray) -> np.ndarray:
+def _q8_rounding_rows(codes: np.ndarray, scales: np.ndarray, ref: np.ndarray, ref_rounding: float = 0.0) -> np.ndarray:
     """Whether each row's Q8_0 values (codes [rows, k], scales [rows, k / 32]) are not the Q8_0
-    rounding of ``ref`` [rows, k] (require_q8_rounding's bound)."""
+    rounding of ``ref`` [rows, k] (require_q8_rounding's bound), or, with ``ref_rounding``, of a
+    value ``ref`` rounds to within that relative error."""
 
     rows, k = codes.shape
     c = codes.reshape(rows, k // 32, 32)
     stored = c * scales[..., None]
-    bound = scales[..., None] * (0.5 * (1 + 2.0**-10) + np.abs(c) * 2.0**-10)
-    return (np.abs(stored - ref.reshape(rows, k // 32, 32)) > bound).any(axis=(1, 2))
+    # llama.cpp rounds each value to a code against the exact scale, then stores the scale rounded
+    # to binary16 (2^-10 of it, or 2^-24 absolute where it is subnormal): half a step of the exact
+    # scale plus each code's share of the scale's error.
+    scale_error = np.maximum(scales * 2.0**-10, 2.0**-24)[..., None]
+    r = ref.reshape(rows, k // 32, 32)
+    bound = scales[..., None] * 0.5 + (np.abs(c) + 0.5) * scale_error + ref_rounding * np.abs(r)
+    return (np.abs(stored - r) > bound).any(axis=(1, 2))
 
 
 def require_q8_rounding(store: GgufStore, name: str, base: SafetensorsSource, source_name: str,
@@ -144,10 +150,21 @@ def require_q8_rounding(store: GgufStore, name: str, base: SafetensorsSource, so
             raise ValueError(f"{name}: row {row} is not the Q8_0 rounding of the checkpoint's {source_name}")
 
 
+def _without_leading_ones(shape: tuple[int, ...]) -> tuple[int, ...]:
+    i = 0
+    while i < len(shape) - 1 and shape[i] == 1:
+        i += 1
+    return tuple(shape[i:])
+
+
 def require_shared_tensors(store: GgufStore, other: GgufStore) -> None:
     """Every tensor of ``store`` but the routed experts must be in ``other`` (and ``other`` holds no
-    further one) as the same bytes, or, for a BF16/F32/F16 tensor of ``store``, as a Q8_0 tensor that is
-    its Q8_0 rounding."""
+    further one) as the same bytes; for a BF16/F32/F16 tensor of ``store``, as a Q8_0 tensor that is
+    the Q8_0 rounding of a value it rounds (GCSA's Q8_0 build rounds the values its Q4 build stores in
+    BF16 from their source: 0.76 steps apart at most); for a Q8_0 tensor of both, as another Q8_0 rounding of the same values: each
+    element within one step of each scale (GCSA's Q4 build rounds its dense MLP and shared-expert
+    matrices otherwise than its Q8_0 build, at most 1.16 steps apart, while ``attn_output`` and the
+    embedding are the same bytes)."""
 
     names = {n for n in store.tensors if "_exps." not in n}
     other_names = {n for n in other.tensors if "_exps." not in n}
@@ -156,7 +173,8 @@ def require_shared_tensors(store: GgufStore, other: GgufStore) -> None:
                          f"{sorted(names ^ other_names)[:4]}")
     for name in sorted(names):
         t, o = store.tensor(name), other.tensor(name)
-        if o.shape != t.shape:
+        # Leading unit dimensions differ between llama.cpp versions ((1, 8192, 1, 4) against (8192, 1, 4)).
+        if _without_leading_ones(o.shape) != _without_leading_ones(t.shape):
             raise ValueError(f"{name}: shape {o.shape} in {other.path}, {t.shape} in {store.path}")
         if o.ggml_type != t.ggml_type and not (o.ggml_type == 8 and t.ggml_type in (0, 1, 30)):
             raise ValueError(f"{name}: type {o.ggml_type} in {other.path} against {t.ggml_type} in {store.path}")
@@ -165,12 +183,20 @@ def require_shared_tensors(store: GgufStore, other: GgufStore) -> None:
             last = min(t.rows, first + _ROW_CHUNK)
             if values is None:
                 bad = ~(store.raw(name, first, last) == other.raw(name, first, last)).all(axis=1)
+                if bad.any() and t.ggml_type == 8:
+                    a_codes, a_scales = _q8_blocks(store, name, first, last, t.row_elems)
+                    b_codes, b_scales = _q8_blocks(other, name, first, last, t.row_elems)
+                    rows = a_codes.shape[0]
+                    a = a_codes.reshape(rows, -1, 32) * a_scales[..., None]
+                    b = b_codes.reshape(rows, -1, 32) * b_scales[..., None]
+                    bad = (np.abs(a - b) > (np.abs(a_scales) + np.abs(b_scales))[..., None]).any(axis=(1, 2))
             else:
                 codes, scales = _q8_blocks(other, name, first, last, t.row_elems)
-                bad = _q8_rounding_rows(codes, scales, values[first:last])
+                # The other build rounded the source, of which ``store`` holds a BF16 rounding.
+                bad = _q8_rounding_rows(codes, scales, values[first:last], 2.0**-8)
             if bad.any():
                 row = first + int(np.flatnonzero(bad)[0])
-                raise ValueError(f"{name}: row {row} of {other.path} is not {store.path}'s (or its Q8_0 rounding)")
+                raise ValueError(f"{name}: row {row} of {other.path} is not {store.path}'s (or a Q8_0 rounding of it)")
 
 
 def require_a_log(store: GgufStore, name: str, base: SafetensorsSource, source_name: str, heads: int) -> None:

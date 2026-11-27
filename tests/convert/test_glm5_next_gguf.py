@@ -79,7 +79,8 @@ def test_kda_convolution_fuses_q_k_v_channels(tmp_path):
 
 
 def test_shared_tensors_of_another_build(tmp_path):
-    """The Q8_0 build's non-expert tensors: the Q4 build's bytes, or the Q8_0 rounding of its BF16 ones."""
+    """The Q8_0 build's non-expert tensors: the Q4 build's bytes, another Q8_0 rounding of its Q8_0
+    ones, or the Q8_0 rounding of its BF16 ones."""
 
     rng = np.random.default_rng(7)
     q8 = gguf.GGMLQuantizationType.Q8_0
@@ -93,8 +94,13 @@ def test_shared_tensors_of_another_build(tmp_path):
     other = dict(main, **{"b.weight": (rounded, q8), "blk.0.ffn_down_exps.weight": (experts[:, :2], q8)})
     with _write(tmp_path / "main.gguf", main) as m, _write(tmp_path / "other.gguf", other) as o:
         require_shared_tensors(m, o)  # the experts may differ in every way
+    # Another rounding of a Q8_0 tensor (a code one step off) passes; a code 40 steps off does not.
+    rerounded = shared.copy()
+    rerounded[2, 5] = np.uint8((int(rerounded[2, 5].view(np.int8)) + (1 if rerounded[2, 5].view(np.int8) < 127 else -1)) & 0xFF)
+    with _write(tmp_path / "main1.gguf", main) as m, _write(tmp_path / "rr.gguf", dict(other, **{"a.weight": (rerounded, q8)})) as o:
+        require_shared_tensors(m, o)
     changed = shared.copy()
-    changed[2, 5] ^= 1
+    changed[2, 5] = np.uint8((int(changed[2, 5].view(np.int8)) + (40 if changed[2, 5].view(np.int8) < 0 else -40)) & 0xFF)
     with _write(tmp_path / "main2.gguf", main) as m, _write(tmp_path / "bad.gguf", dict(other, **{"a.weight": (changed, q8)})) as o:
         with pytest.raises(ValueError, match="row 2"):
             require_shared_tensors(m, o)
