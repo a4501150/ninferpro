@@ -1,0 +1,22 @@
+# Qwen3.8-Flash-Next (orcarouter NVFP4 recipe C, BF16 n-gram, DFlash2 auto, vision).
+# FP8 KV runs the fp8-a8-pair fast path on one RTX PRO 6000 Blackwell (96 GB) with every
+# routed expert resident in VRAM by default.
+
+model = "~/models/infernix/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix"
+ngram-volume = "~/models/infernix/Qwen3.8-Flash-Next-BF16.ngram"
+kv-dtype = "fp8"
+spec = "dflash2"
+draft-model = "~/models/infernix/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
+draft-tokens = "auto"
+lm-head-draft = true
+vision = true
+chat-template = "tools/chat_templates/qwen3_8.jinja"
+
+[serve]
+served-model-name = ["qwen3.8-flash-next"]
+max-context = 262144
+max-concurrency = 6
+host-context-mib = 8192
+tolerant-tool-calls = true
+host = "0.0.0.0"
+port = 8000

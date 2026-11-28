@@ -44,7 +44,9 @@ out/
 /tmp-*/
 /AGENTS.override.md
 /logs/
+/results/
 *.log
+*.pid
 *.tmp
 /core
 /core.*

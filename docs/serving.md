@@ -1666,8 +1666,9 @@ max-context = 32768
   `4096`, `0.7`).
 - A repeatable option (`fast-path`; for the CLI also `stop`, `reasoning-stop`, `stop-token-id` and
   `choice`) takes an array, each element given once in order; any other option refuses an array.
-- Each value is validated as on the command line. Relative paths resolve against the launch
-  directory, not the file's.
+- Each value is validated as on the command line. Leading `~/` on filesystem path options expands to
+  the user's home directory (`HOME` on Linux, `USERPROFILE` on Windows); relative paths resolve
+  against the launch directory, not the file's.
 - Options on the command line override the file wherever `--config` appears, and the file overrides
   the defaults. Values of a repeatable option accumulate: the command line's are added to the
   file's. A flag the file sets cannot be turned off from the command line, since flags have no

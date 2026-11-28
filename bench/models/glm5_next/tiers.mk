@@ -1,7 +1,8 @@
 # The iteration tiers' settings for GLM-5.3-Flash (included by the Makefile for FAMILY=glm5_next;
-# docs/maintainer/round-bench.md). Production's artifacts (~/src/super-quant/configs/GLM-5.3-Flash/model.env).
+# docs/maintainer/round-bench.md). Production's artifacts (configs/GLM-5.3-Flash.toml).
 ARTIFACT   ?= $(MODELS)/GLM-5.3-Flash-Uncensored-NVFP4-Infernix.infernix
 DRAFTER    ?= $(MODELS)/GLM-5.3-Flash-DFlash2-Infernix.infernix
+T3_CONFIG  ?= configs/GLM-5.3-Flash.toml
 MODEL_ENV   = INFERNIX_GLM_ARTIFACT=$(ARTIFACT) INFERNIX_GLM_DRAFT=$(DRAFTER)
 ROUND_ARGS  = --artifact $(ARTIFACT) --draft $(DRAFTER)
 # The golden shapes: plain rounds of one, two and four rows, and a one-row round drafting three

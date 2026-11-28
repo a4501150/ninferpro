@@ -33,9 +33,9 @@ JOBS      ?= 16
 MEM       ?= $(shell expr $(JOBS) \* 2 + 16)G
 ARGS      ?=
 R         ?=
-LOCKS     := $(HOME)/.cache/super-quant
+LOCKS     := $(HOME)/.cache/ninferpro
 CUDA_INC  := /usr/local/cuda-13.4/include
-BUILD_CMD  = env CPATH=$(CUDA_INC) flock $(LOCKS)/build.lock systemd-run --user --scope -q -p MemoryMax=$(MEM) \
+BUILD_CMD  = mkdir -p $(LOCKS) && env CPATH=$(CUDA_INC) flock $(LOCKS)/build.lock systemd-run --user --scope -q -p MemoryMax=$(MEM) \
              cmake --build $(BUILD) -j$(JOBS)
 GPU       := flock $(LOCKS)/gpu.lock
 FAMILY    ?= qwen4_exp
@@ -57,8 +57,8 @@ CONTEXTS  ?= $(SWEEP_CONTEXTS)
 T1_SHAPE  := $(if $(filter-out undefined,$(origin SHAPE)),$(SHAPE),$(if $(PROFILE),6x2,$(if $(SWEEP),$(SWEEP_SHAPE),$(T1_FAST))))
 # T3: the placements bench_infernix.py walks in one boot, and where its tables go.
 PLACEMENTS ?= vram=100%
-T3_OUT    ?= $(HOME)/src/super-quant/results/infernix_t3_$(shell git rev-parse --short HEAD)
-T3_FRONTIER_OUT ?= $(HOME)/src/super-quant/results/infernix_frontier_$(shell git rev-parse --short HEAD)
+T3_OUT    ?= results/infernix_t3_$(shell git rev-parse --short HEAD)
+T3_FRONTIER_OUT ?= results/infernix_frontier_$(shell git rev-parse --short HEAD)
 
 .PHONY: t0 t1 t1-exact t1-record t2 t2-record t2-bench t3 t3-frontier
 
@@ -107,12 +107,12 @@ endif
 
 t3:
 	$(BUILD_CMD) --target infernix-serve
-	$(GPU) flock $(LOCKS)/build.lock python3 $(HOME)/src/super-quant/scripts/bench_infernix.py \
-	    --binary $(BUILD)/apps/infernix-serve --placements '$(PLACEMENTS)' --out $(T3_OUT) $(ARGS)
+	$(GPU) flock $(LOCKS)/build.lock python3 bench/t3/bench_infernix.py \
+	    --binary $(BUILD)/apps/infernix-serve --config $(T3_CONFIG) --placements '$(PLACEMENTS)' --out $(T3_OUT) $(ARGS)
 
 # bench_infernix_frontier.py holds the GPU lock for its server's whole life itself (an outer $(GPU)
 # would wait on itself).
 t3-frontier:
 	$(BUILD_CMD) --target infernix-serve
-	flock $(LOCKS)/build.lock python3 $(HOME)/src/super-quant/scripts/bench_infernix_frontier.py \
-	    --binary $(BUILD)/apps/infernix-serve --out $(T3_FRONTIER_OUT) $(ARGS)
+	flock $(LOCKS)/build.lock python3 bench/t3/bench_infernix_frontier.py \
+	    --binary $(BUILD)/apps/infernix-serve --config $(T3_CONFIG) --out $(T3_FRONTIER_OUT) $(ARGS)

@@ -696,7 +696,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("artifact path is required: give it first on the command line or "
                                     "as `model` in the --config file");
     }
-    options.artifact_path    = std::move(program.model);
+    options.artifact_path    = product::expand_user_path(program.model);
     options.config_path      = std::move(program.config_path);
     options.config_arguments = product::redact_option_values(std::move(program.config_arguments), {"--api-key"});
     const std::vector<std::string>& arguments = program.arguments;
@@ -737,16 +737,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 begin = comma + 1;
             }
         } else if (arg == "--ngram-volume") {
-            options.ngram_volume_path = require_value("--ngram-volume");
+            options.ngram_volume_path = product::expand_user_path(require_value("--ngram-volume"));
         } else if (arg == "--ngram-residency") {
             options.ngram_residency = parse_ngram_residency(require_value("--ngram-residency"));
         } else if (arg == "--expert-state") {
             const std::string path = require_value("--expert-state");
-            options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
+            options.expert_state =
+                path == "off" ? std::filesystem::path{} : std::filesystem::path(product::expand_user_path(path));
         } else if (arg == "--expert-stripe") {
-            options.expert_stripe_path = require_value("--expert-stripe");
+            options.expert_stripe_path = product::expand_user_path(require_value("--expert-stripe"));
         } else if (arg == "--chat-template") {
-            options.chat_template_path = require_value("--chat-template");
+            options.chat_template_path = product::expand_user_path(require_value("--chat-template"));
             if (options.chat_template_path.empty()) {
                 throw std::invalid_argument("--chat-template must not be empty");
             }
@@ -823,7 +824,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_exclusions.push_back(*path);
         } else if (arg == "--context-cost-presets") {
-            options.context_cost_presets = require_value("--context-cost-presets");
+            options.context_cost_presets = product::expand_user_path(require_value("--context-cost-presets"));
             if (options.context_cost_presets.empty()) {
                 throw std::invalid_argument("--context-cost-presets must not be empty");
             }
@@ -849,7 +850,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--log-stats-panel accepts on or off");
             }
         } else if (arg == "--log-file") {
-            options.log_file = require_value("--log-file");
+            options.log_file = product::expand_user_path(require_value("--log-file"));
             if (options.log_file.empty()) {
                 throw std::invalid_argument("--log-file needs a path");
             }
@@ -896,13 +897,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--cache-tap-ladder"), "cache-tap-ladder"));
             cache_option_flag = "--cache-tap-ladder";
         } else if (arg == "--prefix-cache-file") {
-            options.context_cache.hybrid.persistent_file = require_value("--prefix-cache-file");
+            options.context_cache.hybrid.persistent_file =
+                product::expand_user_path(require_value("--prefix-cache-file"));
             if (options.context_cache.hybrid.persistent_file.empty()) {
                 throw std::invalid_argument("--prefix-cache-file must not be empty");
             }
             cache_option_flag = "--prefix-cache-file";
         } else if (arg == "--prefix-cache-disk") {
-            options.context_cache.hybrid.disk_directory = require_value("--prefix-cache-disk");
+            options.context_cache.hybrid.disk_directory =
+                product::expand_user_path(require_value("--prefix-cache-disk"));
             if (options.context_cache.hybrid.disk_directory.empty()) {
                 throw std::invalid_argument("--prefix-cache-disk must not be empty");
             }
@@ -950,7 +953,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             host_context_explicit = true;
             cache_option_flag     = "--host-context-mib";
         } else if (arg == "--request-log-jsonl") {
-            options.request_log_jsonl = require_value("--request-log-jsonl");
+            options.request_log_jsonl = product::expand_user_path(require_value("--request-log-jsonl"));
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
@@ -970,7 +973,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.request_log_rotation.keep = static_cast<std::uint32_t>(keep);
             request_log_keep_explicit         = true;
         } else if (arg == "--route-trace") {
-            options.route_trace = require_value("--route-trace");
+            options.route_trace = product::expand_user_path(require_value("--route-trace"));
             if (options.route_trace.empty()) {
                 throw std::invalid_argument("--route-trace must not be empty");
             }
@@ -1030,7 +1033,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.experts = text;
             }
         } else if (arg == "--expert-placement") {
-            options.expert_placement = std::filesystem::path(std::string(require_value("--expert-placement")));
+            options.expert_placement =
+                std::filesystem::path(product::expand_user_path(require_value("--expert-placement")));
             if (options.expert_placement.empty()) {
                 throw std::invalid_argument("--expert-placement must not be empty");
             }
@@ -1055,7 +1059,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, require_value("--draft-tokens"));
         } else if (arg == "--draft-model") {
-            options.speculative.draft_model = std::filesystem::path(std::string(require_value("--draft-model")));
+            options.speculative.draft_model =
+                std::filesystem::path(product::expand_user_path(require_value("--draft-model")));
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(require_value("--spec-min-p"));
         } else if (arg == "--draft-tree-nodes") {

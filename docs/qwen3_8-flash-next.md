@@ -356,9 +356,9 @@ RAM decode at about four times the speed of half on SSD.
 **Policy is the client's.** The engine provides the mechanism; it does not choose shares, react
 to other programs' memory use, or keep headroom heuristics for the placement. A policy such as
 "leave 32 GB of VRAM and 24 GB of RAM free for other programs" belongs in client code:
-[super-quant](https://github.com/a4501150/super-quant)'s `scripts/infernix_placement.py` computes
-shares from reserves, previews them with `dry_run` and applies them, behind
-`make infernix-gaming` and `make infernix-full` (`vram=all`).
+[`infernix-monitor`](../tools/monitor/README.md) computes shares from reserves, previews them with
+`dry_run` and applies them through the web UI's Gaming preset or
+`infernix-monitor placement --gaming` / `--full` (`vram=all`).
 
 ## N-gram table in RAM
 

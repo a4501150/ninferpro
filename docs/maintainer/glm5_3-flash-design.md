@@ -13,11 +13,10 @@ Built: the Engine, `infernix`, `infernix-serve`, `infernix_bench` and causal sco
 W4A16 and GGUF K-quant (Q4_K/Q3_K/Q2_K) routed experts in any VRAM : RAM : SSD ratio; BF16 and
 INT8-G64 latent caches; DFlash2 speculation (`--draft-tokens auto`) for one-row rounds; prefill by
 streamed experts, layer-major walk spans and qualified fast paths (`expert-a4-residual`,
-`ggml-bf16-prefill`); the prefix cache; image and video prompts. Qwen3.8-Flash-Next stays the
-production default; this family serves with
-`MODEL_DIR=GLM-5.3-Flash make -C ~/src/super-quant serve-infernix`
-(`~/src/super-quant/configs/GLM-5.3-Flash/model.env`) or
-`MODEL_DIR=GLM-5.3-Flash-GSQ` (`configs/GLM-5.3-Flash-GSQ/model.env` for the GGUF K-quant build).
+`ggml-bf16-prefill`); the prefix cache; image and video prompts. This family is the default serving
+profile (`configs/GLM-5.3-Flash.toml`, loaded via `build/apps/infernix-monitor load` or
+`build/apps/infernix-serve --config configs/GLM-5.3-Flash.toml`), with
+`configs/GLM-5.3-Flash-GSQ.toml` for the GGUF K-quant build.
 Every rejected option and open/not-built item is in §17 with its reason.
 
 Every number is labelled **measured** (date, machine and placement named), **upstream** (the
@@ -56,12 +55,12 @@ Measurements ran on the production machine — one RTX PRO 6000 Blackwell (96 GB
 
 **Serving configurations:**
 
-- **NVFP4 (default)** (`configs/GLM-5.3-Flash/model.env`): `orcarouter/GLM-5.3-Flash-Uncensored-NVFP4`
+- **NVFP4 (default)** (`configs/GLM-5.3-Flash.toml`): `orcarouter/GLM-5.3-Flash-Uncensored-NVFP4`
   (BF16 dense 15.44 GiB, NVFP4 experts 159.5 GiB), `--experts vram=40%,ram=60%` (4,838 VRAM /
   7,258 RAM / 0 SSD), INT8 latents, `--max-context 262144`, four lanes, DFlash2 `--draft-tokens
   auto` on one-row rounds (§10.2), the prefix cache with a 2 GiB Host tier, and `--vision` with
   the tower streamed from pinned RAM.
-- **GSQ-Q4 GGUF (optional)** (`configs/GLM-5.3-Flash-GSQ/model.env`): `GCSA-AiLab` RCO-GSQ Q4
+- **GSQ-Q4 GGUF (optional)** (`configs/GLM-5.3-Flash-GSQ.toml`): `GCSA-AiLab` RCO-GSQ Q4
   GGUF (Q8 dense 9.25 GiB, Q4_K/Q3_K/Q2_K experts 118.1 GiB, §3.3), `--experts vram=59%,ram=41%`
   (7,098 VRAM / 4,998 RAM / 0 SSD), same serving flags (`--vision` imports the tower from the
   orcarouter checkpoint).
@@ -310,7 +309,7 @@ converter transposes it once.
 
 [GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF](https://huggingface.co/GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF)
 `Q4/GLM-5.3-Flash-Uncensored-GSQ-RCO-Q4.gguf` (llama.cpp arch `glm5-next`, 1,383 tensors;
-served via `configs/GLM-5.3-Flash-GSQ/model.env` at `vram=59%,ram=41%`) imports
+served via `configs/GLM-5.3-Flash-GSQ.toml` at `vram=59%,ram=41%`) imports
 bit-exactly: `tools.convert --model <orcarouter snapshot> --gguf <file> --recipe
 glm5_3_flash_gcsa_gguf` (`tools/convert/glm5_next_gguf.py`). It reuses the 3.5-bit mixed
 tensor-type allocation of `pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF` (`2 Q4_K / 105 Q3_K / 19 Q2_K`)
@@ -710,7 +709,7 @@ block, then chooses how many of the drafts to verify:
 Greedy output equals plain decoding either way; a sampled row's verification is the same sparse
 rejection sampling against the selector's laws on a prefix of its drafts.
 
-Serving (`configs/GLM-5.3-Flash/model.env`) drafts `auto` (§10.3; `INFERNIX_SPEC=` serves plain
+Serving (`configs/GLM-5.3-Flash.toml`) drafts `auto` (§10.3; `--spec none` serves plain
 decode).
 
 ### 10.3 Measurements

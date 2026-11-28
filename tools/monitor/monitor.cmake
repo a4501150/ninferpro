@@ -1,5 +1,5 @@
-# infernix-monitor, the status-page sidecar (tools/monitor/README.md). Included from
-# apps/CMakeLists.txt; Linux only (NVML through dlopen, /proc).
+# infernix-monitor, the native manager and status page for infernix-serve (tools/monitor/README.md).
+# Included from apps/CMakeLists.txt; Linux only (NVML through dlopen, /proc, POSIX process control).
 
 if(WIN32)
   return()
@@ -19,22 +19,24 @@ add_custom_command(
   COMMENT "Embedding the infernix-monitor page"
   VERBATIM)
 
-# The readers and the state, apart from main.cpp so the tests link them.
+# The readers, profile catalog, lifecycle controller and state, apart from main.cpp so the tests link them.
 add_library(infernix_monitor_core STATIC
   "${INFERNIX_MONITOR_DIR}/prometheus.cpp"
   "${INFERNIX_MONITOR_DIR}/file_tail.cpp"
   "${INFERNIX_MONITOR_DIR}/records.cpp"
   "${INFERNIX_MONITOR_DIR}/system_sampler.cpp"
+  "${INFERNIX_MONITOR_DIR}/profiles.cpp"
   "${INFERNIX_MONITOR_DIR}/control.cpp"
   "${INFERNIX_MONITOR_DIR}/monitor.cpp")
 target_compile_features(infernix_monitor_core PUBLIC cxx_std_20)
 # nvml.h only: NVML itself is loaded at run time.
 target_include_directories(infernix_monitor_core
   PUBLIC "${INFERNIX_MONITOR_DIR}"
-  PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  PRIVATE "${PROJECT_SOURCE_DIR}/src" ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(infernix_monitor_core
-  PUBLIC infernix::json infernix::httplib Threads::Threads ${CMAKE_DL_LIBS})
+  PUBLIC infernix::json infernix::httplib infernix_product_config Threads::Threads ${CMAKE_DL_LIBS}
+  PRIVATE infernix::toml)
 
 add_executable(infernix-monitor "${INFERNIX_MONITOR_DIR}/main.cpp" "${INFERNIX_MONITOR_WEB_HEADER}")
-target_include_directories(infernix-monitor PRIVATE ${CMAKE_BINARY_DIR}/generated)
+target_include_directories(infernix-monitor PRIVATE "${PROJECT_SOURCE_DIR}/src" ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(infernix-monitor PRIVATE infernix_monitor_core)

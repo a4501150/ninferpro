@@ -86,10 +86,12 @@ Modifications made in this product (summary; see README.md for details):
   residual update, with a fused update+mix entry that is bit-identical to the
   separate calls and column-invariant at every width, and a clamped SwiGLU
   elementwise variant (silu_mul_clamped).
-- infernix-monitor (tools/monitor), a live status page for the server that also switches its
-  expert placement and, through a control command, starts and stops it; its page is
-  adapted from Basalt (https://github.com/jesdga95/basalt, MIT License; the notice is
-  kept in tools/monitor/LICENSE.basalt and the copied files).
+- infernix-monitor (tools/monitor), a native server manager and live status page for
+  infernix-serve that discovers TOML serving profiles under configs/, loads, switches and
+  unloads models directly, applies runtime expert-placement and reserve policies, and exposes
+  both a web UI and CLI control subcommands; its page is adapted from Basalt
+  (https://github.com/jesdga95/basalt, MIT License; the notice is kept in
+  tools/monitor/LICENSE.basalt and the copied files).
 
 Third-party components keep their own licenses; see third_party/ and
 packaging/windows/THIRD_PARTY_NOTICES.md.

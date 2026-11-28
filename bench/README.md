@@ -19,15 +19,13 @@ TTFT, cold prefill and output rates. It and the decode-saturation suite of
 README table comes from `make t3` instead ([Performance](../docs/performance.md)). The older serve A/B rig
 under [`ab/`](ab/README.md) predates the `e31bc99b` merge.
 
-Serving benchmarks against a live server, and why each lives where it does: the ones that boot
-production's server read its flags from `~/src/super-quant/configs/<model>/model.env`, so they
-live in super-quant beside that file; the workloads and the client tools that take a server address
-live here.
+Serving benchmarks against a live server live in this repository alongside the serving profiles
+under `configs/*.toml`:
 
 | Benchmark | Location | Measures |
 |---|---|---|
-| `make t3` | super-quant `scripts/bench_infernix.py` | promotion: fixed phases per expert placement, from the server's `req#N done` lines |
-| `make t3-frontier` | super-quant `scripts/bench_infernix_frontier.py` (imports `bench_infernix.py` and this directory's `agentic_ab`) | the throughput / per-user decode-speed frontier over concurrency, agentic or synthetic long-beside-short traffic |
+| `make t3` | `bench/t3/bench_infernix.py` | promotion: fixed phases per expert placement, from the server's `req#N done` lines |
+| `make t3-frontier` | `bench/t3/bench_infernix_frontier.py` (imports `bench_infernix.py` and `agentic_ab`) | the throughput / per-user decode-speed frontier over concurrency, agentic or synthetic long-beside-short traffic |
 | agentic A/B | [`agentic_ab/`](agentic_ab/README.md) | two servers on the same production-shaped closed-loop traffic |
 | decode saturation, corpus makespan | `tools/bench/run_serve_concurrency.py` | per-concurrency decode curves against any server; the reproduction command of the published Qwen3.5-family tables |
 | TTFT campaign | [`tools/bench/ttft/`](../tools/bench/ttft/README.md) | public-HTTP latency, streaming gaps, prefix reuse, preemption |

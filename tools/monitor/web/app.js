@@ -40,7 +40,6 @@ async function post(path, body) {
 }
 
 /* ---- series and charts ---- */
-// the last HIST samples, padded at the start with null (no line) so the newest sample sits at the right edge
 const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : null); while (v.length < HIST) v.unshift(null); return v; };
 const stats = a => {
   const v = a.filter(num);
@@ -49,7 +48,6 @@ const stats = a => {
 const STEPS = [10, 20, 50, 100, 120, 150, 160, 200, 250, 300, 400, 500, 600, 800, 1000, 1200, 1500, 2000, 3000, 4000, 5000,
   8000, 10000, 16000, 20000, 32000, 50000];
 const nice = v => STEPS.find(s => s >= v * 1.15) || Math.ceil(v * 1.15 / 10000) * 10000;
-// polyline points in a 0..W x 0..100 box; a null sample breaks the line
 function lines(a, y, W = 100) {
   const out = []; let cur = [];
   a.forEach((v, i) => {
@@ -63,7 +61,6 @@ const poly = (pts, attrs) => `<polyline points="${pts.join(" ")}" fill="none" ve
 const area = (pts, fill) => `<polygon points="${pts[0].split(",")[0]},100 ${pts.join(" ")} ${pts[pts.length - 1].split(",")[0]},100" fill="${fill}"/>`;
 const baseLine = `<line x1="0" y1="100" x2="100" y2="100" stroke="var(--line)" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
 let gid = 0;
-// a sidebar chart: filled line between lo and hi; `limit` draws a dashed line at the top
 function sbChart(a, lo, hi, accent, limit) {
   const id = `sbg${++gid}`, tint = accent ? "255,122,61" : "154,164,173";
   const segs = lines(a, v => clamp(100 - (v - lo) / (hi - lo) * 100, 1, 99));
@@ -73,13 +70,54 @@ function sbChart(a, lo, hi, accent, limit) {
     + segs.map(p => area(p, `url(#${id})`) + poly(p, `stroke="${accent ? "var(--accent)" : "var(--fg-2)"}" stroke-width="1.5"`)).join("")
     + `</svg></div>`;
 }
-const gy = t => t ? 100 - t * 92 - 4 : 4;             // gridline height for a fraction of the axis
+const gy = t => t ? 100 - t * 92 - 4 : 4;
 const grid = fr => fr.map(t => `<line x1="0" x2="100" y1="${gy(t)}" y2="${gy(t)}" stroke="var(--line-soft)" vector-effect="non-scaling-stroke"/>`).join("");
-// small tick labels at the right edge, at the top and middle gridlines
 const ticks = max => [[4, max], [50, max / 2]].map(t => `<span class="tk" style="top:${t[0]}%">${tick(t[1])}</span>`).join("");
 
-/* ---- top bar ---- */
+/* ---- top bar & profile selection ---- */
 function setState(s, label) { $("#state").dataset.s = s; text($("#state"), label); }
+
+let selectedProfile = "";
+let userPickedProfile = false;
+let lastProfilesKey = "";
+
+function profilesList() { return (M && Array.isArray(M.profiles)) ? M.profiles : []; }
+function findProfile(name) { return profilesList().find(p => p.name === name) || null; }
+
+function syncProfileSelect() {
+  const sel = $("#ctl-model");
+  const list = profilesList();
+  const ctl = (M && M.control) || {};
+  const active = ctl.active_profile || "";
+  const def = (M && M.default_profile) || (list[0] ? list[0].name : "");
+
+  const key = list.map(p => `${p.name}:${p.artifact_exists ? 1 : 0}`).join("|");
+  if (key !== lastProfilesKey) {
+    lastProfilesKey = key;
+    sel.replaceChildren(...list.map(p => {
+      const opt = document.createElement("option");
+      opt.value = p.name;
+      opt.textContent = p.artifact_exists ? p.name : `${p.name} (missing)`;
+      opt.disabled = !p.artifact_exists;
+      return opt;
+    }));
+  }
+
+  if (!userPickedProfile) {
+    selectedProfile = active || def || (list[0] ? list[0].name : "");
+  } else if (selectedProfile && !findProfile(selectedProfile)) {
+    userPickedProfile = false;
+    selectedProfile = active || def || "";
+  }
+  if (selectedProfile && sel.value !== selectedProfile) { sel.value = selectedProfile; }
+}
+
+$("#ctl-model").addEventListener("change", () => {
+  selectedProfile = $("#ctl-model").value;
+  userPickedProfile = true;
+  if (!placementLive() && !P.dirty) { applyProfileDefaultShares(); }
+  draw();
+});
 
 /* ---- sidebar ---- */
 const sbRow = (k, v, u, st) => `<div class="sb-row"><span class="k">${k}</span>${st ? `<span class="st">${st}</span>` : ""}<span class="num">${v}${u ? `<span class="u">${u}</span>` : ""}</span></div>`;
@@ -120,10 +158,12 @@ function drawSide(hw, st, hist, pl, eng) {
     + sbRow("Disk read", num(hw.disk_read_mb) ? hw.disk_read_mb.toFixed(1) : "-", "MB/s")
     + (st.driver ? `<div class="sb-foot">Driver ${esc(st.driver)}${st.cuda ? ` · CUDA ${esc(st.cuda)}` : ""}</div>` : ""));
 
-  // where the routed experts live, by count, and how often a routed lookup found its expert in VRAM
   const m = pl && pl.mechanism;
   if (!m || !m.total_experts) {
-    html($("#experts"), `<div class="sb-none flat">${eng.reachable ? "This model has no expert placement." : "-"}</div>`);
+    const prof = findProfile(selectedProfile);
+    const hint = eng.reachable ? "This model has no expert placement."
+      : (prof && prof.default_experts ? `Profile default: ${prof.default_experts}` : "No model loaded.");
+    html($("#experts"), `<div class="sb-none flat">${esc(hint)}</div>`);
     return;
   }
   const total = m.total_experts;
@@ -142,7 +182,6 @@ function drawSide(hw, st, hist, pl, eng) {
 /* ---- Speed ---- */
 function drawHero(live, hist, reqs, best, eng) {
   const generating = live.state === "generating", reading = live.state === "reading";
-  // the live rate while generating, else the newest finished request's
   const rd = reqs.find(x => x.decode_s > 0 && x.output_tokens > 0), last = rd ? rd.output_tokens / rd.decode_s : null;
   const liveDec = generating && num(live.tok_s) && live.tok_s > 0, dec = liveDec ? live.tok_s : last;
   text($("#dec-k"), liveDec ? "Decode · All requests" : last != null ? "Decode · Last request" : "Decode");
@@ -154,7 +193,6 @@ function drawHero(live, hist, reqs, best, eng) {
   html($("#dec-chart"), `<svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Decode tokens per second, last 60 seconds">${grid([0, .25, .5, .75])}`
     + lines(da, y).map(p => poly(p, `stroke="var(--accent)" stroke-width="1.7"`)).join("") + `</svg>${ticks(max)}`);
 
-  // the live read rate while reading, else the newest finished request's that read part of its prompt
   const rp = reqs.find(x => x.prefill_s > 0 && x.read_tokens > 0), lastPre = rp ? rp.read_tokens / rp.prefill_s : null;
   const livePre = reading && num(live.prefill_tok_s) && live.prefill_tok_s > 0;
   const pre = livePre ? live.prefill_tok_s : lastPre;
@@ -166,7 +204,6 @@ function drawHero(live, hist, reqs, best, eng) {
     + lines(pa, v => 100 - 4 - Math.min(v, pmax) / pmax * 92).map(p => poly(p, `stroke="var(--fg)" stroke-width="1.6"`)).join("") + `</svg>${ticks(pmax)}`);
   const r = reqs[0];
   html($("#pre-last"), r && num(r.prompt_tokens) ? `<b>${fmt(r.prompt_tokens)}</b> tok${r.prefill_s > 0 ? ` in <b>${r.prefill_s.toFixed(2)}</b> s` : ""}` : "-");
-  // the last request's own hit when there is one, else the engine's over the last minute
   const hit = r && r.prompt_tokens > 0 ? r.reused / r.prompt_tokens : (eng.window || {}).prefix_hit;
   text($("#pre-hit"), pct(hit));
 
@@ -185,12 +222,11 @@ $("#tabs").addEventListener("click", e => {
   draw();
 });
 function requestsPane(reqs, sources) {
-  if (!sources.request_log) return `<div class="empty">Start the monitor with --request-log FILE (the engine's --request-log-jsonl) to list finished requests.</div>`;
+  if (!sources.request_log) return `<div class="empty">Request logging is disabled.</div>`;
   if (!reqs.length) return `<div class="empty">No finished requests yet.</div>`;
   return `<table><thead><tr><th>Time</th><th>ID</th><th>API</th><th class="r">Prompt</th><th class="r">Hit</th><th class="r">Output</th>`
     + `<th class="r">TTFT</th><th class="r">Decode</th><th class="r">Accept</th><th class="r">Duration</th></tr></thead><tbody>`
     + reqs.map(r => {
-      // a request that did not simply stop is marked on its id, with the reason
       const odd = r.finish && r.finish !== "stop" ? (r.finish === "error" ? "err" : "warn") : "";
       const rate = r.decode_s > 0 && r.output_tokens > 0 ? (r.output_tokens / r.decode_s).toFixed(1) : "-";
       return `<tr><td>${clock(r.time * 1000)}</td><td class="${odd}">req#${esc(r.id)}${odd ? ` · ${esc(String(r.finish).replace(/_/g, " "))}` : ""}</td>`
@@ -201,10 +237,22 @@ function requestsPane(reqs, sources) {
         + `<td class="r">${num(r.duration_s) ? `${r.duration_s.toFixed(1)} s` : "-"}</td></tr>`;
     }).join("") + `</tbody></table>`;
 }
-function enginePane(live, eng) {
+function enginePane(live, eng, ctl) {
   const w = eng.window || {}, t = eng.total || {};
   const row = (k, v, note) => `<tr><td>${k}</td><td class="r">${v}</td><td class="dim">${note || ""}</td></tr>`;
-  return `<table><thead><tr><th>Engine</th><th class="r">Now</th><th></th></tr></thead><tbody>`
+  const prof = findProfile((ctl && ctl.active_profile) || selectedProfile);
+  let profileTable = "";
+  if (prof) {
+    const label = (ctl && ctl.active_profile) ? "Active profile" : "Selected profile";
+    profileTable = `<table><thead><tr><th>${label}</th><th class="r">${esc(prof.name)}</th><th></th></tr></thead><tbody>`
+      + row("Served name", esc(prof.served_name || "-"))
+      + row("KV / spec", `${esc(prof.kv_dtype || "-")} / ${esc(prof.spec || "none")}`)
+      + row("Context / lanes", `${num(prof.max_context) ? kt(prof.max_context) : "-"} / ${fmt(prof.max_concurrency)}`)
+      + row("Default placement", esc(prof.default_experts || "vram=100%"))
+      + `</tbody></table>`;
+  }
+  return profileTable
+    + `<table><thead><tr><th>Engine</th><th class="r">Now</th><th></th></tr></thead><tbody>`
     + row("Running", `${fmt(live.running)} / ${fmt(live.max_concurrency)}`, "resident requests / lanes")
     + row("Prefilling", fmt(live.prefilling)) + row("Decode-ready", fmt(live.decode_ready))
     + row("Waiting", fmt(live.waiting), "for initial admission") + row("Paused", fmt(live.paused), "waiting for recovery")
@@ -217,18 +265,15 @@ function enginePane(live, eng) {
     + `<tr><td>Tokens prefilled</td><td class="r"></td><td class="r">${num(t.prefill_tokens) ? kt(t.prefill_tokens) : "-"}</td></tr>`
     + `</tbody></table><div class="qsum"><span>Up <b>${dur(eng.uptime_s)}</b></span><span>${esc(eng.url || "")}</span></div>`;
 }
-function drawMain(live, eng, reqs, sources) {
+function drawMain(live, eng, reqs, sources, ctl) {
   const T = [["req", "Requests"], ["engine", `Engine${live.waiting > 0 ? ` (${live.waiting} waiting)` : ""}`]];
   const cur = T.some(t => t[0] === tab) ? tab : T[0][0];
   html($("#tabs"), T.map(t => `<button type="button" role="tab" data-t="${t[0]}" aria-selected="${t[0] === cur}">${t[1]}</button>`).join(""));
-  html($("#pane"), cur === "req" ? requestsPane(reqs, sources) : enginePane(live, eng));
+  html($("#pane"), cur === "req" ? requestsPane(reqs, sources) : enginePane(live, eng, ctl));
 }
 
 /* ---- placement: VRAM and RAM shares of the experts, the rest on SSD ---- */
-// The editor opens from the Experts header. Its sliders follow the server's placement until moved.
-// While the server runs, a move previews the shares (dry run) and Apply switches them; while it
-// is stopped, Start starts with them (with the editor closed, with the configured placement).
-const P = { open: false, dirty: false, applied: 0, seq: 0, timer: 0, err: false };
+const P = { open: false, dirty: false, applied: 0, seq: 0, timer: 0, err: false, pendingReserve: null };
 const plV = $("#pl-vram"), plR = $("#pl-ram");
 const shares = () => ({ vram: +plV.value, ram: +plR.value });
 function setShares(vram, ram) {
@@ -236,19 +281,35 @@ function setShares(vram, ram) {
   const s = shares();
   text($("#pl-vram-v"), `${s.vram}%`); text($("#pl-ram-v"), `${s.ram}%`); text($("#pl-ssd-v"), `${100 - s.vram - s.ram}%`);
 }
+function applyProfileDefaultShares() {
+  const prof = findProfile(selectedProfile);
+  if (prof && prof.default_shares) {
+    setShares(prof.default_shares.vram, prof.default_shares.ram);
+  } else {
+    setShares(100, 0);
+  }
+}
 function note(msg, err) { P.err = !!err; text($("#pl-note"), msg); $("#pl-note").classList.toggle("err", P.err); }
 const placementLive = () => M && M.engine && M.engine.reachable && M.placement && M.placement.supported;
+function formatPreviewNote(r, suffix = "") {
+  const c = r.placement || {}, d = r.predicted || {};
+  const problem = !d.fits ? "does not fit in VRAM" : !d.ram_fits ? "more RAM than is available" : "";
+  return {
+    text: `${fmt(c.vram)} · ${fmt(c.ram)} · ${fmt(c.ssd)} experts; VRAM ${gib(d.vram_expert_bytes)} GiB, ${gib(d.vram_free_after)} free after; RAM ${gib(d.ram_expert_bytes)} GiB${suffix}${problem ? ` — ${problem}` : ""}`,
+    err: !!problem
+  };
+}
 function preview() {
   clearTimeout(P.timer);
-  if (!placementLive()) { note(M && M.control && M.control.enabled ? "Start uses these shares." : ""); return; }
+  P.pendingReserve = null;
+  if (!placementLive()) { note(M && M.control && M.control.enabled ? "Load uses these shares." : ""); return; }
   const seq = ++P.seq;
   P.timer = setTimeout(async () => {
     try {
       const r = await post("api/placement", { ...shares(), dry_run: true });
       if (seq !== P.seq) return;
-      const c = r.placement || {}, d = r.predicted || {};
-      const problem = !d.fits ? "does not fit in VRAM" : !d.ram_fits ? "more RAM than is available" : "";
-      note(`${fmt(c.vram)} · ${fmt(c.ram)} · ${fmt(c.ssd)} experts; VRAM ${gib(d.vram_expert_bytes)} GiB, ${gib(d.vram_free_after)} free after; RAM ${gib(d.ram_expert_bytes)} GiB${problem ? ` — ${problem}` : ""}`, !!problem);
+      const out = formatPreviewNote(r);
+      note(out.text, out.err);
     } catch (e) { if (seq === P.seq) note(e.message, true); }
   }, 250);
 }
@@ -256,29 +317,49 @@ function moved() { P.dirty = true; setShares(+plV.value, +plR.value); preview();
 plV.addEventListener("input", moved);
 plR.addEventListener("input", moved);
 $("#pl-all").addEventListener("click", () => { setShares(100, 0); moved(); });
-// back to following the server; a preview still in flight is dropped
-function resetEditor() { P.dirty = false; P.seq++; note(""); }
+$("#pl-gaming").addEventListener("click", async () => {
+  if (!placementLive()) return;
+  clearTimeout(P.timer);
+  const seq = ++P.seq;
+  const g = (M && M.gaming_reserve) || { vram_gb: 32, ram_gb: 24 };
+  const req = { reserve_vram_gb: g.vram_gb, reserve_ram_gb: g.ram_gb };
+  P.dirty = true; P.pendingReserve = req;
+  note("Computing gaming reserve…");
+  drawPlace();
+  try {
+    const r = await post("api/placement", { ...req, dry_run: true });
+    if (seq !== P.seq) return;
+    if (r.plan && r.plan.total > 0) {
+      setShares(Math.max(1, Math.round(r.plan.vram / r.plan.total * 100)), Math.round(r.plan.ram / r.plan.total * 100));
+    }
+    const out = formatPreviewNote(r, ` (reserve ${g.vram_gb}G VRAM / ${g.ram_gb}G RAM)`);
+    note(out.text, out.err);
+  } catch (e) { if (seq === P.seq) note(e.message, true); }
+  drawPlace();
+});
+function resetEditor() { P.dirty = false; P.pendingReserve = null; P.seq++; note(""); }
 $("#pl-reset").addEventListener("click", () => { resetEditor(); draw(); });
 $("#pl-toggle").addEventListener("click", () => {
   P.open = !P.open;
   if (!P.open && !P.applied) resetEditor();
+  if (P.open && !placementLive() && !P.dirty) applyProfileDefaultShares();
   draw();
 });
 $("#pl-apply").addEventListener("click", async () => {
   $("#pl-apply").disabled = true;
   try {
-    await post("api/placement", shares());
-    P.applied = Date.now(); note("Switching…");
+    const payload = P.pendingReserve ? { ...P.pendingReserve, dry_run: false } : shares();
+    await post("api/placement", payload);
+    P.applied = Date.now(); P.pendingReserve = null; note("Switching…");
   } catch (e) { note(e.message, true); }
   drawPlace();
 });
 function drawPlace() {
   const pl = M && M.placement, ctl = (M && M.control) || {}, live = placementLive();
-  const offline = !(M && M.engine && M.engine.reachable), usable = live || (ctl.enabled && offline);
+  const unloaded = !(M && M.engine && M.engine.reachable), usable = live || (ctl.enabled && unloaded);
   $("#pl-toggle").hidden = !usable;
   text($("#pl-toggle"), P.open ? "Close" : "Change");
   $("#place").hidden = !(usable && P.open);
-  // an applied switch keeps the sliders until the engine reports it done
   if (P.applied && live && !pl.switching && Date.now() - P.applied > 2500) {
     P.applied = 0; P.dirty = false;
     const ls = pl.last_switch || {};
@@ -287,52 +368,97 @@ function drawPlace() {
   if (!P.dirty && live) {
     const m = pl.mechanism, t = m.total_experts;
     setShares(Math.max(1, Math.round(m.vram.experts / t * 100)), Math.round(m.ram.experts / t * 100));
+  } else if (!P.dirty && unloaded) {
+    applyProfileDefaultShares();
+    if (!P.err) note(ctl.enabled ? "Load uses these shares." : "");
   }
-  if (!P.dirty && !live && !P.err) note(ctl.enabled && offline ? "Start uses these shares." : "");
+  $("#pl-gaming").hidden = !live;
   $("#pl-apply").hidden = !live;
   $("#pl-apply").disabled = !P.dirty || !!P.applied || !!(pl && pl.switching);
   $("#pl-reset").hidden = !live;
   $("#pl-reset").disabled = !P.dirty;
 }
 
-/* ---- Start and Stop ---- */
+/* ---- Load / Switch / Unload ---- */
 function drawControl() {
   const ctl = (M && M.control) || {};
   $("#ctl").hidden = !ctl.enabled;
   if (!ctl.enabled) return;
-  const up = !!(M.engine && M.engine.reachable), busy = !!ctl.busy || (M.live || {}).state === "starting";
-  $("#ctl-start").disabled = busy || up;
-  $("#ctl-stop").disabled = busy || !up;
+  syncProfileSelect();
+  const up = !!(M.engine && M.engine.reachable);
+  const busy = !!ctl.busy || ["loading", "unloading", "switching"].includes((M.live || {}).state);
+  const active = ctl.active_profile || "";
+  const switchingProfile = up && selectedProfile && active && selectedProfile !== active;
+  const chosen = findProfile(selectedProfile);
+  const canLoad = !!chosen && chosen.artifact_exists;
+
+  $("#ctl-model").disabled = busy || profilesList().length === 0;
+  const loadBtn = $("#ctl-load");
+  if (!up) {
+    loadBtn.hidden = false;
+    text(loadBtn, "Load");
+    loadBtn.disabled = busy || !canLoad;
+  } else if (switchingProfile) {
+    loadBtn.hidden = false;
+    text(loadBtn, "Switch");
+    loadBtn.disabled = busy || !canLoad;
+  } else {
+    loadBtn.hidden = true;
+  }
+  $("#ctl-unload").disabled = busy || !up;
+
   const last = ctl.last, msg = $("#ctl-msg");
   const show = last && (!last.ok || Date.now() / 1000 - last.time < 60);
-  text(msg, busy ? "" : show ? `${last.action}: ${last.message || (last.ok ? "done" : "failed")}` : "");
+  text(msg, busy ? "" : show ? `${last.action}${last.profile ? ` ${last.profile}` : ""}: ${last.message || (last.ok ? "done" : "failed")}` : "");
   msg.title = show ? last.message || "" : "";
   msg.classList.toggle("err", !!(show && !last.ok));
 }
 async function control(body) {
   try { M.control = await post("api/control", body); }
-  catch (e) { M.control = { ...M.control, last: { action: body.action, ok: false, message: e.message, time: Date.now() / 1000 } }; }
+  catch (e) { M.control = { ...M.control, last: { action: body.action, profile: body.profile || null, ok: false, message: e.message, time: Date.now() / 1000 } }; }
   draw();
 }
-$("#ctl-start").addEventListener("click", () => control(P.open ? { action: "start", ...shares() } : { action: "start" }));
-$("#ctl-stop").addEventListener("click", () => {
-  if (confirm("Stop the server? Requests in flight are cut off.")) control({ action: "stop" });
+$("#ctl-load").addEventListener("click", () => {
+  const up = !!(M && M.engine && M.engine.reachable);
+  const active = M && M.control && M.control.active_profile;
+  if (up && active && selectedProfile && selectedProfile !== active) {
+    const running = (M.live && M.live.running) || 0;
+    const prompt = running > 0
+      ? `Switch from ${active} to ${selectedProfile}? ${running} active request(s) will be cut off.`
+      : `Switch from ${active} to ${selectedProfile}?`;
+    if (!confirm(prompt)) return;
+  }
+  const body = { action: "load", profile: selectedProfile };
+  if (P.open && P.dirty) { Object.assign(body, shares()); resetEditor(); }
+  userPickedProfile = false;
+  control(body);
+});
+$("#ctl-unload").addEventListener("click", () => {
+  const running = (M && M.live && M.live.running) || 0;
+  const prompt = running > 0
+    ? `Unload the model? ${running} active request(s) will be cut off.`
+    : "Unload the model and release all VRAM?";
+  if (confirm(prompt)) {
+    userPickedProfile = false;
+    control({ action: "unload" });
+  }
 });
 
 /* ---- the whole page ---- */
-const STATE = { offline: "Offline", starting: "Starting", loading: "Loading", stopping: "Stopping", idle: "Idle",
+const STATE = { offline: "Offline", unloaded: "Unloaded", starting: "Loading", loading: "Loading",
+  stopping: "Unloading", unloading: "Unloading", switching: "Switching", idle: "Idle",
   reading: "Reading", generating: "Generating" };
 function draw() {
   if (!M) return;
-  const live = M.live || {}, eng = M.engine || {}, hist = M.history || {}, reqs = M.requests || [];
+  const live = M.live || {}, eng = M.engine || {}, hist = M.history || {}, reqs = M.requests || {}, ctl = M.control || {};
   const s = live.state || "offline";
   setState(s, `${STATE[s] || s}${live.waiting > 0 ? ` · ${live.waiting} waiting` : ""}`);
-  text($("#model"), eng.model || "");
+  text($("#model"), eng.model || (ctl.active_profile ? ctl.active_profile : ""));
+  drawControl();
   drawSide(M.hardware || {}, M.hardware_static || {}, hist, M.placement, eng);
   drawHero(live, hist, reqs, M.best || {}, eng);
-  drawMain(live, eng, reqs, M.sources || {});
+  drawMain(live, eng, reqs, M.sources || {}, ctl);
   drawPlace();
-  drawControl();
 }
 
 /* ---- logs ---- */
@@ -373,8 +499,7 @@ async function pollLog() {
     const r = await get(`api/logs?after=${lastLog}`);
     if (r.last < lastLog) { lastLog = 0; clearLog("The monitor restarted."); }
     else if (r.lines.length) { lastLog = r.last; append(r.lines); }
-    else if (!logCount && !logEl.firstChild) clearLog(M && M.sources && !M.sources.log_file
-      ? "Start the monitor with --log-file FILE to follow the engine's log." : "No log lines yet.");
+    else if (!logCount && !logEl.firstChild) clearLog("No log lines yet.");
   } catch (e) { /* the state poll reports the connection */ }
   setTimeout(pollLog, 1000);
 }

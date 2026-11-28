@@ -114,21 +114,30 @@ python -m tools.convert --model <orcarouter checkpoint> \
 
 ## Serve
 
+Run `infernix-serve` directly with one of the checked-in TOML profiles under `configs/` (default
+`GLM-5.3-Flash.toml`, plus `GLM-5.3-Flash-GSQ.toml` and `Qwen3.8-Flash-Next.toml`):
+
 ```bash
-build/apps/infernix-serve Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.infernix \
-  --ngram-volume Qwen3.8-Flash-Next-BF16.ngram --kv-dtype fp8 \
-  --max-context 262144 --max-concurrency 6 \
-  --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix \
-  --draft-tokens auto --lm-head-draft --tolerant-tool-calls --vision \
-  --served-model-name qwen3.8-flash-next --host 0.0.0.0 --port 8000
+build/apps/infernix-serve --config configs/GLM-5.3-Flash.toml
+```
+
+Or run the native manager (`infernix-monitor`, Linux) for the live web UI (`http://127.0.0.1:8090`),
+model switching, full unloading to 0 MiB VRAM, and CLI control:
+
+```bash
+build/apps/infernix-monitor --daemon          # starts idle (0 VRAM); open http://127.0.0.1:8090
+build/apps/infernix-monitor load              # loads default profile (GLM-5.3-Flash) on :8000
+build/apps/infernix-monitor load Qwen3.8-Flash-Next
+build/apps/infernix-monitor placement --gaming
+build/apps/infernix-monitor unload            # terminates infernix-serve (0 VRAM)
 ```
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API
-([serving](docs/serving.md), [CLI](docs/cli.md)). FP8 KV lets recipe C run the `fp8-a8-pair` fast path
-(+5-6 % prefill at 32K-64K); `--kv-dtype int8` has a slightly lower noise floor (6.1e-3 against
-7.5e-3 mean KL in prefill). The prefix cache stays in RAM (`--host-context-mib`, default 8 GiB);
-`--prefix-cache-disk DIR` adds an optional SSD tier. On this machine the server is started and stopped through
-[super-quant](https://github.com/a4501150/super-quant) (`make serve-infernix`, `make stop-infernix`).
+([serving](docs/serving.md), [CLI](docs/cli.md), [manager](tools/monitor/README.md)). On
+Qwen3.8-Flash-Next, FP8 KV lets recipe C run the `fp8-a8-pair` fast path (+5-6 % prefill at
+32K-64K); `--kv-dtype int8` has a slightly lower noise floor (6.1e-3 against 7.5e-3 mean KL in
+prefill). The prefix cache stays in RAM (`--host-context-mib`); `--prefix-cache-disk DIR` adds an
+optional SSD tier on Qwen3.8-Flash-Next.
 
 ## Expert placement
 
@@ -149,9 +158,9 @@ curl -s -X POST localhost:8000/admin/expert-placement -d '{"vram":"50%","ram":"5
 
 A switch that cannot be reached, for example a grow while another program holds the VRAM, stops
 where it can and reports that in `last_switch` (`ok: false`, with the reason); the server keeps
-serving. Placement policy is client code: super-quant's `scripts/infernix_placement.py` computes
-shares from reserves (`--reserve-vram-gb 32 --reserve-ram-gb 24`), checks them with a dry run and
-applies them, behind `make infernix-gaming` and `make infernix-full`.
+serving. Placement policy is client code: `infernix-monitor` computes shares from VRAM and RAM
+reserves, previews them with a dry run, and applies them via the web UI's Gaming preset or
+`build/apps/infernix-monitor placement --gaming` / `--reserve-vram-gb 32 --reserve-ram-gb 24` / `--full`.
 
 ## Documentation
 

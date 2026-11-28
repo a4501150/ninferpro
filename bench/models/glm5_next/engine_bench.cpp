@@ -1,6 +1,6 @@
 // The in-process speed check between T1 and T3 (AGENTS.md "Iteration tiers") for GLM-5.3-Flash:
 // the public Engine on the real artifacts with production's options
-// (~/src/super-quant/configs/GLM-5.3-Flash/model.env: INT8 KV, 4 x 262,144 tokens, DFlash2 with
+// (configs/GLM-5.3-Flash.toml: INT8 KV, 4 x 262,144 tokens, DFlash2 with
 // three draft tokens, vram=40%,ram=60%), and bench_infernix.py's concurrent phase: C chat requests
 // at once (default 4) of N output tokens (default 256), greedy unless --temperature, thinking off, each prompt with a
 // unique prefix so the prefix cache serves none of it. One warm-up set, then --repeat sets

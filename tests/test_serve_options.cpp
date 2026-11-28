@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -1328,6 +1329,38 @@ int main() {
                               std::vector<infernix::FastPath>{infernix::FastPath::SampledMtpDrafts,
                                                               infernix::FastPath::Preemption},
                           "--config's array of a repeatable option did not reach the option in order");
+
+        // Leading ~/ expands to HOME on path options without touching relative paths or other strings.
+        if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+            const std::string expected_home(home);
+            const auto expanded = parse({"infernix-serve", "--config",
+                                         write_config("model = \"~/models/a.infernix\"\n"
+                                                      "draft-model = \"~/models/d.infernix\"\n"
+                                                      "spec = \"dflash2\"\n"
+                                                      "draft-tokens = \"auto\"\n"
+                                                      "chat-template = \"tools/chat_templates/qwen3_8.jinja\"\n"
+                                                      "[serve]\n"
+                                                      "request-log-jsonl = \"~/logs/req.jsonl\"\n")});
+            failures += check(expanded.artifact_path == expected_home + "/models/a.infernix" &&
+                                  expanded.speculative.draft_model == expected_home + "/models/d.infernix" &&
+                                  expanded.chat_template_path == "tools/chat_templates/qwen3_8.jinja" &&
+                                  expanded.request_log_jsonl == expected_home + "/logs/req.jsonl",
+                              "leading ~/ did not expand on serve path options");
+        }
+
+        // Every checked-in serving profile in configs/*.toml must parse cleanly as --config input.
+        {
+            const std::filesystem::path configs_dir = std::filesystem::path(INFERNIX_SOURCE_DIR) / "configs";
+            std::size_t checked = 0;
+            for (const auto& entry : std::filesystem::directory_iterator(configs_dir)) {
+                if (!entry.is_regular_file() || entry.path().extension() != ".toml") { continue; }
+                const auto profile = parse({"infernix-serve", "--config", entry.path().string()});
+                failures += check(!profile.artifact_path.empty() && profile.port > 0,
+                                  ("checked-in profile did not parse cleanly: " + entry.path().string()).c_str());
+                ++checked;
+            }
+            failures += check(checked >= 3, "expected checked-in serving profiles under configs/");
+        }
 
         // Each rejection names the offending key and its line, so a bad file is never applied in
         // part silently.

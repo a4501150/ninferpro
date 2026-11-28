@@ -1,5 +1,5 @@
 // The T2 start-up and correctness smoke test (AGENTS.md "Iteration tiers"): the public Engine on the
-// real artifact with production's options (tools/../super-quant serve_infernix.sh: fp8 KV, 6 lanes,
+// real artifact with production's options (configs/Qwen3.8-Flash-Next.toml: fp8 KV, 6 lanes,
 // DFlash2 with an automatic draft length and the proposal head, the prefix cache), in process. Skips
 // unless INFERNIX_QWEN4_ARTIFACT and INFERNIX_QWEN4_DFLASH2 are set (INFERNIX_QWEN4_NGRAM: the n-gram
 // volume, default <artifact>.ngram).
@@ -135,7 +135,7 @@ infernix::EngineOptions production_options(const Setup& setup, bool fast_paths) 
     options.speculative.draft_model        = setup.drafter;
     options.speculative.draft_tokens_auto  = true;
     options.speculative.proposal_head      = infernix::ProposalHead::Optimized;
-    options.enable_vision                  = true; // production's --vision (serve_infernix.sh)
+    options.enable_vision                  = true; // production's --vision (configs/Qwen3.8-Flash-Next.toml)
     if (!setup.disk.empty()) {
         options.context_cache.hybrid.disk_directory      = setup.disk;
         options.context_cache.hybrid.persistent_identity = "smoke";

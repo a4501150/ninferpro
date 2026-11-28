@@ -1073,8 +1073,8 @@ from a 50/50 VRAM/RAM placement, 9,557 of 12,288 frames held and 3,383 experts w
 (2026-10-22); when the engine idles, the placement returns to its named counts. This family's grow walk refills 512
 keys per maintenance tick, and its boot warm start seeds VRAM only from RAM (the pre-filled
 copies are released and refilled with the next keys of the order). The client owns the tier
-shares; client policy lives in `~/src/super-quant/scripts/infernix_placement.py` (`make
-infernix-gaming`, `make infernix-full`); within the client's counts the per-round LFRU swaps
+shares; client policy lives in `tools/monitor/` (`infernix-monitor placement --gaming`,
+`--full`); within the client's counts the per-round LFRU swaps
 hot experts in and cold ones out. The runtime shrink/regrow law of the original design was
 removed on 2026-10-30 for contradicting this split (it had been unreachable anyway, since
 every default boot on the 96 GB card holds all experts).
@@ -2876,7 +2876,7 @@ refuses them (§11). There is no flag for the cache policy (LFRU only), the expe
 fills the VRAM the plan leaves, §9) or the CPU worker count (`ProgramOptions::cpu_expert_workers`,
 default 6).
 
-Production (RTX PRO 6000, `~/src/super-quant/configs/Qwen3.8-Flash-Next/model.env`) serves recipe C
+Production (RTX PRO 6000, `configs/Qwen3.8-Flash-Next.toml`) serves recipe C
 with `--kv-dtype fp8 --max-context 262144 --max-concurrency 6 --ngram-volume <BF16 volume>`,
 `--spec dflash2 --draft-model <companion> --draft-tokens auto --lm-head-draft`, `--host-context-mib
 8192` and `--vision`; every expert sits in VRAM. The user guide's example uses `--kv-dtype int8`

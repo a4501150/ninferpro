@@ -1,6 +1,7 @@
 #include "test_temp_path.h"
 #include "options.h"
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -435,6 +436,18 @@ int run_tests() {
         failures += check(overridden.artifact_path == "cmd.infernix" && overridden.max_context == 1024 &&
                               overridden.stop_strings.size() == 3,
                           "the CLI command line did not override --config, or its repeated values replaced the file's");
+        if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+            const std::string expected_home(home);
+            const auto expanded = parse({"infernix", "--config",
+                                         write_config("model = \"~/models/a.infernix\"\n"
+                                                      "chat-template = \"~/tpl.jinja\"\n"
+                                                      "[cli]\n"
+                                                      "prompt = \"~/literal-prompt\"\n")});
+            failures += check(expanded.artifact_path == expected_home + "/models/a.infernix" &&
+                                  expanded.chat_template_path == expected_home + "/tpl.jinja" &&
+                                  expanded.prompt == "~/literal-prompt",
+                              "leading ~/ expansion failed on CLI path options or touched non-path prompt");
+        }
         for (const auto& [text, expected] : std::vector<std::pair<std::string, std::string>>{
                  {"prompt = \"x\"\nport = 9000", "unknown option 'port'"},
                  {"prompt = \"x\"\nmax-new = [1, 2]", "'max-new' takes one value, not an array"},

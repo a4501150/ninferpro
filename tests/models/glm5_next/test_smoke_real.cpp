@@ -1,6 +1,6 @@
 // The T2 start-up and correctness smoke test (AGENTS.md "Iteration tiers") for GLM-5.3-Flash: the
 // public Engine on the real artifact with production's options
-// (~/src/super-quant/configs/GLM-5.3-Flash/model.env: INT8 KV, 4 x 262,144 tokens,
+// (configs/GLM-5.3-Flash.toml: INT8 KV, 4 x 262,144 tokens,
 // vram=40%,ram=60%, the prefix cache), in process. Skips unless INFERNIX_GLM_ARTIFACT and
 // INFERNIX_GLM_DRAFT are set.
 //

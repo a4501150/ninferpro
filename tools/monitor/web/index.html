@@ -19,8 +19,9 @@
   <span class="state" id="state" data-s="offline">Connecting</span>
   <span class="ctl" id="ctl" hidden>
     <span class="ctl-msg" id="ctl-msg"></span>
-    <button type="button" class="btn" id="ctl-start">Start</button>
-    <button type="button" class="btn" id="ctl-stop">Stop</button>
+    <select class="sel" id="ctl-model" aria-label="Model profile"></select>
+    <button type="button" class="btn pri" id="ctl-load">Load</button>
+    <button type="button" class="btn" id="ctl-unload">Unload</button>
   </span>
   <span class="where" id="host"></span>
 </header>
@@ -42,6 +43,7 @@
         <div class="pl-row"><span>SSD</span><span class="pl-rest">the rest</span><b id="pl-ssd-v"></b></div>
         <div class="pl-note" id="pl-note"></div>
         <div class="pl-act">
+          <button type="button" class="btn" id="pl-gaming">Gaming</button>
           <button type="button" class="btn" id="pl-all">All VRAM</button>
           <button type="button" class="btn" id="pl-reset">Reset</button>
           <button type="button" class="btn pri" id="pl-apply">Apply</button>

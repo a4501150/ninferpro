@@ -367,7 +367,7 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("a model path (.infernix or .ninfer) is required: give it first on "
                                     "the command line or as `model` in the --config file");
     }
-    options.artifact_path     = program.model;
+    options.artifact_path     = product::expand_user_path(program.model);
     options.config_path       = std::move(program.config_path);
     options.config_arguments  = program.config_arguments;
     bool kv_capacity_explicit = false;
@@ -384,28 +384,29 @@ Options parse_options(int argc, char** argv) {
         if (arg == "--prompt") {
             options.prompt = value(arg);
         } else if (arg == "--chat-template") {
-            options.chat_template_path = value(arg);
+            options.chat_template_path = product::expand_user_path(value(arg));
         } else if (arg == "--ngram-volume") {
-            options.ngram_volume_path = value(arg);
+            options.ngram_volume_path = product::expand_user_path(value(arg));
         } else if (arg == "--ngram-residency") {
             options.ngram_residency = parse_ngram_residency(value(arg));
         } else if (arg == "--expert-state") {
             const std::string path = value(arg);
-            options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
+            options.expert_state =
+                path == "off" ? std::filesystem::path{} : std::filesystem::path(product::expand_user_path(path));
         } else if (arg == "--expert-stripe") {
-            options.expert_stripe_path = value(arg);
+            options.expert_stripe_path = product::expand_user_path(value(arg));
         } else if (arg == "--grammar-file") {
-            options.grammar_path = value(arg);
+            options.grammar_path = product::expand_user_path(value(arg));
         } else if (arg == "--json-object") {
             options.json_object = true;
         } else if (arg == "--json-schema-file") {
-            options.json_schema_path = value(arg);
+            options.json_schema_path = product::expand_user_path(value(arg));
         } else if (arg == "--regex") {
             options.regex = value(arg);
         } else if (arg == "--choice") {
             options.choices.emplace_back(value(arg));
         } else if (arg == "--messages") {
-            options.messages_path = value(arg);
+            options.messages_path = product::expand_user_path(value(arg));
         } else if (arg == "--max-new") {
             options.max_new = parse_u32(value(arg), "max-new");
         } else if (arg == "--rope-yarn-factor") {
@@ -474,7 +475,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, value(arg));
         } else if (arg == "--draft-model") {
-            options.speculative.draft_model = std::filesystem::path(std::string(value(arg)));
+            options.speculative.draft_model =
+                std::filesystem::path(product::expand_user_path(value(arg)));
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value(arg));
         } else if (arg == "--ngram-draft-tokens") {

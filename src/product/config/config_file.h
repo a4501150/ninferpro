@@ -67,4 +67,8 @@ struct ProgramArguments {
 redact_option_values(std::vector<std::string> arguments,
                      std::initializer_list<std::string_view> secrets);
 
+// Expands a leading "~" or "~/" (or "~\\" on Windows) to the user's home directory; other paths
+// are returned unchanged.
+[[nodiscard]] std::string expand_user_path(std::string_view path);
+
 } // namespace infernix::product

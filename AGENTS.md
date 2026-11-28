@@ -74,9 +74,9 @@ The engine provides mechanism; clients own policy. The engine places experts exa
 placement says, moves only the experts whose tier changes, reports what it did, and refuses or
 reports a placement it cannot reach. It does not choose shares, react to other programs' memory
 use, or keep headroom heuristics for the placement. Policies such as "leave 32 GB of VRAM and 24 GB
-of RAM free" live in the client (`~/src/super-quant/scripts/infernix_placement.py`,
-`make infernix-gaming`, `make infernix-full`). Which expert sits in which tier inside the client's
-counts is mechanism and stays in the engine.
+of RAM free" live in the client (`infernix-monitor` under `tools/monitor/`: the Gaming preset and
+`infernix-monitor placement --gaming` / `--reserve-vram-gb`). Which expert sits in which tier inside
+the client's counts is mechanism and stays in the engine.
 
 ## Objective and scope
 
@@ -265,8 +265,8 @@ family's decode are in [Decode profiling tiers](docs/maintainer/round-bench.md).
 | T2 | `make t2`, `make t2-record` | start-up and correctness smoke test (`tests/models/qwen4_exp/test_smoke_real.cpp`): the public Engine in process with production's options on the real artifacts (six concurrent requests, DFlash2 drafting, prefix-cache resume, an expert-placement switch and back), then the exact route's greedy tokens against `tests/models/qwen4_exp/smoke_golden.txt`, alone, six in flight, beside a long prompt's mixed rounds, resumed and after the switch | about a minute |
 | T2 bench | `make t2-bench [ARGS="--repeat 5"]` | aggregate tok/s of six concurrent 256-token requests through the Engine in process (`bench/models/qwen4_exp/engine_bench.cpp`): the DFlash2 policy, host work and the Forward together, without a server boot | about a minute |
 | T2 step | `make t2-bench PROFILE=1` | one T2 bench set under Nsight Systems: each decode round split into the Engine thread's phases (the drafter's proposal and wait, the target's launch and wait), GPU idle time by what the host was doing, and GPU work by launch site | a few minutes |
-| T3 | `make t3 ARGS=...` | promotion: `bench_infernix.py` and the quality gate against the server build; the only tier for policy behaviour that depends on live timing (the DFlash2 cost fit, placement swaps, scheduling) | many minutes |
-| T3 frontier | `make t3-frontier [ARGS="--concurrency 1,4,8"]` | one boot, a concurrency sweep of production-shaped agentic traffic (`bench/agentic_ab`): total output tok/s against per-user decode speed, and the best point at an SLA (`super-quant/scripts/bench_infernix_frontier.py`) | about 30 minutes at the defaults (five levels of 300 s) |
+| T3 | `make t3 ARGS=...` | promotion: `bench/t3/bench_infernix.py` and the quality gate against the server build; the only tier for policy behaviour that depends on live timing (the DFlash2 cost fit, placement swaps, scheduling) | many minutes |
+| T3 frontier | `make t3-frontier [ARGS="--concurrency 1,4,8"]` | one boot, a concurrency sweep of production-shaped agentic traffic (`bench/agentic_ab`): total output tok/s against per-user decode speed, and the best point at an SLA (`bench/t3/bench_infernix_frontier.py`) | about 30 minutes at the defaults (five levels of 300 s) |
 
 - Kernel and Forward work: T1 for every change. A change meant to keep the bits must pass `make t1`
   and `make t1-exact` unchanged; an intended numerical change records new hashes with
@@ -341,7 +341,7 @@ The machine: Ubuntu 26.04, kernel 7.0, one RTX PRO 6000 Blackwell (SM120, 96 GB)
   plus tests and benchmarks), holds the production server and the tests. Export
   `CPATH=/usr/local/cuda-13.4/include` for the plain C++ test targets. Build only what the task
   needs (`--target infernix-serve`, or the affected tests). Wrap builds as
-  `flock ~/.cache/super-quant/build.lock systemd-run --user --scope -p MemoryMax=48G cmake --build
+  `flock ~/.cache/ninferpro/build.lock systemd-run --user --scope -p MemoryMax=48G cmake --build
   build -j16 ...` (the `Makefile` targets default to 16 jobs — the machine's 16 cores — and a
   memory cap that scales with the job count; `JOBS=` and `MEM=` override): an unbounded nvcc build
   has run the host out of memory. Never wrap a `Makefile` target (`make t0`, `make t2`, ...) in an
@@ -355,13 +355,14 @@ The machine: Ubuntu 26.04, kernel 7.0, one RTX PRO 6000 Blackwell (SM120, 96 GB)
   them (about 8 minutes at `-j8`). Its Python tests run with
   `.venv-convert/bin/python` (`Python3_EXECUTABLE`; it holds torch and jsonschema, the system
   interpreter has no torch).
-- GPU: one model boot fits at a time. Hold `flock ~/.cache/super-quant/gpu.lock` for any boot, and
-  the build lock as well while measuring. Production stops for a test boot and must be restarted
-  afterwards.
-- Production: `make -C ~/src/super-quant serve-infernix` / `stop-infernix` (detached with
-  `setsid nohup`; pidfile `~/src/super-quant/.infernix.pid`, log `.infernix.log`). Its flags live in
-  `~/src/super-quant/configs/Qwen3.8-Flash-Next/model.env`. Test servers use ports 8400-8499;
-  port 8000 is production.
+- GPU: one model boot fits at a time. Hold `flock ~/.cache/ninferpro/gpu.lock` for any boot, and
+  the build lock as well while measuring. Unload any active model (`build/apps/infernix-monitor unload`)
+  before a test boot and reload afterwards if needed.
+- Production: managed directly by `build/apps/infernix-monitor` (web UI on `127.0.0.1:8090`,
+  `infernix-serve` on `0.0.0.0:8000`, detached with `--daemon`; pidfiles in `~/.cache/ninferpro/monitor.pid`
+  and `logs/infernix/infernix-serve.pid`, dated server logs under `logs/infernix/` with `latest.log` symlink).
+  Starts idle (0 VRAM); default profile is `configs/GLM-5.3-Flash.toml` (with `GLM-5.3-Flash-GSQ` and
+  `Qwen3.8-Flash-Next` alongside it under `configs/`). Test servers use ports 8400-8499; port 8000 is production.
 - Artifacts: `~/models/infernix/` (`README.local.md` records the conversion commands). Select them
   by explicit path, never glob order, modification time, or unqualified "latest". Source
   checkpoints live in `~/.cache/huggingface`.
@@ -377,7 +378,7 @@ The machine: Ubuntu 26.04, kernel 7.0, one RTX PRO 6000 Blackwell (SM120, 96 GB)
 - Python: the converter uses Python 3.11 from `.venv-convert/`; the system `python3` is 3.14.
   Install or upgrade dependencies only when the task needs it.
 
-Benchmark with `~/src/super-quant/scripts/bench_infernix.py`: one boot per binary, placements
+Benchmark with `bench/t3/bench_infernix.py`: one boot per binary, placements
 switched at runtime, concurrent requests from a thread pool, short polls instead of fixed sleeps,
 unique prompt prefixes so the prefix cache does not hide prefill, and every speed read from the
 server's `req#N done` log lines rather than client timing. Report the per-tier expert counts and the

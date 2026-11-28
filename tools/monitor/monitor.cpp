@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <utility>
 
 namespace infernix::monitor {
 
@@ -14,11 +15,12 @@ namespace {
 constexpr std::uint64_t kRequestBacklogBytes = 16ull << 20; // records carry their token ids
 constexpr std::uint64_t kLogBacklogBytes     = 256ull << 10;
 constexpr double kPlacementRetrySeconds      = 30.0;
+constexpr double kProfileScanSeconds         = 5.0;
 // A switch is validated before it returns (it moves nothing until the next round boundary); a
 // dry run only computes.
-constexpr int kPlacementPostSeconds = 30;
+constexpr int kPlacementPostSeconds   = 30;
 constexpr int kPlacementDryRunSeconds = 5;
-constexpr double kStartSettleSeconds = 5.0;
+constexpr double kStartSettleSeconds  = 5.0;
 // A finished request counts toward the session bests only past these sizes, so a two-token
 // reply does not set the decode record.
 constexpr std::uint64_t kBestDecodeTokens  = 32;
@@ -104,15 +106,34 @@ EngineCounters read_counters(const Metrics& metrics, double time) {
 }
 
 Monitor::Monitor(MonitorOptions options)
-    : options_(std::move(options)), engine_(std::make_unique<EngineClient>(options_.engine_url, options_.api_key)) {
-    if (!options_.request_log.empty()) {
-        request_tail_ = std::make_unique<FileTail>(options_.request_log, kRequestBacklogBytes);
+    : options_(std::move(options)), active_engine_url_(options_.engine_url), active_log_file_(options_.log_file),
+      active_request_log_(options_.request_log), shared_engine_url_(options_.engine_url) {
+    if (options_.manage_server) {
+        if (active_log_file_.empty() && !options_.manager.log_dir.empty()) {
+            active_log_file_ = options_.manager.log_dir / "latest.log";
+        }
+        if (active_request_log_.empty() && options_.manager.enable_request_log && !options_.manager.log_dir.empty()) {
+            active_request_log_ = options_.manager.log_dir / "requests.jsonl";
+        }
+        profiles_ = scan_profiles(options_.manager.configs_dir);
+        for (const ModelProfile& p : profiles_) {
+            if (p.name == options_.manager.default_profile) {
+                active_engine_url_ = profile_engine_url(p);
+                shared_engine_url_ = active_engine_url_;
+                break;
+            }
+        }
     }
-    if (!options_.log_file.empty()) { log_tail_ = std::make_unique<FileTail>(options_.log_file, kLogBacklogBytes); }
-    if (!options_.control.empty()) {
-        controller_ = std::make_unique<Controller>(options_.control, [this](const std::string& line, bool error) {
-            add_log(error ? LogLevel::Error : LogLevel::Info, line);
-        });
+    engine_ = std::make_unique<EngineClient>(active_engine_url_, options_.api_key);
+    if (!active_request_log_.empty()) {
+        request_tail_ = std::make_unique<FileTail>(active_request_log_, kRequestBacklogBytes);
+    }
+    if (!active_log_file_.empty()) { log_tail_ = std::make_unique<FileTail>(active_log_file_, kLogBacklogBytes); }
+    if (options_.manage_server) {
+        controller_ = std::make_unique<Controller>(
+            options_.manager,
+            [this](const std::string& line, bool error) { add_log(error ? LogLevel::Error : LogLevel::Info, line); },
+            [this](const EngineTarget& target) { schedule_target_update(target); });
     }
 }
 
@@ -125,32 +146,110 @@ void Monitor::add_log(LogLevel level, std::string message) {
     while (logs_.size() > kLogLines) { logs_.pop_front(); }
 }
 
-EngineReply Monitor::switch_placement(int vram_percent, int ram_percent, bool dry_run) {
-    const auto body = placement_body(vram_percent, ram_percent);
-    if (!body) {
-        return EngineReply{400, Json{{"error", kSharesError}}.dump()};
+void Monitor::schedule_target_update(const EngineTarget& target) {
+    const std::lock_guard lock(mutex_);
+    pending_target_ = target;
+    if (!target.engine_url.empty()) { shared_engine_url_ = target.engine_url; }
+}
+
+void Monitor::apply_pending_target() {
+    std::optional<EngineTarget> target;
+    {
+        const std::lock_guard lock(mutex_);
+        target = std::exchange(pending_target_, std::nullopt);
     }
+    if (!target) { return; }
+    if (!target->engine_url.empty() && target->engine_url != active_engine_url_) {
+        active_engine_url_ = target->engine_url;
+        engine_            = std::make_unique<EngineClient>(active_engine_url_, options_.api_key);
+        counters_.clear();
+        placement_.clear();
+        next_placement_poll_ = 0.0;
+    }
+    if (!target->log_file.empty() && target->log_file != active_log_file_) {
+        active_log_file_ = target->log_file;
+        log_tail_        = std::make_unique<FileTail>(active_log_file_, kLogBacklogBytes);
+    }
+    if (!target->request_log.empty() && target->request_log != active_request_log_) {
+        active_request_log_ = target->request_log;
+        request_tail_       = std::make_unique<FileTail>(active_request_log_, kRequestBacklogBytes);
+    }
+}
+
+std::string Monitor::current_engine_url() const {
+    const std::lock_guard lock(mutex_);
+    return shared_engine_url_;
+}
+
+EngineReply Monitor::post_placement_body(const Json& body, bool dry_run) {
     // Its own client: the sampler thread owns engine_.
-    httplib::Client client(options_.engine_url);
+    httplib::Client client(current_engine_url());
     client.set_connection_timeout(1, 0);
     client.set_read_timeout(dry_run ? kPlacementDryRunSeconds : kPlacementPostSeconds, 0);
     if (!options_.api_key.empty()) { client.set_bearer_token_auth(options_.api_key); }
     const auto result = client.Post(dry_run ? "/admin/expert-placement?dry_run=1" : "/admin/expert-placement",
-                                    body->dump(), "application/json");
+                                    body.dump(), "application/json");
     if (!result) {
-        return EngineReply{502, Json{{"error", "the engine did not answer: " + httplib::to_string(result.error())}}.dump()};
+        return EngineReply{502,
+                           Json{{"error", "the engine did not answer: " + httplib::to_string(result.error())}}.dump()};
     }
     if (!dry_run) {
         add_log(result->status == 200 ? LogLevel::Info : LogLevel::Warn,
-                "monitor: placement " + body->dump() + " -> HTTP " + std::to_string(result->status) + " " + result->body);
+                "monitor: placement " + body.dump() + " -> HTTP " + std::to_string(result->status) + " " +
+                    result->body);
     }
     return EngineReply{result->status, result->body};
 }
 
+EngineReply Monitor::switch_placement(int vram_percent, int ram_percent, bool dry_run) {
+    const auto body = placement_body(vram_percent, ram_percent);
+    if (!body) { return EngineReply{400, Json{{"error", kSharesError}}.dump()}; }
+    return post_placement_body(*body, dry_run);
+}
+
+EngineReply Monitor::apply_reserve_placement(double reserve_vram_gb, double reserve_ram_gb, bool dry_run) {
+    httplib::Client client(current_engine_url());
+    client.set_connection_timeout(1, 0);
+    client.set_read_timeout(kPlacementDryRunSeconds, 0);
+    if (!options_.api_key.empty()) { client.set_bearer_token_auth(options_.api_key); }
+    const auto status_res = client.Get("/admin/expert-placement");
+    if (!status_res) {
+        return EngineReply{
+            502, Json{{"error", "the engine did not answer: " + httplib::to_string(status_res.error())}}.dump()};
+    }
+    if (status_res->status != 200) { return EngineReply{status_res->status, status_res->body}; }
+    const Json report = Json::parse(status_res->body, nullptr, false);
+    std::string err;
+    const auto plan = compute_reserve_plan(report, reserve_vram_gb, reserve_ram_gb, &err);
+    if (!plan) { return EngineReply{400, Json{{"error", err.empty() ? "cannot compute reserve plan" : err}}.dump()}; }
+
+    EngineReply reply = post_placement_body(plan->body, dry_run);
+    Json parsed       = Json::parse(reply.body, nullptr, false);
+    if (parsed.is_object()) {
+        parsed["reserve"] = {{"vram_gb", reserve_vram_gb}, {"ram_gb", reserve_ram_gb}};
+        parsed["plan"]    = {{"vram", plan->vram_experts},
+                             {"ram", plan->ram_experts},
+                             {"ssd", plan->ssd_experts},
+                             {"total", plan->total_experts}};
+        reply.body        = parsed.dump();
+    }
+    return reply;
+}
+
+void Monitor::refresh_profiles(double now, bool force) {
+    if (!options_.manage_server) { return; }
+    if (!force && now < next_profile_scan_) { return; }
+    profiles_          = scan_profiles(options_.manager.configs_dir);
+    next_profile_scan_ = now + kProfileScanSeconds;
+}
+
 void Monitor::tick() {
     const double now = steady_seconds();
-    gpus_            = sampler_.sample_gpus();
-    host_            = sampler_.sample_host();
+    if (controller_) { controller_->reap_exited(); }
+    apply_pending_target();
+    refresh_profiles(now, false);
+    gpus_ = sampler_.sample_gpus();
+    host_ = sampler_.sample_host();
     for (const GpuReading& g : gpus_) {
         Gpu& h = gpu_history_[g.index];
         push_history(h.util, g.util);
@@ -180,8 +279,9 @@ void Monitor::poll_engine(double now) {
     metrics_                    = Metrics(parse_prometheus(*body));
     const EngineCounters latest = read_counters(metrics_, now);
     // A counter that fell means the engine restarted between two readings.
-    if (!counters_.empty() && (latest.decode_tokens < counters_.back().decode_tokens ||
-                               latest.prefill_tokens < counters_.back().prefill_tokens)) {
+    if (!counters_.empty() &&
+        (latest.decode_tokens < counters_.back().decode_tokens ||
+         latest.prefill_tokens < counters_.back().prefill_tokens)) {
         counters_.clear();
     }
     if (counters_.empty()) {
@@ -297,12 +397,12 @@ Json Monitor::build_state() const {
                         {"prefill_tok_s", series_json(prefill_rate_)},
                         {"gpus", gpu_history}};
 
-    const auto gauge = [&](const char* name) { return optional_json(metrics_.sum(name)); };
+    const auto gauge                        = [&](const char* name) { return optional_json(metrics_.sum(name)); };
     const std::optional<double> decode_now  = decode_rate_.empty() ? std::nullopt : decode_rate_.back();
     const std::optional<double> prefill_now = prefill_rate_.empty() ? std::nullopt : prefill_rate_.back();
-    const double running     = metrics_.sum("infernix_requests_running").value_or(0.0);
-    const double prefilling  = metrics_.sum("infernix_requests_prefilling").value_or(0.0);
-    std::string phase        = "offline";
+    const double running                    = metrics_.sum("infernix_requests_running").value_or(0.0);
+    const double prefilling                 = metrics_.sum("infernix_requests_prefilling").value_or(0.0);
+    std::string phase                       = options_.manage_server ? "unloaded" : "offline";
     if (reachable_) {
         if (metrics_.sum("infernix_engine_ready").value_or(1.0) == 0.0) {
             phase = "loading";
@@ -335,14 +435,14 @@ Json Monitor::build_state() const {
                   {"prefix_hit", optional_json(ratio(b.prompt_cached_tokens - a.prompt_cached_tokens,
                                                      b.prompt_tokens - a.prompt_tokens, 1))},
                   {"accept", optional_json(ratio(b.accepted - a.accepted, b.drafted - a.drafted, 20))}};
-        total = {{"expert_hit", optional_json(ratio(b.expert_hits, b.expert_routed, 100))},
-                 {"prefix_hit", optional_json(ratio(b.prompt_cached_tokens, b.prompt_tokens, 1))},
-                 {"accept", optional_json(ratio(b.accepted, b.drafted, 20))},
-                 {"decode_tokens", b.decode_tokens},
-                 {"prefill_tokens", b.prefill_tokens}};
+        total  = {{"expert_hit", optional_json(ratio(b.expert_hits, b.expert_routed, 100))},
+                  {"prefix_hit", optional_json(ratio(b.prompt_cached_tokens, b.prompt_tokens, 1))},
+                  {"accept", optional_json(ratio(b.accepted, b.drafted, 20))},
+                  {"decode_tokens", b.decode_tokens},
+                  {"prefill_tokens", b.prefill_tokens}};
     }
     const std::optional<double> started = metrics_.sum("infernix_server_start_time_seconds");
-    state["engine"] = {{"url", options_.engine_url},
+    state["engine"] = {{"url", active_engine_url_},
                        {"reachable", reachable_},
                        {"model", metrics_.label("infernix_model_info", "model_name")},
                        {"spec_backend", metrics_.label("infernix_model_info", "speculative_backend")},
@@ -351,6 +451,13 @@ Json Monitor::build_state() const {
                        {"total", total}};
 
     state["placement"] = placement_.empty() ? Json(nullptr) : Json::parse(placement_, nullptr, false);
+
+    Json profiles = Json::array();
+    for (const ModelProfile& p : profiles_) { profiles.push_back(profile_to_json(p)); }
+    state["profiles"]        = std::move(profiles);
+    state["default_profile"] = options_.manage_server ? Json(options_.manager.default_profile) : Json(nullptr);
+    state["gaming_reserve"] =
+        Json{{"vram_gb", options_.gaming_reserve_vram_gb}, {"ram_gb", options_.gaming_reserve_ram_gb}};
 
     Json requests = Json::array();
     for (const FinishedRequest& r : requests_) {
@@ -376,29 +483,34 @@ Json Monitor::build_state() const {
     };
     state["best"]    = {{"decode", best_json(best_decode_)}, {"prefill", best_json(best_prefill_)}};
     state["sources"] = {
-        {"request_log", options_.request_log.empty() ? Json(nullptr) : Json(options_.request_log.string())},
-        {"log_file", options_.log_file.empty() ? Json(nullptr) : Json(options_.log_file.string())}};
+        {"request_log", active_request_log_.empty() ? Json(nullptr) : Json(active_request_log_.string())},
+        {"log_file", active_log_file_.empty() ? Json(nullptr) : Json(active_log_file_.string())}};
     return state;
 }
 
 std::string Monitor::state_json() const {
     // The control state is read now, not at the last tick: a tick can take seconds while the server
     // loads, and a state from before an action would show the page that action undone.
-    const Json control = controller_ ? controller_->state()
-                                     : Json{{"enabled", false}, {"busy", nullptr}, {"last", nullptr}};
+    const Json control = controller_
+                             ? controller_->state()
+                             : Json{{"enabled", false},
+                                    {"busy", nullptr},
+                                    {"active_profile", nullptr},
+                                    {"pid", nullptr},
+                                    {"last", nullptr}};
     const std::lock_guard lock(mutex_);
     if (state_.is_null()) { return "{}"; }
-    Json state         = state_;
-    state["control"]   = control;
-    const bool up      = state["engine"]["reachable"].get<bool>();
-    const Json& last   = control["last"];
-    // A start returns once the server answers; until a tick sees it, it is still starting.
-    const bool started = last.is_object() && last["action"] == "start" && last["ok"] == true &&
-                         unix_seconds() - last["time"].get<double>() < kStartSettleSeconds;
+    Json state       = state_;
+    state["control"] = control;
+    const bool up    = state["engine"]["reachable"].get<bool>();
+    const Json& last = control["last"];
+    // A load returns once the server answers; until the next tick sees it, keep reporting loading.
+    const bool loaded = last.is_object() && last["action"] == "load" && last["ok"] == true &&
+                        unix_seconds() - last["time"].get<double>() < kStartSettleSeconds;
     if (control["busy"].is_string()) {
-        state["live"]["state"] = control["busy"] == "stop" ? "stopping" : up ? "loading" : "starting";
-    } else if (!up && started) {
-        state["live"]["state"] = "starting";
+        state["live"]["state"] = control["busy"].get<std::string>();
+    } else if (!up && loaded) {
+        state["live"]["state"] = "loading";
     }
     return state.dump();
 }

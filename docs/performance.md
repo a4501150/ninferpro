@@ -11,8 +11,8 @@ with production stopped, since the run needs the whole GPU:
 make t3 PLACEMENTS='vram=100%;vram=65%,ram=15%,ssd=20%;vram=50%,ram=50%;vram=50%,ram=0%,ssd=50%;vram=100%'
 ```
 
-`make t3` runs `~/src/super-quant/scripts/bench_infernix.py` against `build/apps/infernix-serve` and
-writes `<out>.md`, `<out>.json` and the server log under `~/src/super-quant/results/`. Every speed
+`make t3` runs `bench/t3/bench_infernix.py` against `build/apps/infernix-serve` and
+writes `<out>.md`, `<out>.json` and the server log under `results/`. Every speed
 is read from the server's own request log (`req#N done | ...`), not from client timing. For each
 placement the script runs the workload once to warm up and once to measure:
 
@@ -30,7 +30,7 @@ slower.
 
 `make t3-frontier` measures the same server differently: one boot, production-shaped agentic
 traffic at each concurrency level, total output tok/s against the per-user decode speed, and the
-best point at an SLA; its tables go to `~/src/super-quant/results/infernix_frontier_<commit>.*`.
+best point at an SLA; its tables go to `results/infernix_frontier_<commit>.*`.
 
 The tiers below `make t3` (Forward time and its speed of light, the in-process engine bench and its
 decode-step split) and their scopes are in [AGENTS.md](../AGENTS.md#iteration-tiers) and

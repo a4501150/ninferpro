@@ -1,95 +1,105 @@
 # infernix-monitor
 
-A live status page for `infernix-serve`: GPU, CPU, RAM and disk readings, decode and prefill
-speed, the expert placement, finished requests, and the server log. From the page you can also
-switch the expert placement between VRAM, RAM and SSD, and, with `--control`, start and stop the
-server. The page is adapted from [Basalt](https://github.com/jesdga95/basalt)'s status page (MIT,
-see [LICENSE.basalt](LICENSE.basalt)).
+A first-class native server manager and live status page for `infernix-serve`: GPU, CPU, RAM and
+disk telemetry, decode and prefill speed, expert placement, finished requests, server logs, and
+direct model lifecycle management (Load, Switch, Unload to 0 MiB VRAM). The page is adapted from
+[Basalt](https://github.com/jesdga95/basalt)'s status page (MIT, see
+[LICENSE.basalt](LICENSE.basalt)).
 
-The monitor is a separate process and a client of the engine's public endpoints; the engine has
-no code for it. It can be started, stopped or restarted at any time without touching the server.
-It reads:
+The monitor is a separate, zero-CUDA process that runs on its own port (`127.0.0.1:8090` by
+default) while `infernix-serve` binds the API port (`0.0.0.0:8000`) directly whenever a model is
+loaded. Unloading exits `infernix-serve`, returning all VRAM, CUDA context, and host RAM to the
+system while keeping the web UI alive across unloads, GPU faults, and server rebuilds.
 
 | Source | Shown as |
 |---|---|
 | NVML (`libnvidia-ml.so.1`, loaded at run time) | GPU load, VRAM, power, temperature, PCIe link |
 | `/proc/stat`, `/proc/meminfo`, `/proc/diskstats` | CPU load, RAM, disk read rate (whole disks only) |
-| `GET /metrics` once a second | decode and prefill tok/s (counter deltas), request gauges, prefix-cache hit, draft acceptance, expert VRAM hit |
-| `GET /admin/expert-placement` | VRAM/RAM/SSD expert counts, expert and KV bytes, the last placement switch |
-| `--request-log FILE`, the engine's `--request-log-jsonl` | the Requests table and the session bests |
-| `--log-file FILE`, the engine's console log or `--log-file` | the Logs pane |
-
-Without `--request-log` or `--log-file` the page shows everything else. Both files are followed
-like `tail -F`: a rotated request log, a log symlink pointed at a new file, or a truncated file
-is read again from its start. On start the monitor reads the last 16 MiB of the request log and
-the last 256 KiB of the console log.
+| `configs/*.toml` (`--configs`) | Model selector dropdown, defaults, and profile details |
+| `GET /metrics` once a second | decode and prefill tok/s, request gauges, prefix-cache hit, draft acceptance, expert VRAM hit |
+| `GET /admin/expert-placement` | VRAM/RAM/SSD expert counts, expert and KV bytes, last placement switch |
+| `<log-dir>/requests.jsonl` (enabled automatically) | Requests table and session bests |
+| `<log-dir>/latest.log` (symlink to dated server log) | Logs pane |
 
 ## Build and run
 
-`infernix-monitor` is built with the apps (Linux only; it needs no CUDA at run time):
+`infernix-monitor` is built with the apps (Linux only; needs no CUDA at run time):
 
 ```bash
-cmake --build build --target infernix-monitor
-build/apps/infernix-monitor --engine http://127.0.0.1:8000 \
-  --request-log requests.jsonl --log-file server.log
+cmake --build build --target infernix-monitor infernix-serve
+build/apps/infernix-monitor --daemon          # starts idle (0 VRAM) on http://127.0.0.1:8090
 ```
 
-Then open `http://127.0.0.1:8090`. The options:
+Running without arguments starts in the foreground; `--daemon` detaches into the background,
+records its PID in `~/.cache/ninferpro/monitor.pid`, and writes its own log to
+`logs/infernix/monitor.log`. By default it discovers `configs/*.toml` from the repository root,
+selects `GLM-5.3-Flash` as the default profile, locates the sibling `infernix-serve` binary, and
+starts **unloaded** (pass `--autoload` to boot the default profile immediately).
+
+### Manager options
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--engine URL` | `http://127.0.0.1:8000` | the server's base URL |
-| `--api-key KEY` | none | the server's `--api-key`, sent as a bearer token |
-| `--request-log FILE` | none | the server's `--request-log-jsonl` file |
-| `--log-file FILE` | none | the server's console log or `--log-file` |
-| `--control CMD` | none | the command behind Start and Stop ([Start and Stop](#start-and-stop)); without it the page has neither |
-| `--host ADDR` | `127.0.0.1` | address the page is served on |
-| `--port N` | `8090` | port the page is served on |
+| `--daemon`, `-d` | off | detach into the background and exit once listening |
+| `--autoload` | off | load the default profile immediately on startup |
+| `--configs DIR` | `<repo>/configs` | directory of standard `infernix-serve --config` TOML profiles |
+| `--default NAME` | `GLM-5.3-Flash` | default profile name (file stem without `.toml`) |
+| `--server-bin PATH` | sibling `infernix-serve` | `infernix-serve` executable spawned on Load |
+| `--log-dir DIR` | `<repo>/logs/infernix` | directory for dated logs, `latest.log`, `requests.jsonl`, GPU core dumps, and `infernix-serve.pid` |
+| `--gaming-vram-gb N` | `32` | VRAM GiB reserved by the Gaming placement preset |
+| `--gaming-ram-gb N` | `24` | host RAM GiB reserved by the Gaming placement preset |
+| `--no-request-log` | off | do not add `--request-log-jsonl` automatically |
+| `--host ADDR` | `127.0.0.1` | address the web UI and control API bind to |
+| `--port N` | `8090` | port the web UI and control API bind to |
+| `--api-key KEY` | none | bearer token sent to `infernix-serve` |
+| `--engine URL` | from profile | read-only monitor mode against an external server (disables lifecycle control unless `--configs` is also given) |
+| `--log-file FILE` | `<log-dir>/latest.log` | override console log file to follow |
+| `--request-log FILE` | `<log-dir>/requests.jsonl` | override request JSONL file to follow |
 
-The page has no authentication of its own; it binds to loopback unless `--host` says otherwise.
-Requests that change the server must come from the page itself: a JSON body, an `Origin` (when
-sent) equal to the page's, and a `Host` that is an IP address, `localhost` or this machine's name,
-so another web site open in the same browser cannot switch the placement or stop the server.
+### CLI control subcommands
 
-## Expert placement
+Every lifecycle and placement action works from the command line against a running manager
+(`--port N` overrides `8090`):
 
-`Change` in the Experts panel opens two sliders: the VRAM and RAM shares of the routed experts,
-whole percents, the rest on SSD. They follow the server's placement until moved. While the server
-runs, a move previews the shares with the engine's dry run (counts per tier, expert bytes, VRAM
-left free, whether it fits) and Apply switches to them through `POST /admin/expert-placement`;
-100 % VRAM is the engine's resident placement (`vram=all`). The engine places exactly what the
-shares say; choosing them, such as leaving room for a game, stays with you.
+```bash
+build/apps/infernix-monitor status
+build/apps/infernix-monitor load                              # loads default profile (GLM-5.3-Flash)
+build/apps/infernix-monitor load Qwen3.8-Flash-Next
+build/apps/infernix-monitor load GLM-5.3-Flash --experts vram=35%,ram=65%
+build/apps/infernix-monitor placement --status
+build/apps/infernix-monitor placement --gaming                # reserve 32 GiB VRAM / 24 GiB RAM
+build/apps/infernix-monitor placement --reserve-vram-gb 40 --reserve-ram-gb 24
+build/apps/infernix-monitor placement --shares vram=50%,ram=50%
+build/apps/infernix-monitor placement --full                  # vram=all
+build/apps/infernix-monitor unload                            # clean SIGTERM, 0 VRAM
+build/apps/infernix-monitor stop [--with-server]              # stop --daemon manager
+```
 
-## Start and Stop
+## Model lifecycle and crash isolation
 
-`--control CMD` names an executable the monitor runs, one action at a time, as
+Each `load` spawns `infernix-serve --config <profile.toml>` in its own session (`setsid`) with
+closed inherited descriptors, `CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1`, a dated log file, an
+atomically updated `latest.log` symlink, 30-day log/coredump pruning, and `<log-dir>/infernix-serve.pid`
+so a restarted manager automatically re-adopts an already-running server. Switching from one profile
+to another unloads the active server first and waits for it to exit cleanly before loading the next.
 
-- `CMD start [EXPERTS]`: start the server and exit 0 once it answers; `EXPERTS` is an `--experts`
-  spec (`vram=80%,ram=20%,ssd=0%`), passed when the placement editor is open, and the server's
-  configured placement applies without it;
-- `CMD stop`: stop the server and exit 0 once it is gone.
+## Expert placement and Gaming preset
 
-Its stdout and stderr go to the Logs pane, and its last line is the outcome shown in the top bar.
-It runs in a process group of its own with no other open file of the monitor's (the server it
-starts must not hold the page's port); a start is killed after 420 s and a stop after 120 s.
-Start is offered while the server does not answer, Stop while it does. The command owns how the
-server is launched (binary, artifact, flags, log); super-quant's `scripts/infernix_control.sh`,
-which `make monitor` passes, runs its `serve_infernix.sh` and `stop_infernix.sh`.
+`Change` in the Experts panel opens VRAM and RAM sliders (the rest on SSD). While unloaded, the
+sliders initialize to the selected profile's configured `experts` share and override it on Load if
+modified. While loaded, slider changes preview with `?dry_run=1`, `All VRAM` requests `vram=all`,
+and `Gaming` computes the largest VRAM/RAM expert counts that leave `--gaming-vram-gb` and
+`--gaming-ram-gb` free before applying through `POST /admin/expert-placement`.
 
-## Endpoints
+## Security and endpoints
 
-- `GET /` with `app.js` and `app.css`: the page. The files in [web/](web/) are embedded in the
-  binary at build time.
-- `GET /api/state`: one JSON object with the latest readings and 60-sample histories.
-- `GET /api/logs?after=N`: log lines after sequence number `N`, and the last sequence number.
-- `POST /api/placement` with `{"vram": V, "ram": R, "dry_run": bool}` (whole percents): passed on
-  to `POST /admin/expert-placement`; the engine's status and body come back.
-- `POST /api/control` with `{"action": "start", "vram": V, "ram": R}` (without `vram`, the
-  configured placement) or `{"action": "stop"}`: queues the action (202 with the control state;
-  409 while another action runs).
+The page has no authentication of its own and binds to loopback unless `--host` says otherwise.
+State-changing POST requests must carry `Content-Type: application/json`, a `Host` that is an IP
+literal, `localhost`, or this machine's hostname, and an `Origin` (when sent) equal to
+`http://<Host>`.
 
-## Differences from Basalt's page
-
-Basalt's per-slot table needs live per-lane figures that `infernix-serve` does not publish; the
-Engine tab shows the request gauges and the cache and acceptance rates instead. The Experts
-panel shows the placement by tier rather than one request's lookups. The page uses system fonts.
+- `GET /`, `/app.js`, `/app.css`: embedded web UI from [web/](web/).
+- `GET /api/state`: latest telemetry, 60-sample histories, discovered profiles, active profile, and control state.
+- `GET /api/logs?after=N`: log entries after sequence number `N`.
+- `POST /api/placement`: accepts `{"vram": V, "ram": R, "dry_run": bool}`, `{"reserve_vram_gb": V, "reserve_ram_gb": R, "dry_run": bool}`, or `{"shares": SPEC, "dry_run": bool}`.
+- `POST /api/control`: accepts `{"action": "load", "profile": NAME, "vram": V, "ram": R | "experts": SPEC}` or `{"action": "unload"}` (202 queued, 409 busy).

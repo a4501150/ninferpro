@@ -1,0 +1,20 @@
+# GLM-5.3-Flash GSQ-Q4 (GCSA-AiLab RCO-GSQ Q4_K/Q3_K/Q2_K experts, Q8 dense, DFlash2 auto, vision).
+# Sized for one RTX PRO 6000 Blackwell (96 GB) within 95% VRAM at 4 x 262,144 INT8 KV
+# (docs/maintainer/glm5_3-flash-design.md §3.3).
+
+model = "~/models/infernix/GLM-5.3-Flash-Uncensored-GSQ-Q4.infernix"
+kv-dtype = "int8"
+spec = "dflash2"
+draft-model = "~/models/infernix/GLM-5.3-Flash-DFlash2-Infernix.infernix"
+draft-tokens = "auto"
+vision = true
+
+[serve]
+served-model-name = ["glm-5.3-flash"]
+max-context = 262144
+max-concurrency = 4
+host-context-mib = 2048
+experts = "vram=59%,ram=41%"
+tolerant-tool-calls = true
+host = "0.0.0.0"
+port = 8000

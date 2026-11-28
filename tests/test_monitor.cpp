@@ -1,11 +1,19 @@
-// infernix-monitor's readers: the Prometheus text the engine serves, the request-log records,
-// the console log lines, and following a file through appends, a partial line and replacement;
-// and its controls: the control command runner, the placement shares and the POST guard.
+// infernix-monitor's readers, TOML profile catalog, reserve-based placement policy, native
+// server lifecycle controller (load/switch/unload/fast-fail), and POST CSRF guard.
 
 #include "control.h"
 #include "file_tail.h"
+#include "profiles.h"
 #include "prometheus.h"
 #include "records.h"
+
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cmath>
@@ -14,8 +22,8 @@
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <fcntl.h>
-#include <unistd.h>
+#include <thread>
+#include <vector>
 
 using namespace infernix::monitor;
 
@@ -33,6 +41,27 @@ void check(bool pass, const char* message) {
 void append(const std::filesystem::path& path, const std::string& text) {
     std::ofstream out(path, std::ios::binary | std::ios::app);
     out << text;
+}
+
+void write_file(const std::filesystem::path& path, const std::string& text) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << text;
+}
+
+int pick_free_port() {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { return 18490; }
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    int port             = 18490;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+        socklen_t len = sizeof(addr);
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) { port = ntohs(addr.sin_port); }
+    }
+    ::close(fd);
+    return port;
 }
 
 void test_prometheus() {
@@ -108,7 +137,8 @@ void test_log_lines() {
 
 void test_file_tail() {
     const std::filesystem::path dir =
-        std::filesystem::temp_directory_path() / ("infernix_monitor_test_" + std::to_string(::getpid()));
+        std::filesystem::temp_directory_path() / ("infernix_monitor_test_tail_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     const auto first = dir / "a.log", second = dir / "b.log", link = dir / "current.log";
 
@@ -146,37 +176,56 @@ void test_file_tail() {
     check(missing.read_lines().empty(), "a missing file reads nothing");
 }
 
-void test_run_command() {
-    std::vector<std::string> lines;
-    const LineSink collect = [&](const std::string& line, bool) { lines.push_back(line); };
-    CommandResult r = run_command({"/bin/sh", "-c", "echo one; echo two >&2; printf 'three\\r\\nfour'; exit 3"},
-                                  std::chrono::seconds(10), collect);
-    check(r.exit_code == 3 && !r.timed_out, "the command's exit status");
-    check(lines == std::vector<std::string>{"one", "two", "three", "four"},
-          "stdout and stderr lines, CR removed, the unterminated last line kept");
-    check(r.last_line == "four", "the last line");
+void test_profiles() {
+    const auto def = parse_experts_shares("");
+    check(def && def->vram == 100 && def->ram == 0, "empty experts defaults to 100/0");
+    const auto g40 = parse_experts_shares("vram=40%,ram=60%");
+    check(g40 && g40->vram == 40 && g40->ram == 60, "vram=40%,ram=60% parses");
+    const auto mix = parse_experts_shares("vram=65%,ram=15%,ssd=20%");
+    check(mix && mix->vram == 65 && mix->ram == 15, "three-tier percentages parse");
+    const auto all = parse_experts_shares("vram=all");
+    check(all && all->vram == 100 && all->ram == 0, "vram=all parses to 100/0");
+    check(!parse_experts_shares("vram=50%,ram=60%"), "percentages past 100 refused");
+    check(!parse_experts_shares("vram=1000,ram=500"), "raw counts return nullopt");
 
-    // The monitor's own descriptors (its listening socket) must not reach the server a start launches.
-    const int fd = ::dup2(::open("/dev/null", O_RDONLY), 57);
-    lines.clear();
-    r = run_command({"/bin/sh", "-c", "test -e /proc/$$/fd/57 && echo open || echo closed"}, std::chrono::seconds(10),
-                    collect);
-    ::close(fd);
-    check(r.exit_code == 0 && lines == std::vector<std::string>{"closed"}, "no inherited descriptor");
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("infernix_monitor_test_prof_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto dummy_model = dir / "dummy.infernix";
+    write_file(dummy_model, "x");
+    write_file(dir / "Beta.toml",
+               "model = \"" + dummy_model.string() + "\"\n"
+               "kv-dtype = \"int8\"\n"
+               "spec = \"dflash2\"\n"
+               "[serve]\n"
+               "served-model-name = [\"beta-alias\"]\n"
+               "experts = \"vram=40%,ram=60%\"\n"
+               "max-context = 262144\n"
+               "max-concurrency = 4\n"
+               "port = 8123\n");
+    write_file(dir / "Alpha.toml",
+               "model = \"" + (dir / "missing.infernix").string() + "\"\n"
+               "[serve]\n"
+               "port = 8000\n");
+    write_file(dir / ".hidden.toml", "model = \"ignored\"\n");
+    write_file(dir / "Broken.toml", "port = [unterminated\n");
 
-    const auto begin = std::chrono::steady_clock::now();
-    r = run_command({"/bin/sh", "-c", "echo waiting; sleep 30"}, std::chrono::seconds(1), collect);
-    const auto took = std::chrono::steady_clock::now() - begin;
-    check(r.timed_out && r.exit_code == 128 + 9 && took < std::chrono::seconds(5),
-          "past the timeout the command and its children are killed");
-
-    const auto detached = std::chrono::steady_clock::now();
-    r = run_command({"/bin/sh", "-c", "(sleep 4 &); echo left"}, std::chrono::seconds(10), collect);
-    check(r.exit_code == 0 && !r.timed_out && std::chrono::steady_clock::now() - detached < std::chrono::seconds(3),
-          "a program the command leaves holding the output does not hold the result");
-
-    r = run_command({"/nonexistent/command"}, std::chrono::seconds(10), collect);
-    check(r.exit_code == 127, "a command that cannot run exits 127");
+    const auto profiles = scan_profiles(dir);
+    check(profiles.size() == 3, "scans non-hidden *.toml profiles sorted alphabetically");
+    if (profiles.size() == 3) {
+        check(profiles[0].name == "Alpha" && !profiles[0].artifact_exists && profiles[0].default_shares &&
+                  profiles[0].default_shares->vram == 100,
+              "Alpha profile missing artifact and defaults to 100% VRAM");
+        check(profiles[1].name == "Beta" && profiles[1].artifact_exists && profiles[1].served_name == "beta-alias" &&
+                  profiles[1].port == 8123 && profiles[1].kv_dtype == "int8" && profiles[1].spec == "dflash2" &&
+                  profiles[1].max_context == 262144 && profiles[1].max_concurrency == 4 &&
+                  profiles[1].default_shares && profiles[1].default_shares->vram == 40 &&
+                  profiles[1].default_shares->ram == 60,
+              "Beta profile reads top-level and [serve] metadata accurately");
+        check(profiles[2].name == "Broken" && !profiles[2].parse_error.empty(), "Broken profile captures parse error");
+    }
+    std::filesystem::remove_all(dir);
 }
 
 void test_placement_shares() {
@@ -185,8 +234,43 @@ void test_placement_shares() {
           "the shares add up to 100 %");
     check(!placement_body(0, 50) && !placement_body(60, 41) && !placement_body(101, 0) && !placement_body(50, -1),
           "VRAM below 1 %, a sum past 100 % or a negative share is refused");
-    check(experts_spec(100, 0) == std::string() && experts_spec(40, 60) == "vram=40%,ram=60%,ssd=0%",
-          "the start spec: empty for the engine's default");
+    check(experts_spec(100, 0) == "vram=100%" && experts_spec(40, 60) == "vram=40%,ram=60%,ssd=0%",
+          "explicit --experts override at 100% and mixed tiers");
+}
+
+void test_reserve_plan() {
+    constexpr std::uint64_t kGiB = 1ULL << 30;
+    const nlohmann::json report{
+        {"supported", true},
+        {"total_experts", 1000},
+        {"mechanism",
+         {{"total_experts", 1000},
+          {"vram", {{"bytes", 60 * kGiB}, {"frame_bytes", 100ULL << 20}}}, // 100 MiB/expert -> 10.24/GiB
+          {"ram", {{"record_bytes", 100ULL << 20}}},
+          {"vram_free", 10 * kGiB},        // 60 + 10 = 70 GiB total expert budget
+          {"host_available", 50 * kGiB}}}, // 50 GiB available RAM
+    };
+    std::string err;
+    // Reserve 32 GiB VRAM -> 38 GiB left -> floor(38 * 1024 / 100) = 389 experts in VRAM.
+    // Reserve 24 GiB RAM -> 26 GiB left -> floor(26 * 1024 / 100) = 266 experts in RAM, 345 on SSD.
+    const auto gaming = compute_reserve_plan(report, 32.0, 24.0, &err);
+    check(gaming.has_value(), "gaming reserve plan computed");
+    if (gaming) {
+        check(gaming->vram_experts == 389 && gaming->ram_experts == 266 && gaming->ssd_experts == 345,
+              "gaming reserve counts match exact VRAM/RAM reserve math");
+        check(gaming->body == nlohmann::json{{"vram", 389}, {"ram", 266}}, "gaming reserve POST body");
+    }
+    // Huge budget with 0 reserve -> fits all 1000 experts in VRAM -> {"vram": "all"}.
+    nlohmann::json roomy                    = report;
+    roomy["mechanism"]["vram_free"]         = 100 * kGiB;
+    const auto full = compute_reserve_plan(roomy, 0.0, 0.0, &err);
+    check(full && full->vram_experts == 1000 && full->ram_experts == 0 &&
+              full->body == nlohmann::json{{"vram", "all"}},
+          "full VRAM fit collapses to vram=all");
+
+    check(!compute_reserve_plan(nlohmann::json{{"supported", false}}, 32.0, 24.0, &err),
+          "unsupported model refused");
+    check(!compute_reserve_plan(report, -1.0, 0.0, &err), "negative reserve refused");
 }
 
 void test_page_request() {
@@ -203,6 +287,117 @@ void test_page_request() {
     check(!page_request_allowed("", "", json, names), "no Host");
 }
 
+void test_native_controller() {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("infernix_monitor_test_ctl_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir / "configs");
+    std::filesystem::create_directories(dir / "logs");
+
+    const auto dummy_model = dir / "mock.infernix";
+    write_file(dummy_model, "mock");
+    const int port = pick_free_port();
+
+    write_file(dir / "configs" / "MockA.toml",
+               "model = \"" + dummy_model.string() + "\"\n[serve]\nport = " + std::to_string(port) + "\n");
+    write_file(dir / "configs" / "MockB.toml",
+               "model = \"" + dummy_model.string() + "\"\n[serve]\nport = " + std::to_string(port) + "\n");
+    write_file(dir / "configs" / "MockCrash.toml",
+               "model = \"" + dummy_model.string() + "\"\n[serve]\nport = " + std::to_string(port) + "\n");
+
+    const auto args_dump = dir / "last_args.txt";
+    const auto mock_bin  = dir / "mock-infernix-serve";
+    write_file(
+        mock_bin,
+        "#!/usr/bin/env python3\n"
+        "import http.server, os, signal, sys\n"
+        "args = sys.argv[1:]\n"
+        "with open(" + nlohmann::json(args_dump.string()).dump() + ", 'w') as f:\n"
+        "    f.write('\\n'.join(args) + '\\n')\n"
+        "    f.write('COREDUMP=' + os.environ.get('CUDA_ENABLE_COREDUMP_ON_EXCEPTION', '') + '\\n')\n"
+        "    f.write('FD57=' + ('open' if os.path.exists('/proc/self/fd/57') else 'closed') + '\\n')\n"
+        "if any('MockCrash.toml' in a for a in args):\n"
+        "    print('FATAL: simulated crash', flush=True)\n"
+        "    sys.exit(2)\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200); self.end_headers(); self.wfile.write(b'{\"data\":[]}')\n"
+        "    def log_message(self, *a): pass\n"
+        "http.server.HTTPServer.allow_reuse_address = True\n"
+        "srv = http.server.HTTPServer(('127.0.0.1', " + std::to_string(port) + "), H)\n"
+        "signal.signal(signal.SIGTERM, lambda *a: os._exit(0))\n"
+        "print('server ready on port " + std::to_string(port) + "', flush=True)\n"
+        "srv.serve_forever()\n");
+    ::chmod(mock_bin.c_str(), 0755);
+
+    ManagerConfig cfg;
+    cfg.configs_dir     = dir / "configs";
+    cfg.server_bin      = mock_bin;
+    cfg.work_dir        = dir;
+    cfg.log_dir         = dir / "logs";
+    cfg.default_profile = "MockA";
+    cfg.load_timeout    = std::chrono::seconds(15);
+    cfg.unload_timeout  = std::chrono::seconds(10);
+
+    const auto wait_idle = [](const Controller& ctl) {
+        for (int i = 0; i < 150; ++i) {
+            const auto st = ctl.state();
+            if (st["busy"].is_null()) { return st; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return ctl.state();
+    };
+
+    const int extra_fd = ::dup2(::open("/dev/null", O_RDONLY), 57);
+    {
+        Controller ctl(cfg, [](const std::string&, bool) {});
+        check(!ctl.load("MockA").has_value(), "load MockA queued");
+        const auto st1 = wait_idle(ctl);
+        check(st1["last"]["ok"] == true && st1["active_profile"] == "MockA" && st1["pid"].is_number_integer(),
+              "MockA loaded and tracked");
+        check(std::filesystem::is_symlink(cfg.log_dir / "latest.log"), "latest.log symlink created");
+        check(std::filesystem::exists(cfg.log_dir / "infernix-serve.pid"), "pidfile written");
+
+        // Verify env, request-log, and closed descriptor 57.
+        std::ifstream in(args_dump);
+        const std::string dumped((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        check(dumped.find("--request-log-jsonl") != std::string::npos, "request-log enabled by default");
+        check(dumped.find("COREDUMP=1") != std::string::npos, "CUDA coredump env set");
+        check(dumped.find("FD57=closed") != std::string::npos, "extra fd not inherited by server");
+
+        // Switch directly from MockA to MockB with explicit --experts override.
+        const pid_t pid_a = static_cast<pid_t>(st1["pid"].get<std::int64_t>());
+        check(!ctl.load("MockB", "vram=100%").has_value(), "switch to MockB queued");
+        const auto st2 = wait_idle(ctl);
+        check(st2["last"]["ok"] == true && st2["active_profile"] == "MockB" &&
+                  st2["pid"].get<std::int64_t>() != pid_a,
+              "switched cleanly from MockA to MockB");
+        std::ifstream in2(args_dump);
+        const std::string dumped2((std::istreambuf_iterator<char>(in2)), std::istreambuf_iterator<char>());
+        check(dumped2.find("--experts\nvram=100%") != std::string::npos, "explicit --experts passed on switch");
+
+        // Unload cleanly.
+        const pid_t pid_b = static_cast<pid_t>(st2["pid"].get<std::int64_t>());
+        check(!ctl.unload().has_value(), "unload queued");
+        const auto st3 = wait_idle(ctl);
+        check(st3["last"]["ok"] == true && st3["active_profile"].is_null() && st3["pid"].is_null(),
+              "unloaded cleanly");
+        check(::kill(pid_b, 0) != 0, "unloaded server process exited");
+        check(!std::filesystem::exists(cfg.log_dir / "infernix-serve.pid"), "pidfile removed on unload");
+
+        // Fast-fail on premature server exit.
+        const auto t0 = std::chrono::steady_clock::now();
+        check(!ctl.load("MockCrash").has_value(), "load MockCrash queued");
+        const auto st4 = wait_idle(ctl);
+        const auto dt  = std::chrono::steady_clock::now() - t0;
+        check(st4["last"]["ok"] == false && dt < std::chrono::seconds(5) &&
+                  st4["last"]["message"].get<std::string>().find("simulated crash") != std::string::npos,
+              "crashed server fails fast with last log line");
+    }
+    if (extra_fd >= 0) { ::close(extra_fd); }
+    std::filesystem::remove_all(dir);
+}
+
 } // namespace
 
 int main() {
@@ -210,9 +405,11 @@ int main() {
     test_request_log();
     test_log_lines();
     test_file_tail();
-    test_run_command();
+    test_profiles();
     test_placement_shares();
+    test_reserve_plan();
     test_page_request();
+    test_native_controller();
     if (failures != 0) {
         std::cerr << failures << " checks failed\n";
         return EXIT_FAILURE;

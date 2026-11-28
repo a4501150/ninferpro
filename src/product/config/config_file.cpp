@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -163,7 +164,7 @@ ProgramArguments read_program_arguments(int argc, char** argv, const ConfigProgr
         if (arg == "--config") {
             if (++i >= argc) { throw std::invalid_argument("--config needs a value"); }
             if (result.config_path) { throw std::invalid_argument("--config may be given only once"); }
-            result.config_path = argv[i];
+            result.config_path = expand_user_path(argv[i]);
             continue;
         }
         const ConfigOption* option = program.find_option(arg);
@@ -203,6 +204,23 @@ std::vector<std::string> redact_option_values(std::vector<std::string> arguments
         }
     }
     return arguments;
+}
+
+std::string expand_user_path(std::string_view path) {
+    if (path.empty() || path.front() != '~') { return std::string(path); }
+    const bool slash = path.size() > 1 && (path[1] == '/' || path[1] == '\\');
+    if (path.size() > 1 && !slash) { return std::string(path); }
+#ifdef _WIN32
+    const char* home = std::getenv("USERPROFILE");
+    if (home == nullptr || *home == '\0') { home = std::getenv("HOME"); }
+#else
+    const char* home = std::getenv("HOME");
+#endif
+    if (home == nullptr || *home == '\0') { return std::string(path); }
+    std::string out(home);
+    while (out.size() > 1 && (out.back() == '/' || out.back() == '\\')) { out.pop_back(); }
+    out.append(path.substr(1));
+    return out;
 }
 
 } // namespace infernix::product
