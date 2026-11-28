@@ -102,10 +102,11 @@ drafter), KV 6.36 GiB, expert cache 69.3 GiB (7,098 frames). Speeds sit below Fl
 each miss moves 8.26-14.16 MB (3-5× Flash-Next's 2.76 MB), dense reads per token are large
 (≈ 16.7 GB BF16 on NVFP4; ≈ 9.3 GB Q8 on GSQ-Q4), and routing locality is flatter (§18).
 
-An opt-in blanket Q8-dense NVFP4 recipe (`glm5_3_flash_nvfp4_orcarouter_q8dense`, model 9.17 GiB,
-fitting `vram=44%`) is built but not served: against BF16 dense (quick corpus, context 8192,
-stride 4096, INT8 KV) it measured mean KL 0.0058, p99 0.066, top-1 97.3 % (PPL 3.1515 vs 3.1489),
-above the 0.002 KL gate; selective per-class Q8 dense remains untested (§17.2).
+An opt-in Q8-dense NVFP4 recipe (`glm5_3_flash_nvfp4_orcarouter_q8dense`, model 9.17 GiB,
+fitting `vram=44%`) is built but not served: even with embeddings, `lm_head`, routers, KDA
+control projections, `key_up`/`value_up` and the indexer kept in BF16, it measured mean KL
+0.0058, p99 0.066, top-1 97.3 % (PPL 3.1515 vs 3.1489) against BF16 dense, above the 0.002 KL
+gate (§17.2).
 
 ## 2. Model facts
 
@@ -235,9 +236,8 @@ What follows from these bytes (model, at the card's 1.79 TB/s):
 - **The dense BF16 reads rival the experts.** ≈ 16.7 GB of dense weights (including `lm_head`)
   per token against 4.76 GB of all-hit routed weights: an all-hit NVFP4 token reads ≈ 21.8 GB
   (≈ 12.2 ms, ceiling ≈ 82 tok/s). The dense GEMVs take ≈ 8.1-8.4 ms per round (§6.5). An opt-in
-  Q8-dense NVFP4 recipe cuts model bytes to 9.17 GiB (not default: blanket Q8 misses the 0.002 KL
-  gate; selective per-class Q8 is untested, §17.2), while the GSQ-Q4 GGUF artifact (§3.3) uses
-  Q8_0 dense projections (model 9.25 GiB).
+  Q8-dense NVFP4 recipe cuts model bytes to 9.17 GiB (not default: it misses the 0.002 KL gate,
+  §17.2), while the GSQ-Q4 GGUF artifact (§3.3) uses Q8_0 dense projections (model 9.25 GiB).
 - **A miss moves 14.16 MB**, 5.1× Flash-Next's 2.76 MB record.
 - **The KV cache is small.** One MLA latent is 512 values per token and layer: 11 MLA layers ×
   1 KiB = 11 KiB per token in BF16, plus 64 B of pooled index key per layer.
@@ -1098,8 +1098,8 @@ open research/compute choices:
 
 | Option | State and reason |
 |---|---|
-| **Selective Q8-dense NVFP4 recipe** | Blanket `glm5_3_flash_nvfp4_orcarouter_q8dense` IS built (model 15.44 → 9.17 GiB, fitting `vram=44%`) and not default because blanket Q8 missed the 0.002 KL gate (mean KL 0.0058, p99 0.066, top-1 97.3 %, PPL 3.1515 vs 3.1489; §1). **Open:** per-class ablation keeping only the KL-sensitive dense projections in BF16 (e.g. KDA or MLA) while quantizing the bulk to Q8, and re-measuring Q8-dense prefill with `MmaR128T128` (`q8_a16_mma.cuh`) |
-| **Custom RCO-GSQ / mixed K-quant from `orcarouter` FP8** | **Open:** the shipped GGUF artifact (§3.3) uses GCSA's abliteration (no matched full-precision reference) and drops layers 39-44 to Q2_K. Quantizing `orcarouter/GLM-5.3-Flash-Uncensored-FP8` directly with RCO-GSQ (3.5-4.0 bpw, optional BF16 or selective-Q8 dense) would provide a verified KL measurement and an allocation sized specifically for 96 GB VRAM |
+| **Q8-dense NVFP4 recipe** | Built (`glm5_3_flash_nvfp4_orcarouter_q8dense`, model 15.44 → 9.17 GiB, fitting `vram=44%`) and not served: even with embeddings, `lm_head`, routers, KDA control projections, `key_up`/`value_up` and the indexer kept in BF16, quantizing KDA q/k/v/o, MLA query/latent/output, dense MLPs and shared experts measured mean KL 0.0058, p99 0.066, top-1 97.3 % (PPL 3.1515 vs 3.1489; §1), above the 0.002 KL gate. Leaving KDA q/k/v/o in BF16 gives back 61 % of the dense bytes (4.68B of 7.66B params), leaving too little VRAM gain |
+| **Custom RCO-GSQ / mixed K-quant from BF16 or `orcarouter` FP8** | **Open:** the shipped GGUF artifact (§3.3) uses GCSA's abliteration (no matched full-precision reference) and drops layers 39-44 to Q2_K. Quantizing from `zai-org/GLM-5.3-Flash-BF16` (598.5 GiB, after clean BF16 abliteration) or `orcarouter/GLM-5.3-Flash-Uncensored-FP8` at ~3.7-4.0 bpw (avoiding Q2_K) would yield a verified KL measurement and an allocation sized for 96 GB VRAM |
 | **Large-scale DFlash2 drafter fine-tuning** | **Open:** the overnight 298k-token pilot overfit after step 400 (§10.4); fine-tuning on 20-100M on-policy tokens from `orcarouter` FP8 or the served artifact remains untried (`tools/drafter/README.md`) |
 | **EXL3 3.05 bpw builds** (MikeRoz's and turboderp's) | Deferred on engineering cost: requires ≈ 7k lines of new trellis codec, E3A16 canonical arithmetic, GPU/CPU kernels and converter plumbing, whereas NVFP4 and GGUF K-quants reuse existing engine formats. External testing measured EXL3 3.05 bpw (122.3 GB) at mean KL 0.047 vs BF16 (§18); remains an option if codec cost is justified |
 | **Further VRAM/RAM cache policies** (router-score / near-miss credit from ranks 9-16, hot-layer reservations, static hot set + adaptive remainder) | LFRU-Blend with cost-marginal landing, cold pre-demotion, adaptive H2D cap and steady landing frontier is shipped (§6.2, MoE §4.3). `--route-trace` IS supported (§16), so `tools/expert_cache_replay/replay.py` can evaluate further policies on recorded `glm5_next` traces |
@@ -1136,8 +1136,9 @@ Why GLM-5.3-Flash misses more than Flash-Next at an equal VRAM fraction: 8 of 28
 (2.8 % vs 10 of 512) combined with auxiliary-free router load balancing produces flatter expert
 popularity (Flash-Next LFRU misses 1.4 % at 48.8 % VRAM vs ~10-24 % here).
 
-`zai-org/GLM-5.3-Flash` ships natively in block-FP8 (306 GiB; no upstream BF16 release);
-`orcarouter/GLM-5.3-Flash-Uncensored-FP8` is the refusal-ablated block-FP8 source from which
+`zai-org/GLM-5.3-Flash-BF16` (598.5 GiB) is the upstream BF16 release and
+`zai-org/GLM-5.3-Flash` (305.8 GiB) is Z.ai's block-FP8 release;
+`orcarouter/GLM-5.3-Flash-Uncensored-FP8` is the refusal-ablated block-FP8 checkpoint from which
 `orcarouter/GLM-5.3-Flash-Uncensored-NVFP4` was quantized, and `RedHatAI/GLM-5.3-Flash-NVFP4`
 (base model, same layout) imports through the same recipe.
 
